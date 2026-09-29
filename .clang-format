@@ -1,0 +1,21 @@
+BasedOnStyle: LLVM
+IndentWidth: 8
+TabWidth: 8
+UseTab: Always
+ContinuationIndentWidth: 4
+ColumnLimit: 100
+AlignAfterOpenBracket: DontAlign
+AlignOperands: DontAlign
+Cpp11BracedListStyle: false
+BinPackLongBracedList: false
+BreakAfterReturnType: AllDefinitions
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+InsertBraces: true
+SortIncludes: Never
+SeparateDefinitionBlocks: Always

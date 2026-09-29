@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Machlin btrfs</string>
+    <key>EXAppExtensionAttributes</key>
+    <dict>
+        <key>EXExtensionPointIdentifier</key>
+        <string>com.apple.fskit.fsmodule</string>
+        <key>FSActivateOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>o:</string>
+        </dict>
+        <key>FSCheckOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>nq</string>
+        </dict>
+        <key>FSMediaTypes</key>
+        <dict>
+            <key>0FC63DAF-8483-4772-8E79-3D69D8477DE4</key>
+            <dict>
+                <key>FSMediaProperties</key>
+                <dict>
+                    <key>Content Hint</key>
+                    <string>0FC63DAF-8483-4772-8E79-3D69D8477DE4</string>
+                    <key>Leaf</key>
+                    <true/>
+                </dict>
+                <key>FSProbeOrder</key>
+                <integer>2000</integer>
+            </dict>
+            <key>Partitionless</key>
+            <dict>
+                <key>FSMediaProperties</key>
+                <dict>
+                    <key>Leaf</key>
+                    <true/>
+                    <key>Whole</key>
+                    <true/>
+                </dict>
+                <key>FSProbeOrder</key>
+                <integer>5000</integer>
+            </dict>
+        </dict>
+        <key>FSPersonalities</key>
+        <dict>
+            <key>btrfs</key>
+            <dict>
+                <key>FSfileObjectsAreCaseSensitive</key>
+                <true/>
+                <key>FSName</key>
+                <string>Machlin btrfs</string>
+            </dict>
+        </dict>
+        <key>FSRequiresSecurityScopedPathURLResources</key>
+        <false/>
+        <key>FSShortName</key>
+        <string>machlin_btrfs</string>
+        <key>FSSupportsBlockResources</key>
+        <true/>
+        <key>FSSupportsGenericURLResources</key>
+        <false/>
+        <key>FSSupportsPathURLs</key>
+        <false/>
+        <key>FSSupportsServerURLs</key>
+        <false/>
+    </dict>
+</dict>
+</plist>

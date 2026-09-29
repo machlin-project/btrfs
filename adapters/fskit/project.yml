@@ -1,0 +1,76 @@
+name: BtrfsFSKit
+options:
+  deploymentTarget:
+    macOS: '26.4'
+  xcodeVersion: '27.1'
+settings:
+  base:
+    CLANG_ENABLE_MODULES: YES
+    CLANG_ENABLE_OBJC_ARC: YES
+    CLANG_WARN_DOCUMENTATION_COMMENTS: YES
+    GCC_C_LANGUAGE_STANDARD: c11
+    GCC_TREAT_WARNINGS_AS_ERRORS: YES
+    SWIFT_VERSION: '5.0'
+    MACOSX_DEPLOYMENT_TARGET: '26.4'
+    MARKETING_VERSION: '0.1.0'
+    CURRENT_PROJECT_VERSION: '1'
+targets:
+  BtrfsCore:
+    type: library.static
+    platform: macOS
+    sources:
+      - ../../core
+      - ../../include
+      - ../common
+    settings:
+      base:
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../../include
+        OTHER_CFLAGS: -ffreestanding -fno-builtin -Wdeclaration-after-statement
+        SKIP_INSTALL: YES
+  BtrfsFSKitExtension:
+    type: extensionkit-extension
+    platform: macOS
+    sources:
+      - BtrfsExtension.swift
+      - BtrfsFileSystem.m
+      - BtrfsFileSystem.h
+      - BridgingHeader.h
+    dependencies:
+      - target: BtrfsCore
+      - sdk: libz.tbd
+      - sdk: FSKit.framework
+      - sdk: ExtensionFoundation.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.machlin.btrfs.filesystem
+        INFOPLIST_FILE: Extension-Info.plist
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: Extension.entitlements
+        ENABLE_APP_SANDBOX: YES
+        SWIFT_OBJC_BRIDGING_HEADER: BridgingHeader.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../../include
+        OTHER_CFLAGS: -Wdeclaration-after-statement
+        SKIP_INSTALL: YES
+  BtrfsFSKitApp:
+    type: application
+    platform: macOS
+    sources:
+      - App.swift
+    dependencies:
+      - target: BtrfsFSKitExtension
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.machlin.btrfs
+        PRODUCT_NAME: Machlin btrfs
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Machlin btrfs
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        ENABLE_APP_SANDBOX: YES
+schemes:
+  BtrfsFSKitApp:
+    build:
+      targets:
+        BtrfsFSKitApp: all
+    run:
+      config: Debug

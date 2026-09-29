@@ -1,0 +1,2 @@
+option('fixtures', type: 'string', value: '', description: 'Require the Linux-authored fixture directory')
+option('fuzzer', type: 'boolean', value: false, description: 'Build the bounded libFuzzer image entry point')

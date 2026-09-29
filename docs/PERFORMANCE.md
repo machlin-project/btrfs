@@ -1,0 +1,67 @@
+# Performance acceptance
+
+The product target is higher throughput than Linux Btrfs on matched filesystem
+workloads, without losing integrity, durability, authorization or concurrency
+semantics. This is an open release gate. A portable image read, checksum benchmark
+or unsigned adapter build cannot establish mounted filesystem performance.
+
+## Existing architecture gates
+
+`btrfs-adversarial` counts backend reads and allocations for a single verified
+4 MiB read on the Linux-authored plain image. The budget is at most 64 I/O calls
+and 16 allocations. The initial accepted run uses 7 reads and 4 allocations.
+These are deterministic structural costs, not speed measurements. ASan/UBSan
+are enabled for this check, so wall-clock timing would be misleading.
+
+A 700-entry directory stream must use at most 32 reads and 8 allocations; the
+accepted run uses 5 reads and 3 allocations. Both native adapters use this stream.
+Attribute requests may require additional inode lookups; the budget measures
+name/type/identity enumeration only.
+
+Retained cursor paths avoid repeated metadata I/O within a read; checksum records
+are consumed across sectors; data reads use up to 1 MiB windows. ARM CRC32C uses
+general-register hardware instructions. Sparse gaps do not iterate over each
+missing block. Subvolume identity uses separate hash indexes by object and native
+number instead of scans over all issued IDs.
+
+Before optimizing further, measure these remaining costs: non-selected subvolume
+operations re-resolve their root; enumeration with attributes fetches each inode;
+each convenience read creates a new operation context;
+the initial XNU device adapter reads through sector-sized native metadata buffers.
+Do not conceal these costs behind hot-cache numbers. Bounded generation-aware
+metadata caching, reusable read sessions and native
+coalesced device I/O are explicit follow-up work.
+
+## Matched benchmark protocol
+
+1. Freeze binaries, fixture images and mount options in generated reports. Record
+   OS/kernel/driver identity, CPU allocation, RAM, cache state, block geometry,
+   compression and checksum algorithms. Source revisions remain in Git.
+2. Use equal dedicated VM resources and the same virtual disk transport for Linux
+   Btrfs and the XNU adapter. FSKit is a separate reported series. Do not compare
+   a host image reader with a VM mounted filesystem as if they were equivalent.
+3. Run correctness and durability oracles first. Benchmarks fail if the reader
+   skips checksums or a writer returns success without the required flush.
+4. Alternate at least seven Linux/driver runs. Report every sample, median,
+   variability, throughput, p50/p95/p99 latency, CPU time, peak memory, backend
+   I/O bytes/calls, allocations and flush count. No unrelated VM/test workloads.
+5. Separate cold data, warm metadata, warm file cache, tiny datasets and datasets
+   larger than guest RAM. Remount alone is not proof of a cold host device cache.
+6. For writes include identical fsync cadence, crash verification, snapshots and
+   equivalent compression. Report write amplification and metadata cost, not just
+   user-byte throughput. Never trade away CoW isolation for a winning number.
+
+| Workload | Sizes/concurrency | Mandatory accompanying checks |
+| --- | --- | --- |
+| Sequential read | 4 KiB/64 KiB/1 MiB calls; 1/4/16 readers | Hash, allocated bytes, cold/warm series |
+| Random read | 4 KiB/16 KiB; queue depths 1/4/16/64 | Same seed, identical working set and checksum policy |
+| Namespace | 1k/100k/1M entries; hit/miss/collision lookup | Full enumeration, stable resume, bounded memory |
+| Compressed read | zlib/LZO/Zstd, low/high entropy | Same image and exact decoded bytes |
+| Shared extents | snapshots, reflink, overwritten middle | Isolation and backreference validation |
+| Mixed read/write | readers + append/overwrite/truncate | No stale pages, torn publication or lock starvation |
+| Durable write | 4 KiB fsync; batched fsync; directory fsync | Every acknowledged boundary survives power cut |
+| Full/fragmented filesystem | 90/99/100% fill | ENOSPC rollback and recovery |
+
+An overall claim requires the agreed representative workload set and no material
+correctness or tail-latency regression. A win in one row is reported as that row's
+win. This repository currently makes no measured claim of outperforming Linux.

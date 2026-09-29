@@ -1,0 +1,13 @@
+.build*/
+.cache/
+artifacts/
+logs/
+vendor/
+__pycache__/
+*.pyc
+/crash-*
+/leak-*
+/timeout-*
+/oom-*
+.DS_Store
+adapters/fskit/*.xcodeproj/
