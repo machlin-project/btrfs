@@ -33,6 +33,8 @@ struct bt_le64 {
 #define BT_EXTENT_TREE UINT64_C(2)
 #define BT_CHUNK_TREE UINT64_C(3)
 #define BT_CSUM_TREE UINT64_C(7)
+#define BT_QUOTA_TREE UINT64_C(8)
+#define BT_DEV_TREE UINT64_C(4)
 #define BT_FIRST_CHUNK_OBJECTID UINT64_C(256)
 #define BT_ROOT_DIR_OBJECTID UINT64_C(6)
 #define BT_CSUM_OBJECTID (UINT64_MAX - UINT64_C(9))
@@ -61,6 +63,12 @@ struct bt_le64 {
 #define BT_SUPER_SEEDING (UINT64_C(1) << 32)
 #define BT_SUPER_METADUMP (UINT64_C(1) << 33)
 #define BT_SUPER_METADUMP_V2 (UINT64_C(1) << 34)
+#define BT_HEADER_WRITTEN UINT64_C(1)
+#define BT_HEADER_MIXED_BACKREF (UINT64_C(1) << 56)
+#define BT_BACKUP_ROOTS 4U
+#define BT_EXTENT_FLAG_DATA UINT64_C(1)
+#define BT_EXTENT_FLAG_TREE UINT64_C(2)
+#define BT_EXTENT_FLAG_FULL_BACKREF (UINT64_C(1) << 8)
 
 enum bt_item_type {
 	BT_INODE_ITEM = 1,
@@ -73,6 +81,10 @@ enum bt_item_type {
 	BT_EXTENT_CSUM = 128,
 	BT_ROOT_ITEM = 132,
 	BT_ROOT_BACKREF = 144,
+	BT_EXTENT_ITEM = 168,
+	BT_METADATA_ITEM = 169,
+	BT_TREE_BLOCK_REF = 176,
+	BT_BLOCK_GROUP_ITEM = 192,
 	BT_CHUNK_ITEM = 228
 };
 
@@ -128,6 +140,15 @@ struct bt_disk_chunk {
 	struct bt_le16 stripes, sub_stripes;
 };
 
+struct bt_disk_root_backup {
+	struct bt_le64 tree, tree_generation, chunk, chunk_generation;
+	struct bt_le64 extent, extent_generation, files, files_generation;
+	struct bt_le64 device, device_generation, checksum, checksum_generation;
+	struct bt_le64 total_bytes, used_bytes, devices, reserved64[4];
+	uint8_t tree_level, chunk_level, extent_level, files_level, device_level, checksum_level;
+	uint8_t reserved8[10];
+};
+
 struct bt_disk_super {
 	uint8_t csum[BT_CSUM_SIZE], fsid[BTRFS_UUID_SIZE];
 	struct bt_le64 bytenr, flags;
@@ -144,7 +165,8 @@ struct bt_disk_super {
 	uint8_t metadata_uuid[BTRFS_UUID_SIZE];
 	struct bt_le64 global_roots, reserved[27];
 	uint8_t system_array[BT_SYSTEM_ARRAY_SIZE];
-	uint8_t backup_roots[672], padding[565];
+	struct bt_disk_root_backup backup_roots[BT_BACKUP_ROOTS];
+	uint8_t padding[565];
 };
 
 struct bt_disk_time {
@@ -165,6 +187,28 @@ struct bt_disk_root {
 	struct bt_le32 refs;
 	struct bt_disk_key drop_progress;
 	uint8_t drop_level, level;
+};
+
+struct bt_disk_root_full {
+	struct bt_disk_root legacy;
+	struct bt_le64 generation_v2;
+	uint8_t uuid[BTRFS_UUID_SIZE], parent_uuid[BTRFS_UUID_SIZE], received_uuid[BTRFS_UUID_SIZE];
+	struct bt_le64 ctransid, otransid, stransid, rtransid;
+	struct bt_disk_time ctime, otime, stime, rtime;
+	struct bt_le64 reserved[8];
+};
+
+struct bt_disk_extent_item {
+	struct bt_le64 refs, generation, flags;
+};
+
+struct bt_disk_inline_ref {
+	uint8_t type;
+	struct bt_le64 offset;
+};
+
+struct bt_disk_block_group {
+	struct bt_le64 used_bytes, chunk_objectid, flags;
 };
 
 struct bt_disk_dir {
@@ -197,12 +241,16 @@ struct bt_disk_extent {
 };
 
 _Static_assert(sizeof(struct bt_disk_super) == BT_SUPER_SIZE, "superblock layout");
+_Static_assert(sizeof(struct bt_disk_root_backup) == 168, "backup root layout");
 _Static_assert(offsetof(struct bt_disk_super, system_array) == 811, "system array layout");
 _Static_assert(sizeof(struct bt_disk_key) == 17, "key layout");
 _Static_assert(sizeof(struct bt_disk_header) == 101, "tree header layout");
 _Static_assert(sizeof(struct bt_disk_chunk) == 48, "chunk layout");
 _Static_assert(sizeof(struct bt_disk_inode) == 160, "inode layout");
 _Static_assert(sizeof(struct bt_disk_root) == 239, "legacy root layout");
+_Static_assert(sizeof(struct bt_disk_root_full) == 439, "root layout");
+_Static_assert(sizeof(struct bt_disk_extent_item) == 24, "extent item layout");
+_Static_assert(sizeof(struct bt_disk_inline_ref) == 9, "inline reference layout");
 _Static_assert(sizeof(struct bt_disk_extent_header) == 21, "inline extent layout");
 
 #endif

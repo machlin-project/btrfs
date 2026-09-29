@@ -4,19 +4,27 @@ A standalone Btrfs filesystem for macOS and Machlin: one portable C core, an
 FSKit application extension, and an XNU filesystem extension. Linux ABI policy
 belongs to LXNU in the XNU fork, not to this repository.
 
-The current implementation is a **read-only foundation for continued development**.
+The current implementation has an accepted **read-only XNU mount** and an
+experimental portable CoW transaction writer.
 It reads single-device CRC32C filesystems with SINGLE/DUP chunks, 4–64 KiB nodes,
 inodes, byte-exact names, directories, hard links, symlinks, inline and regular
 extents, sparse and preallocated data, raw xattrs, subvolumes and snapshots.
 The POSIX image adapter provides zlib and optional Zstd decoding. FSKit supplies
-zlib; XNU codec providers remain a separate integration requirement.
+zlib; the XNU adapter also supplies a bounded kernel zlib decoder.
 
 Independent Linux-created images are compared byte-for-byte under ASan/UBSan.
 The tests also exercise checksum-correct malformed metadata, allocation/I/O
 failures, mirror fallback, subvolume identity and structural I/O budgets.
-Native build evidence and mounted acceptance are tracked separately in
-[acceptance](docs/ACCEPTANCE.md). Writes, recovery, multi-device RAID, complete
-native authorization and Linux ABI policy are still open requirements.
+The XNU guest suite passes on four image profiles, including mmap, native user
+xattrs, Unix permissions, directory cookies, snapshots and concurrent reads.
+
+The writer can replace an existing uncompressed inline file in the top-level
+tree. It updates CoW paths, extent references, block-group accounting, root
+items and superblock mirrors with two persistence barriers. Linux fsck and
+mounted checks accept every whole-write crash prefix. Native mounts remain
+read-only: general file writes, shared reference updates, recovery and native
+write coherence are remaining work. See [acceptance](docs/ACCEPTANCE.md) and
+[the concrete handoff](docs/HANDOFF.md).
 
 The performance goal is to outperform Linux Btrfs on matched filesystem
 workloads. Range I/O and reusable traversal paths are present; the goal has **not

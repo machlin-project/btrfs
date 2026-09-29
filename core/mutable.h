@@ -1,0 +1,57 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+#ifndef MACHLIN_BTRFS_MUTABLE_H
+#define MACHLIN_BTRFS_MUTABLE_H
+
+#include "internal.h"
+
+struct bt_mutation;
+
+enum bt_edit { BT_INSERT, BT_REPLACE, BT_UPSERT, BT_DELETE };
+
+/* The transaction allocator owns live-extent accounting. reserve must return a
+ * fresh, node-aligned logical range of node_size bytes that is absent from every
+ * committed/snapshot/pinned root. The editor never allocates by guessing a gap.
+ * release rolls back a reservation, never frees a committed extent. Callbacks
+ * must not edit these trees recursively. One caller owns a mutation context. */
+struct bt_mutation_allocator {
+	void *context;
+	enum btrfs_result (*reserve)(
+	    void *context, uint64_t owner, uint8_t level, uint64_t *logical);
+	void (*release)(void *context, uint64_t logical);
+	size_t node_limit;
+};
+
+struct bt_mutated_block {
+	uint64_t address;
+	uint64_t original_address;
+	uint64_t owner;
+	uint64_t original_owner;
+	uint64_t original_generation;
+	uint8_t original_level;
+	uint8_t level;
+	int discarded;
+	const void *bytes;
+	size_t size;
+};
+
+/* Edits are private CoW operations. No function in this interface writes media
+ * or publishes a filesystem root. The owning transaction must update extent
+ * references, block groups, root items and durable superblocks before accept.
+ * Any failed edit poisons the context: discard it; do not publish partial work.
+ * The original reader and every untouched subtree remain immutable. */
+enum btrfs_result bt_mutation_create(const struct btrfs_fs *base,
+    const struct bt_mutation_allocator *allocator, struct bt_mutation **result);
+enum btrfs_result bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root,
+    struct bt_key key, const void *value, size_t length, enum bt_edit edit);
+enum btrfs_result bt_mutation_find(struct bt_mutation *mutation, struct bt_root root,
+    struct bt_key key, void *value, size_t capacity, size_t *length);
+const struct btrfs_fs *bt_mutation_view(const struct bt_mutation *mutation);
+size_t bt_mutation_count(const struct bt_mutation *mutation);
+enum btrfs_result bt_mutation_block(
+    struct bt_mutation *mutation, size_t index, struct bt_mutated_block *block);
+enum btrfs_result bt_mutation_seal(struct bt_mutation *mutation);
+/* Accept only after actual publication and its required persistence barrier. */
+enum btrfs_result bt_mutation_accept(struct bt_mutation *mutation);
+void bt_mutation_destroy(struct bt_mutation *mutation);
+
+#endif

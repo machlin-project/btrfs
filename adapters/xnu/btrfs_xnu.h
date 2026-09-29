@@ -4,6 +4,7 @@
 
 #include <btrfs/btrfs.h>
 #include <btrfs/identity.h>
+#include <btrfs/native.h>
 #include <kern/locks.h>
 #include <sys/mount.h>
 #include <sys/queue.h>

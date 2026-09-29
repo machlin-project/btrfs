@@ -14,11 +14,12 @@
 #include <sys/uio.h>
 #include <sys/unistd.h>
 #include <sys/vnode_if.h>
+#include <sys/xattr.h>
 
 static int (**btrfs_xnu_dispatch)(void *);
 
 static enum vtype
-btrfs_xnu_type(uint16_t mode)
+btrfs_xnu_type(uint32_t mode)
 {
 	switch (mode & BTRFS_MODE_TYPE) {
 	case BTRFS_MODE_REGULAR:
@@ -92,6 +93,9 @@ btrfs_xnu_get_node(struct btrfs_xnu_mount *mount, uint64_t number, vnode_t paren
 	lck_mtx_unlock(mount->nodes_lock);
 	if (error == 0) {
 		error = btrfs_xnu_error(btrfs_get_inode(mount->fs, identity, &node->inode));
+	}
+	if (error == 0) {
+		error = btrfs_xnu_error(btrfs_native_inode_supported(mount->fs, &node->inode));
 	}
 	if (error != 0) {
 		goto free_node;
@@ -294,6 +298,7 @@ btrfs_xnu_readdir(void *arguments)
 	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
 	struct btrfs_dir_entry entry;
 	struct btrfs_directory *stream;
+	struct btrfs_inode parent;
 	struct direntry extended;
 	struct dirent basic;
 	void *record;
@@ -319,7 +324,27 @@ btrfs_xnu_readdir(void *arguments)
 	if (result != BTRFS_OK) {
 		return btrfs_xnu_error(result);
 	}
-	while ((result = btrfs_directory_next(stream, &entry, &cookie)) == BTRFS_OK) {
+	for (;;) {
+		if (cookie < 2) {
+			parent = node->inode;
+			if (cookie == 1) {
+				result = btrfs_parent(node->mount->fs, &node->inode, &parent);
+				if (result != BTRFS_OK) {
+					break;
+				}
+			}
+			entry.id = parent.id;
+			entry.type = BTRFS_FT_DIRECTORY;
+			entry.name[0] = '.';
+			entry.name[1] = '.';
+			entry.name_length = cookie == 0 ? 1 : 2;
+			cookie++;
+		} else {
+			result = btrfs_directory_next(stream, &entry, &cookie);
+			if (result != BTRFS_OK) {
+				break;
+			}
+		}
 		if (cookie > INT64_MAX) {
 			result = BTRFS_RANGE;
 			break;
@@ -342,10 +367,14 @@ btrfs_xnu_readdir(void *arguments)
 			memcpy(extended.d_name, entry.name, entry.name_length);
 			record = &extended;
 		} else {
+			if (number > UINT32_MAX) {
+				result = BTRFS_RANGE;
+				break;
+			}
 			bzero(&basic, sizeof(basic));
 			length =
 			    roundup(offsetof(struct dirent, d_name) + entry.name_length + 1, 4);
-			basic.d_ino = number;
+			basic.d_ino = (uint32_t)number;
 			basic.d_namlen = (uint8_t)entry.name_length;
 			basic.d_type = IFTODT(btrfs_mode_for_type(entry.type));
 			basic.d_reclen = (uint16_t)length;
@@ -458,7 +487,7 @@ btrfs_xnu_strategy(void *arguments)
 			buf_unmap(args->a_bp);
 		}
 	}
-	buf_setresid(args->a_bp, (int)(length - completed));
+	buf_setresid(args->a_bp, (uint32_t)(length - completed));
 	buf_seterror(args->a_bp, error);
 	buf_biodone(args->a_bp);
 	return error;
@@ -481,7 +510,7 @@ btrfs_xnu_pathconf(void *arguments)
 
 	switch (args->a_name) {
 	case _PC_LINK_MAX:
-		*args->a_retval = UINT32_MAX;
+		*args->a_retval = INT32_MAX;
 		return 0;
 	case _PC_NAME_MAX:
 		*args->a_retval = BTRFS_NAME_MAX;
@@ -493,6 +522,97 @@ btrfs_xnu_pathconf(void *arguments)
 	default:
 		return EINVAL;
 	}
+}
+
+static int
+btrfs_xnu_getxattr(void *arguments)
+{
+	struct vnop_getxattr_args *args = arguments;
+	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+	void *buffer = NULL;
+	size_t length = 0;
+	size_t name_length;
+	enum btrfs_result result;
+	int error;
+
+	*args->a_size = 0;
+	name_length = strnlen(args->a_name, XATTR_MAXNAMELEN + 1);
+	if (!btrfs_native_xattr_visible(args->a_name, name_length)) {
+		return ENOATTR;
+	}
+	if (args->a_uio != NULL && uio_offset(args->a_uio) != 0) {
+		return EINVAL;
+	}
+	result = btrfs_get_xattr(
+	    node->mount->fs, &node->inode, args->a_name, name_length, NULL, 0, &length);
+	if (result != BTRFS_OK) {
+		return result == BTRFS_NOT_FOUND ? ENOATTR : btrfs_xnu_error(result);
+	}
+	*args->a_size = length;
+	if (args->a_uio == NULL || length == 0) {
+		return 0;
+	}
+	if (uio_resid(args->a_uio) < 0 || (uint64_t)uio_resid(args->a_uio) < length) {
+		return ERANGE;
+	}
+	if (length > BTRFS_NATIVE_XATTR_LIMIT) {
+		return E2BIG;
+	}
+	buffer = _MALLOC(length, M_TEMP, M_WAITOK | M_NULL);
+	if (buffer == NULL) {
+		return ENOMEM;
+	}
+	result = btrfs_get_xattr(
+	    node->mount->fs, &node->inode, args->a_name, name_length, buffer, length, &length);
+	error = btrfs_xnu_error(result);
+	if (error == 0) {
+		error = uiomove(buffer, (int)length, args->a_uio);
+	}
+	_FREE(buffer, M_TEMP);
+	return error;
+}
+
+static int
+btrfs_xnu_listxattr(void *arguments)
+{
+	struct vnop_listxattr_args *args = arguments;
+	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+	void *buffer;
+	size_t length = 0;
+	size_t filtered = 0;
+	enum btrfs_result result;
+	int error;
+
+	*args->a_size = 0;
+	result = btrfs_list_xattrs(node->mount->fs, &node->inode, NULL, 0, &length);
+	if (result != BTRFS_OK || length == 0) {
+		return btrfs_xnu_error(result);
+	}
+	if (length > BTRFS_NATIVE_XATTR_LIMIT) {
+		return E2BIG;
+	}
+	buffer = _MALLOC(length, M_TEMP, M_WAITOK | M_NULL);
+	if (buffer == NULL) {
+		return ENOMEM;
+	}
+	result = btrfs_list_xattrs(node->mount->fs, &node->inode, buffer, length, &length);
+	if (result == BTRFS_OK) {
+		result = btrfs_native_filter_xattrs(buffer, length, &filtered);
+	}
+	error = btrfs_xnu_error(result);
+	if (error == 0) {
+		*args->a_size = filtered;
+		if (args->a_uio != NULL) {
+			if (uio_resid(args->a_uio) < 0 ||
+			    (uint64_t)uio_resid(args->a_uio) < filtered) {
+				error = ERANGE;
+			} else {
+				error = uiomove(buffer, (int)filtered, args->a_uio);
+			}
+		}
+	}
+	_FREE(buffer, M_TEMP);
+	return error;
 }
 
 static int
@@ -510,22 +630,24 @@ btrfs_xnu_reclaim(void *arguments)
 	return 0;
 }
 
-static struct vnodeopv_entry_desc btrfs_xnu_operations[] = {
-	{ &vnop_default_desc, btrfs_xnu_unsupported }, { &vnop_lookup_desc, btrfs_xnu_lookup },
-	{ &vnop_open_desc, btrfs_xnu_open }, { &vnop_close_desc, btrfs_xnu_noop },
-	{ &vnop_getattr_desc, btrfs_xnu_getattr }, { &vnop_read_desc, btrfs_xnu_read },
-	{ &vnop_readdir_desc, btrfs_xnu_readdir }, { &vnop_readlink_desc, btrfs_xnu_readlink },
-	{ &vnop_blockmap_desc, btrfs_xnu_blockmap }, { &vnop_blktooff_desc, btrfs_xnu_blktooff },
-	{ &vnop_offtoblk_desc, btrfs_xnu_offtoblk }, { &vnop_strategy_desc, btrfs_xnu_strategy },
-	{ &vnop_pagein_desc, btrfs_xnu_pagein }, { &vnop_mmap_desc, btrfs_xnu_noop },
-	{ &vnop_mnomap_desc, btrfs_xnu_noop }, { &vnop_fsync_desc, btrfs_xnu_noop },
-	{ &vnop_inactive_desc, btrfs_xnu_noop }, { &vnop_reclaim_desc, btrfs_xnu_reclaim },
-	{ &vnop_pathconf_desc, btrfs_xnu_pathconf }, { &vnop_create_desc, btrfs_xnu_read_only },
-	{ &vnop_mkdir_desc, btrfs_xnu_read_only }, { &vnop_mknod_desc, btrfs_xnu_read_only },
-	{ &vnop_write_desc, btrfs_xnu_read_only }, { &vnop_setattr_desc, btrfs_xnu_read_only },
-	{ &vnop_link_desc, btrfs_xnu_read_only }, { &vnop_symlink_desc, btrfs_xnu_read_only },
-	{ &vnop_remove_desc, btrfs_xnu_read_only }, { &vnop_rmdir_desc, btrfs_xnu_read_only },
-	{ &vnop_rename_desc, btrfs_xnu_read_only }, { NULL, NULL }
-};
+static struct vnodeopv_entry_desc btrfs_xnu_operations[] = { { &vnop_default_desc,
+								 btrfs_xnu_unsupported },
+	{ &vnop_lookup_desc, btrfs_xnu_lookup }, { &vnop_open_desc, btrfs_xnu_open },
+	{ &vnop_close_desc, btrfs_xnu_noop }, { &vnop_getattr_desc, btrfs_xnu_getattr },
+	{ &vnop_read_desc, btrfs_xnu_read }, { &vnop_readdir_desc, btrfs_xnu_readdir },
+	{ &vnop_readlink_desc, btrfs_xnu_readlink }, { &vnop_blockmap_desc, btrfs_xnu_blockmap },
+	{ &vnop_blktooff_desc, btrfs_xnu_blktooff }, { &vnop_offtoblk_desc, btrfs_xnu_offtoblk },
+	{ &vnop_strategy_desc, btrfs_xnu_strategy }, { &vnop_pagein_desc, btrfs_xnu_pagein },
+	{ &vnop_mmap_desc, btrfs_xnu_noop }, { &vnop_mnomap_desc, btrfs_xnu_noop },
+	{ &vnop_fsync_desc, btrfs_xnu_noop }, { &vnop_inactive_desc, btrfs_xnu_noop },
+	{ &vnop_reclaim_desc, btrfs_xnu_reclaim }, { &vnop_pathconf_desc, btrfs_xnu_pathconf },
+	{ &vnop_create_desc, btrfs_xnu_read_only }, { &vnop_getxattr_desc, btrfs_xnu_getxattr },
+	{ &vnop_listxattr_desc, btrfs_xnu_listxattr }, { &vnop_setxattr_desc, btrfs_xnu_read_only },
+	{ &vnop_removexattr_desc, btrfs_xnu_read_only }, { &vnop_mkdir_desc, btrfs_xnu_read_only },
+	{ &vnop_mknod_desc, btrfs_xnu_read_only }, { &vnop_write_desc, btrfs_xnu_read_only },
+	{ &vnop_setattr_desc, btrfs_xnu_read_only }, { &vnop_link_desc, btrfs_xnu_read_only },
+	{ &vnop_symlink_desc, btrfs_xnu_read_only }, { &vnop_remove_desc, btrfs_xnu_read_only },
+	{ &vnop_rmdir_desc, btrfs_xnu_read_only }, { &vnop_rename_desc, btrfs_xnu_read_only },
+	{ NULL, NULL } };
 
 struct vnodeopv_desc btrfs_xnu_vnodeops = { &btrfs_xnu_dispatch, btrfs_xnu_operations };

@@ -26,11 +26,19 @@ number instead of scans over all issued IDs.
 
 Before optimizing further, measure these remaining costs: non-selected subvolume
 operations re-resolve their root; enumeration with attributes fetches each inode;
-each convenience read creates a new operation context;
-the initial XNU device adapter reads through sector-sized native metadata buffers.
+each convenience read creates a new operation context. The XNU adapter now
+coalesces aligned device requests through private I/O buffers, with one-block
+bounce storage only at unaligned edges.
 Do not conceal these costs behind hot-cache numbers. Bounded generation-aware
 metadata caching, reusable read sessions and native
-coalesced device I/O are explicit follow-up work.
+I/O instrumentation are explicit follow-up work.
+
+The private editor reuses its dirty paths; repeated fixed-size replacement in an
+already modified path allocates nothing. It updates payloads and child pointers
+without repacking the whole node. The reservation gap vector begins at 4 KiB and
+grows only when needed. Transaction begin still scans the full committed extent
+map; persistent allocation state and metadata caching need measurements before
+native writable throughput can be competitive.
 
 ## Matched benchmark protocol
 

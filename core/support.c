@@ -429,7 +429,8 @@ btrfs_result_string(enum btrfs_result result)
 	static const char *const names[] = { "success", "invalid argument", "not Btrfs",
 		"unsupported format or operation", "corrupt filesystem", "I/O error",
 		"out of memory", "not found", "not a directory", "is a directory", "range exceeded",
-		"read-only filesystem", "log recovery required", "stale identity" };
+		"read-only filesystem", "log recovery required", "stale identity", "already exists",
+		"no space available" };
 
 	if ((unsigned)result >= sizeof(names) / sizeof(names[0])) {
 		return "unknown result";

@@ -1,182 +1,142 @@
-# Handoff for the next implementer
+# Handoff for continued implementation
 
-Continue the Btrfs driver in this repository. Preserve the existing read core and
-its independent Linux oracle. Do not restart from an ext4 write path or treat the
-native scaffolding as runtime acceptance. The intended handoff is a substantial
-read foundation; the remaining work is not honestly measurable as a fixed 40%
-of a full production Btrfs driver.
+Continue this repository on `development`. The portable reader and read-only XNU
+mount work; a real CoW transaction implementation can replace inline files and
+produce images independently accepted by Linux. Preserve these implementations
+and extend their contracts. Native writable mounts are deliberately still disabled.
 
-Read AGENTS.md, ARCHITECTURE.md and ACCEPTANCE.md first. Use `development`, focused
-commits and personal Git identity. Main agent owns design, code, test contracts,
-diagnosis and acceptance. Delegate routine prepared execution to GPT-6 Luna and
-VM/UI operations to GPT-6.1 Sol, using explicit model names from AGENTS.md. Give
-absolute directories, exact commands, outputs and success criteria; one VM owner
-at a time. Do not rerun completed checks without changes or unresolved evidence.
+Read AGENTS.md, ARCHITECTURE.md, ACCEPTANCE.md and DEVELOPMENT.md. The main agent
+owns design, implementation, tests and diagnosis; GPT-6 Luna executes prepared
+build/test commands and GPT-6.1 Sol owns VM boot/recovery. Give workers absolute
+directories and one VM owner at a time. Use personal Git identity. Generated
+reports hold runtime identities and hashes; Git holds source revisions.
 
-## What is ready to preserve
+## Start by reproducing the accepted behavior
 
-- A freestanding C read core, independent of XNU, Foundation, errno and allocator.
-- Validated superblock/chunk mapping, iterative B-tree cursor, namespace, parent,
-  inode, subvolume/snapshot, extent/checksum and raw xattr reading.
-- Streaming directory traversal and range reads with deterministic I/O budgets.
-- Shared native identity registry preserving full `(tree, inode)` pairs.
-- POSIX oracle adapter, compiling FSKit extension and compiling XNU/UBC adapter.
-- Six Linux-authored images with 312 independent contracts; malformed metadata,
-  fail-point sweeps, concurrency, sanitizer and bounded fuzzing harnesses.
+From the Btrfs repository:
 
-Reproduce `make test ... -Dfixtures=artifacts/fixtures` and `make check-style` using
-DEVELOPMENT.md. Inspect the per-suite output, not just the shell exit code. Images
-and tool staging are generated state; a new checkout must recreate them. Keep
-support tests separate from tests demonstrating safe rejection.
+```sh
+make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
+make check-style
+```
 
-## First: accept the native read path
+Require eight passing test processes and all six reader profiles (312 contracts).
+The seventh image, `transactions.raw`, has 4 KiB nodes, single metadata and no
+free-space tree/cache, and is required by `inline-transactions`. Missing fixtures
+are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md.
 
-1. Reserve dedicated disposable macOS guests through the lab operator. Sign and
-   install FSKit with its actual filesystem-module capability; do not fake
-   provisioning. Load the XNU adapter through the documented guest kernel workflow.
-   Verify the loaded guest kernel/module identity, not merely a successful build.
-2. Implement native xattr access and namespace/authorization policy. Preserve raw
-   Linux names in the core. Keep native credentials and Linux credentials at their
-   owning boundaries. Decide explicitly how native callers see Linux ACLs,
-   security attributes and inode flags before claiming multi-user acceptance.
-3. Complete the bounded codec providers: zlib, Zstd and LZO with malformed-stream,
-   padded-tail, exact-output and allocation-failure tests. Never decode unchecked
-   stored data or pull userspace libc into the kernel.
-4. Run `tests/mounted_contracts.py --suite readonly --disposable-guest` as root on
-   the top-level plain fixture. It requires byte-exact reads, mmap/pread coherence,
-   eight concurrent readers, hardlinks, native identity across snapshots, raw
-   names, xattrs, holes and EROFS. Missing operations are failures, not skips.
-5. Add platform-specific tests for tiny getdirentries buffers, saved/reopened
-   cookies, failed pagein without stale-page publication, vnode/FSItem reclaim,
-   low memory and forced unmount with in-flight I/O. Reclaim and remount must not
-   alias objects; mount-local IDs are not persistent file handles.
-6. In the XNU fork, connect Btrfs backing objects to LXNU at the established VFS
-   boundary. Keep Linux namei, permissions and retry semantics in `bsd/lxnu/vfs`,
-   native glue in `bsd/lxnu/xnu`. Run native regression plus the applicable existing
-   Linux conformance suites; update the ABI matrix with actual results.
+`tests/mounted.c` and `tests/run_macos.py` establish actual XNU mount behavior on
+four profiles. Use the prepared dedicated Btrfs guest and check its loaded kernel
+and module UUIDs before running; compilation or a packaged collection is not boot
+acceptance. The native test artifact is unsanitized for the guest. All normal
+unmounts, detach operations and unchanged-media hash checks must succeed.
 
-Acceptance: each native mount passes its own suite in a guest, independently of
-portable tests. This work must not change host boot policy or install host kexts.
+## Implementation map
 
-## Then: establish a transaction engine before mutation APIs
-
-Use explicit components with single owners:
-
-| Component | Owns | Required invariant |
+| Component | Existing contract | Main files |
 | --- | --- | --- |
-| Device persistence interface | Exact reads/writes, flush/barrier, geometry | Failure and partial/torn writes are representable; no assumed persistence |
-| Committed view | Immutable root set and generation, active-reader pins | Readers keep a consistent view until release |
-| Transaction | Private roots, dirty blocks, reservations, state | No uncommitted pointer is visible through the committed view |
-| Allocator | Chunk/block-group free ranges, reservations, ENOSPC | Live roots and pinned readers prevent reuse |
-| Reference accounting | Extent and shared backrefs, delayed reference changes | Snapshot/reflink ownership remains correct across overwrite/free |
-| Commit publisher | Bottom-up persistence, barriers, superblock generation | A recoverable committed root set always exists |
-| Recovery | Super mirrors, log policy, interrupted publication | Never choose a root simply because its generation number is largest |
+| Immutable reader | Validated geometry, chunks, trees, inodes, namespaces, extents/checksums, subvolumes and xattrs | `core/{mount,chunk,tree,inode,directory,parent,read,xattr}.c` |
+| Private tree editor | Path CoW; insert/replace/upsert/delete; variable-item splits including three leaves; root growth and collapse; poisoned failures | `core/mutable.c`, `tests/mutable.c` |
+| Reservation allocator | Extent-map and block-group reconciliation, physical alias/super-stripe exclusion, pinned committed allocations, bounded free gaps | `core/space.c` |
+| Transaction owner | Inline replacement, exclusive resource contract, reference/accounting fixed point, root/backup updates, two barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
+| Persistence model / Linux oracle | Read/allocation/write/barrier sweeps, whole-write cuts, partial metadata and mirror subsets; Linux fsck/read/write validation | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
+| Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
 
-Proposed transaction states are preparing, writing, publishing, committed and
-failed. Define legal transitions and lock order before code. A pre-publication
-allocation failure may abort privately; ambiguous persistence failures poison the
-writable mount until recovery. Existing read-only callbacks must not grow silent
-write side effects. Reject unknown read-only-compatible bits for writable mounts.
+The mutation view supports metadata traversal; it does not magically update all
+cached root descriptors or provide a live native read/write mount. Reservations
+are fresh for the transaction, and released slots stay pinned until its allocator
+is destroyed. Never route committed readers into private trees. `accept` is legal
+only after successful durable publication; `seal` alone is not a commit.
 
-Start with single-device CRC32C and full transactions for fsync. Implement tree
-insertion/split, deletion/merge and CoW path replacement with reference accounting,
-then allocation and publication. Do not claim tree-log recovery until it exists.
-The read parser remains the oracle for your writer, but cannot be the only oracle.
+## Next changes, in dependency order
 
-Tests before publishing the first writable volume:
+1. **Broaden transaction and recovery acceptance.** Extend the Linux oracle to
+   zero-length replacement, maximum inline size, multi-inode batches, repeated
+   commits, DUP metadata and large nodes. Add full/fragmented metadata ENOSPC,
+   stale-superblock rejection and independently constructed corrupt allocation
+   maps. Current whole-write crash plans are exported, not source-controlled.
+   Add device models that tear superblocks and reorder writes between successful
+   barriers, then test an explicit recovery policy against Linux. The current
+   reader rejects a damaged primary; do not silently select an older mirror or
+   call that rejection successful recovery. Preserve an acknowledged generation.
+2. **Implement shared/delayed references.** `bt_tx_drop_original` intentionally
+   accepts only one inline tree reference with matching owner/generation. Replace
+   that admission with correct shared/full backrefs and child/data reference
+   changes. Test shared leaves and internal nodes, retained snapshots, reflinks
+   and extent-offset references. Linux fsck must report no lost references or
+   accounting errors after every fault cut. Never just delete the rejection.
+3. **Add data extents and checksums.** Extend allocator reservations beyond
+   metadata; support new regular extents, unaligned read-modify-CoW, holes,
+   preallocation conversion, truncation and compressed input as separate cases.
+   Update inode size/nbytes, checksum ranges and data backrefs together. Keep the
+   old extent pinned until publication and reader retirement. Preserve snapshot
+   data at every cut. Do not clear integrity or durability options to improve speed.
+4. **Maintain allocation features.** Add free-space tree/cache and block-group
+   growth with their own Linux fixtures. Writable admission currently rejects
+   free-space-tree/quotas/mixed groups/metadata UUID. Keep each rejection until
+   the corresponding accounting is implemented and tested. Add underfull sibling
+   merge/rebalance to the editor; current deletion removes empty nodes and
+   collapses unary roots but leaves underfull siblings.
+5. **Add namespace mutations.** Create/mkdir, link/unlink, symlink, atomic rename
+   and xattrs must update all coupled inode refs, DIR_ITEM collision records,
+   DIR_INDEX cookies, link counts, parent metadata and orphan state in one
+   transaction. Cover duplicate keys, real name-hash collisions, index exhaustion,
+   rename replacement and cross-directory operations, open-unlink and crash replay.
+6. **Connect native writers.** Define versioned operation views, read pins,
+   publication locks and UBC/FSKit dirty-page ownership first. Supply real exact
+   write and durable flush callbacks, order pageout/truncate/invalidate/fsync,
+   and authorize using actual credentials. Clear security metadata only through
+   the owning transaction contract; no root impersonation or post-write repairs.
+   Existing EROFS paths stay until mounted write suites pass.
+7. **Complete FSKit/LXNU policy and release acceptance.** Provision/register the
+   actual FSKit module and run its mounted suite; an unsigned build is insufficient.
+   Add native/LXNU ACL, capability, immutable/append and set-id contracts at the
+   owning boundary. Linux namei and object provenance belong to the XNU fork's
+   `bsd/lxnu/vfs` and `bsd/lxnu/xnu`. Run existing Linux conformance and native
+   regressions before changing the ABI matrix.
 
-- Force leaf/internal splits and merges at each implemented level; after each
-  operation verify numeric key order, exact parent generation, bounds and reachability.
-- Snapshot a tree, mutate every depth, then prove original leaves and file extents
-  are unchanged. Include shared backrefs and extent-offset references.
-- Fail every reservation and allocation point; neither leaked allocations nor
-  published dangling references are allowed. Test full and fragmented metadata
-  space separately from data space.
-- Test duplicate keys, name-hash collisions, inode-reference collisions, directory
-  index exhaustion and generation overflow explicitly; no magic test-only bypasses.
-- After successful commit, reopen with Linux, run `btrfs check --readonly`, mount
-  and compare the complete namespace/data/xattr manifest. Never use `--repair` to
-  make the acceptance run pass.
+## Executable gates for writable mounts
 
-## Power-cut oracle: a required test harness, not implemented yet
-
-Implement a test-only block backend with separate durable and volatile images.
-Record writes and flushes; support an acknowledged write residing only in volatile
-state, delayed/reordered persistence between barriers, torn sectors, failed writes,
-failed flushes and abrupt termination. Seed all permutations and bound each run.
-The model must match the declared virtual-device persistence contract; dropping
-only the last whole write is insufficient.
-
-For every mutation/fsync sequence and every write/flush cut point:
-
-1. Begin from a Linux-verified immutable baseline and retain an expected logical
-   manifest of operations and acknowledged durability boundaries.
-2. Execute through the fault backend. Keep each possibly durable disk state as a
-   disposable artifact, including ambiguous error outcomes.
-3. Recover with both the driver and Linux. Run Linux read-only fsck, then compare
-   namespace, contents, links, xattrs, shared extents and free-space accounting.
-4. Every acknowledged fsync must survive. Unacknowledged operations may resolve
-   according to the specified transaction contract, but never leave a torn root
-   set, cross-linked allocation, freed live extent or corrupted prior snapshot.
-5. Minimize every failure into a deterministic reproducer. Record the cut, device
-   geometry, flush result and recovery choice in generated reports, not source
-   revision ledgers.
-
-Include data writes, tree splits, rename replacement, parent-directory updates,
-truncate, orphan/open-unlink recovery, xattrs, snapshot/reflink and ENOSPC. Check
-all relevant superblock mirrors and their backup roots. Native fsync acceptance
-must use the actual resource flush interface, not just the simulated backend.
-
-## Mutations and coherence
-
-After the transaction gate, implement create/mkdir, data write/append, truncate,
-link/unlink, symlink, atomic rename and xattrs. Keep multi-object lock ordering
-explicit. Reuse the core through both adapters. Native UBC remains the file-page
-cache; define ordering for dirty pages, truncation, invalidate, mmap, fsync and
-transaction publication. Add append/concurrent-rename stress and reference lifetime
-tests before broadening concurrency.
-
-The prepared `tests/mounted_contracts.py --suite write --disposable-guest` requires
-exclusive creation, unaligned overwrite, mmap/pread/pwrite coherence, shrink/grow
-zeroing, permissions, xattr mutation, links, replacement rename, cross-directory
+`tests/mounted_contracts.py --suite write --disposable-guest` already requires
+exclusive create, unaligned overwrite, mmap/pread/pwrite coherence, shrink/grow
+zeroing, metadata/xattr mutations, links, rename replacement, cross-directory
 rename, nonempty-directory failure, open-unlink lifetime and file/directory fsync.
-It is a starting executable contract, currently unexecuted for this driver. Extend
-it with remount persistence and the power-cut oracle; a single live mount pass
-does not establish durable writing.
+It has not passed for this driver. Missing contracts must fail, not be removed or
+blanket-skipped. Extend with remount persistence, concurrent append/rename and
+full-disk behavior.
 
-Before LXNU acceptance, extend its conformance suite for sticky/setgid directories,
-umask, ACL inheritance, capability-preserving operations, immutable/append flags,
-O_PATH, openat2 resolution and Linux-owned description provenance. No post-operation
-security repair or elevated native authorization is an acceptable workaround.
+For each operation sequence and each device fault:
 
-## Broaden format support only with its own oracle
+- Start with a Linux-verified baseline and an expected logical manifest.
+- Retain possibly durable states, including ambiguous errors and torn writes.
+- Recover with both implementations using a documented recovery choice. Run
+  `btrfs check --readonly` and compare data, links, xattrs, snapshots and space
+  accounting. Never use repair to manufacture a pass.
+- Require every acknowledged fsync to survive. An unacknowledged transaction may
+  resolve to an allowed old/new state; it must not mix roots or free live extents.
+- Reduce every failure to a deterministic test. Record skipped unsupported
+  recovery modes separately from successful recovery.
 
-Add LZO, alternate checksums, data-DUP, NODATASUM, mixed groups, metadata UUID and
-64 KiB-sector fixtures. Add large/fragmented directories, actual name-hash collisions,
-inode extrefs and deeper multi-level trees. Raise capacity bounds only after measured
-memory/stack coverage. Then address multi-device profiles with explicit device-set,
-degraded-read and recovery contracts. Safe rejection of a format remains valuable
-but is never counted as implementing that format.
+The portable model currently covers 64 seeded metadata persistence subsets and
+all four super-mirror subsets, in addition to complete-write cuts. A torn primary
+is an explicit error test. The independent Linux oracle currently covers the
+whole-write cuts for one inline replacement, followed by a Linux read-write
+commit. These are concrete starting tests, not complete crash consistency.
 
-## Performance remains a release target
+## Performance work
 
-Follow PERFORMANCE.md. Preserve the existing deterministic budgets when adding
-features. Measure before introducing a shared metadata cache: immutable generation
-keys, bounded memory, single-flight fills and lifetime/eviction rules must be clear.
-Prioritize coalesced native device reads and reusable per-open read contexts; avoid
-a mount-wide read mutex. Test non-selected subvolume workloads and attribute-rich
-directory enumeration so their costs remain visible.
+Preserve read budgets and the absence of a mount-wide read lock. Private fixed-size
+replacements update one payload/pointer without repacking the whole node; repeated
+edits reuse dirty paths. The allocator starts with 256 gap records and grows within
+an explicit bound. Keep allocation and I/O counts visible in tests.
 
-Claim faster-than-Linux results only after comparable mounted workloads, equal
-device transport/resources, identical checksum/compression/durability policy,
-alternating runs and correctness/crash gates. Report each workload and tail latency.
-Do not infer a win from low core callback counts or a userspace image benchmark.
+Follow PERFORMANCE.md for matched Linux comparisons. Remaining likely costs are
+repeated subvolume-root resolution, per-call cursors, attribute-rich enumeration,
+metadata caching, full-extent-map scanning at transaction begin, and rebuilding
+allocation state for each transaction. Optimize after measurement. Add a bounded,
+generation-aware cache with documented lifetime rules if it pays for itself.
+Do not claim a speed win from a userspace image reader versus a mounted guest.
 
-## Final delivery criteria
-
-Report portable correctness, native compilation, native mounted acceptance, loaded
-custom-kernel evidence, LXNU behavior, persistence and performance separately. List
-remaining failures and justified filesystem-specific skips by contract. Update
-ACCEPTANCE.md with real evidence; remove completed work from this handoff rather
-than accumulating contradictory historical claims. A clean build or a focused
-commit is a checkpoint, not completion of the driver.
+At delivery, report portable contracts, actual loaded native mounts, FSKit,
+LXNU policy, recovery/durability and comparative performance separately. Preserve
+all unresolved tests and keep this document focused on remaining work.

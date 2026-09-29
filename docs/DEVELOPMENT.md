@@ -24,7 +24,8 @@ The default build enables ASan/UBSan, stops on sanitizer findings and treats
 warnings as errors. A second freestanding
 core build has no sanitizer and enforces a 2 KiB stack-frame budget. `make test`
 uses a minimal environment so Meson does not copy unrelated credentials into its
-logs. Without `-Dfixtures`, only self-contained wire/API and identity tests run;
+logs. Without `-Dfixtures`, only self-contained wire/API, identity, native policy and
+private CoW editor tests run;
 that is not complete acceptance. With fixtures, every image is required and an
 unavailable codec causes the image test to fail, not silently skip.
 
@@ -42,8 +43,9 @@ the image helper is not an implementation of host or Linux namei.
 
 ## Linux-authored fixtures
 
-The six required profiles are `plain`, `small-nodes`, `large-nodes`, `zlib`, `zstd`
-and `default-subvolume`. Each uses a separate disposable 256 MiB raw image and the
+The six reader profiles are `plain`, `small-nodes`, `large-nodes`, `zlib`, `zstd`
+and `default-subvolume`. The transaction suite also requires `transactions`, which
+uses 4 KiB nodes, single metadata, no free-space tree and `nospace_cache`. Each uses a separate disposable 256 MiB raw image and the
 payload in `tests/prepare_linux.py`. The payload formats **guest `/dev/vda`**, fills
 files, takes a snapshot, verifies Linux-visible contents, unmounts, and requires
 `btrfs check --readonly` to succeed. Never attach a valuable image to this payload.
@@ -95,8 +97,8 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all six
-profiles, then run the portable image suite. It hashes each complete image before
+Linux checks and a completed VM exit before consuming the image. Repeat all seven
+profiles, then run the portable image and transaction suites. It hashes each complete image before
 and after reading, verifies 312 contracts, and fails if any byte changed.
 
 ## Fuzzing and concurrency
@@ -155,3 +157,80 @@ mount. These mounted suites are prepared contracts, currently **unexecuted** for
 Machlin Btrfs. They are not part of portable acceptance and cannot substitute for
 Linux fsck, unmount/remount, fault injection, crash recovery, native authorization
 or LXNU tests. See HANDOFF.md for those mandatory gates.
+
+## Transaction persistence and independent Linux oracle
+
+The public writer interface is `include/btrfs/write.h`; both native adapters
+currently stay read-only. The image transaction test uses a recorded write device
+with explicit volatile/durable state. It never writes the source fixture. Export
+its accepted transaction into a new generated directory:
+
+```sh
+mkdir artifacts/transaction-plan
+.build/btrfs-transaction-test artifacts/fixtures/transactions.raw artifacts/transaction-plan
+```
+
+The export is a TSV of physical offsets/lengths and separate binary write payloads.
+These are test artifacts, not a source revision ledger. The test requires all
+allocation/read/write/flush fault points to satisfy its contract, then verifies
+whole-write prefixes, seeded partial metadata, independent mirror persistence,
+abort/no-op, and zero-length replacement. A torn primary is rejected, not repaired.
+
+Reserve the Linux runner and stop the macOS test guest first. From the absolute
+lab directory, create a disposable copy without overwriting an existing artifact:
+
+```sh
+python3 -c 'from pathlib import Path; import shutil; s=Path("../btrfs/artifacts/fixtures/transactions.raw"); d=Path("../btrfs/artifacts/transaction-linux.raw"); shutil.copyfileobj(s.open("rb"), d.open("xb"))'
+python3 ../btrfs/tests/prepare_transactions_linux.py \
+  --root artifacts/btrfs-reference/root --plan ../btrfs/artifacts/transaction-plan \
+  --archive artifacts/btrfs-reference/transaction-check.cpio
+.cache/linux-reference/linux-vm .cache/linux-reference/Image \
+  artifacts/btrfs-reference/transaction-check.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/transaction-linux.raw > ../btrfs/logs/linux-transactions.log 2>&1
+```
+
+Require the exact pass marker with the exported number of writes plus one, each
+Linux read-only fsck, each mounted old/new data check and the final Linux
+read-write commit/fsck. Check the original fixture hash before and after.
+The oracle writes only the disposable VM disk; it restores affected ranges
+between crash cases. It does not use `btrfs check --repair`. It proves on-disk
+compatibility for that transaction; actual native flush durability is a separate
+gate once native write callbacks exist.
+
+## Identified macOS mounted acceptance
+
+Use a dedicated guest through the lab's normal native kernel collection workflow.
+The prepared Btrfs guest is `lxnu-btrfs-kext-lab`; preserve its fallback boot slot.
+Do not install a host kext or change host boot policy. Capture the kext bundle,
+matching mount helper and unsanitized `.build/btrfs-mounted-test` before packaging.
+The generated product directory must hold `MachlinBtrfs.kext`, its collection and
+`kc-identity.json`, including the collection/module hashes and kernel UUIDs.
+Verify the actual loaded guest module with `kmutil showloaded` or `kextstat`;
+activate the packed bundle with `kmutil load -b org.machlin.btrfs.kext` if needed.
+
+`tests/run_macos.py` checks these captured identities and transfers only fixture
+copies and probes. Run from the absolute lab directory, passing the observed boot
+session and module UUID (do not copy stale values from old reports):
+
+```sh
+python3 ../btrfs/tests/run_macos.py \
+  --lab "$PWD" --vm lxnu-btrfs-kext-lab \
+  --products "$PWD/artifacts/btrfs-kext" --share btrfs-kext \
+  --guest-directory /var/tmp/machlin-btrfs-tests \
+  --expected-session "$btrfs_test_session" --expected-module-uuid "$btrfs_test_module_uuid" \
+  --probe "$PWD/../btrfs/.build/btrfs-mounted-test" \
+  --mount-helper "$PWD/../btrfs/artifacts/kext-final/arm64e/mount_machlin_btrfs" \
+  --image "$PWD/../btrfs/artifacts/fixtures/plain.raw" \
+  --image "$PWD/../btrfs/artifacts/fixtures/small-nodes.raw" \
+  --image "$PWD/../btrfs/artifacts/fixtures/large-nodes.raw" \
+  --image "$PWD/../btrfs/artifacts/fixtures/zlib.raw" \
+  --output "$PWD/artifacts/btrfs-kext/mounted-new-run"
+```
+
+The output directory must be new and inside the shared product directory. The
+probe starts as guest root solely to run tests under specified ordinary UIDs;
+the filesystem's authorization uses their actual credentials. Every image is
+attached read-only, verified by raw-device hash, mounted, tested, normally
+unmounted, hashed again and detached. A failed cleanup or missing image is not a
+pass. Keep FSKit and LXNU acceptance separate from these native XNU results.

@@ -10,10 +10,14 @@ flowchart TD
   VFS --> Kernel[Btrfs XNU adapter]
   Apps[Stock macOS applications] --> FSKit[FSKit extension]
   Image[Image oracle and fault harness] --> POSIX[POSIX adapter]
-  Kernel --> Core[Portable immutable reader]
+  Kernel --> Core[Portable read core]
   FSKit --> Core
   POSIX --> Core
-  Core --> Trees[Validated B-tree cursor]
+  Writer[Exclusive transaction owner] --> Mutate[Private CoW tree editor]
+  Mutate --> Trees[Validated B-tree cursor]
+  Writer --> Space[Extent reservations and accounting]
+  Writer --> Publish[Ordered writes and persistence barriers]
+  Core --> Trees
   Trees --> Chunks[Logical chunks and mirror selection]
   Core --> Verify[Extent checksums and codec contract]
   Chunks --> Resource[Exact bounded resource reads]
@@ -35,14 +39,15 @@ wire format. There are no casts to native unaligned integer pointers.
 The owner supplies a fixed-size resource that remains unchanged for the mount
 lifetime. Exact-read callbacks either fill the entire requested range or fail;
 the core checks bounds first. Allocate/release are paired with exact sizes.
-The environment has no write operation. Mount, mirror fallback, reads and unmount
+The read environment has no write operation. Mount, mirror fallback, reads and unmount
 cannot repair media or replay a pending tree log.
 
 Only the primary superblock is admitted. Automatic selection of an older mirror
 could silently roll back acknowledged data and is not a mount fallback. Unknown
 incompatible features, alternate checksum algorithms, seeding/metadump formats,
 multiple devices and pending logs have explicit results. Unknown read-only
-compatible bits are admissible only because there is no write capability.
+compatible bits are admissible to the immutable reader only; transaction admission
+rejects them until their write semantics are implemented.
 
 The superblock bootstraps SYSTEM chunks. The chunk-tree scan validates full
 mapping records and reconciles the bootstrap copies exactly before publication.
@@ -115,8 +120,11 @@ There is no CPU feature probe, lazy global initialization or kernel SIMD use.
 FSKit inhibits offloaded I/O so data passes through the core. XNU retains UBC as
 the only native file-page cache. Its blockmap uses file-logical strategy addresses;
 strategy reads/verifies through the core before completing a buffer. It never
-passes those synthetic addresses to the device. UBC integration is compilation
-evidence until actual mmap, pagein, EOF, error and reclaim tests pass in a guest.
+passes those synthetic addresses to the device. The read-only guest suite verifies mmap, descriptor-close lifetime, EOF and
+concurrent reads. Failed pagein and forced reclaim/unmount remain separate gates.
+XNU device requests use private synchronous buffers and coalesced aligned ranges;
+only unaligned edges need a one-block bounce buffer. A bounded kernel zlib provider
+uses exported inflate APIs and paired kernel allocation callbacks.
 
 ## Bounds
 
@@ -134,22 +142,46 @@ The chunk table consumes a fixed bounded allocation; cursors allocate only the
 levels they visit. Kernel-stack compilation enforces 2 KiB frames. These limits
 are development contracts, not a claim that all valid Linux volumes fit them.
 
-## Write architecture to preserve
+## Write architecture
 
-Use Btrfs CoW transactions, not an ext4 journal transplanted into Btrfs. Separate
-an immutable committed view, a transaction's private root set, extent reservation,
-reference accounting, dirty tree blocks and device persistence. Mutations return
-only after their chosen visibility contract is met; fsync must have a real durable
-commit or a correctly implemented tree-log contract. The first writer may use a
-full-tree commit for fsync, with measured cost and no pretend log support.
+`core/mutable.c` owns a private metadata overlay. It CoWs only modified paths,
+keeps dirty nodes in logical/physical hash indexes, and reuses scratch space and
+path buffers. Variable-size insertion may produce two or three leaves; pointer
+splits propagate upward. Deletion removes empty children and collapses unary
+roots; underfull sibling merging remains open. Fixed-size replacements avoid
+whole-node repacking. The original root and bytes remain immutable. A failed
+edit poisons the context; sealing computes checksums, and accepting transfers
+reservations only after the owning transaction's durable publication.
 
-Never overwrite blocks referenced by the committed root set or a live snapshot.
-Persist new file data, new checksums/backreferences and CoW metadata bottom-up;
-flush them before publishing a superblock root set, then flush the publication.
-Account for torn sectors and inconsistent super mirrors. Reuse is forbidden until
-all durable roots and pinned readers release a range. Allocation failure before
-publication rolls back privately. An uncertain write/flush poisons the writer,
-retaining recovery evidence. See the specific crash oracle in HANDOFF.md.
+`core/space.c` validates occupied extents and block-group totals, rejects physical
+chunk aliases, removes superblock stripes from candidate gaps, and produces
+bounded metadata reservations. It pins the committed allocation map for the whole
+transaction and never reuses a released reservation within that transaction.
+Gap storage grows from 256 records to a maximum of 131,072. The current transaction
+limit is 4,096 dirty nodes; the standalone editor supports up to 65,536.
+
+`core/transaction.c` owns the private root set and a separate write environment.
+Its current operation is replacing an existing uncompressed inline regular file
+in the top-level tree, up to 2 KiB. Empty replacement removes the inline extent.
+It updates inode and root change metadata, tree references, block-group totals,
+root items and backup roots. Accounting changes may CoW the extent/root trees;
+a bounded fixed point resolves those allocations before the first media write.
+Shared/full-backreference paths are rejected until delayed references exist.
+
+The publisher writes new metadata bottom-up, persists it with a real adapter
+barrier, writes secondary and then primary superblocks, and requires a second
+barrier before success. Exact write/flush callbacks are explicit capabilities.
+Failure or uncertain persistence makes the transaction terminal. Pre-write
+failures and destruction discard private state without changing media.
+
+The owner must hold exclusive resource access, drain readers before commit and
+retire the original mount after successful or uncertain publication. Live native
+read/write views, reader pins across commits, UBC dirty-page coherence and native
+flush callbacks are not connected yet. Both native adapters remain read-only.
+The primary-only reader rejects a torn primary; recovery selection is a separate
+open feature. Backup roots are rotating recovery hints, not permanently pinned
+snapshots. See ACCEPTANCE.md for the exact crash oracle scope and HANDOFF.md for
+the requirements before general writable mounts.
 
 ## Primary format references
 

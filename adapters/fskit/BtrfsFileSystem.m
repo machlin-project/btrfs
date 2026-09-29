@@ -2,6 +2,7 @@
 #import "BtrfsFileSystem.h"
 #include <btrfs/btrfs.h>
 #include <btrfs/identity.h>
+#include <btrfs/native.h>
 #include <zlib.h>
 
 #include <errno.h>
@@ -45,6 +46,12 @@ btrfs_error(enum btrfs_result result)
 		break;
 	case BTRFS_STALE:
 		error = ESTALE;
+		break;
+	case BTRFS_EXISTS:
+		error = EEXIST;
+		break;
+	case BTRFS_NO_SPACE:
+		error = ENOSPC;
 		break;
 	case BTRFS_CORRUPT:
 	case BTRFS_RECOVERY_REQUIRED:
@@ -191,7 +198,8 @@ btrfs_item_type(uint16_t mode)
 @implementation BtrfsItem
 @end
 
-@interface BtrfsVolume : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations> {
+@interface BtrfsVolume
+    : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations, FSVolumeXattrOperations> {
 	struct btrfs_fs *_fs;
 	struct btrfs_info _info;
 	FSResource *_resource;
@@ -394,6 +402,9 @@ btrfs_item_type(uint16_t mode)
 	(void)options;
 	error = btrfs_root(_fs, &root);
 	if (error == BTRFS_OK) {
+		error = btrfs_native_inode_supported(_fs, &root);
+	}
+	if (error == BTRFS_OK) {
 		item = [self itemForInode:&root];
 		if (item == nil) {
 			error = BTRFS_NO_MEMORY;
@@ -435,6 +446,9 @@ btrfs_item_type(uint16_t mode)
 	enum btrfs_result error;
 
 	error = btrfs_lookup(_fs, &parent->inode, bytes.bytes, bytes.length, &inode);
+	if (error == BTRFS_OK) {
+		error = btrfs_native_inode_supported(_fs, &inode);
+	}
 	if (error == BTRFS_OK) {
 		item = [self itemForInode:&inode];
 		if (item == nil) {
@@ -559,6 +573,92 @@ btrfs_item_type(uint16_t mode)
 		error = BTRFS_IO;
 	}
 	reply(error == BTRFS_OK ? [FSFileName nameWithData:bytes] : nil, btrfs_error(error));
+}
+
+- (void)getXattrNamed:(FSFileName *)name
+	       ofItem:(FSItem *)item
+	 replyHandler:(void (^)(NSData *, NSError *))reply
+{
+	BtrfsItem *owned = (BtrfsItem *)item;
+	NSData *key = name.data;
+	NSMutableData *value;
+	size_t length = 0;
+	enum btrfs_result result;
+
+	if (!btrfs_native_xattr_visible(key.bytes, key.length)) {
+		reply(nil, [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOATTR userInfo:nil]);
+		return;
+	}
+	result = btrfs_get_xattr(_fs, &owned->inode, key.bytes, key.length, NULL, 0, &length);
+	if (result != BTRFS_OK) {
+		reply(nil,
+		    result == BTRFS_NOT_FOUND ? [NSError errorWithDomain:NSPOSIXErrorDomain
+								    code:ENOATTR
+								userInfo:nil]
+					      : btrfs_error(result));
+		return;
+	}
+	if (length > BTRFS_NATIVE_XATTR_LIMIT) {
+		reply(nil, [NSError errorWithDomain:NSPOSIXErrorDomain code:E2BIG userInfo:nil]);
+		return;
+	}
+	value = [NSMutableData dataWithLength:length];
+	result = btrfs_get_xattr(
+	    _fs, &owned->inode, key.bytes, key.length, value.mutableBytes, value.length, &length);
+	reply(result == BTRFS_OK ? value : nil, btrfs_error(result));
+}
+
+- (void)listXattrsOfItem:(FSItem *)item
+	    replyHandler:(void (^)(NSArray<FSFileName *> *, NSError *))reply
+{
+	BtrfsItem *owned = (BtrfsItem *)item;
+	NSMutableData *buffer;
+	NSMutableArray<FSFileName *> *names;
+	const char *bytes;
+	size_t length = 0;
+	size_t filtered = 0;
+	size_t offset;
+	size_t name_length;
+	enum btrfs_result result;
+
+	result = btrfs_list_xattrs(_fs, &owned->inode, NULL, 0, &length);
+	if (result != BTRFS_OK) {
+		reply(nil, btrfs_error(result));
+		return;
+	}
+	if (length > BTRFS_NATIVE_XATTR_LIMIT) {
+		reply(nil, [NSError errorWithDomain:NSPOSIXErrorDomain code:E2BIG userInfo:nil]);
+		return;
+	}
+	buffer = [NSMutableData dataWithLength:length];
+	result = btrfs_list_xattrs(_fs, &owned->inode, buffer.mutableBytes, length, &length);
+	if (result == BTRFS_OK) {
+		result = btrfs_native_filter_xattrs(buffer.mutableBytes, length, &filtered);
+	}
+	if (result != BTRFS_OK) {
+		reply(nil, btrfs_error(result));
+		return;
+	}
+	names = [NSMutableArray array];
+	bytes = buffer.bytes;
+	for (offset = 0; offset < filtered; offset += name_length + 1) {
+		name_length = strlen(bytes + offset);
+		[names addObject:[FSFileName nameWithBytes:bytes + offset length:name_length]];
+	}
+	reply(names, nil);
+}
+
+- (void)setXattrNamed:(FSFileName *)name
+	       toData:(NSData *)value
+	       onItem:(FSItem *)item
+	       policy:(FSSetXattrPolicy)policy
+	 replyHandler:(void (^)(NSError *))reply
+{
+	(void)name;
+	(void)value;
+	(void)item;
+	(void)policy;
+	reply(btrfs_error(BTRFS_READ_ONLY));
 }
 
 - (void)createItemNamed:(FSFileName *)name

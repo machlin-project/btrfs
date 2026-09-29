@@ -26,7 +26,9 @@ enum btrfs_result {
 	BTRFS_RANGE,
 	BTRFS_READ_ONLY,
 	BTRFS_RECOVERY_REQUIRED,
-	BTRFS_STALE
+	BTRFS_STALE,
+	BTRFS_EXISTS,
+	BTRFS_NO_SPACE
 };
 
 enum btrfs_compression {

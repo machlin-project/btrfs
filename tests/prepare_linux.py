@@ -9,7 +9,8 @@ import subprocess
 
 PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "large-nodes": (65536, "dup", ""), "zlib": (16384, "dup", "zlib"),
-            "zstd": (16384, "dup", "zstd"), "default-subvolume": (16384, "dup", "")}
+            "zstd": (16384, "dup", "zstd"), "default-subvolume": (16384, "dup", ""),
+            "transactions": (4096, "single", "")}
 
 
 def prepare(root: Path, profile: str, archive: Path) -> None:
@@ -26,6 +27,9 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
     (inputs / "SHA256SUMS").write_text("".join(
         f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in contents.items()))
     options = f"compress-force={compression}" if compression else "compress=no"
+    features = "-R ^free-space-tree" if profile == "transactions" else ""
+    if profile == "transactions":
+        options += ",nospace_cache"
     set_default = "btrfs subvolume set-default /mnt/subvol" if profile == "default-subvolume" else ":"
     init = f'''#!/bin/busybox sh
 set -eu
@@ -41,7 +45,7 @@ for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c btrfs; d
 done
 uname -r
 mkfs.btrfs --version
-mkfs.btrfs -f -s 4096 -n {node_size} -m {metadata} -d single -L machlin-btrfs /dev/vda
+mkfs.btrfs -f -s 4096 -n {node_size} -m {metadata} -d single {features} -L machlin-btrfs /dev/vda
 mount -t btrfs -o {options} /dev/vda /mnt
 cp /input/greeting /input/big /input/random /mnt/
 chmod 0640 /mnt/greeting

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "btrfs_xnu.h"
 
+#include <libkern/zlib.h>
 #include <sys/buf.h>
 #include <sys/disk.h>
 #include <sys/errno.h>
@@ -35,6 +36,10 @@ btrfs_xnu_error(enum btrfs_result result)
 		return EOVERFLOW;
 	case BTRFS_STALE:
 		return ESTALE;
+	case BTRFS_EXISTS:
+		return EEXIST;
+	case BTRFS_NO_SPACE:
+		return ENOSPC;
 	default:
 		return EIO;
 	}
@@ -55,49 +60,135 @@ btrfs_xnu_release(void *context, void *buffer, size_t size)
 	_FREE(buffer, M_TEMP);
 }
 
+static voidpf
+btrfs_xnu_zalloc(voidpf context, uInt count, uInt size)
+{
+	(void)context;
+	if (count == 0 || size > (1024U * 1024U) / count) {
+		return NULL;
+	}
+	return _MALLOC((size_t)count * size, M_TEMP, M_WAITOK | M_ZERO | M_NULL);
+}
+
+static void
+btrfs_xnu_zfree(voidpf context, voidpf allocation)
+{
+	(void)context;
+	_FREE(allocation, M_TEMP);
+}
+
+static enum btrfs_result
+btrfs_xnu_decompress(void *context, enum btrfs_compression codec, const void *input,
+    size_t input_size, void *output, size_t output_size)
+{
+	z_stream stream;
+	int result;
+
+	(void)context;
+	if (codec != BTRFS_COMPRESSION_ZLIB) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if (input_size > UINT32_MAX || output_size > UINT32_MAX) {
+		return BTRFS_RANGE;
+	}
+	bzero(&stream, sizeof(stream));
+	stream.zalloc = btrfs_xnu_zalloc;
+	stream.zfree = btrfs_xnu_zfree;
+	stream.next_in = (Bytef *)input;
+	stream.avail_in = (uInt)input_size;
+	stream.next_out = output;
+	stream.avail_out = (uInt)output_size;
+	result = inflateInit(&stream);
+	if (result != Z_OK) {
+		return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT;
+	}
+	result = inflate(&stream, Z_FINISH);
+	(void)inflateEnd(&stream);
+	return result == Z_STREAM_END && stream.total_out == output_size
+	    ? BTRFS_OK
+	    : (result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT);
+}
+
+static enum btrfs_result
+btrfs_xnu_read_aligned(struct btrfs_xnu_mount *mount, uint64_t offset, void *buffer, size_t length)
+{
+	buf_t request;
+	int error;
+
+	request = buf_alloc(mount->device);
+	if (request == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	buf_setflags(request, B_READ);
+	buf_setblkno(request, (daddr64_t)(offset / mount->device_block_size));
+	buf_setlblkno(request, (daddr64_t)(offset / mount->device_block_size));
+	buf_setcount(request, (uint32_t)length);
+	buf_setsize(request, (uint32_t)length);
+	buf_setresid(request, (uint32_t)length);
+	buf_setdataptr(request, (uintptr_t)buffer);
+	error = VNOP_STRATEGY(request);
+	if (error == 0) {
+		error = buf_biowait(request);
+	}
+	if (error == 0 && buf_resid(request) != 0) {
+		error = EIO;
+	}
+	buf_free(request);
+	return error == 0 ? BTRFS_OK : BTRFS_IO;
+}
+
 static enum btrfs_result
 btrfs_xnu_device_read(void *context, uint64_t offset, void *buffer, size_t length)
 {
 	struct btrfs_xnu_mount *mount = context;
 	uint8_t *destination = buffer;
-	buf_t block;
+	uint8_t *edge = NULL;
 	size_t within;
 	size_t amount;
-	int error;
+	enum btrfs_result result = BTRFS_OK;
 
-	error = vnode_getwithref(mount->device);
-	if (error != 0) {
+	if (vnode_getwithref(mount->device) != 0) {
 		return BTRFS_IO;
 	}
 	while (length != 0) {
 		within = (size_t)(offset % mount->device_block_size);
-		amount = mount->device_block_size - within;
-		if (amount > length) {
-			amount = length;
+		if (within == 0 && length >= mount->device_block_size) {
+			amount = length - length % mount->device_block_size;
+			if (amount > MAXPHYS) {
+				amount = MAXPHYS;
+			}
+			/* Private iobufs preserve range I/O without overlapping cache keys. */
+			result = btrfs_xnu_read_aligned(mount, offset, destination, amount);
+		} else {
+			if (edge == NULL) {
+				edge = _MALLOC(mount->device_block_size, M_TEMP, M_WAITOK | M_NULL);
+				if (edge == NULL) {
+					result = BTRFS_NO_MEMORY;
+					break;
+				}
+			}
+			amount = mount->device_block_size - within;
+			if (amount > length) {
+				amount = length;
+			}
+			result = btrfs_xnu_read_aligned(
+			    mount, offset - within, edge, mount->device_block_size);
+			if (result == BTRFS_OK) {
+				memcpy(destination, edge + within, amount);
+			}
 		}
-		block = NULL;
-		/* A fixed sector-sized cache key prevents overlapping metadata buffers. */
-		error =
-		    buf_meta_bread(mount->device, (daddr64_t)(offset / mount->device_block_size),
-			(int)mount->device_block_size, NOCRED, &block);
-		if (error == 0 && buf_resid(block) != 0) {
-			error = EIO;
-		}
-		if (error == 0) {
-			memcpy(destination, (const uint8_t *)buf_dataptr(block) + within, amount);
-		}
-		if (block != NULL) {
-			buf_brelse(block);
-		}
-		if (error != 0) {
+		if (result != BTRFS_OK) {
 			break;
 		}
 		offset += amount;
 		destination += amount;
 		length -= amount;
 	}
+	if (edge != NULL) {
+		_FREE(edge, M_TEMP);
+	}
 	vnode_put(mount->device);
-	return error == 0 ? BTRFS_OK : BTRFS_IO;
+	return result;
 }
 
 static void
@@ -174,6 +265,7 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	environment.read = btrfs_xnu_device_read;
 	environment.allocate = btrfs_xnu_allocate;
 	environment.release = btrfs_xnu_release;
+	environment.decompress = btrfs_xnu_decompress;
 	error = btrfs_xnu_error(btrfs_mount(&environment, 0, &mount->fs));
 	if (error != 0) {
 		btrfs_xnu_free_mount(mount);
