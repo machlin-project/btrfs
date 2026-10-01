@@ -293,8 +293,18 @@ CoW-derived references of the same commit, additions before drops. A data
 extent losing its last reference loses its checksum items and block-group space
 in the same commit; ranges freed or allocated in a transaction are never reused
 by it, and the owner must retire readers of the old root before the next one.
-Preallocated ranges are rewritten by CoW, not converted in place; NODATACOW files
-are also written by CoW.
+Writes go in place where Linux's `run_delalloc_nocow` allows: into a
+preallocated extent, or into a regular extent of a NODATACOW file, when the
+extent is uncompressed, newer than the tree's last snapshot, referenced only by
+this file's items for it (`btrfs_cross_ref_exist`) and without checksums in the
+range. Data then goes to the extent's own sectors; a preallocated range becomes
+a regular one by splitting the item into preallocated, written and preallocated
+parts of the same disk extent, each extra item one more reference of the same
+key (`btrfs_mark_extent_written`), with checksums unless the file is NODATASUM.
+Writing into preallocated space before the commit is invisible to the committed
+state, which reads those sectors as zero. A NODATACOW overwrite is visible at
+once and may be torn by a crash, as on Linux. Other ranges are copied on
+write.
 
 Compression follows Linux's `inode_need_compress` and `compress_file_range`.
 NODATACOW, NODATASUM and NOCOMPRESS files are never compressed. Otherwise a

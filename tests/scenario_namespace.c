@@ -654,6 +654,144 @@ extref_join(char *path, size_t size, const char *directory, const char *name)
 	REQUIRE(snprintf(path, size, "%s/%s", directory, name) < (int)size);
 }
 
+/* Writes in place, as Linux's run_delalloc_nocow decides. Linux's 1 MiB
+ * preallocated file takes data where it lies, its item split into regular and
+ * preallocated parts of one disk extent; a written part of a file that is not
+ * NODATACOW is copied on write again. A NODATACOW file's unshared extent is
+ * overwritten in place: crash states before that commit may hold old or new
+ * sectors. After a snapshot shares it, the overwrite copies on write. */
+static void
+namespace_nocow_plan(struct context *context)
+{
+	static uint8_t first[NOCOW_FILE_BYTES];
+	static uint8_t second[NOCOW_FILE_BYTES];
+	static uint8_t third[NOCOW_FILE_BYTES];
+	static uint8_t prealloc[3][NOCOW_PREALLOC_BYTES];
+	static uint8_t data[NOCOW_FILE_BYTES];
+	struct plan plan;
+
+	fill_random(first, sizeof(first), 21);
+	memcpy(second, first, sizeof(second));
+	fill_random(data, NOCOW_PATCH_BYTES, 22);
+	memcpy(second + NOCOW_PATCH_OFFSET, data, NOCOW_PATCH_BYTES);
+	memcpy(third, second, sizeof(third));
+	fill_random(data, NOCOW_SHARED_BYTES, 23);
+	memcpy(third, data, NOCOW_SHARED_BYTES);
+	memset(prealloc, 0, sizeof(prealloc));
+	fill_random(prealloc[0] + NOCOW_PREALLOC_FIRST, NOCOW_PREALLOC_FIRST_BYTES, 24);
+	memcpy(prealloc[1], prealloc[0], NOCOW_PREALLOC_BYTES);
+	fill_random(prealloc[1] + NOCOW_PREALLOC_SECOND, NOCOW_PREALLOC_SECOND_BYTES, 25);
+	namespace_plan(context, &plan, "namespace-nocow");
+	plan_create(&plan, 1, "/ns/nocow/file", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/ns/nocow/file", 0, first, sizeof(first));
+	plan_write_new(&plan, 1, "/preallocated", NOCOW_PREALLOC_FIRST,
+	    prealloc[0] + NOCOW_PREALLOC_FIRST, NOCOW_PREALLOC_FIRST_BYTES);
+	plan_write_new(&plan, 2, "/ns/nocow/file", NOCOW_PATCH_OFFSET, second + NOCOW_PATCH_OFFSET,
+	    NOCOW_PATCH_BYTES);
+	plan_volatile(&plan, 2, "/ns/nocow/file", NOCOW_PATCH_OFFSET, NOCOW_PATCH_BYTES);
+	/* Half regular (copied on write), half still preallocated (in place). */
+	plan_write_new(&plan, 2, "/preallocated", NOCOW_PREALLOC_SECOND,
+	    prealloc[1] + NOCOW_PREALLOC_SECOND, NOCOW_PREALLOC_SECOND_BYTES);
+	plan_snapshot(&plan, 3, "/", "/subvol/shared", 0);
+	plan_write_new(&plan, 3, "/ns/nocow/file", 0, third, NOCOW_SHARED_BYTES);
+
+	expect_file(&plan, 1, 1, "/ns/nocow/file", first, sizeof(first));
+	expect_file(&plan, 2, 2, "/ns/nocow/file", second, sizeof(second));
+	expect_file(&plan, 3, LAST_STAGE, "/ns/nocow/file", third, sizeof(third));
+	expect_file(&plan, 3, LAST_STAGE, "/subvol/shared/ns/nocow/file", second, sizeof(second));
+	expect_flags(
+	    &plan, 1, LAST_STAGE, "/ns/nocow/file", BT_INODE_NODATACOW, BT_INODE_NODATACOW);
+	/* One extent, overwritten in place; the shared overwrite adds one. */
+	expect_extents(&plan, 1, 2, "/ns/nocow/file", 1, 0, 1);
+	expect_extents(&plan, 3, LAST_STAGE, "/ns/nocow/file", 2, 0, 2);
+	expect_file(&plan, 0, 0, "/preallocated", prealloc[2], NOCOW_PREALLOC_BYTES);
+	expect_file(&plan, 1, 1, "/preallocated", prealloc[0], NOCOW_PREALLOC_BYTES);
+	expect_file(&plan, 2, LAST_STAGE, "/preallocated", prealloc[1], NOCOW_PREALLOC_BYTES);
+	expect_extents(&plan, 0, 0, "/preallocated", 0, 1, 1);
+	/* Preallocated, written, preallocated: one disk extent. */
+	expect_extents(&plan, 1, 1, "/preallocated", 1, 2, 1);
+	/* The copied half is a new extent; the other half was written in place. */
+	expect_extents(&plan, 2, LAST_STAGE, "/preallocated", 3, 2, 2);
+	run_plan(context, &plan);
+}
+
+/* The disk extent of the first file extent item of id, as the transaction
+ * sees it. */
+static uint64_t
+first_extent(struct btrfs_transaction *transaction, struct btrfs_object_id id)
+{
+	const struct bt_disk_extent *extent;
+	struct bt_owned_root *tree;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { id.inode, 0, BT_EXTENT_DATA };
+	uint64_t address;
+
+	REQUIRE(bt_tx_tree(transaction, id.tree, &tree) == BTRFS_OK);
+	bt_cursor_init(&cursor, bt_mutation_view(transaction->mutation), tree->root);
+	REQUIRE(bt_cursor_seek(&cursor, key, 0) == BTRFS_OK);
+	REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+	REQUIRE(record.key.objectid == id.inode && record.key.type == BT_EXTENT_DATA &&
+	    record.size == sizeof(*extent));
+	extent = (const void *)record.data;
+	address = bt_u64(extent->disk_bytenr);
+	bt_cursor_fini(&cursor);
+	return address;
+}
+
+/* An extent another reference shares is never overwritten in place, even in a
+ * NODATACOW file and without a snapshot (Linux's btrfs_cross_ref_exist). */
+static void
+namespace_nocow_exclusive(struct context *context)
+{
+	struct btrfs_new_inode attributes;
+	struct btrfs_object_id id;
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct btrfs_time time = { 1800000000, 0 };
+	struct bt_backref reference;
+	struct bt_key extent;
+	uint8_t data[NOCOW_PATCH_BYTES];
+	uint64_t address;
+	int pass;
+
+	memset(&attributes, 0, sizeof(attributes));
+	attributes.mode = BTRFS_MODE_REGULAR | 0644;
+	attributes.time = time;
+	fill_random(data, sizeof(data), 31);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_create(transaction, object(fs, "/ns/nocow"), "shared", 6,
+		    &attributes, &id) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_write(transaction, id, 0, data, sizeof(data), time) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
+	for (pass = 0; pass < 2; pass++) {
+		REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+		REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+		address = first_extent(transaction, id);
+		if (pass == 1) {
+			/* Another file's reference to the same extent. */
+			memset(&reference, 0, sizeof(reference));
+			reference.data = 1;
+			reference.root = BTRFS_TOP_LEVEL_TREE;
+			reference.inode = NOCOW_OTHER_INODE;
+			extent = (struct bt_key){ address, sizeof(data), BT_EXTENT_ITEM };
+			REQUIRE(bt_backref_add(transaction->mutation, &transaction->extents.root,
+				    extent, &reference, 1) == BTRFS_OK);
+		}
+		REQUIRE(btrfs_transaction_write(transaction, id, 0, data, sizeof(data), time) ==
+		    BTRFS_OK);
+		REQUIRE((first_extent(transaction, id) == address) == (pass == 0));
+		btrfs_transaction_destroy(transaction);
+		btrfs_unmount(fs);
+	}
+	truncate_writes(context->device, 0);
+	REQUIRE(context->image.live_allocations == 0);
+	printf("NODATACOW writes in place only into an unshared extent PASS\n");
+}
+
 /* New files in a directory with the zstd property inherit it and are written
  * as zstd extents: 128 KiB pieces and a compressed inline extent; a 4 KiB
  * overwrite that cannot save a sector splits a compressed extent around an
@@ -1492,4 +1630,6 @@ namespace_scenarios(struct context *context)
 	namespace_extref_plan(context);
 	namespace_extref_full_plan(context);
 	namespace_zstd_plan(context);
+	namespace_nocow_plan(context);
+	namespace_nocow_exclusive(context);
 }

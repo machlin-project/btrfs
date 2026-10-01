@@ -10,6 +10,9 @@
  * that already has checksums; deletion trims, splits or removes covering items. */
 enum btrfs_result bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums,
     uint64_t logical, const uint8_t *data, uint64_t length);
+/* Whether any checksum covers part of [logical, logical + length). */
+enum btrfs_result bt_csum_exists(struct bt_mutation *mutation, struct bt_root checksums,
+    uint64_t logical, uint64_t length, int *exists);
 enum btrfs_result bt_csum_delete(
     struct bt_mutation *mutation, struct bt_root *checksums, uint64_t logical, uint64_t length);
 

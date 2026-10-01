@@ -22,6 +22,9 @@ struct bt_backref {
  * that Linux can continue the tree. Each operation validates the item first. */
 enum btrfs_result bt_backref_info(struct bt_mutation *mutation, struct bt_root extents,
     struct bt_key extent, uint64_t *refs, uint64_t *flags);
+/* The count of one reference: an inline or keyed item, 0 when absent. */
+enum btrfs_result bt_backref_count(struct bt_mutation *mutation, struct bt_root extents,
+    struct bt_key extent, const struct bt_backref *reference, uint64_t *count);
 enum btrfs_result bt_backref_add(struct bt_mutation *mutation, struct bt_root *extents,
     struct bt_key extent, const struct bt_backref *reference, uint32_t count);
 /* Removes count references; deletes the extent item when its last reference

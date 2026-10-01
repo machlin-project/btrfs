@@ -79,6 +79,18 @@ bt_csum_find(struct bt_mutation *mutation, struct bt_root root, uint64_t logical
 }
 
 enum btrfs_result
+bt_csum_exists(struct bt_mutation *mutation, struct bt_root checksums, uint64_t logical,
+    uint64_t length, int *exists)
+{
+	struct bt_csum_item item;
+
+	if (length == 0 || length > UINT64_MAX - logical) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	return bt_csum_find(mutation, checksums, logical, logical + length, &item, exists);
+}
+
+enum btrfs_result
 bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t logical,
     const uint8_t *data, uint64_t length)
 {

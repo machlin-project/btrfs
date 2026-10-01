@@ -385,6 +385,48 @@ bt_backref_info(struct bt_mutation *mutation, struct bt_root extents, struct bt_
 }
 
 enum btrfs_result
+bt_backref_count(struct bt_mutation *mutation, struct bt_root extents, struct bt_key extent,
+    const struct bt_backref *reference, uint64_t *count)
+{
+	struct bt_extent_copy copy;
+	struct bt_disk_data_ref wire;
+	struct bt_disk_shared_data_ref shared;
+	struct bt_key key;
+	size_t length;
+	int found = 0;
+	enum btrfs_result error;
+
+	*count = 0;
+	error = bt_extent_begin(mutation, &copy);
+	if (error == BTRFS_OK) {
+		error = bt_extent_load(mutation, extents, extent, &copy);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_extent_search(&copy, reference);
+	}
+	if (error == BTRFS_OK && copy.found) {
+		*count = bt_inline_count(&copy);
+	} else if (error == BTRFS_OK && bt_ref_type(reference) == BT_EXTENT_DATA_REF) {
+		error = bt_keyed_data(
+		    mutation, extents, extent.objectid, reference, &key, &wire, &found);
+		*count = error == BTRFS_OK && found ? bt_u32(wire.count) : 0;
+	} else if (error == BTRFS_OK) {
+		key = (struct bt_key){ extent.objectid,
+			reference->parent != 0 ? reference->parent : reference->root,
+			bt_ref_type(reference) };
+		error = bt_mutation_find(mutation, extents, key, &shared, sizeof(shared), &length);
+		if (error == BTRFS_OK) {
+			*count = key.type == BT_SHARED_DATA_REF && length == sizeof(shared)
+			    ? bt_u32(shared.count)
+			    : 1;
+		}
+		error = error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
+	}
+	bt_extent_end(&copy);
+	return error == BTRFS_RANGE ? BTRFS_CORRUPT : error;
+}
+
+enum btrfs_result
 bt_backref_add(struct bt_mutation *mutation, struct bt_root *extents, struct bt_key extent,
     const struct bt_backref *reference, uint32_t count)
 {

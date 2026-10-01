@@ -36,7 +36,8 @@ NAMESPACE_ARGUMENT = {
     "subvolume": re.compile(r"^(ro|rw):(-|/|(/[A-Za-z0-9._-]{1,255})+)$"),
     "subvolumes": re.compile(r"^-$"),
     "deleted": re.compile(r"^[0-9]+$"),
-    "compressed": re.compile(r"^(zlib|zstd):[0-9]+:[0-9]+$")}
+    "compressed": re.compile(r"^(zlib|zstd):[0-9]+:[0-9]+$"),
+    "extents": re.compile(r"^[0-9]+:[0-9]+:[0-9]+$")}
 PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr", "subvolumes"}
 # Facts that may name the top-level directory itself.
 ROOT_KINDS = {"dir", "stat", "xattr", "noxattr", "flags", "times", "feature", "subvolume",
@@ -108,6 +109,13 @@ def load_scenario(directory, device_bytes):
             if payload != "-":
                 (directory / check_name(payload)).stat()
             facts[int(stage)] = facts.get(int(stage), 0) + 1
+    volatile = directory / "volatile.tsv"
+    if volatile.exists():
+        for line in volatile.read_text().splitlines():
+            commit, path, offset, length = fields(line, 4)
+            if (int(commit) not in stages or not safe_path(path) or int(offset) % 4096 != 0 or
+                    int(length) == 0 or int(length) % 4096 != 0):
+                raise ValueError(f"Invalid volatile range {line!r}")
     cases = []
     touched = [(offset, length) for offset, length, _, _, _ in writes]
     for line in (directory / "cases.tsv").read_text().splitlines():

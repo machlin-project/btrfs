@@ -617,6 +617,155 @@ bt_tx_replace(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	return error;
 }
 
+/* Whether [position, end) of item may be written in place, as Linux's
+ * run_delalloc_nocow decides: a preallocated extent, or a regular one of a
+ * NODATACOW file, uncompressed, newer than the tree's last snapshot, referenced
+ * only by this file's items for it, and without checksums in the range. */
+static enum btrfs_result
+bt_tx_nocow(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    const struct bt_disk_inode *inode, uint64_t ino, const struct bt_file_item *item,
+    uint64_t position, uint64_t end, int *in_place)
+{
+	const struct bt_disk_extent *extent = &item->extent;
+	struct bt_backref reference;
+	struct bt_key key = { bt_u64(extent->disk_bytenr), bt_u64(extent->disk_bytes),
+		BT_EXTENT_ITEM };
+	uint64_t refs = 0;
+	uint64_t flags = 0;
+	uint64_t count = 0;
+	int checksummed = 0;
+	enum btrfs_result error;
+
+	*in_place = 0;
+	if ((extent->header.type != BT_EXTENT_PREALLOC &&
+		(extent->header.type != BT_EXTENT_REGULAR ||
+		    (bt_u64(inode->flags) & BT_INODE_NODATACOW) == 0)) ||
+	    key.objectid == 0 || extent->header.compression != 0 ||
+	    extent->header.encryption != 0 || bt_u16(extent->header.encoding) != 0 ||
+	    bt_u64(extent->header.generation) <= bt_u64(tree->item.legacy.last_snapshot)) {
+		return BTRFS_OK;
+	}
+	bt_zero(&reference, sizeof(reference));
+	reference.data = 1;
+	reference.root = tree->root.owner;
+	reference.inode = ino;
+	reference.offset = item->key.offset - bt_u64(extent->offset);
+	error =
+	    bt_backref_info(transaction->mutation, transaction->extents.root, key, &refs, &flags);
+	if (error == BTRFS_OK) {
+		error = bt_backref_count(
+		    transaction->mutation, transaction->extents.root, key, &reference, &count);
+	}
+	if (error != BTRFS_OK || refs != count) {
+		return error;
+	}
+	error = bt_csum_exists(transaction->mutation, transaction->checksums.root,
+	    key.objectid + bt_u64(extent->offset) + (position - item->key.offset), end - position,
+	    &checksummed);
+	*in_place = error == BTRFS_OK && !checksummed;
+	return error;
+}
+
+/* Writes [position, end) into item's extent where it lies, as a NODATACOW
+ * write does; a preallocated range becomes a regular one in place, splitting
+ * the item as btrfs_mark_extent_written does, with checksums unless the file
+ * is NODATASUM. */
+static enum btrfs_result
+bt_tx_write_in_place(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    const struct bt_disk_inode *inode, uint64_t ino, const struct bt_file_item *item,
+    uint64_t position, uint64_t end, const uint8_t *bytes)
+{
+	struct bt_disk_extent piece;
+	struct bt_key key;
+	uint64_t offset = bt_u64(item->extent.offset);
+	uint64_t logical =
+	    bt_u64(item->extent.disk_bytenr) + offset + (position - item->key.offset);
+	enum btrfs_result error;
+
+	error = bt_tx_write_data(transaction, logical, bytes, end - position);
+	if (error != BTRFS_OK || item->extent.header.type != BT_EXTENT_PREALLOC) {
+		return error;
+	}
+	if (!(bt_u64(inode->flags) & BT_INODE_NODATASUM_FLAG)) {
+		error = bt_csum_insert(transaction->mutation, &transaction->checksums.root, logical,
+		    bytes, end - position);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_tx_edit(transaction, &tree->root, item->key, NULL, 0, BT_DELETE);
+	}
+	/* The preallocated part before, the written part, the part after: each
+	 * extra item is one more reference of the same key. */
+	if (error == BTRFS_OK && position > item->key.offset) {
+		piece = item->extent;
+		bt_put64(&piece.length, position - item->key.offset);
+		error = bt_tx_edit(
+		    transaction, &tree->root, item->key, &piece, sizeof(piece), BT_INSERT);
+		if (error == BTRFS_OK) {
+			error = bt_tx_reference(transaction, tree, item, item->key.offset, 1);
+		}
+	}
+	if (error == BTRFS_OK) {
+		piece = item->extent;
+		bt_put64(&piece.header.generation, transaction->base->info.generation + 1);
+		piece.header.type = BT_EXTENT_REGULAR;
+		bt_put64(&piece.offset, offset + (position - item->key.offset));
+		bt_put64(&piece.length, end - position);
+		key =
+		    (struct bt_key){ .objectid = ino, .type = BT_EXTENT_DATA, .offset = position };
+		error = bt_tx_edit(transaction, &tree->root, key, &piece, sizeof(piece), BT_INSERT);
+	}
+	if (error == BTRFS_OK && end < item->end) {
+		piece = item->extent;
+		bt_put64(&piece.offset, offset + (end - item->key.offset));
+		bt_put64(&piece.length, item->end - end);
+		key = (struct bt_key){ .objectid = ino, .type = BT_EXTENT_DATA, .offset = end };
+		error = bt_tx_edit(transaction, &tree->root, key, &piece, sizeof(piece), BT_INSERT);
+		if (error == BTRFS_OK) {
+			error = bt_tx_reference(transaction, tree, item, item->key.offset, 1);
+		}
+	}
+	return error;
+}
+
+/* Writes [start, end) from buffer: in place where bt_tx_nocow allows it,
+ * otherwise as new extents replacing the old coverage. */
+static enum btrfs_result
+bt_tx_place(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, uint64_t start, uint64_t end, const uint8_t *buffer)
+{
+	struct bt_file_item item;
+	uint64_t position;
+	uint64_t next;
+	int found = 0;
+	int in_place = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (position = start; error == BTRFS_OK && position < end; position = next) {
+		error = bt_tx_file_item(transaction, tree, ino, position, end, &item, &found);
+		if (error != BTRFS_OK) {
+			break;
+		}
+		in_place = 0;
+		if (!found || item.key.offset > position) {
+			next = found ? item.key.offset : end;
+		} else if (item.extent.header.type == BT_EXTENT_INLINE) {
+			/* An inline extent ends unaligned; its sector goes with it. */
+			next = end;
+		} else {
+			next = item.end < end ? item.end : end;
+			error = bt_tx_nocow(
+			    transaction, tree, inode, ino, &item, position, next, &in_place);
+		}
+		if (error == BTRFS_OK) {
+			error = in_place ? bt_tx_write_in_place(transaction, tree, inode, ino,
+					       &item, position, next, buffer + (position - start))
+					 : bt_tx_replace(transaction, tree, inode, ino, position,
+					       next, buffer + (position - start));
+		}
+	}
+	return error;
+}
+
 static enum btrfs_result
 bt_tx_store_inode(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t ino,
     struct bt_disk_inode *inode, uint64_t size, struct btrfs_time modified)
@@ -688,7 +837,7 @@ bt_tx_rewrite(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 		}
 		if (error == BTRFS_OK) {
 			error =
-			    bt_tx_replace(transaction, tree, inode, ino, piece, piece_end, buffer);
+			    bt_tx_place(transaction, tree, inode, ino, piece, piece_end, buffer);
 		}
 	}
 	env->release(env->context, buffer, capacity);

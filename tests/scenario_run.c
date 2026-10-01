@@ -25,6 +25,7 @@ resolve(struct context *context, const struct plan *plan, size_t acknowledged, s
 
 	memset(outcome, 0, sizeof(*outcome));
 	outcome->mounted = NO_STAGE;
+	context->crash_commit = latest;
 	result = btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs);
 	REQUIRE(result == BTRFS_OK || result == BTRFS_CORRUPT);
 	if (result == BTRFS_OK) {
@@ -69,6 +70,7 @@ resolve(struct context *context, const struct plan *plan, size_t acknowledged, s
 		outcome->recovered = 1;
 		context->recoveries++;
 	}
+	context->crash_commit = 0;
 	/* A resolved state is consistent and admits the next transaction. */
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
@@ -125,7 +127,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
 		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
-		"subvolumes", "deleted", "compressed" };
+		"subvolumes", "deleted", "compressed", "extents" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -134,8 +136,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	size_t stage;
 	size_t i;
 
-	_Static_assert(
-	    sizeof(kinds) / sizeof(kinds[0]) == EXPECT_COMPRESSED + 1, "expectation kinds");
+	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_EXTENTS + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
@@ -189,6 +190,11 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 				    e->value == BTRFS_COMPRESSION_ZLIB ? "zlib" : "zstd", e->links,
 				    e->mode) < (int)sizeof(argument));
 			detail = argument;
+		} else if (e->kind == EXPECT_EXTENTS) {
+			/* regular:preallocated:distinct disk extents */
+			REQUIRE(snprintf(argument, sizeof(argument), "%u:%u:%llu", e->links,
+				    e->mode, (unsigned long long)e->value) < (int)sizeof(argument));
+			detail = argument;
 		} else if (e->kind == EXPECT_DELETED) {
 			REQUIRE(snprintf(argument, sizeof(argument), "%llu",
 				    (unsigned long long)e->value) < (int)sizeof(argument));
@@ -212,6 +218,17 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 		}
 	}
 	REQUIRE(fclose(manifest) == 0);
+	if (plan->volatile_count != 0) {
+		/* volatile.tsv: commit, path, offset and length of in-place bytes. */
+		manifest = export_open(exporter, "volatile.tsv");
+		for (i = 0; i < plan->volatile_count; i++) {
+			REQUIRE(fprintf(manifest, "%zu\t%s\t%llu\t%llu\n",
+				    plan->volatiles[i].commit, plan->volatiles[i].path,
+				    (unsigned long long)plan->volatiles[i].offset,
+				    (unsigned long long)plan->volatiles[i].length) > 0);
+		}
+		REQUIRE(fclose(manifest) == 0);
+	}
 }
 
 static void

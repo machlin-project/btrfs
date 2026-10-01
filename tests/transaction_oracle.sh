@@ -134,6 +134,48 @@ check_compressed() {
     test "$counts" = "${2#*:}:0"
 }
 
+# REGULAR:PREALLOC:DISTINCT: the file's regular and preallocated extent items
+# and its distinct disk extents in Linux's own tree dump, which prints the disk
+# range of a preallocated item as "prealloc data disk byte".
+check_extents() {
+    inode=$(stat -c '%i' "$1")
+    counts=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+        awk -v inode="$inode" '
+        $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
+        inside && $1 == "generation" && $3 == "type" { type = $4 }
+        inside && ($1 == "extent" || $1 == "prealloc") && $2 == "data" && $3 == "disk" &&
+            $4 == "byte" && $5 != 0 {
+            if (type == 1) regular++; else if (type == 2) prealloc++
+            disks[$5] = 1 }
+        END { for (d in disks) distinct++; printf "%d:%d:%d", regular, prealloc, distinct }')
+    test "$counts" = "$2" || { echo "extents of $1: $counts" >&2; return 1; }
+}
+
+# A NODATACOW overwrite reaches the disk before its commit: a state of commit
+# $commit resolving to the previous stage may hold, device sector by sector, the
+# old or the new bytes inside the scenario's volatile ranges (volatile.tsv).
+volatile_file() {
+    [ -f "$1/volatile.tsv" ] && [ -n "$commit" ] && [ "$2" = $((commit - 1)) ] || return 1
+    new=$(awk -F '\t' -v stage="$commit" -v path="$3" \
+        '$1 == stage && $2 == "file" && $3 == path { print $5; exit }' "$1/namespace.tsv")
+    [ -n "$new" ] && test "$(stat -c %s "$4")" = "$(stat -c %s "$1/$5")" || return 1
+    cmp -l "$4" "$1/$5" > /tmp/old-diff || true
+    cmp -l "$4" "$1/$new" > /tmp/new-diff || true
+    awk -v commit="$commit" -v path="$3" -v sector=512 '
+        BEGIN { n = 0 }
+        FILENAME ~ /volatile.tsv$/ {
+            if ($1 == commit && $2 == path) { start[n] = $3; end[n] = $3 + $4; n++ }
+            next }
+        FILENAME == "/tmp/old-diff" {
+            byte = $1 - 1; inside = 0
+            for (i = 0; i < n; i++) if (byte >= start[i] && byte < end[i]) inside = 1
+            if (!inside) bad = 1
+            old[int(byte / sector)] = 1; next }
+        { changed[int(($1 - 1) / sector)] = 1 }
+        END { for (s in old) if (s in changed) bad = 1; exit bad }' \
+        "$1/volatile.tsv" /tmp/old-diff /tmp/new-diff
+}
+
 namespace_checks=0
 
 check_namespace() {
@@ -144,7 +186,8 @@ check_namespace() {
         target="/mnt$path"
         case "$kind" in
         absent) test ! -e "$target" && test ! -L "$target" ;;
-        file) test -f "$target" && test ! -L "$target" && cmp "$target" "$1/$payload" ;;
+        file) test -f "$target" && test ! -L "$target" &&
+            { cmp -s "$target" "$1/$payload" || volatile_file "$1" "$2" "$path" "$target" "$payload"; } ;;
         symlink) test -L "$target" && test "$(readlink "$target")" = "$(cat "$1/$payload")" ;;
         dir) test -d "$target" && list_names "$target" > /tmp/listing &&
             cmp /tmp/listing "$1/$payload" && test "$(stat -c '%s' "$target")" = "$arg" ;;
@@ -163,6 +206,7 @@ check_namespace() {
             cmp /tmp/listing "$1/$payload" ;;
         deleted) test "$(btrfs subvolume list -d /mnt | wc -l)" -eq "$arg" ;;
         compressed) check_compressed "$target" "$arg" ;;
+        extents) check_extents "$target" "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"
@@ -187,6 +231,7 @@ verify() {
 }
 
 total=0
+commit=
 for scenario in /transaction/*; do
     name=${scenario##*/}
     while IFS="$(printf '\t')" read -r case commit kind mounted resolved recovered; do
@@ -220,6 +265,7 @@ for scenario in /transaction/*; do
     done < "$scenario/cases.tsv"
     restore "$scenario"
     cmp /dev/vda /dev/vdb
+    commit=
     # Linux continues read-write from the scenario's newest root, cleaning any
     # orphans it left. A free-space tree must stay enabled; the other profiles
     # keep no space cache.

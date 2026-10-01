@@ -79,6 +79,16 @@
 #define ZSTD_SMALL_BYTES 2000U
 #define ZSTD_PATCH_OFFSET 65536U
 #define ZSTD_PATCH_BYTES 4096U
+#define NOCOW_FILE_BYTES (64U * 1024U)
+#define NOCOW_PATCH_OFFSET 4096U
+#define NOCOW_PATCH_BYTES 12288U
+#define NOCOW_SHARED_BYTES 8192U
+#define NOCOW_PREALLOC_BYTES (1024U * 1024U)
+#define NOCOW_PREALLOC_FIRST 8192U
+#define NOCOW_PREALLOC_FIRST_BYTES 16384U
+#define NOCOW_PREALLOC_SECOND 16384U
+#define NOCOW_PREALLOC_SECOND_BYTES 16384U
+#define NOCOW_OTHER_INODE UINT64_C(999999)
 #define COLLISION_BLOCK_BYTES 8U
 #define COLLISION_BLOCKS 10U
 #define COLLISION_NAME_BYTES (COLLISION_BLOCK_BYTES * COLLISION_BLOCKS)
@@ -187,7 +197,8 @@ enum expectation_kind {
 	EXPECT_SUBVOLUME,
 	EXPECT_SUBVOLUMES,
 	EXPECT_DELETED,
-	EXPECT_COMPRESSED
+	EXPECT_COMPRESSED,
+	EXPECT_EXTENTS
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -215,7 +226,9 @@ struct expectation {
 	 * path below the top level, as btrfs subvolume list prints them.
 	 * EXPECT_DELETED: value deleted subvolumes wait for the cleaner.
 	 * EXPECT_COMPRESSED: the file's extents compressed with codec value:
-	 * links regular and mode inline ones, and none with another codec. */
+	 * links regular and mode inline ones, and none with another codec.
+	 * EXPECT_EXTENTS: links regular and mode preallocated file extent items,
+	 * referencing value distinct disk extents. */
 	/* EXPECT_TIMES: seconds of the access and modification times. */
 	int64_t access_seconds;
 	int64_t modify_seconds;
@@ -239,6 +252,22 @@ struct path_table {
 /* Source-controlled operation sequence: stage 0 is the Linux fixture and stage
  * k is the expected logical state after the k-th acknowledged commit, computed
  * by applying that commit's operations to a byte model of each file. */
+/* Bytes a commit writes in place (a NODATACOW overwrite): its crash and fault
+ * states that resolve to the previous stage may hold, sector by sector, the old
+ * or the new bytes there. */
+struct volatile_range {
+	size_t commit;
+	char *path;
+	uint64_t offset;
+	uint64_t length;
+};
+
+#define MAX_VOLATILE 8U
+/* An in-place write may be torn: each device sector of a volatile range holds
+ * old or new bytes. */
+#define DEVICE_VOLATILE_SECTOR DEVICE_SECTOR
+#define MAX_EXTENT_DISKS 256U
+
 struct plan {
 	const char *name;
 	struct tracked *files;
@@ -260,6 +289,8 @@ struct plan {
 	int namespace;
 	/* Committed stages only: no crash states or fault sweeps. */
 	int quick;
+	struct volatile_range volatiles[MAX_VOLATILE];
+	size_t volatile_count;
 };
 
 struct totals {
@@ -298,6 +329,8 @@ struct context {
 	size_t audits;
 	struct btrfs_fs *plan_fs;
 	uint32_t seed;
+	/* While a commit's crash or fault states are resolved: that commit. */
+	size_t crash_commit;
 };
 
 /* Recorded device (tests/scenario_device.c). */
@@ -400,6 +433,10 @@ void expect_subvolumes(struct plan *plan, size_t first, size_t last, const char 
 void expect_deleted(struct plan *plan, size_t first, size_t last, size_t count);
 void expect_compressed(struct plan *plan, size_t first, size_t last, const char *path,
     enum btrfs_compression codec, uint32_t regular, uint32_t inline_extents);
+void expect_extents(struct plan *plan, size_t first, size_t last, const char *path,
+    uint32_t regular, uint32_t prealloc, uint64_t distinct);
+void plan_volatile(
+    struct plan *plan, size_t commit, const char *path, uint64_t offset, uint64_t length);
 
 /* Execution, crash states, fault sweeps and export (tests/scenario_run.c). */
 size_t chunk_count(struct context *context);

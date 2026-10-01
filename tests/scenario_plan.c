@@ -328,9 +328,106 @@ check_subvolumes(
 	}
 }
 
+/* Whether bytes (the expected size) differ from e's only inside the volatile
+ * ranges crash_commit wrote in place, each sector holding e's bytes or the
+ * crash commit's. */
+static int
+volatile_match(const struct plan *plan, size_t stage, size_t crash_commit,
+    const struct expectation *e, const uint8_t *bytes, size_t size)
+{
+	const struct expectation *next = NULL;
+	const struct volatile_range *range;
+	size_t sector;
+	size_t start;
+	size_t length;
+	size_t i;
+	int inside;
+
+	if (crash_commit != stage + 1 || size != e->size) {
+		return 0;
+	}
+	for (i = 0; i < plan->expectation_count && next == NULL; i++) {
+		if (plan->expectations[i].kind == EXPECT_FILE &&
+		    strcmp(plan->expectations[i].path, e->path) == 0 &&
+		    plan->expectations[i].first <= crash_commit &&
+		    crash_commit <= plan->expectations[i].last) {
+			next = &plan->expectations[i];
+		}
+	}
+	if (next == NULL || next->size != size) {
+		return 0;
+	}
+	for (sector = 0; sector < size; sector += DEVICE_VOLATILE_SECTOR) {
+		start = sector;
+		length =
+		    size - sector < DEVICE_VOLATILE_SECTOR ? size - sector : DEVICE_VOLATILE_SECTOR;
+		if (memcmp(bytes + start, e->bytes + start, length) == 0) {
+			continue;
+		}
+		inside = 0;
+		for (i = 0; i < plan->volatile_count; i++) {
+			range = &plan->volatiles[i];
+			inside |= range->commit == crash_commit &&
+			    strcmp(range->path, e->path) == 0 && start >= range->offset &&
+			    start + length <= range->offset + range->length;
+		}
+		if (!inside || memcmp(bytes + start, next->bytes + start, length) != 0) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Counts the inode's regular and preallocated file extent items and their
+ * distinct disk extents. */
 static void
-check_expectation(
-    struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e)
+check_extents(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
+    const struct expectation *e, const struct btrfs_inode *inode)
+{
+	const struct bt_disk_extent *extent;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key = { inode->id.inode, 0, BT_EXTENT_DATA };
+	uint64_t disks[MAX_EXTENT_DISKS];
+	uint32_t regular = 0;
+	uint32_t prealloc = 0;
+	size_t distinct = 0;
+	size_t i;
+	enum btrfs_result result;
+
+	REQUIRE(bt_find_root(fs, inode->id.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != inode->id.inode || record.key.type != BT_EXTENT_DATA) {
+			break;
+		}
+		extent = (const void *)record.data;
+		if (record.size == sizeof(*extent) && bt_u64(extent->disk_bytenr) != 0) {
+			regular += extent->header.type == BT_EXTENT_REGULAR;
+			prealloc += extent->header.type == BT_EXTENT_PREALLOC;
+			for (i = 0; i < distinct && disks[i] != bt_u64(extent->disk_bytenr); i++) {
+			}
+			if (i == distinct) {
+				REQUIRE(distinct < MAX_EXTENT_DISKS);
+				disks[distinct++] = bt_u64(extent->disk_bytenr);
+			}
+		}
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	if (regular != e->links || prealloc != e->mode || distinct != e->value) {
+		fprintf(stderr, "%s stage %zu: %s: %u regular, %u preallocated, %zu disk extents\n",
+		    plan->name, stage, e->path, regular, prealloc, distinct);
+		exit(1);
+	}
+}
+
+static void
+check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, size_t crash_commit,
+    const struct expectation *e)
 {
 	struct btrfs_inode inode;
 	struct btrfs_inode other;
@@ -436,24 +533,29 @@ check_expectation(
 	case EXPECT_COMPRESSED:
 		check_compressed(fs, plan, stage, e, &inode);
 		return;
+	case EXPECT_EXTENTS:
+		check_extents(fs, plan, stage, e, &inode);
+		return;
 	default:
 		REQUIRE(0);
 	}
-	if (size != e->size || (size != 0 && memcmp(bytes, e->bytes, size) != 0)) {
+	if ((size != e->size || (size != 0 && memcmp(bytes, e->bytes, size) != 0)) &&
+	    !(e->kind == EXPECT_FILE &&
+		volatile_match(plan, stage, crash_commit, e, bytes, size))) {
 		expectation_failed(plan, stage, e, "contents differ");
 	}
 	free(bytes);
 }
 
 static void
-check_namespace(struct btrfs_fs *fs, const struct plan *plan, size_t stage)
+check_namespace(struct btrfs_fs *fs, const struct plan *plan, size_t stage, size_t crash_commit)
 {
 	struct namespace_audit audit;
 	size_t i;
 
 	for (i = 0; i < plan->expectation_count; i++) {
 		if (plan->expectations[i].first <= stage && stage <= plan->expectations[i].last) {
-			check_expectation(fs, plan, stage, &plan->expectations[i]);
+			check_expectation(fs, plan, stage, crash_commit, &plan->expectations[i]);
 		}
 	}
 	if (namespace_audit(fs, &audit) != 0) {
@@ -487,7 +589,7 @@ check_stage(struct context *context, struct btrfs_fs *fs, const struct plan *pla
 	}
 	check_invariants(fs);
 	if (plan->namespace) {
-		check_namespace(fs, plan, stage);
+		check_namespace(fs, plan, stage, context->crash_commit);
 	}
 }
 
@@ -668,6 +770,9 @@ plan_destroy(struct plan *plan)
 	}
 	free(plan->expectations);
 	free(plan->files);
+	for (i = 0; i < plan->volatile_count; i++) {
+		free(plan->volatiles[i].path);
+	}
 }
 
 void
@@ -1146,6 +1251,31 @@ expect_compressed(struct plan *plan, size_t first, size_t last, const char *path
 	e->value = (uint64_t)codec;
 	e->links = regular;
 	e->mode = inline_extents;
+}
+
+void
+expect_extents(struct plan *plan, size_t first, size_t last, const char *path, uint32_t regular,
+    uint32_t prealloc, uint64_t distinct)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_EXTENTS, path);
+
+	e->links = regular;
+	e->mode = prealloc;
+	e->value = distinct;
+}
+
+void
+plan_volatile(struct plan *plan, size_t commit, const char *path, uint64_t offset, uint64_t length)
+{
+	struct volatile_range *range;
+
+	REQUIRE(plan->volatile_count < MAX_VOLATILE);
+	range = &plan->volatiles[plan->volatile_count++];
+	range->commit = commit;
+	range->path = strdup(path);
+	REQUIRE(range->path != NULL);
+	range->offset = offset;
+	range->length = length;
 }
 
 void

@@ -85,9 +85,9 @@ only after successful durable publication; `seal` alone is not a commit.
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
 3. **Extend file data.** `btrfs_transaction_write`/`_truncate` write CoW data
    with checksums, holes, preallocated and compressed input, inline conversion
-   and snapshot-safe frees (`core/data.c`, `core/csum.c`). Remaining: in-place
-   preallocation conversion and NODATACOW overwrite for unshared extents (both
-   need their own crash cases), data DUP and 64 KiB-sector fixtures, explicit
+   and snapshot-safe frees (`core/data.c`, `core/csum.c`), in place into
+   preallocated and unshared NODATACOW extents. Remaining: data DUP and 64
+   KiB-sector fixtures, an fallocate operation, explicit
    hole items for filesystems without NO_HOLES, and a compressor in the kernel
    adapter. New data is written as its extents are created, and files compress
    on write as Linux decides.
