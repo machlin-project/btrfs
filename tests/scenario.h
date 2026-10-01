@@ -121,7 +121,10 @@ enum operation_kind {
 	OPERATION_SET_XATTR,
 	OPERATION_REMOVE_XATTR,
 	OPERATION_EVICT,
-	OPERATION_CLEAN_ORPHANS
+	OPERATION_CLEAN_ORPHANS,
+	OPERATION_SET_ATTRIBUTES,
+	OPERATION_KEEP_PRIVILEGES,
+	OPERATION_DROP_PRIVILEGES
 };
 
 /* Operations name objects by path. A path created, renamed or removed by an
@@ -142,6 +145,8 @@ struct operation {
 	uint64_t device;
 	int flags;
 	struct btrfs_object_id id;
+	struct btrfs_time access_time;
+	struct btrfs_time modify_time;
 };
 
 enum expectation_kind {
@@ -155,7 +160,8 @@ enum expectation_kind {
 	EXPECT_STAT,
 	EXPECT_DEVICE,
 	EXPECT_FLAGS,
-	EXPECT_FEATURE
+	EXPECT_FEATURE,
+	EXPECT_TIMES
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -176,6 +182,9 @@ struct expectation {
 	uint64_t value;
 	/* EXPECT_FLAGS: the inode flags in mask must equal value. */
 	uint64_t mask;
+	/* EXPECT_TIMES: seconds of the access and modification times. */
+	int64_t access_seconds;
+	int64_t modify_seconds;
 };
 
 /* Objects named during one attempt: the committed lookup or the latest
@@ -301,6 +310,9 @@ void plan_write_new(struct plan *plan, size_t commit, const char *path, uint64_t
     const void *data, size_t size);
 void plan_evict(struct context *context, struct plan *plan, size_t commit, const char *path);
 void plan_clean(struct plan *plan, size_t commit, uint64_t tree, size_t expected);
+void plan_set_attributes(struct plan *plan, size_t commit, const char *path, unsigned mask,
+    uint32_t mode, uint32_t uid, uint32_t gid, int64_t access_seconds, int64_t modify_seconds);
+void plan_privileges(struct plan *plan, size_t commit, const char *path, int keep);
 struct expectation *expect(
     struct plan *plan, size_t first, size_t last, enum expectation_kind kind, const char *path);
 void expect_absent(struct plan *plan, size_t first, size_t last, const char *path);
@@ -320,6 +332,10 @@ void expect_links(struct context *context, struct plan *plan, size_t first, size
     const char *path, const char *source, uint32_t links);
 void expect_value(struct plan *plan, size_t first, size_t last, enum expectation_kind kind,
     const char *path, uint64_t value);
+void expect_owner(struct plan *plan, size_t first, size_t last, const char *path, uint32_t mode,
+    uint32_t uid, uint32_t gid, uint32_t links);
+void expect_times(struct plan *plan, size_t first, size_t last, const char *path,
+    int64_t access_seconds, int64_t modify_seconds);
 void expect_flags(
     struct plan *plan, size_t first, size_t last, const char *path, uint64_t mask, uint64_t value);
 void expect_names(struct plan *plan, size_t first, size_t last, const char *path,

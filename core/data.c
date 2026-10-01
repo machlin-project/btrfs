@@ -264,13 +264,14 @@ bt_tx_inode(struct btrfs_transaction *transaction, struct bt_owned_root *tree, u
 		    ? BTRFS_IS_DIRECTORY
 		    : BTRFS_UNSUPPORTED;
 	}
-	/* Set-id clearing needs the owner's credential policy; immutable and
-	 * append-only inodes need their own authorization contracts. */
-	if ((bt_u32(item->mode) & 06000U) != 0 || bt_u64(item->sequence) == UINT64_MAX ||
-	    (bt_u64(item->flags) & (BT_INODE_IMMUTABLE | BT_INODE_APPEND)) != 0) {
+	if ((bt_u64(item->flags) & BT_INODE_IMMUTABLE) != 0) {
+		return BTRFS_NOT_PERMITTED;
+	}
+	if (bt_u64(item->sequence) == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
 	}
-	return BTRFS_OK;
+	/* Set-id bits and file capabilities need the caller's explicit decision. */
+	return bt_tx_privileges_settled(transaction, tree, inode, item);
 }
 
 /* Finds the first file extent item of inode overlapping [start, end). */
@@ -690,6 +691,11 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 		return BTRFS_RANGE;
 	}
 	error = bt_tx_data_begin(transaction, id, &tree, &inode, &inline_end);
+	/* An append-only file accepts data only at its end. */
+	if (error == BTRFS_OK && (bt_u64(inode.flags) & BT_INODE_APPEND) != 0 &&
+	    offset != bt_u64(inode.size)) {
+		error = BTRFS_NOT_PERMITTED;
+	}
 	if (error != BTRFS_OK || size == 0) {
 		return error;
 	}
@@ -744,6 +750,9 @@ btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_o
 		return BTRFS_RANGE;
 	}
 	error = bt_tx_data_begin(transaction, id, &tree, &inode, &inline_end);
+	if (error == BTRFS_OK && (bt_u64(inode.flags) & BT_INODE_APPEND) != 0) {
+		error = BTRFS_NOT_PERMITTED;
+	}
 	if (error != BTRFS_OK) {
 		return error;
 	}

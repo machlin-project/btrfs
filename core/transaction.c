@@ -257,9 +257,15 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 	}
 	if (length != sizeof(inode) ||
 	    (bt_u32(inode.mode) & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR ||
-	    (bt_u32(inode.mode) & 06000U) != 0 || bt_u64(inode.sequence) == UINT64_MAX ||
-	    (bt_u64(inode.flags) & (BT_INODE_IMMUTABLE | BT_INODE_APPEND)) != 0) {
+	    bt_u64(inode.sequence) == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
+	}
+	if ((bt_u64(inode.flags) & (BT_INODE_IMMUTABLE | BT_INODE_APPEND)) != 0) {
+		return BTRFS_NOT_PERMITTED;
+	}
+	error = bt_tx_privileges_settled(transaction, tree, id.inode, &inode);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	/* Require exactly one existing, ordinary inline extent. This prevents a
 	 * partial conversion from leaking external extents or changing snapshots. */
@@ -309,8 +315,8 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 		bt_put64(&inode.mtime.seconds, (uint64_t)modified.seconds);
 		bt_put32(&inode.mtime.nanoseconds, modified.nanoseconds);
 		inode.ctime = inode.mtime;
-		/* Set-id inodes were rejected before editing; credential policy belongs
-		 * to the owning adapter, which must authorize the operation separately. */
+		/* Set-id inodes were settled before editing: the owning adapter
+		 * decided to drop or keep their privileges in this transaction. */
 		error = bt_tx_edit(
 		    transaction, &tree->root, inode_key, &inode, sizeof(inode), BT_REPLACE);
 	}

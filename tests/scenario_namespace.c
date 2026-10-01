@@ -489,6 +489,81 @@ namespace_property_plan(struct context *context)
 }
 
 /* Colliding names fill one DIR_ITEM to the largest item a leaf holds. */
+/* Linux's struct vfs_cap_data, revision 2: the security.capability value. */
+#define LINUX_CAPABILITY_REVISION_2 UINT32_C(0x02000000)
+#define LINUX_CAPABILITY_EFFECTIVE UINT32_C(0x000001)
+#define LINUX_CAP_NET_BIND_SERVICE 10U
+#define ATTRIBUTE_ACCESS_SECONDS INT64_C(1600000000)
+#define ATTRIBUTE_MODIFY_SECONDS INT64_C(1600000100)
+#define CHANGED_UID 1234U
+#define CHANGED_GID 5678U
+#define CHOWNED_UID 777U
+
+struct linux_capability {
+	struct bt_le32 magic;
+
+	struct {
+		struct bt_le32 permitted;
+		struct bt_le32 inheritable;
+	} data[2];
+};
+
+_Static_assert(sizeof(struct linux_capability) == 20, "vfs_cap_data revision 2 layout");
+
+/* Attribute changes and the privilege decision for set-id files: a privileged
+ * write keeps S_ISUID; S_ISGID without group execution needs no decision; an
+ * unprivileged write drops S_ISUID/S_ISGID and the file capability; chown
+ * through set_attributes removes the capability with the mode its caller chose. */
+static void
+namespace_attributes_plan(struct context *context)
+{
+	struct linux_capability capability;
+	const unsigned all = BTRFS_ATTRIBUTE_MODE | BTRFS_ATTRIBUTE_UID | BTRFS_ATTRIBUTE_GID |
+	    BTRFS_ATTRIBUTE_ACCESS_TIME | BTRFS_ATTRIBUTE_MODIFY_TIME;
+	struct plan plan;
+
+	memset(&capability, 0, sizeof(capability));
+	bt_put32(&capability.magic, LINUX_CAPABILITY_REVISION_2 | LINUX_CAPABILITY_EFFECTIVE);
+	bt_put32(&capability.data[0].permitted, UINT32_C(1) << LINUX_CAP_NET_BIND_SERVICE);
+	namespace_plan(context, &plan, "namespace-attributes");
+	plan_create(&plan, 1, "/ns/suid", BTRFS_MODE_REGULAR | 04755, NULL);
+	plan_privileges(&plan, 1, "/ns/suid", 1);
+	plan_write_new(&plan, 1, "/ns/suid", 0, "privileged\n", 11);
+	plan_create(&plan, 1, "/ns/sgid", BTRFS_MODE_REGULAR | 02644, NULL);
+	plan_write_new(&plan, 1, "/ns/sgid", 0, "lock marker\n", 12);
+	plan_create(&plan, 1, "/ns/capable", BTRFS_MODE_REGULAR | 02755, NULL);
+	plan_set_xattr(
+	    &plan, 1, "/ns/capable", "security.capability", &capability, sizeof(capability), 0);
+	plan_privileges(&plan, 2, "/ns/capable", 0);
+	plan_write_new(&plan, 2, "/ns/capable", 0, "dropped\n", 8);
+	plan_set_attributes(&plan, 2, "/ns/one", all, 0600, CHANGED_UID, CHANGED_GID,
+	    ATTRIBUTE_ACCESS_SECONDS, ATTRIBUTE_MODIFY_SECONDS);
+	plan_set_attributes(&plan, 2, "/ns/suid",
+	    BTRFS_ATTRIBUTE_MODE | BTRFS_ATTRIBUTE_UID | BTRFS_ATTRIBUTE_REMOVE_CAPABILITY, 0755,
+	    CHOWNED_UID, 0, 0, 0);
+
+	expect_absent(&plan, 0, 0, "/ns/suid");
+	expect_stat(&plan, 1, 1, "/ns/suid", BTRFS_MODE_REGULAR | 04755, 1);
+	expect_owner(&plan, 2, LAST_STAGE, "/ns/suid", BTRFS_MODE_REGULAR | 0755, CHOWNED_UID,
+	    NAMESPACE_GID, 1);
+	expect_text(&plan, 1, LAST_STAGE, "/ns/suid", "privileged\n");
+	expect_stat(&plan, 1, LAST_STAGE, "/ns/sgid", BTRFS_MODE_REGULAR | 02644, 1);
+	expect_text(&plan, 1, LAST_STAGE, "/ns/sgid", "lock marker\n");
+	expect_stat(&plan, 1, 1, "/ns/capable", BTRFS_MODE_REGULAR | 02755, 1);
+	expect_xattr(
+	    &plan, 1, 1, "/ns/capable", "security.capability", &capability, sizeof(capability));
+	expect_text(&plan, 1, 1, "/ns/capable", "");
+	expect_stat(&plan, 2, LAST_STAGE, "/ns/capable", BTRFS_MODE_REGULAR | 0755, 1);
+	expect_xattr(&plan, 2, LAST_STAGE, "/ns/capable", "security.capability", NULL, 0);
+	expect_text(&plan, 2, LAST_STAGE, "/ns/capable", "dropped\n");
+	expect_links(context, &plan, 0, 1, "/ns/one", "/ns/one", 2);
+	expect_owner(&plan, 2, LAST_STAGE, "/ns/one", BTRFS_MODE_REGULAR | 0600, CHANGED_UID,
+	    CHANGED_GID, 2);
+	expect_times(
+	    &plan, 2, LAST_STAGE, "/ns/one", ATTRIBUTE_ACCESS_SECONDS, ATTRIBUTE_MODIFY_SECONDS);
+	run_plan(context, &plan);
+}
+
 static void
 namespace_full_item_plan(struct context *context)
 {
@@ -873,10 +948,116 @@ namespace_audit_self_test(struct context *context)
 	REQUIRE(context->image.live_allocations == 0);
 }
 
+/* Sets inode flags directly, as chattr would, inside a transaction. */
+static void
+set_inode_flags(struct btrfs_transaction *transaction, struct btrfs_object_id id, uint64_t flags)
+{
+	struct bt_disk_inode inode;
+	struct bt_owned_root *tree;
+	struct bt_key key = { id.inode, 0, BT_INODE_ITEM };
+	size_t length;
+
+	REQUIRE(bt_tx_tree(transaction, id.tree, &tree) == BTRFS_OK);
+	REQUIRE(bt_mutation_find(transaction->mutation, tree->root, key, &inode, sizeof(inode),
+		    &length) == BTRFS_OK);
+	bt_put64(&inode.flags, bt_u64(inode.flags) | flags);
+	REQUIRE(bt_tx_edit(transaction, &tree->root, key, &inode, sizeof(inode), BT_REPLACE) ==
+	    BTRFS_OK);
+}
+
+/* Linux's immutable and append-only rules and the set-id decision, refused
+ * before any change. */
+static void
+namespace_flag_refusals(struct context *context)
+{
+	struct btrfs_new_inode file = new_inode(BTRFS_MODE_REGULAR | 0644);
+	struct btrfs_new_inode setuid = new_inode(BTRFS_MODE_REGULAR | 04755);
+	struct btrfs_attributes changes;
+	struct btrfs_object_id ns;
+	struct btrfs_object_id victim;
+	struct btrfs_object_id clone;
+	struct btrfs_object_id full;
+	struct btrfs_object_id tree;
+	struct btrfs_object_id id;
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct btrfs_time time = { 1800000000, 0 };
+
+	memset(&changes, 0, sizeof(changes));
+	changes.mask = BTRFS_ATTRIBUTE_MODE;
+	changes.mode = 0600;
+	changes.time = time;
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	ns = object(fs, "/ns");
+	victim = object(fs, "/ns/victim");
+	clone = object(fs, "/ns/clone");
+	full = object(fs, "/ns/full");
+	tree = object(fs, "/ns/tree");
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	set_inode_flags(transaction, victim, BT_INODE_IMMUTABLE);
+	set_inode_flags(transaction, clone, BT_INODE_APPEND);
+	set_inode_flags(transaction, full, BT_INODE_IMMUTABLE);
+	set_inode_flags(transaction, tree, BT_INODE_APPEND);
+	refused(transaction, btrfs_transaction_write(transaction, victim, 0, "x", 1, time),
+	    BTRFS_NOT_PERMITTED, "write an immutable file");
+	refused(transaction, btrfs_transaction_truncate(transaction, victim, 0, time),
+	    BTRFS_NOT_PERMITTED, "truncate an immutable file");
+	refused(transaction, btrfs_transaction_unlink(transaction, ns, "victim", 6, time, 0),
+	    BTRFS_NOT_PERMITTED, "unlink an immutable file");
+	refused(transaction,
+	    btrfs_transaction_rename(transaction, ns, "victim", 6, ns, "moved", 5, time, 0),
+	    BTRFS_NOT_PERMITTED, "rename an immutable file");
+	refused(transaction, btrfs_transaction_link(transaction, victim, ns, "linked", 6, time),
+	    BTRFS_NOT_PERMITTED, "link an immutable file");
+	refused(transaction,
+	    btrfs_transaction_set_xattr(transaction, victim, "user.x", 6, "x", 1, 0, time),
+	    BTRFS_NOT_PERMITTED, "set an xattr of an immutable file");
+	refused(transaction, btrfs_transaction_set_attributes(transaction, victim, &changes),
+	    BTRFS_NOT_PERMITTED, "chmod an immutable file");
+	refused(transaction, btrfs_transaction_drop_privileges(transaction, victim, time),
+	    BTRFS_NOT_PERMITTED, "drop privileges of an immutable file");
+	refused(transaction, btrfs_transaction_write(transaction, clone, 0, "x", 1, time),
+	    BTRFS_NOT_PERMITTED, "overwrite an append-only file");
+	refused(transaction, btrfs_transaction_truncate(transaction, clone, 0, time),
+	    BTRFS_NOT_PERMITTED, "truncate an append-only file");
+	refused(transaction, btrfs_transaction_unlink(transaction, ns, "clone", 5, time, 0),
+	    BTRFS_NOT_PERMITTED, "unlink an append-only file");
+	refused(transaction, btrfs_transaction_set_attributes(transaction, clone, &changes),
+	    BTRFS_NOT_PERMITTED, "chmod an append-only file");
+	refused(transaction, btrfs_transaction_create(transaction, full, "x", 1, &file, &id),
+	    BTRFS_NOT_PERMITTED, "create in an immutable directory");
+	refused(transaction, btrfs_transaction_unlink(transaction, full, "inner", 5, time, 0),
+	    BTRFS_NOT_PERMITTED, "unlink from an immutable directory");
+	refused(transaction,
+	    btrfs_transaction_rename(transaction, ns, "one", 3, full, "one", 3, time, 0),
+	    BTRFS_NOT_PERMITTED, "rename into an immutable directory");
+	refused(transaction, btrfs_transaction_unlink(transaction, tree, "one-link", 8, time, 0),
+	    BTRFS_NOT_PERMITTED, "unlink from an append-only directory");
+	refused(transaction,
+	    btrfs_transaction_rename(transaction, tree, "one-link", 8, ns, "moved", 5, time, 0),
+	    BTRFS_NOT_PERMITTED, "rename out of an append-only directory");
+	/* Appending and creating in an append-only directory remain allowed. */
+	REQUIRE(btrfs_transaction_write(transaction, clone, 65536, "tail", 4, time) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_create(transaction, tree, "added", 5, &file, &id) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_create(transaction, ns, "suid", 4, &setuid, &id) == BTRFS_OK);
+	refused(transaction, btrfs_transaction_write(transaction, id, 0, "x", 1, time),
+	    BTRFS_UNSUPPORTED, "write a set-id file without a decision");
+	refused(transaction, btrfs_transaction_truncate(transaction, id, 0, time),
+	    BTRFS_UNSUPPORTED, "truncate a set-id file without a decision");
+	REQUIRE(btrfs_transaction_keep_privileges(transaction, id) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_write(transaction, id, 0, "x", 1, time) == BTRFS_OK);
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
+	REQUIRE(context->device->count == 0);
+	REQUIRE(context->image.live_allocations == 0);
+	printf("immutable, append-only and set-id refusals PASS\n");
+}
+
 void
 namespace_scenarios(struct context *context)
 {
 	namespace_refusals(context);
+	namespace_flag_refusals(context);
 	namespace_limits(context);
 	namespace_audit_self_test(context);
 	namespace_create_plan(context);
@@ -889,5 +1070,6 @@ namespace_scenarios(struct context *context)
 	namespace_xattr_plan(context);
 	namespace_subvolume_plan(context);
 	namespace_property_plan(context);
+	namespace_attributes_plan(context);
 	namespace_full_item_plan(context);
 }

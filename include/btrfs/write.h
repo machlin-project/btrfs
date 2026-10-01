@@ -66,8 +66,9 @@ enum btrfs_result btrfs_transaction_begin(const struct btrfs_fs *base,
  * extents. Payloads are bounded by Btrfs's 2 KiB default inline-write policy. */
 enum btrfs_result btrfs_transaction_write_inline(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, const void *bytes, size_t size, struct btrfs_time modified);
-/* Copy-on-write file data, for regular files without set-id bits, immutable or
- * append-only flags, on filesystems with NO_HOLES. Partially covered sectors
+/* Copy-on-write file data for regular files on filesystems with NO_HOLES.
+ * Immutable files refuse writes and append-only files accept data only at
+ * their end (NOT_PERMITTED); set-id files need a privilege decision. Partially covered sectors
  * are read from this transaction's own view and rewritten; old extents keep
  * their references until commit drops them and are never reused before the
  * next transaction. New data stays in memory (at most 64 MiB per transaction)
@@ -140,6 +141,39 @@ enum btrfs_result btrfs_transaction_set_xattr(struct btrfs_transaction *transact
     size_t value_length, int flags, struct btrfs_time time);
 enum btrfs_result btrfs_transaction_remove_xattr(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, const void *name, size_t name_length, struct btrfs_time time);
+/* Inode attributes changed together with the change time (ctime). mode holds
+ * permission bits only. REMOVE_CAPABILITY removes security.capability in the
+ * same transaction, as Linux's ATTR_KILL_PRIV after chown. Which set-id bits a
+ * change keeps is the caller's policy: the core stores the mode it is given.
+ * Immutable and append-only inodes refuse these changes (NOT_PERMITTED). */
+#define BTRFS_ATTRIBUTE_MODE 1U
+#define BTRFS_ATTRIBUTE_UID 2U
+#define BTRFS_ATTRIBUTE_GID 4U
+#define BTRFS_ATTRIBUTE_ACCESS_TIME 8U
+#define BTRFS_ATTRIBUTE_MODIFY_TIME 16U
+#define BTRFS_ATTRIBUTE_REMOVE_CAPABILITY 32U
+
+struct btrfs_attributes {
+	unsigned mask;
+	uint32_t mode;
+	uint32_t uid;
+	uint32_t gid;
+	struct btrfs_time access_time;
+	struct btrfs_time modify_time;
+	struct btrfs_time time;
+};
+enum btrfs_result btrfs_transaction_set_attributes(struct btrfs_transaction *transaction,
+    struct btrfs_object_id id, const struct btrfs_attributes *attributes);
+/* Writing or truncating a regular file with S_ISUID, S_ISGID and group
+ * execution, or security.capability needs the caller's decision first
+ * (UNSUPPORTED otherwise). drop_privileges is Linux's file_remove_privs for a
+ * writer without CAP_FSETID: it clears those bits and removes the capability
+ * now. keep_privileges records a privileged writer for this transaction; at
+ * most 64 inodes per transaction. */
+enum btrfs_result btrfs_transaction_drop_privileges(
+    struct btrfs_transaction *transaction, struct btrfs_object_id id, struct btrfs_time time);
+enum btrfs_result btrfs_transaction_keep_privileges(
+    struct btrfs_transaction *transaction, struct btrfs_object_id id);
 /* Deletes an orphaned inode after its last native reference closes. */
 enum btrfs_result btrfs_transaction_evict(
     struct btrfs_transaction *transaction, struct btrfs_object_id id);

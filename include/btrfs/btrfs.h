@@ -32,7 +32,8 @@ enum btrfs_result {
 	BTRFS_NOT_EMPTY,
 	BTRFS_CROSS_TREE,
 	BTRFS_TOO_MANY_LINKS,
-	BTRFS_NAME_TOO_LONG
+	BTRFS_NAME_TOO_LONG,
+	BTRFS_NOT_PERMITTED
 };
 
 enum btrfs_compression {
@@ -94,6 +95,11 @@ struct btrfs_time {
 	int64_t seconds;
 	uint32_t nanoseconds;
 };
+
+/* Linux inode flags (btrfs_inode.flags) that native policy maps. */
+#define BTRFS_INODE_FLAG_IMMUTABLE (UINT64_C(1) << 6)
+#define BTRFS_INODE_FLAG_APPEND (UINT64_C(1) << 7)
+#define BTRFS_INODE_FLAG_NODUMP (UINT64_C(1) << 8)
 
 struct btrfs_inode {
 	struct btrfs_object_id id;

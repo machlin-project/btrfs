@@ -19,6 +19,7 @@ core = static_library('btrfs_core', sources, include_directories: inc,
   c_args: ['-ffreestanding', '-fno-builtin'] + fuzz_flags)
 identity = static_library('btrfs_identity', 'adapters/common/identity.c', include_directories: inc)
 native = static_library('btrfs_native', 'adapters/common/native.c', include_directories: inc)
+volume = static_library('btrfs_volume', 'adapters/common/volume.c', include_directories: inc)
 static_library('btrfs_freestanding', sources, include_directories: inc,
   override_options: ['b_sanitize=none', 'optimization=2'],
   c_args: ['-ffreestanding', '-fno-builtin', '-Wframe-larger-than=2048'])
@@ -51,6 +52,8 @@ native_test = executable('btrfs-native-policy', 'tests/native_policy.c', include
 test('native-xattr-policy', native_test, suite: 'core')
 executable('btrfs-mounted-test', 'tests/mounted.c', dependencies: dependency('threads'),
   override_options: ['b_sanitize=none'])
+volume_test = executable('btrfs-volume-test', 'tests/volume.c', include_directories: inc,
+  link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
 concurrent = executable('btrfs-concurrent', 'tests/concurrent.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
 if get_option('fuzzer')
@@ -101,6 +104,8 @@ if fixtures != ''
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,
     suite: 'images')
+  test('native-volume-views', volume_test,
+    args: [join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
   test('metadata-exhaustion', transaction_test,
     args: ['--full', join_paths(fixtures, 'transactions-full.raw')], timeout: 180, suite: 'images')
 endif

@@ -194,6 +194,12 @@ check_expectation(
 			expectation_failed(plan, stage, e, "device number");
 		}
 		return;
+	case EXPECT_TIMES:
+		if (inode.access_time.seconds != e->access_seconds ||
+		    inode.modify_time.seconds != e->modify_seconds) {
+			expectation_failed(plan, stage, e, "access or modification time");
+		}
+		return;
 	case EXPECT_FLAGS:
 		if ((inode.flags & e->mask) != e->value) {
 			expectation_failed(plan, stage, e, "inode flags");
@@ -569,6 +575,30 @@ plan_clean(struct plan *plan, size_t commit, uint64_t tree, size_t expected)
 	operation->size = expected;
 }
 
+/* chmod, chown and utimes with mask BTRFS_ATTRIBUTE_*; the change time is
+ * the commit's time. */
+void
+plan_set_attributes(struct plan *plan, size_t commit, const char *path, unsigned mask,
+    uint32_t mode, uint32_t uid, uint32_t gid, int64_t access_seconds, int64_t modify_seconds)
+{
+	struct operation *operation =
+	    plan_namespace(plan, commit, OPERATION_SET_ATTRIBUTES, path, NULL);
+
+	operation->flags = (int)mask;
+	operation->mode = mode;
+	operation->uid = uid;
+	operation->gid = gid;
+	operation->access_time.seconds = access_seconds;
+	operation->modify_time.seconds = modify_seconds;
+}
+
+void
+plan_privileges(struct plan *plan, size_t commit, const char *path, int keep)
+{
+	(void)plan_namespace(
+	    plan, commit, keep ? OPERATION_KEEP_PRIVILEGES : OPERATION_DROP_PRIVILEGES, path, NULL);
+}
+
 struct expectation *
 expect(struct plan *plan, size_t first, size_t last, enum expectation_kind kind, const char *path)
 {
@@ -669,6 +699,29 @@ expect_stat(
 	e->uid = NAMESPACE_UID;
 	e->gid = NAMESPACE_GID;
 	e->links = links;
+}
+
+/* Mode, owner and links that need not be the scenario's own owner. */
+void
+expect_owner(struct plan *plan, size_t first, size_t last, const char *path, uint32_t mode,
+    uint32_t uid, uint32_t gid, uint32_t links)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_STAT, path);
+
+	e->mode = mode;
+	e->uid = uid;
+	e->gid = gid;
+	e->links = links;
+}
+
+void
+expect_times(struct plan *plan, size_t first, size_t last, const char *path, int64_t access_seconds,
+    int64_t modify_seconds)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_TIMES, path);
+
+	e->access_seconds = access_seconds;
+	e->modify_seconds = modify_seconds;
 }
 
 /* Owner and mode of source in the committed state, with links at path. */

@@ -334,6 +334,25 @@ EMLINK otherwise (TOO_MANY_LINKS). Subvolume and snapshot creation or deletion,
 O_TMPFILE links of unlinked inodes, rename exchange and whiteouts are not part
 of this interface.
 
+## Native writers
+
+`adapters/common/volume.c` (`include/btrfs/volume.h`) owns a mounted volume's
+versioned views. Each committed root set is one immutable `btrfs_fs`; readers
+pin the current view for one operation and never see a private tree. One writer
+at a time runs a transaction on the current view; a commit that wrote media opens
+the next view and publishes it, and older views are released when their last
+pin goes. The next transaction waits until no view older than its base is
+pinned, because the blocks that commit freed may be reused. The volume counts
+the writes and barriers a transaction issued: a commit that fails before any I/O
+leaves the volume usable (for example NO_SPACE), while one that fails after I/O
+makes it read-only for the rest of the mount, since only explicit superblock
+recovery may decide what became durable. A read-write open admits a first
+transaction, so copies needing recovery fail the mount rather than a later write.
+
+The FSKit adapter stays read-only. Its block-device resource offers direct and
+buffered writes but no device cache flush or barrier, so it cannot meet the
+writer's flush contract; enabling writes there needs such an interface first.
+
 ## Superblock copies, publication and recovery
 
 Linux maintains a superblock copy at 64 KiB, 64 MiB and 256 GiB when the copy

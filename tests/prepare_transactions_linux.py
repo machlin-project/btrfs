@@ -26,11 +26,12 @@ NAMESPACE_PATH = re.compile(r"^(/[A-Za-z0-9._-]{1,255})+$")
 NAMESPACE_ARGUMENT = {
     "absent": re.compile(r"^-$"), "file": re.compile(r"^-$"), "symlink": re.compile(r"^-$"),
     "dir": re.compile(r"^[0-9]+$"), "same": NAMESPACE_PATH,
-    "xattr": re.compile(r"^(user|trusted|btrfs)\.[A-Za-z0-9._-]{1,248}$"),
-    "noxattr": re.compile(r"^(user|trusted|btrfs)\.[A-Za-z0-9._-]{1,248}$"),
+    "xattr": re.compile(r"^(user|trusted|security|btrfs)\.[A-Za-z0-9._-]{1,248}$"),
+    "noxattr": re.compile(r"^(user|trusted|security|btrfs)\.[A-Za-z0-9._-]{1,248}$"),
     "stat": re.compile(r"^[0-9a-f]+:[0-9]+:[0-9]+:[0-9]+$"),
     "device": re.compile(r"^[0-9a-f]+:[0-9a-f]+$"), "flags": re.compile(r"^0x[0-9a-f]+:0x[0-9a-f]+$"),
-    "feature": re.compile(r"^COMPRESS_(LZO|ZSTD)$")}
+    "feature": re.compile(r"^COMPRESS_(LZO|ZSTD)$"),
+    "times": re.compile(r"^-?[0-9]+:-?[0-9]+$")}
 PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr"}
 
 

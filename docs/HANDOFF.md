@@ -20,7 +20,7 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require eighteen passing test processes and all six reader profiles (312
+Require nineteen passing test processes and all six reader profiles (312
 contracts). Ten writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,

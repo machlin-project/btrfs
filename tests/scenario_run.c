@@ -124,7 +124,7 @@ static void
 export_namespace(struct context *context, const struct plan *plan, struct exporter *exporter)
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
-		"noxattr", "stat", "device", "flags", "feature" };
+		"noxattr", "stat", "device", "flags", "feature", "times" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -175,6 +175,12 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 			    e->value == BT_FEATURE_COMPRESS_ZSTD);
 			detail =
 			    e->value == BT_FEATURE_COMPRESS_LZO ? "COMPRESS_LZO" : "COMPRESS_ZSTD";
+		} else if (e->kind == EXPECT_TIMES) {
+			/* stat -c '%X:%Y' */
+			REQUIRE(snprintf(argument, sizeof(argument), "%lld:%lld",
+				    (long long)e->access_seconds,
+				    (long long)e->modify_seconds) < (int)sizeof(argument));
+			detail = argument;
 		}
 		for (stage = e->first; stage <= e->last && stage <= plan->commits; stage++) {
 			REQUIRE(fprintf(manifest, "%zu\t%s\t%s\t%s\t%s\n", stage, kinds[e->kind],
@@ -583,6 +589,7 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 	struct btrfs_object_id id;
 	const char *leaf = NULL;
 	const char *new_leaf = NULL;
+	struct btrfs_attributes changes;
 	size_t cleaned;
 	enum btrfs_result result;
 
@@ -660,6 +667,23 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 			exit(1);
 		}
 		return result;
+	case OPERATION_SET_ATTRIBUTES:
+		memset(&changes, 0, sizeof(changes));
+		changes.mask = (unsigned)operation->flags;
+		changes.mode = operation->mode;
+		changes.uid = operation->uid;
+		changes.gid = operation->gid;
+		changes.access_time = operation->access_time;
+		changes.modify_time = operation->modify_time;
+		changes.time = time;
+		return btrfs_transaction_set_attributes(
+		    transaction, path_object(table, operation->path, 0, NULL), &changes);
+	case OPERATION_KEEP_PRIVILEGES:
+		return btrfs_transaction_keep_privileges(
+		    transaction, path_object(table, operation->path, 0, NULL));
+	case OPERATION_DROP_PRIVILEGES:
+		return btrfs_transaction_drop_privileges(
+		    transaction, path_object(table, operation->path, 0, NULL), time);
 	}
 	return BTRFS_INVALID_ARGUMENT;
 }

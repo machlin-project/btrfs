@@ -80,6 +80,7 @@ check_namespace() {
         device) test "$(stat -c '%t:%T' "$target")" = "$arg" ;;
         flags) check_flags "$target" "$arg" ;;
         feature) btrfs inspect-internal dump-super /dev/vda | grep -qw "$arg" ;;
+        times) test "$(stat -c '%X:%Y' "$target")" = "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"

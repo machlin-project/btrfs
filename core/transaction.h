@@ -17,6 +17,7 @@
 #define BT_TRANSACTION_REFERENCES 65536U
 #define BT_INLINE_WRITE_LIMIT 2048U
 #define BT_TRANSACTION_INDEXES 256U
+#define BT_TRANSACTION_PRIVILEGED 64U
 #define BT_ACCOUNT_ORIGINAL 1U
 #define BT_ACCOUNT_NEW 2U
 #define BT_INODE_NODATASUM_FLAG (UINT64_C(1) << 0)
@@ -95,6 +96,9 @@ struct btrfs_transaction {
 	uint64_t next_objectid[BT_TRANSACTION_TREES];
 	struct bt_index_cache indexes[BT_TRANSACTION_INDEXES];
 	size_t index_count;
+	/* Inodes whose set-id bits and file capability a privileged writer keeps. */
+	struct btrfs_object_id privileged[BT_TRANSACTION_PRIVILEGED];
+	size_t privileged_count;
 	unsigned copies;
 	enum btrfs_result failure;
 	int changed;
@@ -113,5 +117,9 @@ enum btrfs_result bt_tx_write_staged(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_drop_range(struct btrfs_transaction *transaction,
     struct bt_owned_root *tree, uint64_t inode, uint64_t start, uint64_t end, uint64_t *removed);
 void bt_tx_release_data(struct btrfs_transaction *transaction);
+/* A write or truncation of a regular file needs a settled privilege decision
+ * when it has set-id bits Linux removes or a file capability. */
+enum btrfs_result bt_tx_privileges_settled(struct btrfs_transaction *transaction,
+    struct bt_owned_root *tree, uint64_t inode, const struct bt_disk_inode *item);
 
 #endif

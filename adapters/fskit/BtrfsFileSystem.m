@@ -338,6 +338,9 @@ btrfs_item_type(uint16_t mode)
 	return INT64_MAX;
 }
 
+/* Writes stay disabled: the block-device resource has no device cache flush,
+ * so the writer's flush contract (every acknowledged write durable and
+ * ordered before the next barrier) cannot be met through FSKit. */
 - (FSMountOptions)requestedMountOptions
 {
 	return FSMountOptionsReadOnly;
