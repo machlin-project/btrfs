@@ -46,6 +46,8 @@
 #define PAIR_LAST 119U
 #define DATA_SCENARIO_BYTES 8192U
 #define EXHAUSTION_WRITE_BYTES (16U * 1024U * 1024U)
+#define FRAGMENT_WRITE_BYTES (2U * 1024U * 1024U)
+#define FAULT_POINTS 512U
 #define SYNTHETIC_COMMIT SIZE_MAX
 
 enum fault { FAULT_NONE, FAULT_ALLOCATE, FAULT_READ, FAULT_WRITE, FAULT_FLUSH, FAULT_MODES };
@@ -981,6 +983,7 @@ fault_sweeps(struct context *context, const struct plan *plan, size_t commit, si
 	size_t limits[FAULT_MODES];
 	size_t failures[FAULT_MODES] = { 0 };
 	size_t point;
+	size_t stride;
 	enum fault fault;
 	enum btrfs_result result;
 
@@ -990,7 +993,13 @@ fault_sweeps(struct context *context, const struct plan *plan, size_t commit, si
 	limits[FAULT_WRITE] = totals->writes;
 	limits[FAULT_FLUSH] = totals->flushes;
 	for (fault = FAULT_ALLOCATE; fault < FAULT_MODES; fault++) {
-		for (point = 1; point <= limits[fault]; point++) {
+		/* Every point up to FAULT_POINTS per class; larger commits use a
+		 * deterministic stride that keeps the first and last points. */
+		stride = (limits[fault] + FAULT_POINTS - 1) / FAULT_POINTS;
+		for (point = 1; point <= limits[fault];
+		    point = point < limits[fault] && point + stride > limits[fault]
+			? limits[fault]
+			: point + stride) {
 			result = attempt(context, plan, commit, fault, point, &ignored);
 			if (fault == FAULT_ALLOCATE) {
 				REQUIRE(result == BTRFS_NO_MEMORY);
@@ -1425,6 +1434,33 @@ data_scenarios(struct context *context)
 	plan_write(context, &plan, 1, "/data/small", 2048, data, 4096);
 	plan_truncate(context, &plan, 1, "/data/small", 3000);
 	run_plan(context, &plan);
+}
+
+/* A data block group whose free space Linux keeps as bitmaps: freeing a file
+ * between two holes merges runs, and a write larger than the first group's
+ * free tail allocates the remaining sectors from bitmap holes. */
+static void
+fragment_scenarios(struct context *context)
+{
+	uint8_t *data;
+	struct plan plan;
+
+	data = malloc(FRAGMENT_WRITE_BYTES);
+	REQUIRE(data != NULL);
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "fst-free";
+	plan_truncate(context, &plan, 1, "/fragment/f001", 0);
+	plan_truncate(context, &plan, 1, "/fragment/f003", 0);
+	plan_truncate(context, &plan, 2, "/fragment/f255", 1000);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "fst-fill";
+	track_data(context, &plan, "small");
+	fill_pattern(data, FRAGMENT_WRITE_BYTES, 17);
+	plan_write(context, &plan, 1, "/data/small", 0, data, FRAGMENT_WRITE_BYTES);
+	run_plan(context, &plan);
+	free(data);
 }
 
 static void
@@ -2080,6 +2116,7 @@ main(int argc, char **argv)
 	int shared = 0;
 	int keyed = 0;
 	int data = 0;
+	int fragment = 0;
 	int i;
 
 	context = calloc(1, sizeof(*context));
@@ -2095,6 +2132,8 @@ main(int argc, char **argv)
 			keyed = 1;
 		} else if (strcmp(argv[i], "--data") == 0) {
 			data = 1;
+		} else if (strcmp(argv[i], "--fragment") == 0) {
+			fragment = 1;
 		} else {
 			REQUIRE(image == NULL);
 			image = argv[i];
@@ -2137,6 +2176,9 @@ main(int argc, char **argv)
 	}
 	if (data) {
 		data_scenarios(context);
+	}
+	if (fragment) {
+		fragment_scenarios(context);
 	}
 	REQUIRE(context->image.live_allocations == 0);
 	btrfs_image_close(&context->image);

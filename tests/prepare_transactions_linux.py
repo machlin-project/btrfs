@@ -240,7 +240,12 @@ awk -F '\\t' '{{ printf "%d\\t%d\\t%s\\t0\\n", $2 / 512, $3 / 512, $4 }}' "$scen
 cp /tmp/all.tsv "$scenario/all.tsv"
 apply "$scenario" all.tsv
 verify "$scenario" "$(cat "$scenario/final.txt")"
-mount -t btrfs -o nospace_cache /dev/vda /mnt
+# A free-space tree must stay enabled; the other profiles keep no space cache.
+options=nospace_cache
+if btrfs inspect-internal dump-super /dev/vda | grep -q FREE_SPACE_TREE_VALID; then
+    options=defaults
+fi
+mount -t btrfs -o "$options" /dev/vda /mnt
 printf 'Linux accepted the new root\\n' > /mnt/after-machlin
 btrfs filesystem sync /mnt
 umount /mnt

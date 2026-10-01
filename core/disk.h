@@ -37,6 +37,7 @@ struct bt_le64 {
 #define BT_CHUNK_TREE UINT64_C(3)
 #define BT_CSUM_TREE UINT64_C(7)
 #define BT_QUOTA_TREE UINT64_C(8)
+#define BT_FREE_SPACE_TREE UINT64_C(10)
 #define BT_DATA_RELOC_TREE (UINT64_MAX - UINT64_C(8))
 #define BT_DEV_TREE UINT64_C(4)
 #define BT_FIRST_CHUNK_OBJECTID UINT64_C(256)
@@ -76,6 +77,10 @@ struct bt_le64 {
 #define BT_EXTENT_FLAG_DATA UINT64_C(1)
 #define BT_EXTENT_FLAG_TREE UINT64_C(2)
 #define BT_EXTENT_FLAG_FULL_BACKREF (UINT64_C(1) << 8)
+#define BT_COMPAT_RO_FREE_SPACE_TREE (UINT64_C(1) << 0)
+#define BT_COMPAT_RO_FREE_SPACE_TREE_VALID (UINT64_C(1) << 1)
+#define BT_FREE_SPACE_USING_BITMAPS UINT32_C(1)
+#define BT_FREE_SPACE_BITMAP_BYTES 256U
 
 enum bt_item_type {
 	BT_INODE_ITEM = 1,
@@ -95,6 +100,9 @@ enum bt_item_type {
 	BT_SHARED_BLOCK_REF = 182,
 	BT_SHARED_DATA_REF = 184,
 	BT_BLOCK_GROUP_ITEM = 192,
+	BT_FREE_SPACE_INFO = 198,
+	BT_FREE_SPACE_EXTENT = 199,
+	BT_FREE_SPACE_BITMAP = 200,
 	BT_CHUNK_ITEM = 228
 };
 
@@ -231,6 +239,10 @@ struct bt_disk_shared_data_ref {
 struct bt_disk_tree_block_info {
 	struct bt_disk_key key;
 	uint8_t level;
+};
+
+struct bt_disk_free_space_info {
+	struct bt_le32 extent_count, flags;
 };
 
 struct bt_disk_block_group {

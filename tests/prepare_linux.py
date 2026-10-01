@@ -13,8 +13,9 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions": (4096, "single", ""), "transactions-dup": (16384, "dup", ""),
             "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", ""),
             "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", ""),
-            "transactions-data": (4096, "single", "")}
-# Writable profiles avoid allocation features the writer does not maintain yet.
+            "transactions-data": (4096, "single", ""), "transactions-fst": (16384, "dup", "")}
+# Writable profiles without a free-space tree; transactions-fst keeps mkfs
+# defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
             "transactions-shared", "transactions-keyed", "transactions-data"}
 # Enough inline files for a level-2 subvolume tree with 4 KiB nodes, so that a
@@ -39,6 +40,10 @@ DATA_SPARSE_BYTES = 4194304
 DATA_PREALLOC_BYTES = 262144
 DATA_ZLIB_BYTES = 262144
 DATA_NODATASUM_BYTES = 65536
+# Enough freed holes in one data block group that Linux switches its free
+# space to bitmaps.
+FRAGMENT_FILES = 256
+FRAGMENT_BYTES = 4096
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
@@ -166,7 +171,7 @@ btrfs filesystem sync /mnt
 cmp /mnt/keyed-29/r29 /mnt/keyed/origin
 btrfs inspect-internal dump-tree -t extent /dev/vda > /tmp/extent.txt
 echo BTRFS_REFERENCE_KEYED_REFS:$(grep -cE 'key \\([0-9]+ (TREE_BLOCK_REF|EXTENT_DATA_REF|SHARED_BLOCK_REF|SHARED_DATA_REF) ' /tmp/extent.txt || true)'''
-    if profile == "transactions-data":
+    if profile in ("transactions-data", "transactions-fst"):
         fill = f'''btrfs subvolume create /mnt/data
 head -c {DATA_BIG_BYTES} /input/big > /mnt/data/big
 head -c {DATA_SMALL_BYTES} /input/random > /mnt/data/small
@@ -191,6 +196,24 @@ btrfs inspect-internal dump-tree /dev/vda > /tmp/tree.txt
 echo BTRFS_REFERENCE_DATA_COMPRESSED:$(grep -c 'compression 1 (zlib)' /tmp/tree.txt || true)
 echo BTRFS_REFERENCE_DATA_PREALLOC:$(grep -c 'prealloc' /tmp/tree.txt || true)
 lsattr /mnt/data/nodatasum'''
+    if profile == "transactions-fst":
+        fill += f'''
+mkdir /mnt/fragment
+i=0
+while [ "$i" -lt {FRAGMENT_FILES} ]; do
+    head -c {FRAGMENT_BYTES} /input/random > /mnt/fragment/f$(printf '%03d' "$i")
+    i=$((i + 1))
+done
+btrfs filesystem sync /mnt
+i=0
+while [ "$i" -lt {FRAGMENT_FILES} ]; do
+    rm /mnt/fragment/f$(printf '%03d' "$i")
+    i=$((i + 2))
+done
+btrfs filesystem sync /mnt
+btrfs inspect-internal dump-tree -t 10 /dev/vda > /tmp/free-space.txt
+echo BTRFS_REFERENCE_FREE_SPACE_BITMAPS:$(grep -c 'FREE_SPACE_BITMAP' /tmp/free-space.txt || true)
+echo BTRFS_REFERENCE_FREE_SPACE_EXTENTS:$(grep -c 'FREE_SPACE_EXTENT' /tmp/free-space.txt || true)'''
     init = f'''#!/bin/busybox sh
 set -eu
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin

@@ -8,6 +8,9 @@
 #define SLOTS 4096U
 #define KEYS 601U
 #define VALUE_MAX 3900U
+#define MERGE_KEYS 4000U
+#define MERGE_VALUE 100U
+#define MERGE_KEEP 10U
 #define REQUIRE(condition)                                                                         \
 	do {                                                                                       \
 		if (!(condition)) {                                                                \
@@ -367,6 +370,102 @@ three_way_split(void)
 }
 
 static void
+count_nodes(
+    const struct btrfs_fs *fs, struct bt_root root, size_t *leaves, size_t *nodes, size_t *used)
+{
+	const struct bt_disk_header *header;
+	const struct bt_disk_item *items;
+	const struct bt_disk_pointer *pointers;
+	struct bt_root child;
+	uint8_t *block;
+	uint32_t i;
+
+	block = malloc(fs->info.node_size);
+	REQUIRE(block != NULL);
+	REQUIRE(bt_tree_read(fs, root, block) == BTRFS_OK);
+	header = (const void *)block;
+	items = (const void *)(header + 1);
+	pointers = (const void *)(header + 1);
+	if (root.level == 0) {
+		(*leaves)++;
+		for (i = 0; i < bt_u32(header->count); i++) {
+			*used += sizeof(*items) + bt_u32(items[i].size);
+		}
+	} else {
+		(*nodes)++;
+		for (i = 0; i < bt_u32(header->count); i++) {
+			child = root;
+			child.address = bt_u64(pointers[i].bytenr);
+			child.generation = bt_u64(pointers[i].generation);
+			child.level = (uint8_t)(root.level - 1);
+			count_nodes(fs, child, leaves, nodes, used);
+		}
+	}
+	free(block);
+}
+
+/* Deleting most items merges underfull leaves and then underfull nodes, so the
+ * tree shrinks instead of keeping one sparse leaf per original leaf. */
+static void
+rebalance(void)
+{
+	struct fixture fixture;
+	struct bt_mutation *mutation;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	uint8_t value[MERGE_VALUE];
+	size_t leaves = 0;
+	size_t nodes = 0;
+	size_t used = 0;
+	size_t capacity;
+	unsigned i;
+	unsigned index;
+	enum btrfs_result error;
+
+	initialize(&fixture, 4096, 0);
+	capacity = fixture.fs.info.node_size - sizeof(struct bt_disk_header);
+	root = fixture.root;
+	mutation = begin(&fixture, SLOTS / 2);
+	for (i = 0; i < MERGE_KEYS; i++) {
+		memset(value, (int)(i & 0xffU), sizeof(value));
+		REQUIRE(bt_mutation_edit(
+			    mutation, &root, key(i), value, sizeof(value), BT_INSERT) == BTRFS_OK);
+	}
+	publish_tree(&fixture, mutation);
+	REQUIRE(root.level == 2);
+	count_nodes(&fixture.fs, root, &leaves, &nodes, &used);
+	REQUIRE(leaves >
+	    6 * (MERGE_KEYS / MERGE_KEEP) * (sizeof(struct bt_disk_item) + MERGE_VALUE) / capacity);
+	mutation = begin(&fixture, SLOTS / 2);
+	for (i = 0; i < MERGE_KEYS; i++) {
+		index = i * 1999 % MERGE_KEYS;
+		if (index % MERGE_KEEP != 0) {
+			REQUIRE(bt_mutation_edit(mutation, &root, key(index), NULL, 0, BT_DELETE) ==
+			    BTRFS_OK);
+		}
+	}
+	bt_cursor_init(&cursor, bt_mutation_view(mutation), root);
+	error = bt_cursor_seek(&cursor, (struct bt_key){ 0 }, 0);
+	for (i = 0; i < MERGE_KEYS; i += MERGE_KEEP) {
+		REQUIRE(error == BTRFS_OK && bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		REQUIRE(bt_key_compare(record.key, key(i)) == 0 && record.size == MERGE_VALUE &&
+		    record.data[0] == (uint8_t)(i & 0xffU));
+		error = bt_cursor_next(&cursor);
+	}
+	REQUIRE(error == BTRFS_NOT_FOUND);
+	bt_cursor_fini(&cursor);
+	publish_tree(&fixture, mutation);
+	leaves = nodes = used = 0;
+	count_nodes(&fixture.fs, root, &leaves, &nodes, &used);
+	/* No two adjacent edited leaves are both below a third, so each pair of
+	 * leaves holds at least a third of a leaf. */
+	REQUIRE(leaves <= 6 * used / capacity + 2);
+	REQUIRE(root.level == 1 && nodes == 1);
+	free(fixture.medium);
+}
+
+static void
 failures(void)
 {
 	struct fixture fixture;
@@ -427,10 +526,12 @@ int
 main(void)
 {
 	three_way_split();
+	rebalance();
 	exercise(4096, 0);
 	exercise(16384, 1);
 	exercise(65536, 0);
 	failures();
-	puts("private CoW trees: model, split/grow/shrink, snapshot isolation, abort/faults PASS");
+	puts("private CoW trees: model, split/grow/shrink/merge, snapshot isolation, abort/faults "
+	     "PASS");
 	return 0;
 }

@@ -6,6 +6,13 @@
 
 struct bt_space;
 
+struct bt_space_change {
+	uint64_t start;
+	uint64_t length;
+	size_t chunk;
+	int allocate;
+};
+
 /* Transaction-local reservations from an independently validated extent tree.
  * Released reservations are not reused within the transaction. The committed
  * extent map stays pinned until the owner discards this entire allocator. */
@@ -19,6 +26,8 @@ enum btrfs_result bt_space_reserve_data(
 enum btrfs_result bt_space_change_used(
     struct bt_space *space, uint64_t address, uint64_t size, int allocate);
 uint64_t bt_space_used(const struct bt_space *space, size_t chunk);
+size_t bt_space_change_count(const struct bt_space *space);
+const struct bt_space_change *bt_space_change(const struct bt_space *space, size_t index);
 void bt_space_destroy(struct bt_space *space);
 
 #endif

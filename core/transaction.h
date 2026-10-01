@@ -4,6 +4,7 @@
 
 #include "backref.h"
 #include "csum.h"
+#include "fst.h"
 #include "encode.h"
 #include "space.h"
 #include <btrfs/write.h>
@@ -60,6 +61,9 @@ struct btrfs_transaction {
 	size_t tree_count;
 	struct bt_owned_root extents;
 	struct bt_owned_root checksums;
+	struct bt_owned_root free_space;
+	size_t free_space_applied;
+	int has_free_space;
 	struct bt_disk_super original_super;
 	struct bt_disk_super super;
 	uint8_t accounted[BT_TRANSACTION_NODES];

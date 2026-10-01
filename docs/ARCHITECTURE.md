@@ -148,7 +148,9 @@ are development contracts, not a claim that all valid Linux volumes fit them.
 keeps dirty nodes in logical/physical hash indexes, and reuses scratch space and
 path buffers. Variable-size insertion may produce two or three leaves; pointer
 splits propagate upward. Deletion removes empty children and collapses unary
-roots; underfull sibling merging remains open. Fixed-size replacements avoid
+roots. An edited leaf below a third of its capacity, or node below a quarter of
+its pointers, merges with its right sibling, else its left one, when both fit in
+one node; the sibling is CoWed like any edited block and merges cascade upward. Fixed-size replacements avoid
 whole-node repacking. The original root and bytes remain immutable. A failed
 edit poisons the context; sealing computes checksums, and accepting transfers
 reservations only after the owning transaction's durable publication.
@@ -208,6 +210,21 @@ reference, a shared block in an unshareable position, or a sole implicit
 reference not owned by the CoWing tree, fails the transaction before writing.
 Root `bytes_used` changes by one node per new block and per CoW'd original, as
 Linux records it for snapshots.
+
+## Free-space tree
+
+Filesystems created with Linux defaults carry a free-space tree. Admission
+accepts it only with its VALID bit and first compares it, block group by block
+group, with the free space implied by the extent tree (superblock stripes are
+not subtracted, as Linux records them); any disagreement refuses the
+transaction. The allocator logs every allocation and release in order. Each
+round of the commit fixed point applies the logged changes to the free-space
+tree in the block group's current representation: free extents are trimmed,
+split or merged, bitmaps flip one bit per sector, and the info item's extent
+count tracks free runs. Changes to the free-space tree allocate and free blocks
+themselves, which later rounds apply until nothing is pending. Block groups are
+not converted between extents and bitmaps, and items of block groups that no
+longer exist are left as Linux leaves them.
 
 ## File data
 

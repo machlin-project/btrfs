@@ -21,6 +21,9 @@ struct bt_space {
 	struct bt_gaps metadata;
 	struct bt_gaps data;
 	uint64_t *used;
+	struct bt_space_change *changes;
+	size_t change_count;
+	size_t change_capacity;
 	size_t node_limit;
 };
 
@@ -371,11 +374,54 @@ bt_space_allocator(struct bt_space *space, struct bt_mutation_allocator *allocat
 		space->node_limit };
 }
 
+/* Every allocation and release is logged in order for free-space maintenance. */
+static enum btrfs_result
+bt_space_log(struct bt_space *space, size_t chunk, uint64_t address, uint64_t size, int allocate)
+{
+	const struct btrfs_environment *env = &space->fs->env;
+	struct bt_space_change *grown;
+	size_t capacity;
+
+	if (space->change_count == space->change_capacity) {
+		if (space->change_capacity == BT_SPACE_MAX_GAPS) {
+			return BTRFS_UNSUPPORTED;
+		}
+		capacity = space->change_capacity == 0 ? 256 : space->change_capacity * 2;
+		grown = env->allocate(env->context, capacity * sizeof(*grown));
+		if (grown == NULL) {
+			return BTRFS_NO_MEMORY;
+		}
+		if (space->changes != NULL) {
+			bt_copy(grown, space->changes, space->change_count * sizeof(*grown));
+			env->release(
+			    env->context, space->changes, space->change_capacity * sizeof(*grown));
+		}
+		space->changes = grown;
+		space->change_capacity = capacity;
+	}
+	space->changes[space->change_count++] =
+	    (struct bt_space_change){ address, size, chunk, allocate };
+	return BTRFS_OK;
+}
+
+size_t
+bt_space_change_count(const struct bt_space *space)
+{
+	return space->change_count;
+}
+
+const struct bt_space_change *
+bt_space_change(const struct bt_space *space, size_t index)
+{
+	return &space->changes[index];
+}
+
 enum btrfs_result
 bt_space_change_used(struct bt_space *space, uint64_t address, uint64_t size, int allocate)
 {
 	const struct bt_chunk *chunk;
 	size_t i;
+	enum btrfs_result error;
 
 	for (i = 0; i < space->fs->chunk_count; i++) {
 		chunk = &space->fs->chunks[i];
@@ -385,8 +431,12 @@ bt_space_change_used(struct bt_space *space, uint64_t address, uint64_t size, in
 				      : size > space->used[i])) {
 				return BTRFS_CORRUPT;
 			}
-			space->used[i] = allocate ? space->used[i] + size : space->used[i] - size;
-			return BTRFS_OK;
+			error = bt_space_log(space, i, address, size, allocate);
+			if (error == BTRFS_OK) {
+				space->used[i] =
+				    allocate ? space->used[i] + size : space->used[i] - size;
+			}
+			return error;
 		}
 	}
 	return BTRFS_CORRUPT;
@@ -418,6 +468,10 @@ bt_space_destroy(struct bt_space *space)
 	if (space->used != NULL) {
 		env->release(
 		    env->context, space->used, space->fs->chunk_count * sizeof(*space->used));
+	}
+	if (space->changes != NULL) {
+		env->release(
+		    env->context, space->changes, space->change_capacity * sizeof(*space->changes));
 	}
 	env->release(env->context, space, sizeof(*space));
 }

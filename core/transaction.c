@@ -78,6 +78,7 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	struct bt_root quota;
 	enum btrfs_result error;
 	uint64_t unsupported = BT_FEATURE_MIXED_GROUPS | BT_FEATURE_METADATA_UUID;
+	uint64_t free_space = BT_COMPAT_RO_FREE_SPACE_TREE | BT_COMPAT_RO_FREE_SPACE_TREE_VALID;
 
 	if (result == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
@@ -87,7 +88,10 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	    environment->flush == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	if (base->info.readonly_features != 0 ||
+	/* The free-space tree is maintained; other read-only features are not. */
+	if ((base->info.readonly_features & ~free_space) != 0 ||
+	    ((base->info.readonly_features & free_space) != 0 &&
+		(base->info.readonly_features & free_space) != free_space) ||
 	    (base->info.incompat_features & unsupported) != 0 ||
 	    !(base->info.incompat_features & BT_FEATURE_SKINNY_METADATA) ||
 	    base->info.generation == UINT64_MAX) {
@@ -128,6 +132,15 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	}
 	if (error == BTRFS_OK) {
 		error = bt_tx_root(base, BT_CSUM_TREE, &transaction->checksums);
+	}
+	transaction->has_free_space = (base->info.readonly_features & free_space) != 0;
+	if (error == BTRFS_OK && transaction->has_free_space) {
+		error = bt_tx_root(base, BT_FREE_SPACE_TREE, &transaction->free_space);
+	}
+	/* A free-space tree that disagrees with the extent tree is not propagated. */
+	if (error == BTRFS_OK && transaction->has_free_space) {
+		error =
+		    bt_fst_verify(base, transaction->free_space.root, transaction->extents.root);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_find_root(base, BTRFS_TOP_LEVEL_TREE, &transaction->top);
@@ -600,6 +613,32 @@ bt_tx_backup(struct btrfs_transaction *transaction)
 	bt_put64(&backup->devices, 1);
 }
 
+/* Applies the allocations and releases logged since the previous round. */
+static enum btrfs_result
+bt_tx_free_space(struct btrfs_transaction *transaction)
+{
+	const struct bt_space_change *change;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (!transaction->has_free_space) {
+		return BTRFS_OK;
+	}
+	for (; error == BTRFS_OK &&
+	    transaction->free_space_applied < bt_space_change_count(transaction->space);
+	    transaction->free_space_applied++) {
+		change = bt_space_change(transaction->space, transaction->free_space_applied);
+		error = bt_fst_change(transaction->mutation, &transaction->free_space.root,
+		    &transaction->base->chunks[change->chunk], change->start, change->length,
+		    change->allocate);
+	}
+	if (error == BTRFS_OK &&
+	    transaction->free_space.root.address !=
+		bt_u64(transaction->free_space.item.legacy.bytenr)) {
+		error = bt_tx_update_root(transaction, &transaction->free_space);
+	}
+	return error;
+}
+
 static enum btrfs_result
 bt_tx_prepare(struct btrfs_transaction *transaction)
 {
@@ -658,7 +697,10 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 			}
 			used += bt_space_used(transaction->space, i);
 		}
-		error = bt_tx_update_root(transaction, &transaction->extents);
+		error = bt_tx_free_space(transaction);
+		if (error == BTRFS_OK) {
+			error = bt_tx_update_root(transaction, &transaction->extents);
+		}
 		if (error != BTRFS_OK) {
 			return error;
 		}

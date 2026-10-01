@@ -20,13 +20,14 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require fifteen passing test processes and all six reader profiles (312
-contracts). Seven writable images are required by the transaction suites:
+Require sixteen passing test processes and all six reader profiles (312
+contracts). Eight writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
 fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
-references), `transactions-keyed` (keyed backreferences) and `transactions-data`
-(file data inputs with snapshots). Missing fixtures
+references), `transactions-keyed` (keyed backreferences), `transactions-data`
+(file data inputs with snapshots) and `transactions-fst` (mkfs defaults with a
+free-space tree in extent and bitmap form). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -45,6 +46,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Reservation allocator | Extent-map and block-group reconciliation, physical alias/super-stripe exclusion, pinned committed allocations, bounded free gaps | `core/space.c` |
 | Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission, reference/accounting fixed point, root/backup updates, three barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
 | Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, log/foreign-copy refusal, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
+| Free-space tree | Verification against the extent tree, logged allocation changes applied in the fixed point, extents and bitmaps | `core/fst.c`, `core/space.c` |
 | File data / checksums | CoW writes and truncation, drop-extents splitting, staged data, private read view, checksum items | `core/data.c`, `core/csum.c` |
 | Shared references / audit | Linux CoW reference rules, inline/keyed placement and ordering, FULL_BACKREF conversion; independent whole-filesystem reference audit | `core/backref.c`, `tests/references.c` |
 | Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
@@ -82,12 +84,14 @@ only after successful durable publication; `seal` alone is not a commit.
    need their own crash cases), compression on write, data DUP and 64 KiB-sector
    fixtures, explicit hole items for filesystems without NO_HOLES, and lifting
    the 64 MiB staging bound with streaming writeback once native writers exist.
-4. **Maintain allocation features.** Add free-space tree/cache and block-group
-   growth with their own Linux fixtures. Writable admission currently rejects
-   free-space-tree/quotas/mixed groups/metadata UUID. Keep each rejection until
-   the corresponding accounting is implemented and tested. Add underfull sibling
-   merge/rebalance to the editor; current deletion removes empty nodes and
-   collapses unary roots but leaves underfull siblings.
+4. **Finish allocation features.** The free-space tree is verified and kept in
+   step with every allocation (`core/fst.c`), and the editor merges underfull
+   siblings. Remaining: block-group growth (chunk, device-extent, device-item,
+   block-group and free-space info creation, with system-array updates for
+   system chunks) with its own fixture; extent/bitmap conversion at Linux's
+   thresholds; the v1 space cache (`cache_generation` is currently invalidated)
+   needs its own fixture; quotas, mixed groups, metadata UUID and the
+   block-group tree stay rejected until each is implemented and tested.
 5. **Add namespace mutations.** Create/mkdir, link/unlink, symlink, atomic rename
    and xattrs must update all coupled inode refs, DIR_ITEM collision records,
    DIR_INDEX cookies, link counts, parent metadata and orphan state in one
