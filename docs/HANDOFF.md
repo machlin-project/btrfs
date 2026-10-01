@@ -20,15 +20,16 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require seventeen passing test processes and all six reader profiles (312
-contracts). Nine writable images are required by the transaction suites:
+Require eighteen passing test processes and all six reader profiles (312
+contracts). Ten writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
 fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
 references), `transactions-keyed` (keyed backreferences), `transactions-data`
 (file data inputs with snapshots), `transactions-fst` (mkfs defaults with a
-free-space tree in extent and bitmap form) and `transactions-grow` (nearly full
-metadata with unallocated device space). Missing fixtures
+free-space tree in extent and bitmap form), `transactions-grow` (nearly full
+metadata with unallocated device space) and `transactions-namespace` (name-hash
+collisions, extended references, compression properties). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -49,6 +50,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, log/foreign-copy refusal, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
 | Free-space tree | Verification against the extent tree, logged allocation changes applied in the fixed point, extents and bitmaps | `core/fst.c`, `core/space.c` |
 | File data / checksums | CoW writes and truncation, drop-extents splitting, staged data, private read view, checksum items | `core/data.c`, `core/csum.c` |
+| Namespace mutations / audit | Create of every type, link, unlink with orphans, rename with replacement, packed collision items, xattrs and the compression property; independent namespace audit | `core/namespace.c`, `tests/namespace_audit.c` |
 | Shared references / audit | Linux CoW reference rules, inline/keyed placement and ordering, FULL_BACKREF conversion; independent whole-filesystem reference audit | `core/backref.c`, `tests/references.c` |
 | Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
 | Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
@@ -94,11 +96,21 @@ only after successful durable publication; `seal` alone is not a commit.
    currently invalidated) with its own fixture, and quotas, mixed groups,
    metadata UUID and the block-group tree, which stay rejected until each is
    implemented and tested.
-5. **Add namespace mutations.** Create/mkdir, link/unlink, symlink, atomic rename
-   and xattrs must update all coupled inode refs, DIR_ITEM collision records,
-   DIR_INDEX cookies, link counts, parent metadata and orphan state in one
-   transaction. Cover duplicate keys, real name-hash collisions, index exhaustion,
-   rename replacement and cross-directory operations, open-unlink and crash replay.
+5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
+   orphan items for open inodes, eviction and orphan cleanup, atomic rename
+   (replacement, cross-directory, between names of one inode), xattrs and the
+   `btrfs.compression` property update all coupled records in one transaction
+   (`core/namespace.c`); real CRC32C collisions, numbering limits, refusals and
+   crash states are covered and Linux agrees (see ACCEPTANCE.md). Remaining:
+   editing extended inode references (names only there, and links beyond a full
+   INODE_REF, are UNSUPPORTED); subvolume and snapshot creation and deletion;
+   O_TMPFILE links, rename exchange/whiteout; truncation orphans of pre-3.12
+   kernels are dropped as Linux does. Directory indexes are monotonic only within
+   one transaction: after the highest entry is removed and committed, a later
+   transaction may reuse its index, which Linux avoids within a mount through
+   its in-memory `index_cnt`; native writers must carry that counter across
+   transactions before open directory streams can rely on it. They also supply
+   time, mode, owner, set-id and ACL decisions.
 6. **Connect native writers.** Define versioned operation views, read pins,
    publication locks and UBC/FSKit dirty-page ownership first. Supply real exact
    write and durable flush callbacks, order pageout/truncate/invalidate/fsync,

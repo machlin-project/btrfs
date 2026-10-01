@@ -167,7 +167,8 @@ standalone editor supports up to 65,536. Exhausted reservations return NO_SPACE
 from the failing edit, before any media write.
 
 `core/transaction.c` owns the private root set and a separate write environment.
-Its current operation is replacing an existing uncompressed inline regular file,
+File data and namespace operations are described in their own sections below.
+Its own operation is replacing an existing uncompressed inline regular file,
 up to 2 KiB, in any writable file tree: the top level, subvolumes and writable
 snapshots. Read-only snapshots return READ_ONLY; dead or partially dropped trees
 are unsupported. Empty replacement removes the inline extent. One transaction may
@@ -277,6 +278,61 @@ by it, and the owner must retire readers of the old root before the next one.
 Preallocated ranges are rewritten by CoW, not converted in place; NODATACOW files
 are also written by CoW; data is never compressed on write. Set-id, immutable
 and append-only inodes are refused until their policy contracts exist.
+
+## Namespace mutations
+
+`core/namespace.c` creates, links, unlinks and renames names and edits xattrs in
+the transaction's private file trees, following Linux's `btrfs_add_link` and
+`btrfs_unlink_inode`. A name exists as three coupled records: an INODE_REF entry
+(index and name) keyed by inode and parent, a DIR_ITEM entry keyed by the parent
+and the name's CRC32C hash, and a DIR_INDEX item keyed by the parent and the
+index. Names with equal hashes share one packed DIR_ITEM; new names are appended
+and removed entries are cut out of the item, as Linux extends and truncates it.
+Xattrs use the same packing in XATTR_ITEM. Every lookup cross-checks all three
+records, so an inconsistent name fails as CORRUPT instead of being edited.
+
+New inode numbers continue after the highest object below
+`BTRFS_LAST_FREE_OBJECTID`, and directory indexes after the directory's highest
+DIR_INDEX, from 2. Both never repeat within a transaction, which caches the next
+index of up to 256 directories; more are refused before any change. A directory
+whose index reached `UINT64_MAX` is full (RANGE). A new inode has one link, all
+four times set to the caller's time, this transaction's generation and Linux's
+inherited flags: NOCOMPRESS or COMPRESS, and NODATACOW (with NODATASUM for
+regular files). A directory's valid codec property (`btrfs.compression`) passes
+to new regular files and directories as an xattr with the canonical codec name,
+as `btrfs_inode_inherit_props` does. Symlink targets become one inline extent
+(at most PATH_MAX - 1 bytes and one leaf item). Mode, owner and device number are
+the caller's: set-id inheritance, ACL defaults and umask belong to the owning
+native or LXNU boundary.
+
+Each name change updates the parent's size (twice the name lengths), mtime,
+ctime, change counter and transid, the affected inode's ctime and links, and the
+tree's root-item ctransid. Directories have one link and may be removed only when
+empty. An inode losing its last name is deleted with its items, dropping its
+file extent references through the data writer's ordered reference pass, unless
+the caller holds it open: then it keeps zero links and an ORPHAN item until
+`btrfs_transaction_evict`, or until `btrfs_transaction_clean_orphans` runs as
+Linux's orphan cleanup does at mount (an orphan item of a missing or still
+linked inode only goes away). Rename removes the old name, then any replaced
+name and its link, then adds the new name, all in one transaction; two names of
+one inode make it a no-op, and a directory cannot move below itself.
+
+Setting or removing `btrfs.compression` is Linux's property operation: the value
+must start with zlib, lzo or zstd, or be "no"/"none", and the inode must keep
+data checksums; it is ignored for objects other than files and directories. It
+updates COMPRESS/NOCOMPRESS and records the LZO or ZSTD incompat feature when a
+codec first appears. Other `btrfs.` names are invalid. Raw xattr values are
+otherwise uninterpreted; native policy decides which namespaces callers may use.
+
+Every refusal (existing or missing name, wrong type, non-empty directory, full
+packed item, exhausted numbering, read-only snapshot, crossing a subvolume entry
+or tree) is decided before the first change and leaves the transaction usable. A
+failure after a change poisons the transaction. Names stored only in extended
+inode references (INODE_EXTREF), and new names that would need one, are refused
+as UNSUPPORTED on filesystems with that feature; Linux refuses such links with
+EMLINK otherwise (TOO_MANY_LINKS). Subvolume and snapshot creation or deletion,
+O_TMPFILE links of unlinked inodes, rename exchange and whiteouts are not part
+of this interface.
 
 ## Superblock copies, publication and recovery
 

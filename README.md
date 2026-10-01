@@ -19,18 +19,19 @@ The XNU guest suite passes on four image profiles, including mmap, native user
 xattrs, Unix permissions, directory cookies, snapshots and concurrent reads.
 
 The portable writer writes and truncates regular files as copy-on-write data
-with checksums, and replaces inline files, in any writable subvolume or
-snapshot, many operations per transaction. It updates CoW paths, shared and
-keyed extent backreferences with Linux's snapshot rules, data checksum items,
-block-group accounting, root items and superblock copies with three persistence
-barriers. An independent reference and checksum audit checks every committed
-state.
+with checksums, replaces inline files, and creates, links, unlinks (with
+orphans for open files), renames and sets xattrs and the compression property,
+in any writable subvolume or snapshot, many operations per transaction. It
+updates CoW paths, shared and keyed extent backreferences with Linux's snapshot
+rules, data checksum items, block-group accounting, root items and superblock
+copies with three persistence barriers. Independent reference, checksum and
+namespace audits check every committed state.
 Explicit superblock recovery resolves torn or disagreeing copies without rolling
 back an acknowledged generation. Linux agrees with the recorded outcome of
-reordered and torn crash states on seven writable profiles. Native mounts remain
-read-only: namespace operations, native writeback and write coherence are
-remaining work. See [acceptance](docs/ACCEPTANCE.md) and
-[the concrete handoff](docs/HANDOFF.md).
+reordered and torn crash states on twelve profiles, including namespace facts
+and its own cleanup of the orphans left. Native mounts remain read-only: native
+writeback and write coherence are remaining work. See
+[acceptance](docs/ACCEPTANCE.md) and [the concrete handoff](docs/HANDOFF.md).
 
 The performance goal is to outperform Linux Btrfs on matched filesystem
 workloads. Range I/O and reusable traversal paths are present; the goal has **not

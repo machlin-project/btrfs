@@ -10,7 +10,7 @@ add_project_arguments(cc.get_supported_arguments(warnings), language: 'c')
 sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
-  'core/data.c', 'core/fst.c')
+  'core/data.c', 'core/fst.c', 'core/namespace.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -30,10 +30,10 @@ posix = static_library('btrfs_posix', 'adapters/posix/image.c',
 inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
-  'tests/references.c', include_directories: inc, link_with: [posix, core],
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
   dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
-  include_directories: inc, link_with: [posix, core], dependencies: [zlib, zstd])
+  'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core], dependencies: [zlib, zstd])
 unit = executable('btrfs-unit', 'tests/unit.c', include_directories: inc, link_with: core)
 test('wire-and-api', unit, suite: 'core')
 mutable_test = executable('btrfs-mutable-test', 'tests/mutable.c', include_directories: inc,
@@ -93,7 +93,11 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-large.raw'), join_paths(fixtures, 'transactions-full.raw'),
     join_paths(fixtures, 'transactions-shared.raw'), join_paths(fixtures, 'transactions-keyed.raw'),
     join_paths(fixtures, 'transactions-data.raw'), join_paths(fixtures, 'transactions-fst.raw'),
-    join_paths(fixtures, 'transactions-grow.raw')],
+    join_paths(fixtures, 'transactions-grow.raw'),
+    join_paths(fixtures, 'transactions-namespace.raw')],
+    suite: 'images')
+  test('namespace-transactions', transaction_test,
+    args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,
     suite: 'images')
   test('metadata-exhaustion', transaction_test,
     args: ['--full', join_paths(fixtures, 'transactions-full.raw')], timeout: 180, suite: 'images')

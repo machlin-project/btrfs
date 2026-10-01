@@ -1,15 +1,17 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #define _POSIX_C_SOURCE 200809L
 #include "../adapters/posix/image.h"
+#include "namespace_audit.h"
 #include "references.h"
 #include <stdio.h>
 
-/* Validates the independent reference audit on Linux-authored images before the
- * writer tests rely on it. */
+/* Validates the independent reference and namespace audits on Linux-authored
+ * images before the writer tests rely on them. */
 int
 main(int argc, char **argv)
 {
 	struct reference_audit audit;
+	struct namespace_audit names;
 	struct btrfs_image image;
 	struct btrfs_fs *fs;
 	int i;
@@ -36,6 +38,16 @@ main(int argc, char **argv)
 			    argv[i], audit.trees, audit.blocks, audit.data_extents, audit.tree_refs,
 			    audit.shared_block_refs, audit.data_refs, audit.shared_data_refs,
 			    audit.keyed_refs, audit.full_backref_blocks, audit.checksums);
+		}
+		if (namespace_audit(fs, &names) != 0) {
+			fprintf(stderr, "%s: namespace: %s\n", argv[i], names.failure);
+			failures++;
+		} else {
+			printf("%s: %zu file trees, %zu inodes, %zu names (%zu extended), %zu "
+			       "subvolume entries, %zu collision items, %zu xattrs, %zu orphans "
+			       "PASS\n",
+			    argv[i], names.trees, names.inodes, names.names, names.extended_names,
+			    names.subvolume_entries, names.collisions, names.xattrs, names.orphans);
 		}
 		btrfs_unmount(fs);
 		btrfs_image_close(&image);

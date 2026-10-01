@@ -14,7 +14,8 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", ""),
             "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", ""),
             "transactions-data": (4096, "single", ""), "transactions-fst": (16384, "dup", ""),
-            "transactions-grow": (16384, "dup", "")}
+            "transactions-grow": (16384, "dup", ""),
+            "transactions-namespace": (4096, "single", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -48,6 +49,19 @@ FRAGMENT_BYTES = 4096
 # Leaf-sized xattrs for 16 KiB nodes in the growth profile.
 GROW_XATTR_BYTES = 3800
 GROW_ROOM_FILES = 600
+# Namespace-writer inputs. Four names share one CRC32C name hash (as directory
+# entries, and with the "user." prefix as xattrs): equal-length CRC collisions
+# survive equal-length suffixes, so the pairs of one collision form four names.
+# Linux writes the first two; the writer adds and removes the others. Two
+# directories carry compression properties ("zstd", inherited by new files and
+# directories, and "no", which only sets NOCOMPRESS).
+NAMESPACE_COLLISIONS = ("ethvq997ethvq997", "ethvq997wdkjavbx", "wdkjavbxethvq997",
+                        "wdkjavbxwdkjavbx")
+NAMESPACE_DATA_BYTES = 65536
+# With 4 KiB nodes one INODE_REF item holds 18 of these names; Linux stores the
+# remaining links of the inode as extended references.
+EXTREF_NAME_BYTES = 200
+EXTREF_LINKS = 40
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
@@ -225,6 +239,41 @@ btrfs filesystem sync /mnt
 btrfs balance start -dusage=0 /mnt
 btrfs filesystem sync /mnt
 btrfs filesystem usage -b /mnt'''
+    if profile == "transactions-namespace":
+        first, second = NAMESPACE_COLLISIONS[:2]
+        fill = f'''mkdir -p /mnt/ns/tree/a/b /mnt/ns/empty /mnt/ns/full /mnt/ns/collide /mnt/ns/nocow \\
+    /mnt/ns/compress /mnt/ns/extref
+printf 'one\\n' > /mnt/ns/one
+ln /mnt/ns/one /mnt/ns/tree/one-link
+head -c {NAMESPACE_DATA_BYTES} /input/random > /mnt/ns/data
+cp --reflink=always /mnt/ns/data /mnt/ns/clone
+printf 'victim\\n' > /mnt/ns/victim
+printf 'inner\\n' > /mnt/ns/full/inner
+printf 'deep\\n' > /mnt/ns/tree/a/b/deep
+printf 'first\\n' > /mnt/ns/collide/{first}
+printf 'second\\n' > /mnt/ns/collide/{second}
+setfattr -n user.{first} -v first /mnt/ns/one
+setfattr -n user.{second} -v second /mnt/ns/one
+chattr +C /mnt/ns/nocow
+chattr +c /mnt/ns/compress
+mkdir /mnt/ns/zstd /mnt/ns/nocompress
+setfattr -n btrfs.compression -v zstd /mnt/ns/zstd
+setfattr -n btrfs.compression -v no /mnt/ns/nocompress
+mkfifo /mnt/ns/fifo
+mknod /mnt/ns/null c 1 3
+printf 'target\\n' > /mnt/ns/extref/target
+long=$(head -c {EXTREF_NAME_BYTES} /dev/zero | tr '\\0' x)
+i=0
+while [ "$i" -lt {EXTREF_LINKS} ]; do
+    ln /mnt/ns/extref/target /mnt/ns/extref/l$(printf '%03d' "$i")$long
+    i=$((i + 1))
+done
+test "$(stat -c '%h' /mnt/ns/extref/target)" = {EXTREF_LINKS + 1}
+lsattr -d /mnt/ns/nocow /mnt/ns/compress /mnt/ns/zstd /mnt/ns/nocompress
+getfattr -n btrfs.compression /mnt/ns/zstd /mnt/ns/nocompress
+btrfs filesystem sync /mnt
+btrfs inspect-internal dump-tree -t 5 /dev/vda > /tmp/fs.txt
+echo BTRFS_REFERENCE_EXTREF_ITEMS:$(grep -c 'INODE_EXTREF' /tmp/fs.txt || true)'''
     if profile == "transactions-fst":
         fill += f'''
 mkdir /mnt/fragment

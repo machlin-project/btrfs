@@ -986,6 +986,12 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 		env->release(
 		    env->context, transaction->original, transaction->base->info.node_size);
 	}
+	if (transaction->item != NULL) {
+		env->release(env->context, transaction->item, transaction->base->info.node_size);
+	}
+	if (transaction->entry != NULL) {
+		env->release(env->context, transaction->entry, transaction->base->info.node_size);
+	}
 	if (transaction->fs.chunks != NULL) {
 		env->release(env->context, transaction->fs.chunks,
 		    BT_MAX_CHUNKS * sizeof(*transaction->fs.chunks));

@@ -496,7 +496,8 @@ btrfs_result_string(enum btrfs_result result)
 		"unsupported format or operation", "corrupt filesystem", "I/O error",
 		"out of memory", "not found", "not a directory", "is a directory", "range exceeded",
 		"read-only filesystem", "recovery required", "stale identity", "already exists",
-		"no space available" };
+		"no space available", "directory not empty", "crosses a subvolume",
+		"too many links", "name too long" };
 
 	if ((unsigned)result >= sizeof(names) / sizeof(names[0])) {
 		return "unknown result";

@@ -21,6 +21,22 @@ MAX_DEVICE = 1 << 30
 NAME = re.compile(r"^[a-z0-9-]+\.(bin|tsv)$")
 SCENARIO = re.compile(r"^[a-z0-9-]+$")
 STAGE_PATH = re.compile(r"^(/[A-Za-z0-9._-]+)+$")
+# Namespace facts: kind -> pattern of the argument field.
+NAMESPACE_PATH = re.compile(r"^(/[A-Za-z0-9._-]{1,255})+$")
+NAMESPACE_ARGUMENT = {
+    "absent": re.compile(r"^-$"), "file": re.compile(r"^-$"), "symlink": re.compile(r"^-$"),
+    "dir": re.compile(r"^[0-9]+$"), "same": NAMESPACE_PATH,
+    "xattr": re.compile(r"^(user|trusted|btrfs)\.[A-Za-z0-9._-]{1,248}$"),
+    "noxattr": re.compile(r"^(user|trusted|btrfs)\.[A-Za-z0-9._-]{1,248}$"),
+    "stat": re.compile(r"^[0-9a-f]+:[0-9]+:[0-9]+:[0-9]+$"),
+    "device": re.compile(r"^[0-9a-f]+:[0-9a-f]+$"), "flags": re.compile(r"^0x[0-9a-f]+:0x[0-9a-f]+$"),
+    "feature": re.compile(r"^COMPRESS_(LZO|ZSTD)$")}
+PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr"}
+
+
+def safe_path(path):
+    return NAMESPACE_PATH.match(path) and all(
+        part not in (".", "..") for part in path.split("/")[1:])
 
 
 def fields(line, count):
@@ -68,6 +84,21 @@ def load_scenario(directory, device_bytes):
         check_name(name)
         stages.setdefault(int(stage), {"generation": int(generation), "files": []})
         stages[int(stage)]["files"].append((path, name))
+    facts = {}
+    namespace = directory / "namespace.tsv"
+    if namespace.exists():
+        for line in namespace.read_text().splitlines():
+            stage, kind, path, argument, payload = fields(line, 5)
+            if (int(stage) not in stages or kind not in NAMESPACE_ARGUMENT or
+                    not (safe_path(path) or (kind == "feature" and path == "/")) or
+                    not NAMESPACE_ARGUMENT[kind].match(argument) or
+                    (kind == "same" and not safe_path(argument))):
+                raise ValueError(f"Invalid namespace record {line!r}")
+            if (payload == "-") == (kind in PAYLOAD_KINDS):
+                raise ValueError(f"Invalid namespace payload {line!r}")
+            if payload != "-":
+                (directory / check_name(payload)).stat()
+            facts[int(stage)] = facts.get(int(stage), 0) + 1
     cases = []
     touched = [(offset, length) for offset, length, _, _, _ in writes]
     for line in (directory / "cases.tsv").read_text().splitlines():
@@ -80,9 +111,17 @@ def load_scenario(directory, device_bytes):
         touched += load_fragments(directory, f"recover-{case}.tsv", device_bytes)
         cases.append({"case": case, "commit": int(commit), "kind": kind, "mounted": mounted,
                       "resolved": int(resolved), "recovered": recovered == "1"})
+    # The guest checks a stage's facts at every verification of that stage:
+    # the mounted state, twice per recovery, and the final state.
+    checks = facts.get(max(stages), 0)
+    for case in cases:
+        if case["mounted"] != "-":
+            checks += facts.get(int(case["mounted"]), 0)
+        if case["recovered"]:
+            checks += 2 * facts.get(case["resolved"], 0)
     if not writes or not cases or not 0 < len(cases) <= 4096:
         raise ValueError(f"Empty or oversized scenario {directory.name}")
-    return writes, stages, cases, touched
+    return writes, stages, cases, touched, checks
 
 
 def merge(ranges):
@@ -114,13 +153,15 @@ def main():
     target.mkdir()
     summary = {}
     total = 0
+    namespace_checks = 0
     scenarios = sorted(path for path in plan.iterdir() if path.is_dir())
     if not scenarios:
         raise ValueError("No exported scenarios")
     for directory in scenarios:
         if not SCENARIO.match(directory.name):
             raise ValueError(f"Unexpected scenario name {directory.name!r}")
-        writes, stages, cases, touched = load_scenario(directory, args.device_bytes)
+        writes, stages, cases, touched, checks = load_scenario(directory, args.device_bytes)
+        namespace_checks += checks
         # Superblock copies may be rewritten by Linux recovery as well.
         touched += [(65536, 4096), (64 * 1024 * 1024, 4096)]
         shutil.copytree(directory, target / directory.name)
@@ -130,7 +171,7 @@ def main():
         (target / directory.name / "final.txt").write_text(f"{final}\n")
         summary[directory.name] = {"writes": len(writes), "cases": len(cases),
                                    "recoveries": sum(case["recovered"] for case in cases),
-                                   "stages": len(stages)}
+                                   "stages": len(stages), "namespace_checks": checks}
         total += len(cases)
     init = f'''#!/bin/busybox sh
 set -eu
@@ -177,6 +218,44 @@ primary_generation() {{
     btrfs inspect-internal dump-super /dev/vda | awk '$1 == "generation" {{ print $2; exit }}'
 }}
 
+# MASK:VALUE: the flags of the path's inode item in the top-level tree equal
+# VALUE in the bits of MASK. Busybox lsattr shows no NOCOMPRESS flag, and
+# `btrfs inspect-internal rootid` needs a writable mount.
+check_flags() {{
+    inode=$(stat -c '%i' "$1")
+    flags=$(btrfs inspect-internal dump-tree -t 5 /dev/vda | awk -v key="key ($inode INODE_ITEM 0)" '
+        index($0, key) && index($0, "itemoff") {{ found = 1 }}
+        found && match($0, /flags 0x[0-9a-f]+/) {{ print substr($0, RSTART + 6, RLENGTH - 6); exit }}')
+    test -n "$flags" && test $((flags & ${{2%%:*}})) -eq $((${{2#*:}}))
+}}
+
+namespace_checks=0
+
+check_namespace() {{
+    [ -f "$1/namespace.tsv" ] || return 0
+    while IFS="$(printf '\\t')" read -r stage kind path arg payload; do
+        [ "$stage" = "$2" ] || continue
+        namespace_checks=$((namespace_checks + 1))
+        target="/mnt$path"
+        case "$kind" in
+        absent) test ! -e "$target" && test ! -L "$target" ;;
+        file) test -f "$target" && test ! -L "$target" && cmp "$target" "$1/$payload" ;;
+        symlink) test -L "$target" && test "$(readlink "$target")" = "$(cat "$1/$payload")" ;;
+        dir) test -d "$target" && ls -A1 "$target" | LC_ALL=C sort > /tmp/listing &&
+            cmp /tmp/listing "$1/$payload" && test "$(stat -c '%s' "$target")" = "$arg" ;;
+        same) test "$(stat -c '%d:%i' "$target")" = "$(stat -c '%d:%i' "/mnt$arg")" ;;
+        xattr) getfattr --only-values -n "$arg" "$target" > /tmp/value &&
+            cmp /tmp/value "$1/$payload" ;;
+        noxattr) ! getfattr -n "$arg" "$target" > /dev/null 2>&1 ;;
+        stat) test "$(stat -c '%f:%u:%g:%h' "$target")" = "$arg" ;;
+        device) test "$(stat -c '%t:%T' "$target")" = "$arg" ;;
+        flags) check_flags "$target" "$arg" ;;
+        feature) btrfs inspect-internal dump-super /dev/vda | grep -qw "$arg" ;;
+        *) false ;;
+        esac || {{ echo "Namespace check failed: $kind $path"; exit 1; }}
+    done < "$1/namespace.tsv"
+}}
+
 verify() {{
     btrfs check --readonly /dev/vda < /dev/null
     test "$(primary_generation)" = "$(generation "$1" "$2")"
@@ -191,6 +270,7 @@ verify() {{
     test "$(cat /mnt/snapshot/value)" = 'snapshot original'
     test "$(cat /mnt/subvol/value)" = 'subvolume changed'
     test "$(getfattr --only-values -n user.text /mnt/greeting 2>/dev/null)" = 'Linux xattr'
+    check_namespace "$1" "$2"
     umount /mnt
 }}
 
@@ -228,28 +308,29 @@ for scenario in /transaction/*; do
     done < "$scenario/cases.tsv"
     restore "$scenario"
     cmp /dev/vda /dev/vdb
+    # Linux continues read-write from the scenario's newest root, cleaning any
+    # orphans it left. A free-space tree must stay enabled; the other profiles
+    # keep no space cache.
+    awk -F '\\t' '{{ printf "%d\\t%d\\t%s\\t0\\n", $2 / 512, $3 / 512, $4 }}' "$scenario/writes.tsv" > "$scenario/all.tsv"
+    apply "$scenario" all.tsv
+    verify "$scenario" "$(cat "$scenario/final.txt")"
+    options=nospace_cache
+    if btrfs inspect-internal dump-super /dev/vda | grep -q FREE_SPACE_TREE_VALID; then
+        options=defaults
+    fi
+    mount -t btrfs -o "$options" /dev/vda /mnt
+    printf 'Linux accepted the new root\\n' > /mnt/after-machlin
+    btrfs filesystem sync /mnt
+    umount /mnt
+    btrfs check --readonly /dev/vda < /dev/null
+    test "$(btrfs inspect-internal dump-tree -t 5 /dev/vda | grep -c ORPHAN_ITEM || true)" = 0
+    dd if=/dev/vdb of=/dev/vda bs=1048576 conv=notrunc 2>/dev/null
+    refresh
+    cmp /dev/vda /dev/vdb
     echo "BTRFS_TRANSACTION_SCENARIO:$name"
 done
-for scenario in /transaction/*; do
-    restore "$scenario"
-done
-cmp /dev/vda /dev/vdb
-# Linux continues read-write from the newest root of the last scenario.
-scenario=$(ls -d /transaction/* | tail -1)
-awk -F '\\t' '{{ printf "%d\\t%d\\t%s\\t0\\n", $2 / 512, $3 / 512, $4 }}' "$scenario/writes.tsv" > /tmp/all.tsv
-cp /tmp/all.tsv "$scenario/all.tsv"
-apply "$scenario" all.tsv
-verify "$scenario" "$(cat "$scenario/final.txt")"
-# A free-space tree must stay enabled; the other profiles keep no space cache.
-options=nospace_cache
-if btrfs inspect-internal dump-super /dev/vda | grep -q FREE_SPACE_TREE_VALID; then
-    options=defaults
-fi
-mount -t btrfs -o "$options" /dev/vda /mnt
-printf 'Linux accepted the new root\\n' > /mnt/after-machlin
-btrfs filesystem sync /mnt
-umount /mnt
-btrfs check --readonly /dev/vda < /dev/null
+echo "BTRFS_TRANSACTION_NAMESPACE_CHECKS:$namespace_checks"
+test "$namespace_checks" = {namespace_checks}
 echo BTRFS_TRANSACTION_PASS:$total
 trap - EXIT
 poweroff -f
@@ -261,9 +342,9 @@ poweroff -f
     with archive.open("wb") as output:
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root,
                        input=paths, stdout=output, check=True)
-    archive.with_suffix(".json").write_text(json.dumps(
-        {"cases": total, "scenarios": summary}, indent=2) + "\n")
-    print(json.dumps({"cases": total, "scenarios": summary}))
+    report = {"cases": total, "namespace_checks": namespace_checks, "scenarios": summary}
+    archive.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report))
 
 
 if __name__ == "__main__":

@@ -8,19 +8,20 @@ conformance and a performance win over Linux remain open.
 
 | Layer | Result | Reproduction / generated evidence |
 | --- | --- | --- |
-| Linux fixtures | Fifteen independently created images; Linux contents and read-only fsck pass | `tests/prepare_linux.py`; `logs/linux-reference-*.log` |
+| Linux fixtures | Sixteen independently created images; Linux contents and read-only fsck pass | `tests/prepare_linux.py`; `logs/linux-reference-*.log` |
 | Portable reader | 312 contracts across six read profiles; image hashes unchanged | `tests/check_images.py`; `logs/acceptance-tests.log` |
-| Portable acceptance | Seventeen Meson test processes pass under ASan/UBSan | `make test -Dfixtures=...` via DEVELOPMENT.md |
+| Portable acceptance | Eighteen Meson test processes pass under ASan/UBSan | `make test -Dfixtures=...` via DEVELOPMENT.md |
 | Private CoW editor | Independent ordered model; 4/16/64 KiB nodes; root growth/collapse; three-way variable-item split; snapshot isolation; reservation/allocation/read failures | `tests/mutable.c` |
-| Transactions | Five inline scenarios (replace, zero-length, 2048-byte, 20-inode batch, two repeated commits) on seven writable profiles, plus six shared-block, three keyed-reference and eleven data scenarios; allocation/read/write/barrier fault points of each last commit (all up to 512 per class, a deterministic stride beyond); three barriers per commit | `tests/transaction.c`; `logs/data-export-*.log` |
+| Transactions | Five inline scenarios (replace, zero-length, 2048-byte, 20-inode batch, two repeated commits) on seven writable profiles, plus six shared-block, three keyed-reference, eleven data and eleven namespace scenarios; allocation/read/write/barrier fault points of each last commit (all up to 512 per class, a deterministic stride beyond); three barriers per commit | `tests/transaction.c`; `logs/data-export-*.log` |
 | File data | Eleven data scenarios: unaligned overwrite splitting a reflinked extent, append, writes into holes and past EOF, preallocated and zlib extents, NODATASUM, inline conversion, two-step truncation, snapshot overwrites that free an extent, overlapping writes in one transaction; metadata and data exhaustion return NO_SPACE without writes | `tests/transaction.c` (`--data`, `--full`) |
+| Namespace mutations | Eleven scenarios on a Linux image with real CRC32C name and xattr collisions, extended references and compression properties: every object type with inherited flags, 100 names splitting leaves, appends to, cuts from and renames within packed collision items, a DIR_ITEM filled to the largest item, hard links (including beside extended references), unlinks of shared and last data references, renames across directories and over files and an empty directory, open unlinks with orphans, eviction and orphan cleanup, the largest xattr, a subvolume tree, and property inheritance recording a new incompat feature; about forty refusals and four numbering/packing limits decided before any change; every state matches its expected namespace facts and passes the independent namespace audit, which agrees with all sixteen Linux images and detects wrong link counts and directory sizes | `tests/transaction.c` (`--namespace`), `tests/namespace_audit.c` |
 | Free-space tree | Default-feature images (16 KiB DUP and 4 KiB nodes, extents and bitmaps): every committed and crash-resolved state is compared with the extent tree at the next admission; freeing between holes merges bitmap runs; a 2 MiB write fills the remaining extent-mode space and then bitmap holes | `tests/transaction.c` (`--fragment`), `core/fst.c` |
 | Block-group growth | On a Linux image with nearly full metadata and unallocated space, growing 2,000 leaf-sized files allocates a DUP metadata chunk and a 40 MiB write allocates a data chunk; the next admission re-verifies device extents, chunk items, block groups and the free-space tree | `tests/transaction.c` (`--grow`), `core/space.c` |
 | Tree rebalancing | Deleting 90% of 4,000 items merges underfull leaves and nodes: the tree drops from level 2 to 1 and keeps no adjacent pair of underfull edited leaves; disabling the merge fails the test | `tests/mutable.c` |
-| Shared references | Owner and snapshot CoW of shared leaves and level-1 nodes, FULL_BACKREF creation, conversion and release, reflinked and offset data references, writes across three trees, inline and keyed references; the independent audit agrees with all thirteen Linux images and every committed state, and rejects damaged references; its checksum audit verifies containment, stored CRC32C values and coverage of written data | `tests/references.c`, `tests/audit.c`, `tests/transaction.c` |
-| Persistence and recovery model | 26,152 crash states in the Meson suite: every prefix, 32 seeded reorder/tear states per metadata epoch (data writes included) and six tear patterns per superblock epoch; 1,075 need and pass explicit recovery; all resolve to the acknowledged or new stage and admit the next transaction | `tests/transaction.c` |
+| Shared references | Owner and snapshot CoW of shared leaves and level-1 nodes, FULL_BACKREF creation, conversion and release, reflinked and offset data references, writes across three trees, inline and keyed references; the independent audit agrees with all sixteen Linux images and every committed state, and rejects damaged references; its checksum audit verifies containment, stored CRC32C values and coverage of written data | `tests/references.c`, `tests/audit.c`, `tests/transaction.c` |
+| Persistence and recovery model | 34,865 crash states in the Meson suite: every prefix, 32 seeded reorder/tear states per metadata epoch (data writes included) and six tear patterns per superblock epoch; 1,341 need and pass explicit recovery; all resolve to the acknowledged or new stage and admit the next transaction | `tests/transaction.c` |
 | Copies, allocation maps, exhaustion | Stale primary/secondary rejection; disagreeing copies block admission; recovery refuses rollback, foreign copies and pending logs; ten checksum-correct damaged allocation maps (nine with 4 KiB nodes) rejected before writes; full metadata returns NO_SPACE with no write | `tests/transaction.c` |
-| Independent writer oracle | 4,207 exported states over eleven profiles (including `plain` and `small-nodes`, which keep Linux's default free-space tree), covering every shared, keyed, data, free-space and growth scenario; Linux fsck (extent references and checksum items included), primary generation and exact contents agree for each, with Linux verifying data checksums on read; 1,012 recovery states agree with `btrfs rescue super-recover` and with this recovery's writes; Linux then commits read-write | `tests/prepare_transactions_linux.py`; `logs/linux-transactions-*.log` |
+| Independent writer oracle | 5,166 exported states over twelve profiles (including `plain` and `small-nodes`, which keep Linux's default free-space tree), covering every shared, keyed, data, free-space, growth and namespace scenario; Linux fsck (extent references, checksum items and the fs-tree namespace included), primary generation and exact contents agree for each, with Linux verifying data checksums on read; on the namespace profile Linux also confirms 7,415 namespace facts (listings and sizes, link identity and counts, symlinks, xattrs, device numbers, inode flags via its own tree dump, incompat features), and after each scenario mounts read-write, cleans the orphans left and passes fsck with none remaining; 1,244 recovery states agree with `btrfs rescue super-recover` and with this recovery's writes; Linux then commits read-write | `tests/prepare_transactions_linux.py`; `logs/linux-transactions-*.log` |
 | Native identities / policy | 65,536 distinct identities, capacity failure, user-xattr filtering and malformed lists pass | `tests/identity.c`, `tests/native_policy.c` |
 | Corruption / concurrency | Adversarial/fault/budget tests and eight concurrent readers pass; prior reader TSAN and bounded fuzz runs passed | `tests/adversarial.c`, `tests/concurrent.c`, `logs/fuzz-final.log` |
 | Freestanding core | Stack frames bounded to 2 KiB, including writer | Meson freestanding target |
@@ -77,6 +78,11 @@ conversion are unsupported. Adapters still owe credential, ACL and
 capability policy. CoW of shared blocks follows Linux's snapshot reference rules;
 inline and keyed references, FULL_BACKREF conversion and release are covered,
 and every committed state passes the independent reference audit.
+Namespace operations create every object type, link, unlink (keeping open
+inodes as orphans), evict, clean orphans, rename and edit xattrs, including the
+`btrfs.compression` property, in any writable file tree; every committed state
+passes the independent namespace audit. Names held only in extended references,
+subvolume and snapshot creation or deletion are unsupported.
 
 The allocator validates in one ordered pass that every extent lies inside a chunk
 and that block-group totals match, excludes all superblock stripes and rejects
@@ -102,7 +108,8 @@ remaining durability gates pass.
 
 Native data writeback, relocation trees and snapshot deletion, system-chunk
 growth, chunk removal and balance, free-space representation conversion, the v1 space cache, quotas, native read/write views and
-UBC/FSKit coherence; create/mkdir/link/unlink/rename/xattr mutations and orphan
-recovery; adapter use of superblock recovery and tree-log replay; LZO/alternate checksums/RAID;
+UBC/FSKit coherence; extended inode reference edits, subvolume and snapshot
+creation/deletion and cross-transaction directory index counters; adapter use of
+superblock recovery and tree-log replay; LZO/alternate checksums/RAID;
 full Linux authorization semantics; provisioning and mounted FSKit acceptance;
 matched Linux performance measurements.

@@ -47,7 +47,8 @@ The six reader profiles are `plain`, `small-nodes`, `large-nodes`, `zlib`, `zstd
 and `default-subvolume`. The transaction suites require seven writable profiles
 without a free-space tree and mounted with `nospace_cache`, plus
 `transactions-fst` and `transactions-grow` with mkfs and mount defaults (16 KiB
-nodes, DUP metadata and a free-space tree): `transactions` (4 KiB
+nodes, DUP metadata and a free-space tree) and `transactions-namespace` (mkfs
+defaults with 4 KiB nodes and single metadata): `transactions` (4 KiB
 nodes, single metadata), `transactions-dup` (16 KiB nodes, DUP metadata),
 `transactions-large` (64 KiB nodes, DUP metadata), `transactions-full` (4 KiB
 nodes, single metadata, 128 MiB), and `transactions-shared`, `transactions-keyed`
@@ -71,6 +72,13 @@ other one so Linux keeps that data block group's free space as bitmaps. The
 growth profile fills data, then metadata with leaf-sized xattr files until
 ENOSPC, deletes the data and the newest 600 fillers, and runs `btrfs balance
 start -dusage=0`, leaving nearly full metadata and unallocated device space.
+The namespace profile (`transactions-namespace`, 4 KiB nodes, single metadata,
+mkfs defaults with a free-space tree) adds `/ns` with nested directories, a
+hard link, a reflinked data file, a FIFO and `/dev/null`'s device number, a
+NODATACOW and a COMPRESS directory, directories with `btrfs.compression`
+properties `zstd` and `no`, two directory entries and two xattrs whose names
+share one CRC32C hash, and a file with 41 links whose 200-byte names exceed its
+INODE_REF item, so Linux stores 22 of them as extended references.
 Other profiles use 256 MiB. Each uses a separate disposable
 raw image and the payload in `tests/prepare_linux.py`. The payload formats **guest
 `/dev/vda`**, fills files, takes a snapshot, verifies Linux-visible contents,
@@ -125,7 +133,7 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all fifteen
+Linux checks and a completed VM exit before consuming the image. Repeat all sixteen
 profiles, then run the portable image and transaction suites. It hashes each complete image before
 and after reading, verifies 312 contracts, and fails if any byte changed.
 
@@ -204,6 +212,7 @@ scenarios on a recorded device. It never writes the source fixture.
 | `grow-*` (`--grow`) | Metadata and data chunk growth from unallocated device space |
 | `fst-*` (`--fragment`) | Frees between bitmap holes and a write that spills from extent-mode free space into bitmap holes |
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes |
+| `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item |
 
 `btrfs-reference-audit` is an independent reference oracle in the portable
 suite. It walks every tree from the superblock and root items, derives the
@@ -211,6 +220,13 @@ backreference every parent pointer and file extent item requires (shared forms
 under FULL_BACKREF parents), and compares the multiset and totals exactly with
 the extent tree, including leaks. It runs on every Linux fixture, after every
 scenario commit, and against deliberately damaged references.
+`tests/namespace_audit.c` is the matching namespace oracle: in every file tree
+each name must exist exactly once as DIR_ITEM, DIR_INDEX and inode or extended
+reference with equal index, inode and type; link counts must equal names,
+directory sizes twice their name lengths, and unlinked inodes must have orphan
+items. It runs on every Linux fixture, after every commit, in every crash state
+of the namespace scenarios, and against a committed wrong link count and wrong
+directory size.
 
 Each scenario's last commit runs allocation, read, write and barrier fault
 points: every point up to 512 per class, and a deterministic stride that keeps
@@ -224,13 +240,18 @@ invariant snapshots/xattrs/links, and admit the next transaction. The suite also
 checks admission, stale copies, recovery refusals and checksum-correct damaged
 allocation maps. `--full` adds the metadata-exhaustion case: the full profile's
 remaining metadata cannot hold a batch of all inline files, so the edit returns
-NO_SPACE without any write.
+NO_SPACE without any write. `--namespace` also checks that every refusal (about
+forty: names, types, read-only snapshots, subvolume entries, extended references,
+xattr limits, properties) and numbering or packed-item limit (last directory
+index, last inode number, the per-transaction directory bound, a full colliding
+DIR_ITEM) is decided before the first change and leaves the transaction able to
+commit.
 
 Export a profile's crash cases into a new generated directory. Pass the same
 profile flag Meson uses: `--full` for `transactions-full`, `--shared` for
 `transactions-shared`, `--keyed` for `transactions-keyed`, `--data` for
-`transactions-data`, `--data --fragment` for `transactions-fst` and `--grow`
-for `transactions-grow`. Reader
+`transactions-data`, `--data --fragment` for `transactions-fst`, `--grow`
+for `transactions-grow` and `--namespace` for `transactions-namespace`. Reader
 profiles with a free-space tree (`plain`, `small-nodes`) also run the default
 scenarios:
 
@@ -242,7 +263,11 @@ mkdir artifacts/transaction-plan-transactions
 
 Each scenario directory holds write payloads (`writes.tsv`), per-stage expected
 contents (`stages.tsv`), and one sector-run list per case plus the superblock
-writes this implementation's recovery chose. These are generated test inputs, not
+writes this implementation's recovery chose. Namespace scenarios add
+`namespace.tsv`: per stage, absent paths, file contents, exact sorted directory
+listings with their sizes, symlink targets, hard-link identity, xattr values and
+absence, mode/owner/link counts, device numbers, inode flags and incompat
+features, with payload files for expected bytes. These are generated test inputs, not
 a source ledger. About sixteen prefixes, ten metadata states and all superblock
 tear patterns are exported per commit; the portable test checks all of them.
 
@@ -267,15 +292,20 @@ python3 ../btrfs/tests/prepare_transactions_linux.py \
 The guest restores the working disk from the pristine `/dev/vdb` before every
 case and compares both disks after each scenario. For each case it applies the
 exported sector runs, then requires Linux to agree with the recorded outcome:
-`btrfs check --readonly`, the primary generation and exact tracked contents plus
-invariants for a valid primary, or a failed mount for a torn primary. For each
+`btrfs check --readonly`, the primary generation, exact tracked contents,
+invariants and the stage's namespace facts for a valid primary (with Linux's
+`ls`, `stat`, `readlink`, `getfattr` and its own `dump-tree` for inode flags),
+or a failed mount for a torn primary. For each
 recovery case it runs `btrfs rescue super-recover -y`, requires status 2 and the
 same resolved generation and contents, then repeats from the crash state with
 this implementation's recovery writes and requires Linux to find every copy
-valid. Finally Linux mounts the last scenario's newest root read-write, writes,
-syncs and passes `btrfs check`. Require `BTRFS_TRANSACTION_PASS:N` with the case
-count printed by the preparer and in its JSON, and an unchanged pristine copy and
-fixture. The oracle never runs `btrfs check --repair`. It proves on-disk
+valid. After each scenario's cases Linux mounts its newest root read-write
+(cleaning any orphans the scenario left), writes, syncs and passes `btrfs check`
+with no orphan item left in the top-level tree; the guest then copies the
+pristine disk back whole. Require `BTRFS_TRANSACTION_NAMESPACE_CHECKS:M` and
+`BTRFS_TRANSACTION_PASS:N` with the counts printed by the preparer and in its
+JSON (the guest also compares the namespace count itself), and an unchanged
+pristine copy and fixture. The oracle never runs `btrfs check --repair`. It proves on-disk
 compatibility and Linux agreement for these states; actual native flush
 durability is a separate gate once native write callbacks exist.
 

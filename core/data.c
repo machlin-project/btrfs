@@ -358,7 +358,7 @@ bt_tx_reference(struct btrfs_transaction *transaction, const struct bt_owned_roo
 /* Removes file coverage of [start, end) the way btrfs_drop_extents does:
  * covered items go, overlapping ones are trimmed, moved or split, and the
  * file references change accordingly. removed reports the dropped bytes. */
-static enum btrfs_result
+enum btrfs_result
 bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
     uint64_t start, uint64_t end, uint64_t *removed)
 {
