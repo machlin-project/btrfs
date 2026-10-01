@@ -38,7 +38,13 @@ already modified path allocates nothing. It updates payloads and child pointers
 without repacking the whole node. The reservation gap vector begins at 4 KiB and
 grows only when needed. Transaction begin still scans the full committed extent
 map; persistent allocation state and metadata caching need measurements before
-native writable throughput can be competitive.
+native writable throughput can be competitive. Each backreference edit copies its
+extent item into a fresh node-sized buffer and probes for keyed items with a new
+cursor, so a shared-subvolume commit costs several hundred allocations; the test
+output prints these counts per commit. New file data is staged in memory up to
+64 MiB per transaction and written once at commit; unaligned edges are read back
+through the private view. Streaming writeback, buffer reuse and extent-item
+caching are unmeasured follow-up work.
 
 ## Matched benchmark protocol
 

@@ -18,15 +18,17 @@ failures, mirror fallback, subvolume identity and structural I/O budgets.
 The XNU guest suite passes on four image profiles, including mmap, native user
 xattrs, Unix permissions, directory cookies, snapshots and concurrent reads.
 
-The writer can replace existing uncompressed inline files in any writable
-subvolume or snapshot, many per transaction. It updates CoW paths, shared and
-keyed extent backreferences with Linux's snapshot rules, block-group accounting,
-root items and superblock copies with three persistence barriers. An independent
-reference audit checks every committed state.
+The portable writer writes and truncates regular files as copy-on-write data
+with checksums, and replaces inline files, in any writable subvolume or
+snapshot, many operations per transaction. It updates CoW paths, shared and
+keyed extent backreferences with Linux's snapshot rules, data checksum items,
+block-group accounting, root items and superblock copies with three persistence
+barriers. An independent reference and checksum audit checks every committed
+state.
 Explicit superblock recovery resolves torn or disagreeing copies without rolling
 back an acknowledged generation. Linux agrees with the recorded outcome of
-reordered and torn crash states on six writable profiles. Native mounts remain
-read-only: data extents, namespace operations and native write coherence are
+reordered and torn crash states on seven writable profiles. Native mounts remain
+read-only: namespace operations, native writeback and write coherence are
 remaining work. See [acceptance](docs/ACCEPTANCE.md) and
 [the concrete handoff](docs/HANDOFF.md).
 

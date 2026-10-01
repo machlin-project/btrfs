@@ -28,13 +28,14 @@ main(int argc, char **argv)
 			fprintf(stderr, "%s: %s\n", argv[i], audit.failure);
 			failures++;
 		} else {
-			printf("%s: %zu trees, %zu blocks, %zu data extents; refs tree %zu, shared "
-			       "block "
-			       "%zu, data %zu, shared data %zu, keyed %zu; %zu full-backref blocks "
-			       "PASS\n",
+			printf(
+			    "%s: %zu trees, %zu blocks, %zu data extents; refs tree %zu, shared "
+			    "block "
+			    "%zu, data %zu, shared data %zu, keyed %zu; %zu full-backref blocks; "
+			    "%zu checksums PASS\n",
 			    argv[i], audit.trees, audit.blocks, audit.data_extents, audit.tree_refs,
 			    audit.shared_block_refs, audit.data_refs, audit.shared_data_refs,
-			    audit.keyed_refs, audit.full_backref_blocks);
+			    audit.keyed_refs, audit.full_backref_blocks, audit.checksums);
 		}
 		btrfs_unmount(fs);
 		btrfs_image_close(&image);

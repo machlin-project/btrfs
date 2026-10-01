@@ -9,7 +9,8 @@ warnings = ['-Wdeclaration-after-statement', '-Werror=conditional-uninitialized'
 add_project_arguments(cc.get_supported_arguments(warnings), language: 'c')
 sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
-  'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c')
+  'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
+  'core/data.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -74,6 +75,8 @@ if fixtures != ''
     args: [join_paths(fixtures, 'transactions-large.raw')], timeout: 180, suite: 'images')
   test('shared-references', transaction_test,
     args: ['--shared', join_paths(fixtures, 'transactions-shared.raw')], timeout: 300, suite: 'images')
+  test('data-extents', transaction_test,
+    args: ['--data', join_paths(fixtures, 'transactions-data.raw')], timeout: 300, suite: 'images')
   test('keyed-references', transaction_test,
     args: ['--keyed', join_paths(fixtures, 'transactions-keyed.raw')], timeout: 300, suite: 'images')
   test('linux-reference-audit', reference_audit, args: [
@@ -82,7 +85,8 @@ if fixtures != ''
     join_paths(fixtures, 'zstd.raw'), join_paths(fixtures, 'default-subvolume.raw'),
     join_paths(fixtures, 'transactions.raw'), join_paths(fixtures, 'transactions-dup.raw'),
     join_paths(fixtures, 'transactions-large.raw'), join_paths(fixtures, 'transactions-full.raw'),
-    join_paths(fixtures, 'transactions-shared.raw'), join_paths(fixtures, 'transactions-keyed.raw')],
+    join_paths(fixtures, 'transactions-shared.raw'), join_paths(fixtures, 'transactions-keyed.raw'),
+    join_paths(fixtures, 'transactions-data.raw')],
     suite: 'images')
   test('metadata-exhaustion', transaction_test,
     args: ['--full', join_paths(fixtures, 'transactions-full.raw')], timeout: 180, suite: 'images')

@@ -66,6 +66,20 @@ enum btrfs_result btrfs_transaction_begin(const struct btrfs_fs *base,
  * extents. Payloads are bounded by Btrfs's 2 KiB default inline-write policy. */
 enum btrfs_result btrfs_transaction_write_inline(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, const void *bytes, size_t size, struct btrfs_time modified);
+/* Copy-on-write file data, for regular files without set-id bits, immutable or
+ * append-only flags, on filesystems with NO_HOLES. Partially covered sectors
+ * are read from this transaction's own view and rewritten; old extents keep
+ * their references until commit drops them and are never reused before the
+ * next transaction. New data stays in memory (at most 64 MiB per transaction)
+ * and reaches media during commit before the first barrier. Checksums follow
+ * the inode's NODATASUM flag. Inline files become regular extents. Writes past
+ * an unaligned EOF clear the old EOF sector's tail; truncation clears the new
+ * EOF sector's tail and drops coverage beyond it. */
+enum btrfs_result btrfs_transaction_write(struct btrfs_transaction *transaction,
+    struct btrfs_object_id id, uint64_t offset, const void *bytes, size_t size,
+    struct btrfs_time modified);
+enum btrfs_result btrfs_transaction_truncate(struct btrfs_transaction *transaction,
+    struct btrfs_object_id id, uint64_t size, struct btrfs_time modified);
 enum btrfs_result btrfs_transaction_commit(struct btrfs_transaction *transaction);
 void btrfs_transaction_destroy(struct btrfs_transaction *transaction);
 

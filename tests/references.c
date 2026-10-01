@@ -32,6 +32,17 @@ struct extent_record {
 	int matched;
 };
 
+struct range {
+	uint64_t start;
+	uint64_t end;
+};
+
+struct range_list {
+	struct range *items;
+	size_t count;
+	size_t capacity;
+};
+
 struct audit_state {
 	const struct btrfs_fs *fs;
 	struct reference_audit *audit;
@@ -43,6 +54,8 @@ struct audit_state {
 	uint64_t *visited;
 	size_t visited_count;
 	size_t visited_capacity;
+	struct range_list required;
+	struct range_list checksummed;
 	int failed;
 };
 
@@ -77,10 +90,40 @@ grow(void *items, size_t *capacity, size_t count, size_t size)
 }
 
 static void
+add_range(struct range_list *list, uint64_t start, uint64_t end)
+{
+	if (list->count != 0 && list->items[list->count - 1].end == start) {
+		list->items[list->count - 1].end = end;
+		return;
+	}
+	list->items = grow(list->items, &list->capacity, list->count, sizeof(*list->items));
+	list->items[list->count++] = (struct range){ start, end };
+}
+
+static void
 add_reference(struct reference_list *list, struct reference reference)
 {
 	list->items = grow(list->items, &list->capacity, list->count, sizeof(*list->items));
 	list->items[list->count++] = reference;
+}
+
+/* The extent starting at or below bytenr. */
+static struct extent_record *
+find_containing(struct audit_state *state, uint64_t bytenr)
+{
+	size_t low = 0;
+	size_t high = state->extent_count;
+	size_t middle;
+
+	while (low < high) {
+		middle = low + (high - low) / 2;
+		if (state->extents[middle].bytenr <= bytenr) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low == 0 ? NULL : &state->extents[low - 1];
 }
 
 static struct extent_record *
@@ -340,13 +383,15 @@ expect_tree(struct audit_state *state, uint64_t child, uint64_t parent, uint64_t
 }
 
 static void
-expect_data(
-    struct audit_state *state, uint64_t leaf, uint64_t owner, const struct bt_record *record)
+expect_data(struct audit_state *state, uint64_t tree, uint64_t leaf, uint64_t owner,
+    const struct bt_record *record)
 {
 	const struct bt_disk_extent *file = (const void *)record->data;
 	struct extent_record *parent = find_extent(state, leaf);
 	struct extent_record *extent;
 	struct reference reference;
+	struct btrfs_object_id id;
+	struct btrfs_inode inode;
 
 	if (record->size < sizeof(*file) ||
 	    (file->header.type != BT_EXTENT_REGULAR && file->header.type != BT_EXTENT_PREALLOC)) {
@@ -365,6 +410,28 @@ expect_data(
 		return;
 	}
 	extent->matched = 1;
+	/* Written data of a checksummed file needs checksums for the stored bytes
+	 * it uses: the whole extent when compressed, else its referenced range. */
+	if (bt_file_tree(tree) && file->header.type == BT_EXTENT_REGULAR) {
+		id.tree = tree;
+		id.inode = record->key.objectid;
+		if (btrfs_get_inode(state->fs, id, &inode) != BTRFS_OK) {
+			fail(state, "file extent of missing inode %llu:%llu",
+			    (unsigned long long)tree, (unsigned long long)id.inode);
+			return;
+		}
+		if (!(inode.flags & BT_INODE_NODATASUM)) {
+			state->required.items =
+			    grow(state->required.items, &state->required.capacity,
+				state->required.count, sizeof(*state->required.items));
+			state->required.items[state->required.count++] =
+			    file->header.compression != 0
+			    ? (struct range){ extent->bytenr, extent->bytenr + extent->length }
+			    : (struct range){ extent->bytenr + bt_u64(file->offset),
+				      extent->bytenr + bt_u64(file->offset) +
+					  bt_u64(file->length) };
+		}
+	}
 	memset(&reference, 0, sizeof(reference));
 	reference.target = extent->bytenr;
 	reference.count = 1;
@@ -426,7 +493,8 @@ walk(struct audit_state *state, struct bt_root root, uint64_t parent, uint64_t o
 				record.data =
 				    (const uint8_t *)(header + 1) + bt_u32(items[i].offset);
 				record.size = bt_u32(items[i].size);
-				expect_data(state, root.address, bt_u64(header->owner), &record);
+				expect_data(state, root.owner, root.address, bt_u64(header->owner),
+				    &record);
 				result = state->failed ? -1 : 0;
 			}
 		} else {
@@ -482,6 +550,115 @@ walk_roots(struct audit_state *state)
 	bt_cursor_fini(&cursor);
 	if (!state->failed && error != BTRFS_NOT_FOUND) {
 		return fail(state, "root tree walk: %s", btrfs_result_string(error));
+	}
+	return state->failed ? -1 : 0;
+}
+
+/* Checksum items arrive in key order and are merged when adjacent. */
+static int
+covered(const struct range_list *list, struct range wanted)
+{
+	size_t low = 0;
+	size_t high = list->count;
+	size_t middle;
+
+	while (low < high) {
+		middle = low + (high - low) / 2;
+		if (list->items[middle].start <= wanted.start) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low != 0 && list->items[low - 1].end >= wanted.end;
+}
+
+/* Every checksum item lies inside a data extent and matches the stored sectors;
+ * every data extent of a checksummed file is fully covered. */
+static int
+audit_checksums(struct audit_state *state)
+{
+	const struct btrfs_fs *fs = state->fs;
+	struct extent_record *extent;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key first = { .objectid = BT_CSUM_OBJECTID, .type = BT_EXTENT_CSUM };
+	struct bt_le32 stored;
+	uint8_t *sector;
+	uint64_t physical;
+	uint64_t length;
+	uint64_t position;
+	uint64_t end;
+	uint64_t i;
+	unsigned mirrors;
+	enum btrfs_result error;
+
+	sector = malloc(fs->info.sector_size);
+	if (sector == NULL) {
+		abort();
+	}
+	bt_cursor_init(&cursor, fs, fs->checksum_tree);
+	error = bt_cursor_seek(&cursor, first, 0);
+	while (error == BTRFS_OK && !state->failed) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.objectid != BT_CSUM_OBJECTID || record.key.type != BT_EXTENT_CSUM) {
+			break;
+		}
+		length = (uint64_t)(record.size / sizeof(stored)) * fs->info.sector_size;
+		if (record.size == 0 || record.size % sizeof(stored) != 0) {
+			fail(state, "malformed checksum item at %llu",
+			    (unsigned long long)record.key.offset);
+			break;
+		}
+		/* One item may cover several adjacent extents. */
+		for (position = record.key.offset; position < record.key.offset + length;
+		    position = end) {
+			extent = find_containing(state, position);
+			if (extent == NULL || !(extent->flags & BT_EXTENT_FLAG_DATA) ||
+			    position >= extent->bytenr + extent->length) {
+				fail(state, "checksum for %llu outside every data extent",
+				    (unsigned long long)position);
+				break;
+			}
+			end = extent->bytenr + extent->length < record.key.offset + length
+			    ? extent->bytenr + extent->length
+			    : record.key.offset + length;
+		}
+		add_range(&state->checksummed, record.key.offset, record.key.offset + length);
+		state->audit->checksums += record.size / sizeof(stored);
+		for (i = 0; i < record.size / sizeof(stored) && !state->failed; i++) {
+			mirrors = 1;
+			if (bt_map(fs, record.key.offset + i * fs->info.sector_size,
+				fs->info.sector_size, BT_BLOCK_DATA, 0, &physical,
+				&mirrors) != BTRFS_OK ||
+			    bt_read_physical(fs, physical, sector, fs->info.sector_size) !=
+				BTRFS_OK) {
+				fail(state, "unreadable checksummed sector %llu",
+				    (unsigned long long)(record.key.offset +
+					i * fs->info.sector_size));
+				break;
+			}
+			memcpy(&stored, record.data + i * sizeof(stored), sizeof(stored));
+			if (bt_u32(stored) !=
+			    ~bt_crc32c(UINT32_MAX, sector, fs->info.sector_size)) {
+				fail(state, "checksum mismatch at %llu",
+				    (unsigned long long)(record.key.offset +
+					i * fs->info.sector_size));
+			}
+		}
+		error = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	free(sector);
+	if (!state->failed && error != BTRFS_OK && error != BTRFS_NOT_FOUND) {
+		return fail(state, "checksum tree walk: %s", btrfs_result_string(error));
+	}
+	for (i = 0; !state->failed && i < state->required.count; i++) {
+		if (!covered(&state->checksummed, state->required.items[i])) {
+			fail(state, "written data %llu..%llu lacks checksums",
+			    (unsigned long long)state->required.items[i].start,
+			    (unsigned long long)state->required.items[i].end);
+		}
 	}
 	return state->failed ? -1 : 0;
 }
@@ -556,6 +733,9 @@ reference_audit(const struct btrfs_fs *fs, struct reference_audit *audit)
 	if (result == 0) {
 		result = walk_roots(&state);
 	}
+	if (result == 0) {
+		result = audit_checksums(&state);
+	}
 	for (i = 0; result == 0 && i < state.extent_count; i++) {
 		if (!state.extents[i].matched) {
 			result = fail(&state, "unreferenced extent %llu",
@@ -586,5 +766,7 @@ reference_audit(const struct btrfs_fs *fs, struct reference_audit *audit)
 	free(state.actual.items);
 	free(state.extents);
 	free(state.visited);
+	free(state.required.items);
+	free(state.checksummed.items);
 	return result;
 }

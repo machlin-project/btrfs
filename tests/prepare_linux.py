@@ -12,10 +12,11 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "zstd": (16384, "dup", "zstd"), "default-subvolume": (16384, "dup", ""),
             "transactions": (4096, "single", ""), "transactions-dup": (16384, "dup", ""),
             "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", ""),
-            "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", "")}
+            "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", ""),
+            "transactions-data": (4096, "single", "")}
 # Writable profiles avoid allocation features the writer does not maintain yet.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
-            "transactions-shared", "transactions-keyed"}
+            "transactions-shared", "transactions-keyed", "transactions-data"}
 # Enough inline files for a level-2 subvolume tree with 4 KiB nodes, so that a
 # snapshot shares internal nodes as well as leaves.
 SHARED_INLINE_FILES = 1600
@@ -29,6 +30,15 @@ PAIR_FILES = 120
 KEYED_FILES = 40
 KEYED_SNAPSHOTS = 30
 KEYED_REFLINKS = 30
+# Data-writer inputs: one multi-sector extent, an unaligned tail, holes, an
+# unwritten preallocation, a compressed extent, a no-checksum file, an inline
+# file and a reflink, then a writable and a read-only snapshot.
+DATA_BIG_BYTES = 1048576
+DATA_SMALL_BYTES = 10000
+DATA_SPARSE_BYTES = 4194304
+DATA_PREALLOC_BYTES = 262144
+DATA_ZLIB_BYTES = 262144
+DATA_NODATASUM_BYTES = 65536
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
@@ -156,6 +166,31 @@ btrfs filesystem sync /mnt
 cmp /mnt/keyed-29/r29 /mnt/keyed/origin
 btrfs inspect-internal dump-tree -t extent /dev/vda > /tmp/extent.txt
 echo BTRFS_REFERENCE_KEYED_REFS:$(grep -cE 'key \\([0-9]+ (TREE_BLOCK_REF|EXTENT_DATA_REF|SHARED_BLOCK_REF|SHARED_DATA_REF) ' /tmp/extent.txt || true)'''
+    if profile == "transactions-data":
+        fill = f'''btrfs subvolume create /mnt/data
+head -c {DATA_BIG_BYTES} /input/big > /mnt/data/big
+head -c {DATA_SMALL_BYTES} /input/random > /mnt/data/small
+truncate -s {DATA_SPARSE_BYTES} /mnt/data/sparse
+printf HOLE-A | dd of=/mnt/data/sparse bs=1 seek=1048576 conv=notrunc 2>/dev/null
+printf HOLE-B | dd of=/mnt/data/sparse bs=1 seek=3145728 conv=notrunc 2>/dev/null
+fallocate -l {DATA_PREALLOC_BYTES} /mnt/data/prealloc
+touch /mnt/data/zlib
+btrfs property set /mnt/data/zlib compression zlib
+head -c {DATA_ZLIB_BYTES} /input/big > /mnt/data/zlib
+touch /mnt/data/nodatasum
+chattr +C /mnt/data/nodatasum
+head -c {DATA_NODATASUM_BYTES} /input/random > /mnt/data/nodatasum
+printf 'inline data\\n' > /mnt/data/inline
+btrfs filesystem sync /mnt
+cp --reflink=always /mnt/data/big /mnt/data/big-clone
+btrfs filesystem sync /mnt
+btrfs subvolume snapshot /mnt/data /mnt/data-snap > /dev/null
+btrfs subvolume snapshot -r /mnt/data /mnt/data-ro > /dev/null
+btrfs filesystem sync /mnt
+btrfs inspect-internal dump-tree /dev/vda > /tmp/tree.txt
+echo BTRFS_REFERENCE_DATA_COMPRESSED:$(grep -c 'compression 1 (zlib)' /tmp/tree.txt || true)
+echo BTRFS_REFERENCE_DATA_PREALLOC:$(grep -c 'prealloc' /tmp/tree.txt || true)
+lsattr /mnt/data/nodatasum'''
     init = f'''#!/bin/busybox sh
 set -eu
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin

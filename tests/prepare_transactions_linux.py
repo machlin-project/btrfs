@@ -16,7 +16,7 @@ import shutil
 import subprocess
 
 SECTOR = 512
-MAX_WRITE = 65536
+MAX_WRITE = 1024 * 1024
 MAX_DEVICE = 1 << 30
 NAME = re.compile(r"^[a-z0-9-]+\.(bin|tsv)$")
 SCENARIO = re.compile(r"^[a-z0-9-]+$")

@@ -20,12 +20,13 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require fourteen passing test processes and all six reader profiles (312
-contracts). Six writable images are required by the transaction suites:
+Require fifteen passing test processes and all six reader profiles (312
+contracts). Seven writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
 fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
-references) and `transactions-keyed` (keyed backreferences). Missing fixtures
+references), `transactions-keyed` (keyed backreferences) and `transactions-data`
+(file data inputs with snapshots). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -44,6 +45,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Reservation allocator | Extent-map and block-group reconciliation, physical alias/super-stripe exclusion, pinned committed allocations, bounded free gaps | `core/space.c` |
 | Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission, reference/accounting fixed point, root/backup updates, three barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
 | Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, log/foreign-copy refusal, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
+| File data / checksums | CoW writes and truncation, drop-extents splitting, staged data, private read view, checksum items | `core/data.c`, `core/csum.c` |
 | Shared references / audit | Linux CoW reference rules, inline/keyed placement and ordering, FULL_BACKREF conversion; independent whole-filesystem reference audit | `core/backref.c`, `tests/references.c` |
 | Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
 | Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
@@ -73,12 +75,13 @@ only after successful durable publication; `seal` alone is not a commit.
    stay unsupported; data reference edits from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
-3. **Add data extents and checksums.** Extend allocator reservations beyond
-   metadata; support new regular extents, unaligned read-modify-CoW, holes,
-   preallocation conversion, truncation and compressed input as separate cases.
-   Update inode size/nbytes, checksum ranges and data backrefs together. Keep the
-   old extent pinned until publication and reader retirement. Preserve snapshot
-   data at every cut. Do not clear integrity or durability options to improve speed.
+3. **Extend file data.** `btrfs_transaction_write`/`_truncate` write CoW data
+   with checksums, holes, preallocated and compressed input, inline conversion
+   and snapshot-safe frees (`core/data.c`, `core/csum.c`). Remaining: in-place
+   preallocation conversion and NODATACOW overwrite for unshared extents (both
+   need their own crash cases), compression on write, data DUP and 64 KiB-sector
+   fixtures, explicit hole items for filesystems without NO_HOLES, and lifting
+   the 64 MiB staging bound with streaming writeback once native writers exist.
 4. **Maintain allocation features.** Add free-space tree/cache and block-group
    growth with their own Linux fixtures. Writable admission currently rejects
    free-space-tree/quotas/mixed groups/metadata UUID. Keep each rejection until
@@ -126,11 +129,7 @@ For each operation sequence and each device fault:
   recovery modes separately from successful recovery.
 
 The portable model covers every prefix, seeded reorder/tear states of the
-metadata epoch and six tear patterns per superblock epoch for the inline,
-shared and keyed scenarios on six profiles, each resolved through explicit
-recovery. The Linux
-oracle checks a bounded export of those states, including shared and keyed
-references. Data extents and namespace operations have no crash coverage yet.
+
 
 ## Performance work
 

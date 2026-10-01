@@ -209,6 +209,35 @@ reference not owned by the CoWing tree, fails the transaction before writing.
 Root `bytes_used` changes by one node per new block and per CoW'd original, as
 Linux records it for snapshots.
 
+## File data
+
+`btrfs_transaction_write` and `btrfs_transaction_truncate` change regular files
+as copy-on-write data on filesystems with NO_HOLES (`core/data.c`). The range is
+widened to whole sectors; partially covered sectors are read through a private
+view (mutation metadata overlay, staged data, the transaction's own checksum and
+file trees, and the adapter's codec), so later operations see earlier ones and
+compressed or preallocated input reads correctly. Existing coverage is removed
+the way `btrfs_drop_extents` does: covered items go, overlapping ones are
+trimmed, moved or split, keeping the reference key (file offset minus extent
+offset). New extents come from data block-group gaps, at most 128 MiB each, with
+a data extent item carrying the first reference inline, checksum items unless
+the inode is NODATASUM, and a regular file extent item. Inline files become
+regular extents. A write past an unaligned EOF clears the old EOF sector's tail;
+truncation clears the new EOF sector's tail and drops coverage beyond it. Inode
+size, `nbytes`, times, transid and sequence change together.
+
+New data stays in memory (at most 64 MiB and 4,096 extents per transaction) and
+is written during commit before the metadata, ahead of the first barrier, so a
+destroyed transaction leaves media untouched and a crash leaves new data
+unreferenced. File extent reference changes are queued and applied after the
+CoW-derived references of the same commit, additions before drops. A data
+extent losing its last reference loses its checksum items and block-group space
+in the same commit; ranges freed or allocated in a transaction are never reused
+by it, and the owner must retire readers of the old root before the next one.
+Preallocated ranges are rewritten by CoW, not converted in place; NODATACOW files
+are also written by CoW; data is never compressed on write. Set-id, immutable
+and append-only inodes are refused until their policy contracts exist.
+
 ## Superblock copies, publication and recovery
 
 Linux maintains a superblock copy at 64 KiB, 64 MiB and 256 GiB when the copy

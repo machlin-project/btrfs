@@ -21,10 +21,13 @@
 /* Device persistence is modeled per 512-byte sector: between two successful
  * barriers, issued writes may persist in any order and any subset of sectors. */
 #define DEVICE_SECTOR 512U
-#define WRITE_SECTORS (BT_MAX_NODE_SIZE / DEVICE_SECTOR)
+#define MAX_WRITE (1024U * 1024U)
+#define WRITE_SECTORS (MAX_WRITE / DEVICE_SECTOR)
 #define INLINE_LIMIT 2048U
 #define MAX_FILES 32U
 #define MAX_STAGES 4U
+#define MAX_OPERATIONS 32U
+#define MAX_FILE_BYTES (UINT64_C(16) * 1024 * 1024)
 #define MAX_RECOVERY_WRITES BTRFS_SUPER_COPIES
 #define METADATA_SAMPLES 32U
 #define EXPORT_SAMPLES 8U
@@ -41,6 +44,8 @@
 #define ABSENT_TREE UINT64_C(4000)
 #define SHARED_LAST 1599U
 #define PAIR_LAST 119U
+#define DATA_SCENARIO_BYTES 8192U
+#define EXHAUSTION_WRITE_BYTES (16U * 1024U * 1024U)
 #define SYNTHETIC_COMMIT SIZE_MAX
 
 enum fault { FAULT_NONE, FAULT_ALLOCATE, FAULT_READ, FAULT_WRITE, FAULT_FLUSH, FAULT_MODES };
@@ -75,15 +80,26 @@ struct tracked {
 	size_t size[MAX_STAGES];
 };
 
+enum operation_kind { OPERATION_INLINE, OPERATION_WRITE, OPERATION_TRUNCATE };
+
+struct operation {
+	size_t file;
+	enum operation_kind kind;
+	uint64_t offset;
+	uint8_t *data;
+	size_t size;
+};
+
 /* Source-controlled operation sequence: stage 0 is the Linux fixture and stage
- * k is the expected logical state after the k-th acknowledged commit. */
+ * k is the expected logical state after the k-th acknowledged commit, computed
+ * by applying that commit's operations to a byte model of each file. */
 struct plan {
 	const char *name;
 	struct tracked files[MAX_FILES];
 	size_t file_count;
 	size_t commits;
-	size_t updated[MAX_STAGES][MAX_FILES];
-	size_t update_count[MAX_STAGES];
+	struct operation operations[MAX_STAGES][MAX_OPERATIONS];
+	size_t operation_count[MAX_STAGES];
 };
 
 struct totals {
@@ -190,6 +206,16 @@ read_device(void *context, uint64_t offset, void *bytes, size_t size)
 	return error;
 }
 
+static enum btrfs_result
+decompress_device(void *context, enum btrfs_compression codec, const void *input, size_t input_size,
+    void *output, size_t output_size)
+{
+	struct device *device = context;
+
+	return device->image->environment.decompress(
+	    device->image->environment.context, codec, input, input_size, output, output_size);
+}
+
 static void *
 allocate(void *context, size_t size)
 {
@@ -213,7 +239,7 @@ record(struct device *device, uint64_t offset, const void *bytes, size_t size)
 	struct saved_write *grown;
 
 	REQUIRE(offset % DEVICE_SECTOR == 0 && size % DEVICE_SECTOR == 0 && size != 0 &&
-	    size <= BT_MAX_NODE_SIZE);
+	    size <= MAX_WRITE);
 	REQUIRE(offset <= device->image->environment.size_bytes &&
 	    size <= device->image->environment.size_bytes - offset);
 	if (device->count == device->capacity) {
@@ -328,25 +354,44 @@ check_invariants(struct btrfs_fs *fs)
 	check_text(fs, "/subvol/value", "subvolume changed\n");
 }
 
+static uint8_t *
+read_file(struct btrfs_fs *fs, const char *path, size_t *size)
+{
+	struct btrfs_inode inode;
+	uint8_t *buffer;
+	size_t completed;
+
+	REQUIRE(btrfs_image_lookup(fs, path, &inode) == BTRFS_OK);
+	REQUIRE(inode.size <= MAX_FILE_BYTES);
+	buffer = malloc((size_t)inode.size + 1);
+	REQUIRE(buffer != NULL);
+	REQUIRE(btrfs_read(fs, &inode, 0, buffer, (size_t)inode.size, &completed) == BTRFS_OK);
+	REQUIRE(completed == inode.size);
+	*size = completed;
+	return buffer;
+}
+
 static void
 check_stage(struct context *context, struct btrfs_fs *fs, const struct plan *plan, size_t stage)
 {
 	struct btrfs_info info;
-	struct btrfs_inode inode;
-	uint8_t buffer[INLINE_LIMIT + 1];
 	const struct tracked *file;
-	size_t completed;
+	uint8_t *contents;
+	size_t size;
 	size_t i;
 
 	btrfs_get_info(fs, &info);
 	REQUIRE(info.generation == context->base_generation + stage);
 	for (i = 0; i < plan->file_count; i++) {
 		file = &plan->files[i];
-		REQUIRE(btrfs_image_lookup(fs, file->path, &inode) == BTRFS_OK);
-		REQUIRE(inode.size == file->size[stage]);
-		REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
-		REQUIRE(completed == file->size[stage]);
-		REQUIRE(completed == 0 || memcmp(buffer, file->data[stage], completed) == 0);
+		contents = read_file(fs, file->path, &size);
+		if (size != file->size[stage] ||
+		    (size != 0 && memcmp(contents, file->data[stage], size) != 0)) {
+			fprintf(stderr, "%s stage %zu: %s differs (%zu bytes, expected %zu)\n",
+			    plan->name, stage, file->path, size, file->size[stage]);
+			exit(1);
+		}
+		free(contents);
 	}
 	check_invariants(fs);
 }
@@ -355,10 +400,7 @@ static size_t
 plan_file(struct context *context, struct plan *plan, const char *path)
 {
 	struct btrfs_fs *fs;
-	struct btrfs_inode inode;
 	struct tracked *file;
-	uint8_t buffer[INLINE_LIMIT + 1];
-	size_t completed;
 	size_t i;
 
 	for (i = 0; i < plan->file_count; i++) {
@@ -371,53 +413,102 @@ plan_file(struct context *context, struct plan *plan, const char *path)
 	memset(file, 0, sizeof(*file));
 	strcpy(file->path, path);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
-	REQUIRE(btrfs_image_lookup(fs, path, &inode) == BTRFS_OK);
-	REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
-	REQUIRE(completed <= INLINE_LIMIT && completed == inode.size);
+	file->data[0] = read_file(fs, path, &file->size[0]);
 	btrfs_unmount(fs);
-	file->size[0] = completed;
-	file->data[0] = malloc(completed + 1);
-	REQUIRE(file->data[0] != NULL);
-	memcpy(file->data[0], buffer, completed);
 	return plan->file_count++;
 }
 
 static void
-plan_update(struct context *context, struct plan *plan, size_t commit, const char *path,
-    const void *data, size_t size)
+plan_operation(struct context *context, struct plan *plan, size_t commit, const char *path,
+    enum operation_kind kind, uint64_t offset, const void *data, size_t size)
 {
-	struct tracked *file;
-	size_t index;
+	struct operation *operation;
 
-	REQUIRE(commit > 0 && commit < MAX_STAGES && size <= INLINE_LIMIT);
-	index = plan_file(context, plan, path);
-	file = &plan->files[index];
-	REQUIRE(file->data[commit] == NULL);
-	file->size[commit] = size;
-	file->data[commit] = malloc(size + 1);
-	REQUIRE(file->data[commit] != NULL);
-	memcpy(file->data[commit], data, size);
-	plan->updated[commit][plan->update_count[commit]++] = index;
+	REQUIRE(
+	    commit > 0 && commit < MAX_STAGES && plan->operation_count[commit] < MAX_OPERATIONS);
+	REQUIRE(kind != OPERATION_INLINE || size <= INLINE_LIMIT);
+	operation = &plan->operations[commit][plan->operation_count[commit]++];
+	operation->file = plan_file(context, plan, path);
+	operation->kind = kind;
+	operation->offset = offset;
+	operation->size = size;
+	operation->data = malloc(size + 1);
+	REQUIRE(operation->data != NULL);
+	if (size != 0) {
+		memcpy(operation->data, data, size);
+	}
 	if (commit > plan->commits) {
 		plan->commits = commit;
 	}
 }
 
 static void
+plan_update(struct context *context, struct plan *plan, size_t commit, const char *path,
+    const void *data, size_t size)
+{
+	plan_operation(context, plan, commit, path, OPERATION_INLINE, 0, data, size);
+}
+
+static void
+plan_write(struct context *context, struct plan *plan, size_t commit, const char *path,
+    uint64_t offset, const void *data, size_t size)
+{
+	plan_operation(context, plan, commit, path, OPERATION_WRITE, offset, data, size);
+}
+
+static void
+plan_truncate(
+    struct context *context, struct plan *plan, size_t commit, const char *path, uint64_t size)
+{
+	plan_operation(context, plan, commit, path, OPERATION_TRUNCATE, size, NULL, 0);
+}
+
+static void
+model_resize(struct tracked *file, size_t stage, uint64_t size)
+{
+	uint8_t *grown;
+
+	REQUIRE(size <= MAX_FILE_BYTES);
+	grown = realloc(file->data[stage], (size_t)size + 1);
+	REQUIRE(grown != NULL);
+	if (size > file->size[stage]) {
+		memset(grown + file->size[stage], 0, (size_t)size - file->size[stage]);
+	}
+	file->data[stage] = grown;
+	file->size[stage] = (size_t)size;
+}
+
+static void
 plan_finish(struct plan *plan)
 {
+	const struct operation *operation;
 	struct tracked *file;
 	size_t stage;
 	size_t i;
 
-	for (i = 0; i < plan->file_count; i++) {
-		file = &plan->files[i];
-		for (stage = 1; stage <= plan->commits; stage++) {
-			if (file->data[stage] == NULL) {
-				file->size[stage] = file->size[stage - 1];
-				file->data[stage] = malloc(file->size[stage] + 1);
-				REQUIRE(file->data[stage] != NULL);
-				memcpy(file->data[stage], file->data[stage - 1], file->size[stage]);
+	for (stage = 1; stage <= plan->commits; stage++) {
+		for (i = 0; i < plan->file_count; i++) {
+			file = &plan->files[i];
+			file->size[stage] = file->size[stage - 1];
+			file->data[stage] = malloc(file->size[stage] + 1);
+			REQUIRE(file->data[stage] != NULL);
+			memcpy(file->data[stage], file->data[stage - 1], file->size[stage]);
+		}
+		for (i = 0; i < plan->operation_count[stage]; i++) {
+			operation = &plan->operations[stage][i];
+			file = &plan->files[operation->file];
+			if (operation->kind == OPERATION_INLINE) {
+				model_resize(file, stage, operation->size);
+				memcpy(file->data[stage], operation->data, operation->size);
+			} else if (operation->kind == OPERATION_WRITE) {
+				if (operation->offset + operation->size > file->size[stage]) {
+					model_resize(
+					    file, stage, operation->offset + operation->size);
+				}
+				memcpy(file->data[stage] + operation->offset, operation->data,
+				    operation->size);
+			} else {
+				model_resize(file, stage, operation->offset);
 			}
 		}
 	}
@@ -432,6 +523,11 @@ plan_destroy(struct plan *plan)
 	for (i = 0; i < plan->file_count; i++) {
 		for (stage = 0; stage < MAX_STAGES; stage++) {
 			free(plan->files[i].data[stage]);
+		}
+	}
+	for (stage = 0; stage < MAX_STAGES; stage++) {
+		for (i = 0; i < plan->operation_count[stage]; i++) {
+			free(plan->operations[stage][i].data);
 		}
 	}
 }
@@ -556,7 +652,10 @@ export_begin(struct context *context, const struct plan *plan, struct exporter *
 	char name[64];
 	FILE *stages;
 	size_t stage;
+	size_t earlier;
 	size_t i;
+	size_t j = 0;
+	int found;
 
 	memset(exporter, 0, sizeof(*exporter));
 	if (context->export_root == NULL) {
@@ -568,10 +667,27 @@ export_begin(struct context *context, const struct plan *plan, struct exporter *
 	stages = export_open(exporter, "stages.tsv");
 	for (stage = 0; stage <= plan->commits; stage++) {
 		for (i = 0; i < plan->file_count; i++) {
-			REQUIRE(snprintf(name, sizeof(name), "stage-%zu-%02zu.bin", stage, i) <
-			    (int)sizeof(name));
-			export_bytes(
-			    exporter, name, plan->files[i].data[stage], plan->files[i].size[stage]);
+			/* Identical contents (snapshot copies, unchanged stages) share a file. */
+			found = 0;
+			for (earlier = 0; !found && earlier <= stage; earlier++) {
+				for (j = 0; !found && j < (earlier == stage ? i : plan->file_count);
+				    j++) {
+					found = plan->files[j].size[earlier] ==
+						plan->files[i].size[stage] &&
+					    memcmp(plan->files[j].data[earlier],
+						plan->files[i].data[stage],
+						plan->files[i].size[stage]) == 0;
+				}
+			}
+			if (found) {
+				REQUIRE(snprintf(name, sizeof(name), "stage-%zu-%02zu.bin",
+					    earlier - 1, j - 1) < (int)sizeof(name));
+			} else {
+				REQUIRE(snprintf(name, sizeof(name), "stage-%zu-%02zu.bin", stage,
+					    i) < (int)sizeof(name));
+				export_bytes(exporter, name, plan->files[i].data[stage],
+				    plan->files[i].size[stage]);
+			}
 			REQUIRE(fprintf(stages, "%zu\t%llu\t%s\t%s\n", stage,
 				    (unsigned long long)(context->base_generation + stage),
 				    plan->files[i].path, name) > 0);
@@ -787,12 +903,12 @@ static enum btrfs_result
 attempt(struct context *context, const struct plan *plan, size_t commit, enum fault fault,
     size_t point, struct totals *totals)
 {
-	struct btrfs_object_id ids[MAX_FILES];
+	struct btrfs_object_id ids[MAX_OPERATIONS];
 	struct btrfs_fs *fs;
 	struct btrfs_transaction *transaction = NULL;
 	struct btrfs_inode inode;
 	struct btrfs_time time = { 1700000000 + (int64_t)commit, 123456789 };
-	const struct tracked *file;
+	const struct operation *operation;
 	struct device *device = context->device;
 	uint64_t allocations;
 	uint64_t reads;
@@ -800,9 +916,9 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	enum btrfs_result result;
 
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
-	for (i = 0; i < plan->update_count[commit]; i++) {
-		REQUIRE(btrfs_image_lookup(
-			    fs, plan->files[plan->updated[commit][i]].path, &inode) == BTRFS_OK);
+	for (i = 0; i < plan->operation_count[commit]; i++) {
+		REQUIRE(btrfs_image_lookup(fs, plan->files[plan->operations[commit][i].file].path,
+			    &inode) == BTRFS_OK);
 		ids[i] = inode.id;
 	}
 	device->commit = commit;
@@ -816,10 +932,18 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	context->image.fail_allocate = fault == FAULT_ALLOCATE ? allocations + point : 0;
 	context->image.fail_read = fault == FAULT_READ ? reads + point : 0;
 	result = btrfs_transaction_begin(fs, &context->writer, &transaction);
-	for (i = 0; result == BTRFS_OK && i < plan->update_count[commit]; i++) {
-		file = &plan->files[plan->updated[commit][i]];
-		result = btrfs_transaction_write_inline(
-		    transaction, ids[i], file->data[commit], file->size[commit], time);
+	for (i = 0; result == BTRFS_OK && i < plan->operation_count[commit]; i++) {
+		operation = &plan->operations[commit][i];
+		if (operation->kind == OPERATION_INLINE) {
+			result = btrfs_transaction_write_inline(
+			    transaction, ids[i], operation->data, operation->size, time);
+		} else if (operation->kind == OPERATION_WRITE) {
+			result = btrfs_transaction_write(transaction, ids[i], operation->offset,
+			    operation->data, operation->size, time);
+		} else {
+			result = btrfs_transaction_truncate(
+			    transaction, ids[i], operation->offset, time);
+		}
 	}
 	if (result == BTRFS_OK) {
 		result = btrfs_transaction_commit(transaction);
@@ -1171,6 +1295,135 @@ keyed_scenarios(struct context *context)
 	keyed_update(context, &plan, 2, "keyed-07", "last");
 	keyed_update(context, &plan, 3, "keyed-29", "last");
 	keyed_update(context, &plan, 3, "keyed", "i39");
+	run_plan(context, &plan);
+}
+
+static void
+fill_pattern(uint8_t *data, size_t size, unsigned seed)
+{
+	size_t i;
+
+	for (i = 0; i < size; i++) {
+		data[i] = (uint8_t)(seed + i * 131U + (i >> 9));
+	}
+}
+
+static void
+track_data(struct context *context, struct plan *plan, const char *name)
+{
+	static const char *const trees[] = { "data", "data-snap", "data-ro" };
+	char path[32];
+	size_t i;
+
+	for (i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+		REQUIRE(snprintf(path, sizeof(path), "/%s/%s", trees[i], name) < (int)sizeof(path));
+		(void)plan_file(context, plan, path);
+	}
+}
+
+/* File data written as new extents: unaligned edges are rewritten from the
+ * transaction's view, old extents are trimmed, moved or split, and snapshots,
+ * reflinks, preallocation, compression and checksum policy are preserved. */
+static void
+data_scenarios(struct context *context)
+{
+	static uint8_t data[DATA_SCENARIO_BYTES];
+	struct plan plan;
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-overwrite";
+	track_data(context, &plan, "big");
+	plan_file(context, &plan, "/data/big-clone");
+	fill_pattern(data, 8192, 1);
+	plan_write(context, &plan, 1, "/data/big", 300000, data, 8192);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-append";
+	track_data(context, &plan, "small");
+	fill_pattern(data, 5000, 2);
+	plan_write(context, &plan, 1, "/data/small", 10000, data, 5000);
+	fill_pattern(data, 10, 3);
+	plan_write(context, &plan, 1, "/data/small", 4090, data, 10);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-hole";
+	track_data(context, &plan, "sparse");
+	fill_pattern(data, 4096, 4);
+	plan_write(context, &plan, 1, "/data/sparse", 2 * 1024 * 1024, data, 4096);
+	fill_pattern(data, 100, 5);
+	plan_write(context, &plan, 1, "/data/sparse", 6 * 1024 * 1024 + 7, data, 100);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-prealloc";
+	track_data(context, &plan, "prealloc");
+	fill_pattern(data, 4096, 6);
+	plan_write(context, &plan, 1, "/data/prealloc", 65536, data, 4096);
+	fill_pattern(data, 100, 7);
+	plan_write(context, &plan, 1, "/data/prealloc", 1000, data, 100);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-truncate";
+	track_data(context, &plan, "big");
+	track_data(context, &plan, "small");
+	track_data(context, &plan, "sparse");
+	track_data(context, &plan, "zlib");
+	plan_truncate(context, &plan, 1, "/data/big", 100001);
+	plan_truncate(context, &plan, 1, "/data/small", 20000);
+	plan_truncate(context, &plan, 1, "/data/sparse", 0);
+	plan_truncate(context, &plan, 2, "/data/big", 300000);
+	plan_truncate(context, &plan, 2, "/data/zlib", 5000);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-compressed";
+	track_data(context, &plan, "zlib");
+	fill_pattern(data, 4096, 8);
+	plan_write(context, &plan, 1, "/data/zlib", 65536, data, 4096);
+	fill_pattern(data, 7, 9);
+	plan_write(context, &plan, 1, "/data/zlib", 100003, data, 7);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-nodatasum";
+	track_data(context, &plan, "nodatasum");
+	fill_pattern(data, 5000, 10);
+	plan_write(context, &plan, 1, "/data/nodatasum", 3000, data, 5000);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-inline";
+	track_data(context, &plan, "inline");
+	fill_pattern(data, 5000, 11);
+	plan_write(context, &plan, 1, "/data/inline", 0, data, 5000);
+	plan_write(context, &plan, 2, "/data/inline", 9000, "X", 1);
+	run_plan(context, &plan);
+
+	/* The source and its writable snapshot overwrite shared extents in turn;
+	 * the third commit drops the first commit's extent entirely. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-snapshot";
+	track_data(context, &plan, "big");
+	fill_pattern(data, 4096, 12);
+	plan_write(context, &plan, 1, "/data/big", 0, data, 4096);
+	fill_pattern(data, 8192, 13);
+	plan_write(context, &plan, 2, "/data-snap/big", 4096, data, 8192);
+	fill_pattern(data, 4096, 14);
+	plan_write(context, &plan, 3, "/data/big", 0, data, 4096);
+	run_plan(context, &plan);
+
+	/* Overlapping writes in one transaction read each other's staged data. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "data-overlap";
+	track_data(context, &plan, "small");
+	fill_pattern(data, 4096, 15);
+	plan_write(context, &plan, 1, "/data/small", 0, data, 4096);
+	fill_pattern(data, 4096, 16);
+	plan_write(context, &plan, 1, "/data/small", 2048, data, 4096);
+	plan_truncate(context, &plan, 1, "/data/small", 3000);
 	run_plan(context, &plan);
 }
 
@@ -1752,7 +2005,9 @@ exhaustion_test(struct context *context)
 	struct btrfs_time time = { 1700000000, 0 };
 	struct bt_space *space;
 	struct bt_root extents;
+	struct btrfs_inode inode;
 	uint8_t data[INLINE_LIMIT];
+	uint8_t *big;
 	uint64_t logical;
 	size_t available = 0;
 	size_t count = 0;
@@ -1792,11 +2047,24 @@ exhaustion_test(struct context *context)
 	REQUIRE(context->device->count == 0 && context->device->issued == 0 &&
 	    context->device->flushes == 0);
 	btrfs_transaction_destroy(transaction);
+	/* Data space is exhausted as well: a large write fails before any I/O. */
+	big = malloc(EXHAUSTION_WRITE_BYTES);
+	REQUIRE(big != NULL);
+	memset(big, 0x5a, EXHAUSTION_WRITE_BYTES);
+	REQUIRE(btrfs_image_lookup(fs, "/big", &inode) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_write(
+		    transaction, inode.id, 0, big, EXHAUSTION_WRITE_BYTES, time) == BTRFS_NO_SPACE);
+	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_NO_SPACE);
+	REQUIRE(context->device->count == 0 && context->device->issued == 0);
+	btrfs_transaction_destroy(transaction);
+	free(big);
 	check_invariants(fs);
 	btrfs_unmount(fs);
 	free(ids);
 	REQUIRE(context->image.live_allocations == 0);
-	printf("metadata exhaustion: %zu reservable nodes, %zu files stopped after %zu edits; "
+	printf("metadata and data exhaustion: %zu reservable nodes, %zu files stopped after %zu "
+	       "edits; "
 	       "no write PASS\n",
 	    available, count, i);
 }
@@ -1811,6 +2079,7 @@ main(int argc, char **argv)
 	int full = 0;
 	int shared = 0;
 	int keyed = 0;
+	int data = 0;
 	int i;
 
 	context = calloc(1, sizeof(*context));
@@ -1824,6 +2093,8 @@ main(int argc, char **argv)
 			shared = 1;
 		} else if (strcmp(argv[i], "--keyed") == 0) {
 			keyed = 1;
+		} else if (strcmp(argv[i], "--data") == 0) {
+			data = 1;
 		} else {
 			REQUIRE(image == NULL);
 			image = argv[i];
@@ -1839,7 +2110,7 @@ main(int argc, char **argv)
 	context->env.read = read_device;
 	context->env.allocate = allocate;
 	context->env.release = release;
-	context->env.decompress = NULL;
+	context->env.decompress = decompress_device;
 	context->writer =
 	    (struct btrfs_write_environment){ context->device, write_device, flush_device };
 	context->seed = UINT32_C(0x142857);
@@ -1863,6 +2134,9 @@ main(int argc, char **argv)
 	}
 	if (keyed) {
 		keyed_scenarios(context);
+	}
+	if (data) {
+		data_scenarios(context);
 	}
 	REQUIRE(context->image.live_allocations == 0);
 	btrfs_image_close(&context->image);
