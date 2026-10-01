@@ -163,6 +163,40 @@ check_holes() {
     test "$count" = "$2" || { echo "holes of $1: $count" >&2; return 1; }
 }
 
+# 1 when the block group holding the file's first data extent keeps its free
+# space as bitmaps, by Linux's own dumps of the file's tree and the free-space
+# tree.
+check_bitmaps() {
+    inode=$(stat -c '%i' "$1")
+    address=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+        awk -v inode="$inode" '
+        $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
+        inside && ($1 == "extent" || $1 == "prealloc") && $2 == "data" && $3 == "disk" &&
+            $4 == "byte" && $5 != 0 { print $5; exit }')
+    flags=$(btrfs inspect-internal dump-tree -t free-space /dev/vda |
+        awk -v address="$address" '
+        $1 == "item" && $5 == "FREE_SPACE_INFO" {
+            start = substr($4, 2) + 0; size = $6 + 0
+            inside = address + 0 >= start && address + 0 < start + size; next }
+        inside && $1 == "free" && $2 == "space" && $3 == "info" { print $8; exit }')
+    test -n "$address" && test "$flags" = "$2" ||
+        { echo "bitmaps of $1: $address $flags" >&2; return 1; }
+}
+
+# GROUPS:SYSTEM: chunk items and block group items in Linux's dumps (they
+# agree), and entries of the superblock's system chunk array. Only leaf item
+# lines count; internal nodes print their children's first keys as well.
+check_groups() {
+    chunks=$(btrfs inspect-internal dump-tree -t chunk /dev/vda |
+        grep -c 'item [0-9]* key (FIRST_CHUNK_TREE CHUNK_ITEM ' || true)
+    groups=$(btrfs inspect-internal dump-tree -t extent /dev/vda |
+        grep -c 'item [0-9]* key ([0-9]* BLOCK_GROUP_ITEM ' || true)
+    system=$(btrfs inspect-internal dump-super -f /dev/vda |
+        grep -c 'item [0-9]* key (FIRST_CHUNK_TREE CHUNK_ITEM ' || true)
+    test "$chunks" = "${1%%:*}" && test "$groups" = "${1%%:*}" && test "$system" = "${1#*:}" ||
+        { echo "groups: $chunks chunks, $groups block groups, $system system entries" >&2; return 1; }
+}
+
 # A NODATACOW overwrite reaches the disk before its commit: a state of commit
 # $commit resolving to the previous stage may hold, device sector by sector, the
 # old or the new bytes inside the scenario's volatile ranges (volatile.tsv).
@@ -220,6 +254,8 @@ check_namespace() {
         compressed) check_compressed "$target" "$arg" ;;
         extents) check_extents "$target" "$arg" ;;
         holes) check_holes "$target" "$arg" ;;
+        bitmaps) check_bitmaps "$target" "$arg" ;;
+        groups) check_groups "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"

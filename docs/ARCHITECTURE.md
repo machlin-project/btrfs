@@ -230,19 +230,35 @@ map: every stripe has exactly one extent, extents do not overlap, stay inside
 the device and above Linux's reserved first MiB, and sum to the device's used
 bytes. The gaps between them are the device's unallocated space.
 
-When a data or metadata reservation finds no free range, the allocator creates
-a chunk of that class in memory only: the next logical address after the last
-chunk, the profile of an existing chunk of the class (DUP gives two stripes),
-a tenth of the device rounded down to 1 MiB and capped at 1 GiB for data or
-256 MiB for metadata, halved until the stripes fit in unallocated space. It
-never edits trees from inside the editor's callback. The commit fixed point
-then inserts the chunk item and updates the device item in the chunk tree,
-inserts device extents, the block group (whose total follows each round) and,
-with a free-space tree, its info item and one free extent before any logged
-allocation inside it is applied. Chunk-tree blocks come from system chunks,
-which are never grown, so the superblock's system array never changes; the
-superblock records the new chunk root and device usage. A destroyed
-transaction discards the private chunks with everything else.
+When a reservation finds no free range, the allocator creates a chunk of that
+class in memory only: the next logical address after the last chunk, the
+profile of an existing chunk of the class (DUP gives two stripes), a tenth of
+the device rounded down to 1 MiB and capped at 1 GiB for data, 256 MiB for
+metadata or 32 MiB for system chunks, halved until the stripes fit in
+unallocated space. Before a data or metadata chunk is added or a group removed,
+a system chunk is created first when free system space is below what one chunk
+item and one device item update may need (24 nodes, Linux's
+`check_system_chunk`); chunk-tree blocks that find no system space grow one
+too. It never edits trees from inside the editor's callback. The commit fixed
+point then inserts the chunk item and updates the device item in the chunk
+tree, inserts device extents, the block group (whose total follows each round)
+and, with a free-space tree, its info item and one free extent before any
+logged allocation inside it is applied. A system chunk's key and item are also
+appended to the superblock's system array (`btrfs_add_system_chunk`), the only
+place a reader finds chunk-tree blocks that live in it; the superblock records
+the new chunk root and device usage. A destroyed transaction discards the
+private chunks with everything else.
+
+`btrfs_transaction_remove_unused_groups` is Linux's cleaner pass
+`btrfs_delete_unused_bgs`: a block group that held nothing when the transaction
+began and has not been allocated from or freed in since (Linux skips groups
+with pinned bytes, so a group emptied in a transaction waits for the next one)
+is removed unless it is the last of its type and profile or has a v1
+space-cache inode. Its gap leaves the allocator at once; at commit its block
+group item, free-space items, device extents and chunk item go (and its system
+array entry for a system group), and the device item's used bytes shrink. The
+device space becomes allocatable in the next transaction, never in this one,
+since the committed root set still maps it.
 
 ## Free-space tree
 
@@ -255,9 +271,15 @@ round of the commit fixed point applies the logged changes to the free-space
 tree in the block group's current representation: free extents are trimmed,
 split or merged, bitmaps flip one bit per sector, and the info item's extent
 count tracks free runs. Changes to the free-space tree allocate and free blocks
-themselves, which later rounds apply until nothing is pending. Block groups are
-not converted between extents and bitmaps, and items of block groups that no
-longer exist are left as Linux leaves them.
+themselves, which later rounds apply until nothing is pending. A change of the
+extent count converts the group at once, as Linux's
+`update_free_space_extent_count` does: above the high threshold its free
+extent items become bitmap items of 2,048 sectors each (the last one shorter),
+below the low threshold its bitmaps become one extent item per run. The high
+threshold is the number of 25-byte items that would take the room of the
+group's bitmap items with their headers, the low one 100 less (0 for groups of
+up to 64 MiB with 4 KiB sectors). Items of block groups that no longer exist
+are left as Linux leaves them.
 
 ## File data
 

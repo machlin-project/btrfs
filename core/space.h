@@ -24,6 +24,15 @@ enum btrfs_result bt_space_create(
 enum btrfs_result bt_space_devices(
     struct bt_space *space, struct bt_root chunk_tree, struct bt_root device_tree);
 enum btrfs_result bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum);
+/* Linux's check_system_chunk before a chunk is added or removed: grows a
+ * system chunk when free system space is below the nodes one chunk item and
+ * one device item update may need; failing to grow is not an error. */
+enum btrfs_result bt_space_check_system(struct bt_space *space);
+/* Whether a group of the committed state held nothing and this transaction has
+ * neither allocated nor freed anything in it. */
+int bt_space_unused(const struct bt_space *space, size_t chunk);
+/* Takes an unused group out of allocation and marks it removed. */
+void bt_space_retire(struct bt_space *space, size_t chunk);
 /* Chunks at or after this index were created by growth in this transaction. */
 size_t bt_space_original_chunks(const struct bt_space *space);
 void bt_space_allocator(struct bt_space *space, struct bt_mutation_allocator *allocator);

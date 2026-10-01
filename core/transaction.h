@@ -165,6 +165,8 @@ enum btrfs_result bt_tx_queue(struct btrfs_transaction *transaction, struct bt_k
 /* Applies queued file references; a data extent whose last reference goes
  * loses its checksums and its block-group space. */
 enum btrfs_result bt_tx_apply_refs(struct btrfs_transaction *transaction);
+/* Deletes the items of every group marked removed (core/group.c). */
+enum btrfs_result bt_tx_remove_groups(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_drop_range(struct btrfs_transaction *transaction,
     struct bt_owned_root *tree, uint64_t inode, uint64_t start, uint64_t end, uint64_t *removed);
 void bt_tx_release_data(struct btrfs_transaction *transaction);

@@ -758,6 +758,23 @@ bt_tx_backup(struct btrfs_transaction *transaction)
 	bt_put64(&backup->devices, 1);
 }
 
+static enum btrfs_result
+bt_tx_system_array_add(
+    struct btrfs_transaction *transaction, struct bt_key key, const void *item, size_t size)
+{
+	struct bt_disk_key wire;
+	uint32_t used = bt_u32(transaction->super.system_array_size);
+
+	if (used > BT_SYSTEM_ARRAY_SIZE || sizeof(wire) + size > BT_SYSTEM_ARRAY_SIZE - used) {
+		return BTRFS_NO_SPACE;
+	}
+	bt_key_encode(&wire, key);
+	bt_copy(transaction->super.system_array + used, &wire, sizeof(wire));
+	bt_copy(transaction->super.system_array + used + sizeof(wire), item, size);
+	bt_put32(&transaction->super.system_array_size, used + (uint32_t)(sizeof(wire) + size));
+	return BTRFS_OK;
+}
+
 /* Records chunks created by growth: chunk item and device item in the chunk
  * tree, device extents, the block group (its total follows each round) and,
  * with a free-space tree, its info and one free extent before any logged
@@ -799,8 +816,13 @@ bt_tx_publish_chunks(struct btrfs_transaction *transaction)
 			bt_copy(item.stripes[stripe].uuid, base->device_uuid, BTRFS_UUID_SIZE);
 		}
 		key = (struct bt_key){ BT_FIRST_CHUNK_OBJECTID, chunk->logical, BT_CHUNK_ITEM };
-		error = bt_tx_edit(transaction, &transaction->chunks, key, &item,
-		    sizeof(item.chunk) + chunk->mirrors * sizeof(item.stripes[0]), BT_INSERT);
+		size = sizeof(item.chunk) + chunk->mirrors * sizeof(item.stripes[0]);
+		error = bt_tx_edit(transaction, &transaction->chunks, key, &item, size, BT_INSERT);
+		/* Chunk-tree blocks may live in a new system chunk, so the superblock's
+		 * bootstrap array names it too (btrfs_add_system_chunk). */
+		if (error == BTRFS_OK && (chunk->type & BT_BLOCK_SYSTEM) != 0) {
+			error = bt_tx_system_array_add(transaction, key, &item, size);
+		}
 		for (stripe = 0; error == BTRFS_OK && stripe < chunk->mirrors; stripe++) {
 			bt_zero(&extent, sizeof(extent));
 			bt_put64(&extent.chunk_tree, BT_CHUNK_TREE);
@@ -916,6 +938,9 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 	    transaction->uuids.root.address != bt_u64(transaction->uuids.item.legacy.bytenr)) {
 		error = bt_tx_update_root(transaction, &transaction->uuids);
 	}
+	if (error == BTRFS_OK) {
+		error = bt_tx_remove_groups(transaction);
+	}
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -934,6 +959,9 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 				return error;
 			}
 			chunk = &transaction->fs.chunks[i];
+			if (chunk->removed) {
+				continue;
+			}
 			bt_put64(&item.used_bytes, bt_space_used(transaction->space, i));
 			bt_put64(&item.chunk_objectid, BT_FIRST_CHUNK_OBJECTID);
 			bt_put64(&item.flags, chunk->type);

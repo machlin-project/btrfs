@@ -11,8 +11,17 @@
  * longer exist are left alone, as Linux does. */
 enum btrfs_result bt_fst_verify(
     const struct btrfs_fs *fs, struct bt_root tree, struct bt_root extents);
+/* Linux's set_free_space_tree_thresholds for a block group of length bytes:
+ * free extent items take more room than the group's bitmaps above high; a
+ * bitmap group returns to extent items below low (high minus 100, or 0). */
+void bt_fst_thresholds(uint64_t sector, uint64_t length, uint32_t *high, uint32_t *low);
+/* Deletes the info item and every free extent or bitmap item of a block group
+ * being removed, as remove_block_group_free_space does. */
+enum btrfs_result bt_fst_remove_group(
+    struct bt_mutation *mutation, struct bt_root *tree, const struct bt_chunk *chunk);
 /* Marks [start, start + length) of the chunk allocated (removed from free
- * space) or freed, keeping the block group's representation and extent count. */
+ * space) or freed and updates the block group's extent count; a count past a
+ * threshold converts the group between extent items and bitmaps at once. */
 enum btrfs_result bt_fst_change(struct bt_mutation *mutation, struct bt_root *tree,
     const struct bt_chunk *chunk, uint64_t start, uint64_t length, int allocate);
 

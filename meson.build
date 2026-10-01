@@ -10,7 +10,8 @@ add_project_arguments(cc.get_supported_arguments(warnings), language: 'c')
 sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
-  'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c')
+  'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c',
+  'core/group.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -86,6 +87,14 @@ if fixtures != ''
   test('holes-and-dup-data', transaction_test,
     args: ['--data', '--holes', join_paths(fixtures, 'transactions-holes.raw')], timeout: 600,
     suite: 'images')
+  test('free-space-conversion', transaction_test,
+    args: ['--convert', join_paths(fixtures, 'transactions-convert.raw')], timeout: 600,
+    suite: 'images')
+  test('block-group-removal', transaction_test,
+    args: ['--groups', join_paths(fixtures, 'transactions.raw')], timeout: 300, suite: 'images')
+  test('block-group-removal-dup', transaction_test,
+    args: ['--groups', join_paths(fixtures, 'transactions-dup.raw')], timeout: 300,
+    suite: 'images')
   test('free-space-tree', transaction_test,
     args: ['--data', '--fragment', join_paths(fixtures, 'transactions-fst.raw')], timeout: 600,
     suite: 'images')
@@ -104,7 +113,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-data.raw'), join_paths(fixtures, 'transactions-fst.raw'),
     join_paths(fixtures, 'transactions-grow.raw'),
     join_paths(fixtures, 'transactions-namespace.raw'),
-    join_paths(fixtures, 'transactions-holes.raw')],
+    join_paths(fixtures, 'transactions-holes.raw'),
+    join_paths(fixtures, 'transactions-convert.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

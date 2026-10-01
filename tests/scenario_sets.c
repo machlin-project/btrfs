@@ -603,6 +603,131 @@ holes_scenarios(struct context *context)
 	run_plan(context, &plan);
 }
 
+/* Both conversions of one 112 MiB data block group (thresholds 157 and 57,
+ * which Linux itself crossed at 158 and 56 when it wrote the fixture). A
+ * filler takes the free space before the group's tail, so new one-sector
+ * files lie side by side there; removing every other one pushes the count
+ * past the high threshold and the group becomes bitmaps; removing the rest
+ * merges the runs below the low threshold and it returns to extent items. */
+void
+convert_scenarios(struct context *context)
+{
+	static uint8_t data[FST_FILE_BYTES];
+	static uint8_t filler[CONVERT_FILLER_BYTES];
+	struct plan plan;
+	char path[64];
+	size_t i;
+
+	fill_random(data, sizeof(data), 52);
+	fill_pattern(filler, sizeof(filler), 53);
+	namespace_plan(context, &plan, "fst-round-trip");
+	plan_create(&plan, 1, "/convert/more", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/convert/more", 0, filler, sizeof(filler));
+	for (i = 0; i < CONVERT_FILES; i++) {
+		REQUIRE(snprintf(path, sizeof(path), "/convert/r%03zu", i) < (int)sizeof(path));
+		plan_create(&plan, 1, path, BTRFS_MODE_REGULAR | 0644, NULL);
+		plan_write_new(&plan, 1, path, 0, data, sizeof(data));
+		plan_unlink(&plan, i % 2 == 1 ? 2 : 3, path, 0);
+	}
+	expect_bitmaps(&plan, 0, 1, "/convert/anchor", 0);
+	expect_bitmaps(&plan, 2, 2, "/convert/anchor", 1);
+	expect_bitmaps(&plan, 3, LAST_STAGE, "/convert/anchor", 0);
+	expect_absent(&plan, 3, LAST_STAGE, "/convert/r000");
+	run_plan(context, &plan);
+}
+
+/* A group whose last extents this transaction freed stays until the next
+ * one, as Linux keeps a group with pinned bytes. Data frees land at commit,
+ * so this test frees /sparse's sectors at once, as the cleaner frees blocks. */
+static void
+groups_pinned_test(struct context *context)
+{
+	const struct bt_disk_extent *extent;
+	struct btrfs_inode inode;
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key;
+	size_t removed = 1;
+	size_t freed = 0;
+	enum btrfs_result result;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(fs, "/sparse", &inode) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, inode.id.tree, &root) == BTRFS_OK);
+	key = (struct bt_key){ inode.id.inode, 0, BT_EXTENT_DATA };
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != inode.id.inode || record.key.type != BT_EXTENT_DATA) {
+			break;
+		}
+		extent = (const void *)record.data;
+		if (record.size == sizeof(*extent) && bt_u64(extent->disk_bytenr) != 0) {
+			REQUIRE(
+			    bt_space_change_used(transaction->space, bt_u64(extent->disk_bytenr),
+				bt_u64(extent->disk_bytes), 0) == BTRFS_OK);
+			freed++;
+		}
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	REQUIRE(freed != 0);
+	REQUIRE(btrfs_transaction_remove_unused_groups(transaction, &removed) == BTRFS_OK);
+	REQUIRE(removed == 0);
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
+	REQUIRE(context->image.live_allocations == 0);
+	printf("groups-pinned: a group emptied in the transaction stays PASS\n");
+}
+
+/* Block groups come and go as on Linux. Removing /sparse empties the 32 MiB
+ * data group holding its two sectors; like btrfs_delete_unused_bgs, the
+ * cleaner keeps it in that commit (its space was freed there) and removes it
+ * in the next: block group, free-space items, device extents and chunk item go
+ * and the device item shrinks. A later write needs a new data chunk, which
+ * takes the device space back. A chunk tree that outgrows its system chunk
+ * gets a new one through the superblock's system array, and the emptied old
+ * system group is removed from both. */
+void
+groups_scenarios(struct context *context)
+{
+	static uint8_t data[GROUPS_WRITE_BYTES];
+	struct plan plan;
+	struct btrfs_fs *fs;
+	uint64_t groups;
+
+	groups_pinned_test(context);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	groups = fs->chunk_count;
+	btrfs_unmount(fs);
+	fill_random(data, sizeof(data), 61);
+	namespace_plan(context, &plan, "groups-remove");
+	plan_unlink(&plan, 1, "/sparse", 0);
+	plan_remove_groups(&plan, 1, 0);
+	plan_remove_groups(&plan, 2, 1);
+	plan_create(&plan, 3, "/grown", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 3, "/grown", 0, data, sizeof(data));
+	expect_groups(&plan, 0, 1, groups, 1);
+	expect_groups(&plan, 2, 2, groups - 1, 1);
+	expect_groups(&plan, 3, LAST_STAGE, groups, 1);
+	expect_file(&plan, 3, LAST_STAGE, "/grown", data, sizeof(data));
+	run_plan(context, &plan);
+
+	namespace_plan(context, &plan, "groups-system");
+	plan_system_growth(&plan, 1);
+	plan_create(&plan, 1, "/system-grown", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_remove_groups(&plan, 2, 1);
+	expect_groups(&plan, 0, 0, groups, 1);
+	expect_groups(&plan, 1, 1, groups + 1, 2);
+	expect_groups(&plan, 2, LAST_STAGE, groups, 1);
+	run_plan(context, &plan);
+}
+
 /* A data block group whose free space Linux keeps as bitmaps: freeing a file
  * between two holes merges runs, and a write larger than the first group's
  * free tail allocates the remaining sectors from bitmap holes. */

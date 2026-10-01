@@ -1609,6 +1609,35 @@ namespace_flag_refusals(struct context *context)
 	printf("immutable, append-only and set-id refusals PASS\n");
 }
 
+/* Removing every other one of 200 one-sector files leaves about a hundred
+ * free extents in their data block group, past its high threshold: the group
+ * converts to bitmaps in that commit, as Linux's
+ * update_free_space_extent_count does. */
+static void
+namespace_fst_bitmaps_plan(struct context *context)
+{
+	static uint8_t data[FST_FILE_BYTES];
+	struct plan plan;
+	char path[64];
+	size_t i;
+
+	fill_random(data, sizeof(data), 51);
+	namespace_plan(context, &plan, "fst-bitmaps");
+	plan_create(&plan, 1, "/ns/fst", BTRFS_MODE_DIRECTORY | 0755, NULL);
+	for (i = 0; i < FST_FILES; i++) {
+		REQUIRE(snprintf(path, sizeof(path), "/ns/fst/f%03zu", i) < (int)sizeof(path));
+		plan_create(&plan, 1, path, BTRFS_MODE_REGULAR | 0644, NULL);
+		plan_write_new(&plan, 1, path, 0, data, sizeof(data));
+		if (i % 2 == 1) {
+			plan_unlink(&plan, 2, path, 0);
+		}
+	}
+	expect_bitmaps(&plan, 1, 1, "/ns/fst/f000", 0);
+	expect_bitmaps(&plan, 2, LAST_STAGE, "/ns/fst/f000", 1);
+	expect_file(&plan, 2, LAST_STAGE, "/ns/fst/f198", data, sizeof(data));
+	run_plan(context, &plan);
+}
+
 void
 namespace_scenarios(struct context *context)
 {
@@ -1634,4 +1663,5 @@ namespace_scenarios(struct context *context)
 	namespace_zstd_plan(context);
 	namespace_nocow_plan(context);
 	namespace_nocow_exclusive(context);
+	namespace_fst_bitmaps_plan(context);
 }

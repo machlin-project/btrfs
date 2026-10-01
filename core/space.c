@@ -6,6 +6,11 @@
 #define BT_CHUNK_ALIGN (UINT64_C(1) << 20)
 #define BT_CHUNK_DATA_MAX (UINT64_C(1) << 30)
 #define BT_CHUNK_METADATA_MAX (UINT64_C(256) << 20)
+#define BT_CHUNK_SYSTEM_MAX (UINT64_C(32) << 20)
+/* Linux's check_system_chunk: system space for one device item update
+ * (btrfs_calc_metadata_size, nodes for BTRFS_MAX_LEVEL levels, twice) and one
+ * chunk item insertion (btrfs_calc_insert_metadata_size), in nodes. */
+#define BT_SYSTEM_RESERVE_NODES (BT_MAX_LEVEL * 2U + BT_MAX_LEVEL)
 
 struct bt_gap {
 	uint64_t start, end;
@@ -282,11 +287,39 @@ bt_space_take(struct bt_gaps *device, uint64_t length, uint64_t *physical)
 	return 0;
 }
 
+/* Free system space this transaction can still hand out. */
+static uint64_t
+bt_space_system_free(const struct bt_space *space)
+{
+	uint64_t free = 0;
+	size_t i;
+
+	for (i = space->system.next; i < space->system.count; i++) {
+		free += space->system.items[i].end - space->system.items[i].start;
+	}
+	return free;
+}
+
+enum btrfs_result
+bt_space_check_system(struct bt_space *space)
+{
+	enum btrfs_result error = BTRFS_OK;
+
+	/* As Linux, a failed system chunk is ignored: the chunk tree may not need
+	 * all of the reserve. */
+	if (bt_space_system_free(space) <
+	    (uint64_t)BT_SYSTEM_RESERVE_NODES * space->fs->info.node_size) {
+		error = bt_space_grow(space, BT_BLOCK_SYSTEM, 0);
+	}
+	return error == BTRFS_NO_SPACE ? BTRFS_OK : error;
+}
+
 /* Creates a chunk of the given class from unallocated device space, in memory
  * only: the chunk map, block-group accounting and gaps grow now, and the
  * transaction publishes chunk, device-extent, device, block-group and
- * free-space items before writing. Profiles copy an existing chunk of the
- * class. Undone with the whole transaction. */
+ * free-space items (and a system chunk's superblock array entry) before
+ * writing. Profiles copy an existing chunk of the class. Undone with the whole
+ * transaction. */
 enum btrfs_result
 bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 {
@@ -297,7 +330,9 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	uint64_t type = 0;
 	uint64_t logical = 0;
 	uint64_t length;
-	uint64_t limit = kind == BT_BLOCK_DATA ? BT_CHUNK_DATA_MAX : BT_CHUNK_METADATA_MAX;
+	uint64_t limit = kind == BT_BLOCK_DATA ? BT_CHUNK_DATA_MAX
+	    : kind == BT_BLOCK_SYSTEM	       ? BT_CHUNK_SYSTEM_MAX
+					       : BT_CHUNK_METADATA_MAX;
 	uint64_t physical[2];
 	size_t i;
 	unsigned stripes;
@@ -308,10 +343,17 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	if (!space->growth || fs->chunk_count == BT_MAX_CHUNKS) {
 		return BTRFS_NO_SPACE;
 	}
+	/* The chunk item and device item updates need system space first. */
+	if (kind != BT_BLOCK_SYSTEM) {
+		error = bt_space_check_system(space);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+	}
 	for (i = 0; i < fs->chunk_count; i++) {
 		if ((fs->chunks[i].type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) ==
 			kind &&
-		    type == 0) {
+		    !fs->chunks[i].removed && type == 0) {
 			type = fs->chunks[i].type;
 		}
 		if (fs->chunks[i].logical + fs->chunks[i].length > logical) {
@@ -394,11 +436,8 @@ bt_space_reserve(void *context, uint64_t owner, uint8_t level, uint64_t *logical
 			}
 			list->next++;
 		}
-		/* System chunks would need superblock bootstrap updates; never grown. */
-		if (owner == BT_CHUNK_TREE) {
-			return BTRFS_NO_SPACE;
-		}
-		error = bt_space_grow(space, BT_BLOCK_METADATA, size);
+		error = bt_space_grow(
+		    space, owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM : BT_BLOCK_METADATA, size);
 		if (error != BTRFS_OK) {
 			return error;
 		}
@@ -674,6 +713,43 @@ size_t
 bt_space_original_chunks(const struct bt_space *space)
 {
 	return space->original_chunks;
+}
+
+int
+bt_space_unused(const struct bt_space *space, size_t chunk)
+{
+	const struct bt_chunk *group = &space->fs->chunks[chunk];
+	const struct bt_gaps *list = bt_space_class((struct bt_space *)space, group);
+	size_t i;
+
+	if (chunk >= space->original_chunks || group->removed || space->used[chunk] != 0 ||
+	    list == NULL) {
+		return 0;
+	}
+	/* Gaps are never returned, so an untouched whole-group gap means this
+	 * transaction neither allocated nor freed anything there. */
+	for (i = list->next; i < list->count; i++) {
+		if (list->items[i].start == group->logical &&
+		    list->items[i].end == group->logical + group->length) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void
+bt_space_retire(struct bt_space *space, size_t chunk)
+{
+	struct bt_chunk *group = &space->fs->chunks[chunk];
+	struct bt_gaps *list = bt_space_class(space, group);
+	size_t i;
+
+	for (i = list->next; i < list->count; i++) {
+		if (list->items[i].start == group->logical) {
+			list->items[i].start = list->items[i].end;
+		}
+	}
+	group->removed = 1;
 }
 
 void

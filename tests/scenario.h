@@ -105,6 +105,22 @@
 #define COLLISION_BLOCK_BYTES 8U
 #define COLLISION_BLOCKS 10U
 #define COLLISION_NAME_BYTES (COLLISION_BLOCK_BYTES * COLLISION_BLOCKS)
+/* Files whose alternate removal fragments one data block group's free space
+ * past its bitmap threshold. */
+#define FST_FILES 200U
+#define FST_FILE_BYTES 4096U
+/* A file needing a new data chunk once an emptied data group is removed. */
+#define GROUPS_WRITE_BYTES (4U * 1024U * 1024U)
+/* The convert fixture's one-sector files (see tests/prepare_linux.py), and a
+ * filler larger than the free space before the 112 MiB group's tail. */
+#define CONVERT_FILES 480U
+#define CONVERT_FILLER_BYTES (8U * 1024U * 1024U)
+/* Linux's free-space-tree thresholds: sectors per bitmap item, its bytes, the
+ * size of struct btrfs_item and the margin between the thresholds. */
+#define LINUX_FREE_SPACE_BITMAP_BITS 2048U
+#define LINUX_FREE_SPACE_BITMAP_BYTES 256U
+#define LINUX_ITEM_BYTES 25U
+#define LINUX_FREE_SPACE_MARGIN 100U
 /* Linux's PATH_MAX, one more than the longest symlink target. */
 #define LINUX_PATH_MAX 4096U
 
@@ -165,7 +181,9 @@ enum operation_kind {
 	OPERATION_SUBVOLUME,
 	OPERATION_SNAPSHOT,
 	OPERATION_DELETE_SUBVOLUME,
-	OPERATION_CLEAN_SUBVOLUMES
+	OPERATION_CLEAN_SUBVOLUMES,
+	OPERATION_REMOVE_GROUPS,
+	OPERATION_SYSTEM_GROWTH
 };
 
 /* Operations name objects by path. A path created, renamed or removed by an
@@ -212,7 +230,9 @@ enum expectation_kind {
 	EXPECT_DELETED,
 	EXPECT_COMPRESSED,
 	EXPECT_EXTENTS,
-	EXPECT_HOLES
+	EXPECT_HOLES,
+	EXPECT_BITMAPS,
+	EXPECT_GROUPS
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -243,7 +263,10 @@ struct expectation {
 	 * links regular and mode inline ones, and none with another codec.
 	 * EXPECT_EXTENTS: links regular and mode preallocated file extent items,
 	 * referencing value distinct disk extents. EXPECT_HOLES: value hole
-	 * items (disk_bytenr 0). */
+	 * items (disk_bytenr 0). EXPECT_BITMAPS: value 1 when the block group
+	 * holding the file's first data extent keeps its free space as bitmaps.
+	 * EXPECT_GROUPS: value block groups (chunk items and block group items
+	 * alike), links entries in the superblock's system chunk array. */
 	/* EXPECT_TIMES: seconds of the access and modification times. */
 	int64_t access_seconds;
 	int64_t modify_seconds;
@@ -451,6 +474,11 @@ void expect_compressed(struct plan *plan, size_t first, size_t last, const char 
 void expect_extents(struct plan *plan, size_t first, size_t last, const char *path,
     uint32_t regular, uint32_t prealloc, uint64_t distinct);
 void expect_holes(struct plan *plan, size_t first, size_t last, const char *path, uint64_t holes);
+void expect_bitmaps(struct plan *plan, size_t first, size_t last, const char *path, int bitmaps);
+void expect_groups(
+    struct plan *plan, size_t first, size_t last, uint64_t groups, uint32_t system_entries);
+void plan_remove_groups(struct plan *plan, size_t commit, size_t removed);
+void plan_system_growth(struct plan *plan, size_t commit);
 void plan_volatile(
     struct plan *plan, size_t commit, const char *path, uint64_t offset, uint64_t length);
 
@@ -469,6 +497,8 @@ void keyed_scenarios(struct context *context);
 void data_scenarios(struct context *context);
 void fragment_scenarios(struct context *context);
 void holes_scenarios(struct context *context);
+void convert_scenarios(struct context *context);
+void groups_scenarios(struct context *context);
 void grow_scenarios(struct context *context);
 
 /* Scenario sets. */

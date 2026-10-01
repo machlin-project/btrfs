@@ -127,7 +127,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
 		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
-		"subvolumes", "deleted", "compressed", "extents", "holes" };
+		"subvolumes", "deleted", "compressed", "extents", "holes", "bitmaps", "groups" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -136,7 +136,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	size_t stage;
 	size_t i;
 
-	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_HOLES + 1, "expectation kinds");
+	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_GROUPS + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
@@ -190,12 +190,19 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 				    e->value == BTRFS_COMPRESSION_ZLIB ? "zlib" : "zstd", e->links,
 				    e->mode) < (int)sizeof(argument));
 			detail = argument;
+		} else if (e->kind == EXPECT_GROUPS) {
+			/* block groups:system array entries */
+			REQUIRE(
+			    snprintf(argument, sizeof(argument), "%llu:%u",
+				(unsigned long long)e->value, e->links) < (int)sizeof(argument));
+			detail = argument;
 		} else if (e->kind == EXPECT_EXTENTS) {
 			/* regular:preallocated:distinct disk extents */
 			REQUIRE(snprintf(argument, sizeof(argument), "%u:%u:%llu", e->links,
 				    e->mode, (unsigned long long)e->value) < (int)sizeof(argument));
 			detail = argument;
-		} else if (e->kind == EXPECT_DELETED || e->kind == EXPECT_HOLES) {
+		} else if (e->kind == EXPECT_DELETED || e->kind == EXPECT_HOLES ||
+		    e->kind == EXPECT_BITMAPS) {
 			REQUIRE(snprintf(argument, sizeof(argument), "%llu",
 				    (unsigned long long)e->value) < (int)sizeof(argument));
 			detail = argument;
@@ -617,6 +624,8 @@ prepare_paths(struct path_table *table, struct btrfs_fs *fs, const struct operat
 		break;
 	case OPERATION_EVICT:
 	case OPERATION_CLEAN_ORPHANS:
+	case OPERATION_REMOVE_GROUPS:
+	case OPERATION_SYSTEM_GROWTH:
 		break;
 	case OPERATION_SUBVOLUME:
 	case OPERATION_DELETE_SUBVOLUME:
@@ -632,6 +641,33 @@ prepare_paths(struct path_table *table, struct btrfs_fs *fs, const struct operat
 		path_prepare(table, fs, operation->path, 0);
 		break;
 	}
+}
+
+/* Stands in for a chunk tree that has filled its system chunks: takes every
+ * remaining system-space reservation until the allocator grows a system
+ * chunk, so this commit's chunk-tree blocks must come from the new chunk,
+ * which only the superblock's system array can locate. */
+static enum btrfs_result
+system_growth(struct btrfs_transaction *transaction)
+{
+	struct bt_mutation_allocator allocator;
+	uint64_t logical = 0;
+	uint64_t steps;
+	size_t original = bt_space_original_chunks(transaction->space);
+	size_t i;
+	enum btrfs_result result = BTRFS_OK;
+
+	bt_space_allocator(transaction->space, &allocator);
+	for (steps = 0; result == BTRFS_OK && steps < RESERVATION_PROBE_LIMIT; steps++) {
+		result = allocator.reserve(allocator.context, BT_CHUNK_TREE, 0, &logical);
+		for (i = original; result == BTRFS_OK && i < transaction->fs.chunk_count; i++) {
+			if (logical - transaction->fs.chunks[i].logical <
+			    transaction->fs.chunks[i].length) {
+				return BTRFS_OK;
+			}
+		}
+	}
+	return result == BTRFS_OK ? BTRFS_UNSUPPORTED : result;
 }
 
 static enum btrfs_result
@@ -779,6 +815,16 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 			exit(1);
 		}
 		return result;
+	case OPERATION_REMOVE_GROUPS:
+		result = btrfs_transaction_remove_unused_groups(transaction, &cleaned);
+		if (result == BTRFS_OK && cleaned != operation->size) {
+			fprintf(stderr, "removed %zu block groups, expected %zu\n", cleaned,
+			    operation->size);
+			exit(1);
+		}
+		return result;
+	case OPERATION_SYSTEM_GROWTH:
+		return system_growth(transaction);
 	case OPERATION_SNAPSHOT:
 		id = path_object(table, operation->path, 0, NULL);
 		parent = path_object(table, operation->target, 1, &leaf);

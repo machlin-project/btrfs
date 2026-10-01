@@ -234,6 +234,15 @@ enum btrfs_result btrfs_transaction_snapshot(struct btrfs_transaction *transacti
  * snapshot) is removed alone. Adapters keep mounted or busy subvolumes. */
 enum btrfs_result btrfs_transaction_delete_subvolume(struct btrfs_transaction *transaction,
     struct btrfs_object_id parent, const void *name, size_t length, struct btrfs_time time);
+/* Removes block groups that held nothing when the transaction began and that
+ * it has not allocated from, as Linux's cleaner does with
+ * btrfs_delete_unused_bgs (a group emptied in this transaction waits for the
+ * next one). The last group of each type and profile stays, and so does a group
+ * with a v1 space-cache inode. Their chunk and device extents, block group and
+ * free-space items go at commit; their device space is free from the next
+ * transaction on. removed counts them. */
+enum btrfs_result btrfs_transaction_remove_unused_groups(
+    struct btrfs_transaction *transaction, size_t *removed);
 /* Drops deleted subvolumes, as Linux's cleaner does with btrfs_drop_snapshot:
  * references of their blocks and file extents go, blocks other trees share
  * are first converted to parent references when the deleted tree owns them,

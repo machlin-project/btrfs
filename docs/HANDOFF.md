@@ -20,8 +20,8 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require twenty-four passing test processes and all seven reader profiles (367
-contracts). Eleven writable images are required by the transaction suites:
+Require twenty-seven passing test processes and all seven reader profiles (367
+contracts). Twelve writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
 fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
@@ -30,7 +30,8 @@ references), `transactions-keyed` (keyed backreferences), `transactions-data`
 free-space tree in extent and bitmap form), `transactions-grow` (nearly full
 metadata with unallocated device space), `transactions-namespace` (name-hash
 collisions, extended references, compression properties) and
-`transactions-holes` (no NO_HOLES, DUP data). Missing fixtures
+`transactions-holes` (no NO_HOLES, DUP data) and `transactions-convert` (1 GiB with
+a free-space tree whose conversions Linux measured). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -90,17 +91,18 @@ only after successful durable publication; `seal` alone is not a commit.
    preallocated and unshared NODATACOW extents, with hole items on filesystems
    without NO_HOLES and both copies of DUP data. Remaining: a 64 KiB-sector
    fixture, an fallocate operation, an inode-flags operation (`chattr`) and a
-   compressor in the kernel adapter. New data is written as its extents are created, and files compress
-   on write as Linux decides.
+   compressor in the kernel adapter. New data is written as its extents are
+   created, and files compress on write as Linux decides.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
    siblings, and data and metadata chunks grow from unallocated device space
-   (`core/space.c`, `bt_tx_publish_chunks`). Remaining: system-chunk growth with
-   superblock system-array updates, removal of empty block groups, extent/bitmap
-   conversion at Linux's thresholds, the v1 space cache (`cache_generation` is
-   currently invalidated) with its own fixture, and quotas, mixed groups,
-   metadata UUID and the block-group tree, which stay rejected until each is
-   implemented and tested.
+   (`core/space.c`, `bt_tx_publish_chunks`); groups convert between free extent
+   items and bitmaps at Linux's thresholds; system chunks grow through the
+   superblock's system array and unused groups are removed by an explicit
+   cleaner pass (`core/group.c`), which native writers have yet to call.
+   Remaining: the v1 space cache (`cache_generation` is currently invalidated)
+   with its own fixture, and quotas, mixed groups, metadata UUID and the
+   block-group tree, which stay rejected until each is implemented and tested.
 5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
    orphan items for open inodes, eviction and orphan cleanup, atomic rename
    (replacement, cross-directory, between names of one inode), xattrs and the

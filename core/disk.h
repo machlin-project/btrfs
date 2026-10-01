@@ -38,6 +38,8 @@ struct bt_le64 {
 #define BT_CSUM_TREE UINT64_C(7)
 #define BT_QUOTA_TREE UINT64_C(8)
 #define BT_FREE_SPACE_TREE UINT64_C(10)
+/* Root-tree items (objectid, 0, block group) naming a v1 space-cache inode. */
+#define BT_FREE_SPACE_OBJECTID (UINT64_MAX - UINT64_C(10))
 #define BT_DATA_RELOC_TREE (UINT64_MAX - UINT64_C(8))
 #define BT_DEV_TREE UINT64_C(4)
 #define BT_UUID_TREE UINT64_C(9)

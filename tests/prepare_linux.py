@@ -16,7 +16,8 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-data": (4096, "single", ""), "transactions-fst": (16384, "dup", ""),
             "transactions-grow": (16384, "dup", ""),
             "transactions-namespace": (4096, "single", ""),
-            "transactions-holes": (4096, "dup", "")}
+            "transactions-holes": (4096, "dup", ""),
+            "transactions-convert": (4096, "single", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -28,6 +29,13 @@ WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transacti
 DATA_PROFILES = {"transactions-holes": "dup"}
 MKFS_FEATURES = {"transactions-holes": "-O ^no-holes"}
 HOLES_GROWN_BYTES = 1048576
+# The convert profile keeps mkfs defaults (a free-space tree) on 1 GiB, so data
+# block groups span enough bitmaps for both of Linux's conversion thresholds.
+# Linux removes every other one of these one-sector files, then the rest in
+# order, syncing after each removal, and records the free extent count at which
+# it converts the group to bitmaps and back.
+CONVERT_FILES = 480
+CONVERT_FILLER_MIB = 8
 # Enough inline files for a level-2 subvolume tree with 4 KiB nodes, so that a
 # snapshot shares internal nodes as well as leaves.
 SHARED_INLINE_FILES = 1600
@@ -71,7 +79,8 @@ NAMESPACE_DATA_BYTES = 65536
 EXTREF_NAME_BYTES = 200
 EXTREF_LINKS = 40
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
-                "transactions-holes": 512 * 1024 * 1024}
+                "transactions-holes": 512 * 1024 * 1024,
+                "transactions-convert": 1024 * 1024 * 1024}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
 FILL_REMOVE_STRIDE = 7
@@ -240,6 +249,66 @@ btrfs inspect-internal dump-tree /dev/vda > /tmp/tree.txt
 holes=$(grep -c 'extent data disk byte 0 nr 0' /tmp/tree.txt || true)
 echo BTRFS_REFERENCE_HOLE_ITEMS:$holes
 test "$holes" -gt 0'''
+    if profile == "transactions-convert":
+        fill = f'''mkdir /mnt/convert
+# The free extent count and flags of the block group holding disk byte $1, and
+# its length, from Linux's own free-space tree.
+group_of() {{
+    btrfs filesystem sync /mnt
+    blockdev --flushbufs /dev/vda
+    btrfs inspect-internal dump-tree -t free-space /dev/vda | awk -v address="$1" '
+        $1 == "item" && $5 == "FREE_SPACE_INFO" {{
+            start = substr($4, 2) + 0; size = $6 + 0
+            inside = address + 0 >= start && address + 0 < start + size; next }}
+        inside && $1 == "free" && $2 == "space" && $3 == "info" {{ print $6, $8, size; exit }}'
+}}
+dd if=/dev/zero of=/mnt/convert/filler bs=1048576 count={CONVERT_FILLER_MIB} 2>/dev/null
+btrfs filesystem sync /mnt
+head -c 4096 /input/random > /mnt/convert/anchor
+i=0
+while [ "$i" -lt {CONVERT_FILES} ]; do
+    head -c 4096 /input/random > /mnt/convert/f$(printf '%03d' "$i")
+    i=$((i + 1))
+done
+btrfs filesystem sync /mnt
+blockdev --flushbufs /dev/vda
+inode=$(stat -c '%i' /mnt/convert/anchor)
+address=$(btrfs inspect-internal dump-tree -t 5 /dev/vda | awk -v inode="$inode" '
+    $1 == "item" && $3 == "key" {{ inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }}
+    inside && $1 == "extent" && $2 == "data" && $3 == "disk" && $4 == "byte" {{ print $5; exit }}')
+set -- $(group_of "$address")
+bitmaps=$((($3 + 8388607) / 8388608))
+high=$((bitmaps * 281 / 25))
+low=0
+if [ "$high" -gt 100 ]; then
+    low=$((high - 100))
+fi
+echo BTRFS_REFERENCE_CONVERT_GROUP:$address:$3:$high:$low
+test "$low" -gt 0
+to_bitmaps=
+i=1
+while [ "$i" -lt {CONVERT_FILES} ]; do
+    rm /mnt/convert/f$(printf '%03d' "$i")
+    set -- $(group_of "$address")
+    if [ -z "$to_bitmaps" ] && [ "$2" = 1 ]; then
+        to_bitmaps=$1
+    fi
+    i=$((i + 2))
+done
+to_extents=
+i=0
+while [ -z "$to_extents" ] && [ "$i" -lt {CONVERT_FILES} ]; do
+    rm /mnt/convert/f$(printf '%03d' "$i")
+    set -- $(group_of "$address")
+    if [ "$2" = 0 ]; then
+        to_extents=$1
+    fi
+    i=$((i + 2))
+done
+echo BTRFS_REFERENCE_FST_TO_BITMAPS:$to_bitmaps
+echo BTRFS_REFERENCE_FST_TO_EXTENTS:$to_extents
+test "$to_bitmaps" = $((high + 1))
+test "$to_extents" = $((low - 1))'''
     if profile == "transactions-grow":
         # Fill data, then metadata until Linux reports ENOSPC; delete the data and
         # the newest fillers (whole leaves of room for balance's own transaction),

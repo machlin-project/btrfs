@@ -17,6 +17,8 @@ struct bt_root {
 struct bt_chunk {
 	uint64_t logical, length, type, physical[2];
 	uint8_t mirrors, confirmed;
+	/* A writer removes this unused block group at commit. */
+	uint8_t removed;
 };
 
 struct btrfs_fs {

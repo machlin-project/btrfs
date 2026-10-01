@@ -17,6 +17,55 @@ check_text(struct btrfs_fs *fs, const char *path, const char *expected)
 }
 
 /* Objects outside the transaction's write set keep their Linux contents. */
+/* Linux converts a block group's free space between extent items and bitmaps
+ * as soon as its extent count crosses a threshold, so no state holds an
+ * extent-mode group above the high threshold or a bitmap group below the low
+ * one (set_free_space_tree_thresholds, derived here independently). */
+static void
+check_free_space_thresholds(struct btrfs_fs *fs)
+{
+	const struct bt_disk_free_space_info *info;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key;
+	uint64_t range = (uint64_t)fs->info.sector_size * LINUX_FREE_SPACE_BITMAP_BITS;
+	uint64_t bitmaps;
+	uint64_t high;
+	uint64_t low;
+	uint32_t count;
+	size_t i;
+
+	if (bt_find_root(fs, BT_FREE_SPACE_TREE, &root) != BTRFS_OK) {
+		return;
+	}
+	for (i = 0; i < fs->chunk_count; i++) {
+		key = (struct bt_key){ fs->chunks[i].logical, fs->chunks[i].length,
+			BT_FREE_SPACE_INFO };
+		bt_cursor_init(&cursor, fs, root);
+		REQUIRE(bt_cursor_seek(&cursor, key, 0) == BTRFS_OK);
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		REQUIRE(bt_key_compare(record.key, key) == 0 && record.size == sizeof(*info));
+		info = (const void *)record.data;
+		bitmaps = (fs->chunks[i].length + range - 1) / range;
+		high =
+		    bitmaps * (LINUX_ITEM_BYTES + LINUX_FREE_SPACE_BITMAP_BYTES) / LINUX_ITEM_BYTES;
+		low = high > LINUX_FREE_SPACE_MARGIN ? high - LINUX_FREE_SPACE_MARGIN : 0;
+		count = bt_u32(info->extent_count);
+		if ((bt_u32(info->flags) & BT_FREE_SPACE_USING_BITMAPS) ? count < low
+									: count > high) {
+			fprintf(stderr,
+			    "block group %llu: %u free extents as %s (thresholds %llu, %llu)\n",
+			    (unsigned long long)fs->chunks[i].logical, count,
+			    (bt_u32(info->flags) & BT_FREE_SPACE_USING_BITMAPS) ? "bitmaps"
+										: "extents",
+			    (unsigned long long)low, (unsigned long long)high);
+			exit(1);
+		}
+		bt_cursor_fini(&cursor);
+	}
+}
+
 void
 check_invariants(struct btrfs_fs *fs)
 {
@@ -35,6 +84,7 @@ check_invariants(struct btrfs_fs *fs)
 	REQUIRE(length == strlen("Linux xattr") && memcmp(value, "Linux xattr", length) == 0);
 	check_text(fs, "/snapshot/value", "snapshot original\n");
 	check_text(fs, "/subvol/value", "subvolume changed\n");
+	check_free_space_thresholds(fs);
 }
 
 static uint8_t *
@@ -459,6 +509,112 @@ check_holes(struct btrfs_fs *fs, const struct plan *plan, size_t stage, const st
 }
 
 static void
+check_bitmaps(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
+    const struct expectation *e, const struct btrfs_inode *inode)
+{
+	const struct bt_disk_free_space_info *info;
+	const struct bt_disk_extent *extent;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key = { inode->id.inode, 0, BT_EXTENT_DATA };
+	uint64_t address = 0;
+	uint64_t bitmaps = 2;
+	size_t i;
+	enum btrfs_result result;
+
+	REQUIRE(bt_find_root(fs, inode->id.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK && address == 0) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != inode->id.inode || record.key.type != BT_EXTENT_DATA) {
+			break;
+		}
+		extent = (const void *)record.data;
+		if (record.size == sizeof(*extent)) {
+			address = bt_u64(extent->disk_bytenr);
+		}
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	REQUIRE(bt_find_root(fs, BT_FREE_SPACE_TREE, &root) == BTRFS_OK);
+	for (i = 0; address != 0 && i < fs->chunk_count; i++) {
+		if (address - fs->chunks[i].logical >= fs->chunks[i].length) {
+			continue;
+		}
+		key = (struct bt_key){ fs->chunks[i].logical, fs->chunks[i].length,
+			BT_FREE_SPACE_INFO };
+		bt_cursor_init(&cursor, fs, root);
+		REQUIRE(bt_cursor_seek(&cursor, key, 0) == BTRFS_OK);
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		REQUIRE(bt_key_compare(record.key, key) == 0 && record.size == sizeof(*info));
+		info = (const void *)record.data;
+		bitmaps = (bt_u32(info->flags) & BT_FREE_SPACE_USING_BITMAPS) != 0;
+		bt_cursor_fini(&cursor);
+	}
+	if (bitmaps != e->value) {
+		fprintf(stderr, "%s stage %zu: %s: data at %llu, bitmaps %llu\n", plan->name, stage,
+		    e->path, (unsigned long long)address, (unsigned long long)bitmaps);
+		for (i = 0; i < fs->chunk_count; i++) {
+			key = (struct bt_key){ fs->chunks[i].logical, fs->chunks[i].length,
+				BT_FREE_SPACE_INFO };
+			bt_cursor_init(&cursor, fs, root);
+			if (bt_cursor_seek(&cursor, key, 0) == BTRFS_OK &&
+			    bt_cursor_record(&cursor, &record) == BTRFS_OK &&
+			    record.size == sizeof(*info)) {
+				info = (const void *)record.data;
+				fprintf(stderr, "  group %llu: %u free extents, flags %u\n",
+				    (unsigned long long)fs->chunks[i].logical,
+				    bt_u32(info->extent_count), bt_u32(info->flags));
+			}
+			bt_cursor_fini(&cursor);
+		}
+		exit(1);
+	}
+}
+
+/* Block groups as chunk items and as block group items, which must agree,
+ * and the entries of the primary superblock's system chunk array. */
+static void
+check_groups(
+    struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e)
+{
+	const struct bt_disk_chunk *chunk;
+	struct bt_disk_super super;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key = { 0, 0, BT_BLOCK_GROUP_ITEM };
+	uint64_t groups = 0;
+	uint32_t entries = 0;
+	size_t offset = 0;
+	enum btrfs_result result;
+
+	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		groups += record.key.type == BT_BLOCK_GROUP_ITEM;
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	REQUIRE(fs->env.read(fs->env.context, BT_SUPER_OFFSET, &super, sizeof(super)) == BTRFS_OK);
+	while (offset < bt_u32(super.system_array_size)) {
+		chunk = (const void *)(super.system_array + offset + sizeof(struct bt_disk_key));
+		offset += sizeof(struct bt_disk_key) + sizeof(*chunk) +
+		    bt_u16(chunk->stripes) * sizeof(struct bt_disk_stripe);
+		entries++;
+	}
+	if (groups != fs->chunk_count || groups != e->value || entries != e->links) {
+		fprintf(stderr, "%s stage %zu: %zu chunks, %llu block groups, %u system entries\n",
+		    plan->name, stage, fs->chunk_count, (unsigned long long)groups, entries);
+		exit(1);
+	}
+}
+
+static void
 check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, size_t crash_commit,
     const struct expectation *e)
 {
@@ -571,6 +727,12 @@ check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, si
 		return;
 	case EXPECT_HOLES:
 		check_holes(fs, plan, stage, e, &inode);
+		return;
+	case EXPECT_BITMAPS:
+		check_bitmaps(fs, plan, stage, e, &inode);
+		return;
+	case EXPECT_GROUPS:
+		check_groups(fs, plan, stage, e);
 		return;
 	default:
 		REQUIRE(0);
@@ -956,6 +1118,18 @@ plan_clean_subvolumes(struct plan *plan, size_t commit, size_t budget, size_t dr
 }
 
 void
+plan_remove_groups(struct plan *plan, size_t commit, size_t removed)
+{
+	plan_namespace(plan, commit, OPERATION_REMOVE_GROUPS, "/", NULL)->size = removed;
+}
+
+void
+plan_system_growth(struct plan *plan, size_t commit)
+{
+	(void)plan_namespace(plan, commit, OPERATION_SYSTEM_GROWTH, "/", NULL);
+}
+
+void
 plan_snapshot(
     struct plan *plan, size_t commit, const char *source, const char *target, int read_only)
 {
@@ -1304,6 +1478,22 @@ void
 expect_holes(struct plan *plan, size_t first, size_t last, const char *path, uint64_t holes)
 {
 	expect(plan, first, last, EXPECT_HOLES, path)->value = holes;
+}
+
+void
+expect_bitmaps(struct plan *plan, size_t first, size_t last, const char *path, int bitmaps)
+{
+	expect(plan, first, last, EXPECT_BITMAPS, path)->value = bitmaps != 0;
+}
+
+void
+expect_groups(
+    struct plan *plan, size_t first, size_t last, uint64_t groups, uint32_t system_entries)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_GROUPS, "/");
+
+	e->value = groups;
+	e->links = system_entries;
 }
 
 void
