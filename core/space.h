@@ -31,6 +31,14 @@ void bt_space_allocator(struct bt_space *space, struct bt_mutation_allocator *al
  * callers repeat for the remainder. Ranges are never handed out twice. */
 enum btrfs_result bt_space_reserve_data(
     struct bt_space *space, uint64_t length, uint64_t *logical, uint64_t *size);
+/* Whether length bytes of data fit in free data space and in device space a
+ * new data chunk could take: Linux reserves a buffered write's data space
+ * before accepting it. */
+int bt_space_data_available(const struct bt_space *space, uint64_t length);
+/* Returns exactly length bytes of contiguous free data space (a compressed
+ * extent's size), from the first gap that holds them. */
+enum btrfs_result bt_space_reserve_exact(
+    struct bt_space *space, uint64_t length, uint64_t *logical);
 enum btrfs_result bt_space_change_used(
     struct bt_space *space, uint64_t address, uint64_t size, int allocate);
 uint64_t bt_space_used(const struct bt_space *space, size_t chunk);

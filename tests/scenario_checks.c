@@ -624,7 +624,9 @@ exhaustion_test(struct context *context)
 	REQUIRE(context->device->count == 0 && context->device->issued == 0 &&
 	    context->device->flushes == 0);
 	btrfs_transaction_destroy(transaction);
-	/* Data space is exhausted as well: a large write fails before any I/O. */
+	/* Data space is exhausted as well: a large write is refused before any
+	 * change or I/O, as Linux reserves data space at write time, and the
+	 * transaction stays usable. */
 	big = malloc(EXHAUSTION_WRITE_BYTES);
 	REQUIRE(big != NULL);
 	memset(big, 0x5a, EXHAUSTION_WRITE_BYTES);
@@ -632,7 +634,8 @@ exhaustion_test(struct context *context)
 	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
 	REQUIRE(btrfs_transaction_write(
 		    transaction, inode.id, 0, big, EXHAUSTION_WRITE_BYTES, time) == BTRFS_NO_SPACE);
-	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_NO_SPACE);
+	REQUIRE(transaction->failure == BTRFS_OK);
+	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
 	REQUIRE(context->device->count == 0 && context->device->issued == 0);
 	btrfs_transaction_destroy(transaction);
 	free(big);

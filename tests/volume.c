@@ -29,6 +29,7 @@
 #define SECTOR 512U
 #define OVERLAY_SLOTS 131072U
 #define WAIT_MILLISECONDS 100L
+#define DATA_FILE_BYTES 8192U
 #define STRESS_FILES 16U
 #define STRESS_READERS 4U
 #define STRESS_MAX_SIZE 70000U
@@ -229,6 +230,36 @@ create_file(struct btrfs_volume *volume, struct btrfs_transaction *transaction, 
 	return result;
 }
 
+/* A file larger than an inline extent: its data reaches the device while the
+ * transaction runs. */
+static enum btrfs_result
+create_data_file(
+    struct btrfs_volume *volume, struct btrfs_transaction *transaction, const char *name)
+{
+	struct btrfs_volume_view *view;
+	struct btrfs_new_inode attributes;
+	struct btrfs_object_id id;
+	struct btrfs_inode root;
+	const struct btrfs_fs *fs;
+	uint8_t data[DATA_FILE_BYTES];
+	enum btrfs_result result;
+
+	fs = btrfs_volume_pin(volume, &view);
+	REQUIRE(btrfs_root(fs, &root) == BTRFS_OK);
+	btrfs_volume_unpin(volume, view);
+	memset(&attributes, 0, sizeof(attributes));
+	memset(data, 0x5a, sizeof(data));
+	attributes.mode = BTRFS_MODE_REGULAR | 0644;
+	attributes.time.seconds = 1800000000;
+	result =
+	    btrfs_transaction_create(transaction, root.id, name, strlen(name), &attributes, &id);
+	if (result == BTRFS_OK) {
+		result = btrfs_transaction_write(
+		    transaction, id, 0, data, sizeof(data), attributes.time);
+	}
+	return result;
+}
+
 static struct btrfs_object_id
 root_id(struct btrfs_volume *volume)
 {
@@ -303,8 +334,8 @@ harness_open(struct harness *harness, const char *path)
 	harness->environment.allocate = overlay_allocate;
 	harness->environment.release = overlay_release;
 	harness->environment.decompress = overlay_decompress;
-	harness->device =
-	    (struct btrfs_write_environment){ &harness->overlay, overlay_write, overlay_flush };
+	harness->device = (struct btrfs_write_environment){ &harness->overlay, overlay_write,
+		overlay_flush, NULL, BTRFS_COMPRESSION_NONE };
 	pthread_mutex_init(&harness->locks.mutex, NULL);
 	pthread_cond_init(&harness->locks.condition, NULL);
 	harness->callbacks =
@@ -355,13 +386,17 @@ views_test(struct harness *harness)
 	REQUIRE(btrfs_volume_writable(volume) && harness->overlay.writes == 0);
 	generation = btrfs_volume_generation(volume);
 
-	/* An empty and an aborted transaction publish nothing. */
+	/* An empty transaction writes nothing; an aborted one wrote only its new
+	 * data, to unreferenced space, and publishes nothing. */
 	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
 	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	REQUIRE(harness->overlay.writes == 0 && harness->overlay.flushes == 0);
 	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
-	REQUIRE(create_file(volume, transaction, "aborted") == BTRFS_OK);
+	REQUIRE(create_data_file(volume, transaction, "aborted") == BTRFS_OK);
+	REQUIRE(harness->overlay.writes != 0);
 	btrfs_volume_abort(volume, transaction);
-	REQUIRE(btrfs_volume_generation(volume) == generation && harness->overlay.writes == 0);
+	REQUIRE(btrfs_volume_generation(volume) == generation && harness->overlay.flushes == 0 &&
+	    btrfs_volume_failure(volume) == BTRFS_OK);
 
 	/* A pinned view keeps the old root set; the new view has the file. */
 	old_fs = btrfs_volume_pin(volume, &old_view);

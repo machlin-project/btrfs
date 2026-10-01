@@ -63,7 +63,7 @@ read_device(void *context, uint64_t offset, void *bytes, size_t size)
 			    write->visible[sector + run] == write->visible[sector];
 			    run++) {
 			}
-			if (write->visible[sector]) {
+			if (write->visible[sector] || device->coherent) {
 				overlay(bytes, offset, size, write, sector, run);
 			}
 		}

@@ -435,6 +435,62 @@ bt_space_reserve_data(struct bt_space *space, uint64_t length, uint64_t *logical
 	}
 }
 
+int
+bt_space_data_available(const struct bt_space *space, uint64_t length)
+{
+	uint64_t available = 0;
+	uint64_t unallocated = 0;
+	unsigned copies = 1;
+	size_t i;
+
+	for (i = space->data.next; i < space->data.count && available < length; i++) {
+		available += space->data.items[i].end - space->data.items[i].start;
+	}
+	if (available >= length) {
+		return 1;
+	}
+	if (!space->growth) {
+		return 0;
+	}
+	for (i = 0; i < space->fs->chunk_count; i++) {
+		if ((space->fs->chunks[i].type & BT_BLOCK_DATA) != 0 &&
+		    (space->fs->chunks[i].type & BT_BLOCK_DUP) != 0) {
+			copies = 2;
+		}
+	}
+	for (i = space->device.next; i < space->device.count; i++) {
+		unallocated += space->device.items[i].end - space->device.items[i].start;
+	}
+	return unallocated / copies >= length - available;
+}
+
+enum btrfs_result
+bt_space_reserve_exact(struct bt_space *space, uint64_t length, uint64_t *logical)
+{
+	struct bt_gap *gap;
+	uint64_t sector = space->fs->info.sector_size;
+	size_t i;
+	enum btrfs_result error;
+
+	if (length == 0 || length % sector != 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	for (;;) {
+		for (i = space->data.next; i < space->data.count; i++) {
+			gap = &space->data.items[i];
+			if (gap->end - gap->start >= length) {
+				*logical = gap->start;
+				gap->start += length;
+				return BTRFS_OK;
+			}
+		}
+		error = bt_space_grow(space, BT_BLOCK_DATA, length);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+	}
+}
+
 static void
 bt_space_release(void *context, uint64_t address)
 {

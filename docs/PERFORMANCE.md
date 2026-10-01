@@ -41,10 +41,11 @@ map; persistent allocation state and metadata caching need measurements before
 native writable throughput can be competitive. Each backreference edit copies its
 extent item into a fresh node-sized buffer and probes for keyed items with a new
 cursor, so a shared-subvolume commit costs several hundred allocations; the test
-output prints these counts per commit. New file data is staged in memory up to
-64 MiB per transaction and written once at commit; unaligned edges are read back
-through the private view. Streaming writeback, buffer reuse and extent-item
-caching are unmeasured follow-up work.
+output prints these counts per commit. New file data is written to the device
+as its extents are created, from rewrite pieces of at most 8 MiB; unaligned
+edges are read back through the private view. Compression costs one codec call
+per 128 KiB. Buffer reuse and extent-item caching are unmeasured follow-up
+work.
 
 ## Matched benchmark protocol
 

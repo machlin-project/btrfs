@@ -15,6 +15,14 @@ struct btrfs_write_environment {
 	void *context;
 	enum btrfs_result (*write)(void *context, uint64_t offset, const void *bytes, size_t size);
 	enum btrfs_result (*flush)(void *context);
+	/* Optional: compresses input into one stream of codec in output, as Linux
+	 * stores a compressed extent, reporting its size; RANGE when it would not
+	 * fit capacity. Without it no data is compressed. */
+	enum btrfs_result (*compress)(void *context, enum btrfs_compression codec,
+	    const void *input, size_t input_size, void *output, size_t capacity, size_t *size);
+	/* The compress mount option's codec, or NONE: files ask for compression
+	 * with their property or COMPRESS flag only. */
+	enum btrfs_compression compression;
 };
 
 #define BTRFS_SUPER_COPIES 3U

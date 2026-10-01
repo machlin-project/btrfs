@@ -4,6 +4,20 @@
 #define _POSIX_C_SOURCE 200809L
 #include "scenario.h"
 
+#define STREAM_BYTES (UINT32_C(80) * 1024 * 1024)
+#define COMPRESSION_PROPERTY "btrfs.compression"
+#define COMPRESS_TEXT_BYTES (300U * 1024U)
+#define COMPRESS_NOISE_BYTES (200U * 1024U)
+#define COMPRESS_SMALL_BYTES 3000U
+#define COMPRESS_TINY_BYTES 1000U
+#define COMPRESS_PLAIN_BYTES 1500U
+#define COMPRESS_PATCH_OFFSET 140000U
+#define COMPRESS_PATCH_BYTES 8192U
+#define COMPRESS_TRUNCATE_SIZE 200000U
+#define COMPRESS_MOUNT_BYTES (150U * 1024U)
+#define STREAM_PIECE (1024U * 1024U)
+#define STREAM_MEMORY_BOUND (UINT64_C(16) * 1024 * 1024)
+
 void
 plan_scenarios(struct context *context)
 {
@@ -239,6 +253,158 @@ track_data(struct context *context, struct plan *plan, const char *name)
 /* File data written as new extents: unaligned edges are rewritten from the
  * transaction's view, old extents are trimmed, moved or split, and snapshots,
  * reflinks, preallocation, compression and checksum policy are preserved. */
+/* One transaction writes more than the former 64 MiB staging bound: new data
+ * reaches the device as its extents are created, so the transaction's live
+ * memory stays bounded; after the commit the file reads back exactly and both
+ * audits pass. */
+static void
+data_stream_test(struct context *context)
+{
+	struct btrfs_new_inode attributes;
+	struct btrfs_object_id id;
+	struct btrfs_inode inode;
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct btrfs_time time = { 1800000000, 0 };
+	uint8_t *data;
+	uint8_t *back;
+	uint64_t before;
+	uint64_t held;
+	size_t completed;
+	size_t offset;
+
+	data = malloc(STREAM_BYTES);
+	back = malloc(STREAM_PIECE);
+	REQUIRE(data != NULL && back != NULL);
+	fill_pattern(data, STREAM_BYTES, 77);
+	memset(&attributes, 0, sizeof(attributes));
+	attributes.mode = BTRFS_MODE_REGULAR | 0644;
+	attributes.time = time;
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_create(
+		    transaction, object(fs, "/data"), "stream", 6, &attributes, &id) == BTRFS_OK);
+	before = context->image.live_bytes;
+	REQUIRE(btrfs_transaction_write(transaction, id, 0, data, STREAM_BYTES, time) == BTRFS_OK);
+	held = context->image.live_bytes - before;
+	REQUIRE(held < STREAM_MEMORY_BOUND);
+	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
+	audit_state(context, "data-stream");
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(fs, "/data/stream", &inode) == BTRFS_OK);
+	REQUIRE(inode.size == STREAM_BYTES);
+	for (offset = 0; offset < STREAM_BYTES; offset += STREAM_PIECE) {
+		REQUIRE(btrfs_read(fs, &inode, offset, back, STREAM_PIECE, &completed) == BTRFS_OK);
+		REQUIRE(
+		    completed == STREAM_PIECE && memcmp(back, data + offset, STREAM_PIECE) == 0);
+	}
+	btrfs_unmount(fs);
+	truncate_writes(context->device, 0);
+	REQUIRE(context->image.live_allocations == 0);
+	free(data);
+	free(back);
+	printf("data-stream: %u MiB in one transaction with %llu KiB held PASS\n",
+	    (unsigned)(STREAM_BYTES >> 20), (unsigned long long)(held >> 10));
+}
+
+/* Compression on write, as Linux's compress_file_range: a file with the zlib
+ * property is written in 128 KiB compressed extents; incompressible data stays
+ * uncompressed; a small file is one inline extent, compressed when that
+ * shrinks it; overwriting and truncating compressed extents keep the parts
+ * still referenced. */
+static void
+data_compress_plan(struct context *context)
+{
+	static uint8_t text[COMPRESS_TEXT_BYTES];
+	static uint8_t noise[COMPRESS_NOISE_BYTES];
+	static uint8_t small[COMPRESS_SMALL_BYTES];
+	static uint8_t tiny[COMPRESS_TINY_BYTES];
+	static uint8_t plain[COMPRESS_PLAIN_BYTES];
+	static uint8_t patch[COMPRESS_PATCH_BYTES];
+	static uint8_t grown[2 * COMPRESS_SMALL_BYTES];
+	struct plan plan;
+
+	fill_text(text, sizeof(text), 1);
+	fill_random(noise, sizeof(noise), 2);
+	fill_text(small, sizeof(small), 3);
+	fill_random(tiny, sizeof(tiny), 4);
+	fill_text(plain, sizeof(plain), 5);
+	fill_text(patch, sizeof(patch), 6);
+	fill_text(grown, sizeof(grown), 7);
+	memcpy(grown, small, sizeof(small));
+	plan_init(&plan);
+	plan.name = "data-compress";
+	track_data(context, &plan, "zlib");
+	plan_write(context, &plan, 1, "/data/zlib", 0, text, sizeof(text));
+	plan_create(&plan, 1, "/data/noise", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_set_xattr(&plan, 1, "/data/noise", COMPRESSION_PROPERTY, "zlib", 4, 0);
+	plan_write_new(&plan, 1, "/data/noise", 0, noise, sizeof(noise));
+	plan_create(&plan, 1, "/data/zsmall", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_set_xattr(&plan, 1, "/data/zsmall", COMPRESSION_PROPERTY, "zlib", 4, 0);
+	plan_write_new(&plan, 1, "/data/zsmall", 0, small, sizeof(small));
+	plan_create(&plan, 1, "/data/ztiny", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_set_xattr(&plan, 1, "/data/ztiny", COMPRESSION_PROPERTY, "zlib", 4, 0);
+	plan_write_new(&plan, 1, "/data/ztiny", 0, tiny, sizeof(tiny));
+	plan_create(&plan, 1, "/data/plain-small", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/data/plain-small", 0, plain, sizeof(plain));
+	plan_write(context, &plan, 2, "/data/zlib", COMPRESS_PATCH_OFFSET, patch, sizeof(patch));
+	plan_write_new(
+	    &plan, 2, "/data/zsmall", sizeof(small), grown + sizeof(small), sizeof(small));
+	plan_truncate(context, &plan, 3, "/data/zlib", COMPRESS_TRUNCATE_SIZE);
+
+	/* 128 KiB, 128 KiB and the rest, each compressed. */
+	expect_compressed(&plan, 1, 1, "/data/zlib", BTRFS_COMPRESSION_ZLIB, 3, 0);
+	/* The patch splits the second extent around a new compressed one. */
+	expect_compressed(&plan, 2, 2, "/data/zlib", BTRFS_COMPRESSION_ZLIB, 5, 0);
+	/* The truncated tail drops the third extent; the new EOF sector does not
+	 * compress to less than itself. */
+	expect_compressed(&plan, 3, LAST_STAGE, "/data/zlib", BTRFS_COMPRESSION_ZLIB, 4, 0);
+	expect_compressed(&plan, 1, LAST_STAGE, "/data/noise", BTRFS_COMPRESSION_ZLIB, 0, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/data/noise", noise, sizeof(noise));
+	expect_compressed(&plan, 1, 1, "/data/zsmall", BTRFS_COMPRESSION_ZLIB, 0, 1);
+	expect_file(&plan, 1, 1, "/data/zsmall", small, sizeof(small));
+	/* Grown past one sector, the inline extent becomes a compressed one. */
+	expect_compressed(&plan, 2, LAST_STAGE, "/data/zsmall", BTRFS_COMPRESSION_ZLIB, 1, 0);
+	expect_file(&plan, 2, LAST_STAGE, "/data/zsmall", grown, sizeof(grown));
+	expect_compressed(&plan, 1, LAST_STAGE, "/data/ztiny", BTRFS_COMPRESSION_ZLIB, 0, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/data/ztiny", tiny, sizeof(tiny));
+	expect_compressed(&plan, 1, LAST_STAGE, "/data/plain-small", BTRFS_COMPRESSION_ZLIB, 0, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/data/plain-small", plain, sizeof(plain));
+	run_plan(context, &plan);
+}
+
+/* The compress mount option: plain files compress with its codec, which
+ * records the ZSTD incompat feature; a file whose property says "no" and a
+ * NODATASUM file stay uncompressed. */
+static void
+data_compress_mount_plan(struct context *context)
+{
+	static uint8_t text[COMPRESS_MOUNT_BYTES];
+	struct plan plan;
+
+	fill_text(text, sizeof(text), 8);
+	plan_init(&plan);
+	plan.name = "data-compress-mount";
+	(void)plan_file(context, &plan, "/data/small");
+	plan_create(&plan, 1, "/data/mounted", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/data/mounted", 0, text, sizeof(text));
+	plan_create(&plan, 1, "/data/refuses", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_set_xattr(&plan, 1, "/data/refuses", COMPRESSION_PROPERTY, "no", 2, 0);
+	plan_write_new(&plan, 1, "/data/refuses", 0, text, sizeof(text));
+	plan_write_new(&plan, 1, "/data/nodatasum", 0, text, sizeof(text));
+	expect_compressed(&plan, 1, LAST_STAGE, "/data/mounted", BTRFS_COMPRESSION_ZSTD, 2, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/data/mounted", text, sizeof(text));
+	expect_compressed(&plan, 1, LAST_STAGE, "/data/refuses", BTRFS_COMPRESSION_ZSTD, 0, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/data/refuses", text, sizeof(text));
+	expect_compressed(&plan, 1, LAST_STAGE, "/data/nodatasum", BTRFS_COMPRESSION_ZSTD, 0, 0);
+	expect_value(&plan, 1, LAST_STAGE, EXPECT_FEATURE, "/", BT_FEATURE_COMPRESS_ZSTD);
+	context->writer.compression = BTRFS_COMPRESSION_ZSTD;
+	run_plan(context, &plan);
+	context->writer.compression = BTRFS_COMPRESSION_NONE;
+}
+
 void
 data_scenarios(struct context *context)
 {
@@ -340,6 +506,10 @@ data_scenarios(struct context *context)
 	plan_write(context, &plan, 1, "/data/small", 2048, data, 4096);
 	plan_truncate(context, &plan, 1, "/data/small", 3000);
 	run_plan(context, &plan);
+
+	data_stream_test(context);
+	data_compress_plan(context);
+	data_compress_mount_plan(context);
 }
 
 /* A data block group whose free space Linux keeps as bitmaps: freeing a file

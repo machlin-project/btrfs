@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-#include "transaction.h"
+#include "namespace.h"
 
-/* Largest single data write issued to the device during publication. */
+/* Largest single data write issued to the device. */
 #define BT_DATA_WRITE (1024U * 1024U)
+/* Bytes one rewrite holds in memory; longer ranges are written in pieces. */
+#define BT_REWRITE_CHUNK (UINT64_C(8) * 1024 * 1024)
 /* Linux's limit on one uncompressed data extent. */
 #define BT_DATA_EXTENT (UINT64_C(128) * 1024 * 1024)
+/* Linux compresses data in pieces of at most 128 KiB (BTRFS_MAX_UNCOMPRESSED),
+ * each one extent. */
+#define BT_COMPRESS_CHUNK (128U * 1024U)
 #define BT_FILE_SIZE_LIMIT ((UINT64_C(1) << 63) - 1)
 
 struct bt_file_item {
@@ -18,23 +23,12 @@ void
 bt_tx_release_data(struct btrfs_transaction *transaction)
 {
 	const struct btrfs_environment *env = &transaction->base->env;
-	size_t i;
 
-	for (i = 0; i < transaction->staged_count; i++) {
-		env->release(env->context, transaction->staged[i].bytes,
-		    (size_t)transaction->staged[i].length);
-	}
-	if (transaction->staged != NULL) {
-		env->release(env->context, transaction->staged,
-		    BT_TRANSACTION_EXTENTS * sizeof(*transaction->staged));
-	}
 	if (transaction->refs != NULL) {
 		env->release(env->context, transaction->refs,
 		    BT_TRANSACTION_REFERENCES * sizeof(*transaction->refs));
 	}
-	transaction->staged = NULL;
 	transaction->refs = NULL;
-	transaction->staged_count = 0;
 	transaction->ref_count = 0;
 }
 
@@ -62,18 +56,12 @@ bt_tx_queue(struct btrfs_transaction *transaction, struct bt_key extent,
 static enum btrfs_result
 bt_tx_free_data(struct btrfs_transaction *transaction, struct bt_key extent)
 {
-	size_t i;
 	enum btrfs_result error;
 
 	error = bt_csum_delete(
 	    transaction->mutation, &transaction->checksums.root, extent.objectid, extent.offset);
 	if (error == BTRFS_OK) {
 		error = bt_space_change_used(transaction->space, extent.objectid, extent.offset, 0);
-	}
-	for (i = 0; error == BTRFS_OK && i < transaction->staged_count; i++) {
-		if (transaction->staged[i].logical == extent.objectid) {
-			transaction->staged[i].freed = 1;
-		}
 	}
 	return error;
 }
@@ -109,66 +97,19 @@ bt_tx_apply_refs(struct btrfs_transaction *transaction)
 	return error;
 }
 
-enum btrfs_result
-bt_tx_write_staged(struct btrfs_transaction *transaction)
-{
-	const struct bt_staged *staged;
-	uint64_t done;
-	size_t length;
-	size_t i;
-	unsigned mirror;
-	enum btrfs_result error = BTRFS_OK;
-
-	for (i = 0; error == BTRFS_OK && i < transaction->staged_count; i++) {
-		staged = &transaction->staged[i];
-		for (mirror = 0; !staged->freed && error == BTRFS_OK && mirror < staged->mirrors;
-		    mirror++) {
-			for (done = 0; error == BTRFS_OK && done < staged->length; done += length) {
-				length = staged->length - done < BT_DATA_WRITE
-				    ? (size_t)(staged->length - done)
-				    : BT_DATA_WRITE;
-				error = transaction->io.write(transaction->io.context,
-				    staged->physical[mirror] + done, staged->bytes + done, length);
-			}
-		}
-	}
-	return error;
-}
-
-/* Private read view: metadata through the mutation overlay, staged data by
- * physical address, and the transaction's own checksum and file tree roots. */
+/* Private read view: metadata through the mutation overlay, new data from the
+ * device (written when its extent was created), and the transaction's own
+ * checksum and file tree roots. */
 static enum btrfs_result
 bt_view_read(void *context, uint64_t offset, void *buffer, size_t length)
 {
 	struct btrfs_transaction *transaction = context;
 	const struct btrfs_fs *mutation = bt_mutation_view(transaction->mutation);
-	const struct bt_staged *staged;
-	uint64_t start;
-	uint64_t end;
-	size_t i;
-	unsigned mirror;
-	enum btrfs_result error;
 
 	if (mutation == NULL) {
 		return transaction->failure != BTRFS_OK ? transaction->failure : BTRFS_IO;
 	}
-	error = mutation->env.read(mutation->env.context, offset, buffer, length);
-	for (i = 0; error == BTRFS_OK && i < transaction->staged_count; i++) {
-		staged = &transaction->staged[i];
-		for (mirror = 0; mirror < staged->mirrors; mirror++) {
-			start =
-			    offset > staged->physical[mirror] ? offset : staged->physical[mirror];
-			end = offset + length < staged->physical[mirror] + staged->length
-			    ? offset + length
-			    : staged->physical[mirror] + staged->length;
-			if (start < end) {
-				bt_copy((uint8_t *)buffer + (start - offset),
-				    staged->bytes + (start - staged->physical[mirror]),
-				    (size_t)(end - start));
-			}
-		}
-	}
-	return error;
+	return mutation->env.read(mutation->env.context, offset, buffer, length);
 }
 
 static void *
@@ -436,54 +377,80 @@ bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tr
 	return error;
 }
 
+/* Writes new data to its extent now: no committed root references the space,
+ * and the commit's first barrier makes it durable before any metadata naming
+ * it. A failed write fails the transaction. */
 static enum btrfs_result
-bt_tx_stage(
+bt_tx_write_data(
     struct btrfs_transaction *transaction, uint64_t logical, const uint8_t *bytes, uint64_t length)
 {
-	const struct btrfs_environment *env = &transaction->base->env;
-	struct bt_staged *staged;
+	uint64_t physical;
+	uint64_t done;
+	size_t chunk = 0;
+	unsigned mirrors = 1;
 	unsigned mirror;
 	enum btrfs_result error = BTRFS_OK;
 
-	if (transaction->staged == NULL) {
-		transaction->staged = env->allocate(
-		    env->context, BT_TRANSACTION_EXTENTS * sizeof(*transaction->staged));
-		if (transaction->staged == NULL) {
-			return BTRFS_NO_MEMORY;
+	for (mirror = 0; error == BTRFS_OK && mirror < mirrors; mirror++) {
+		for (done = 0; error == BTRFS_OK && done < length; done += chunk) {
+			chunk =
+			    length - done < BT_DATA_WRITE ? (size_t)(length - done) : BT_DATA_WRITE;
+			error = bt_map(&transaction->fs, logical + done, chunk, BT_BLOCK_DATA,
+			    mirror, &physical, &mirrors);
+			if (error == BTRFS_OK) {
+				error = transaction->io.write(
+				    transaction->io.context, physical, bytes + done, chunk);
+			}
 		}
 	}
-	if (transaction->staged_count == BT_TRANSACTION_EXTENTS ||
-	    length > BT_TRANSACTION_DATA - transaction->staged_bytes) {
-		return BTRFS_UNSUPPORTED;
+	if (error != BTRFS_OK) {
+		transaction->failure = error;
 	}
-	staged = &transaction->staged[transaction->staged_count];
-	bt_zero(staged, sizeof(*staged));
-	staged->logical = logical;
-	staged->length = length;
-	staged->mirrors = 1;
-	for (mirror = 0; error == BTRFS_OK && mirror < staged->mirrors; mirror++) {
-		error = bt_map(&transaction->fs, logical, (size_t)length, BT_BLOCK_DATA, mirror,
-		    &staged->physical[mirror], &staged->mirrors);
+	return error;
+}
+
+/* The codec new data of a file is compressed with, as Linux's
+ * inode_need_compress and compress_type choose: none for NODATACOW, NODATASUM
+ * or NOCOMPRESS files; else the file's compression property, else the mount's
+ * codec when the file has COMPRESS or the mount compresses everything (zlib
+ * when the mount names none). LZO is read only here: such files are written
+ * uncompressed. Without a compress callback nothing is compressed. */
+static enum btrfs_result
+bt_tx_codec(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t ino,
+    const struct bt_disk_inode *inode, enum btrfs_compression *codec)
+{
+	const struct bt_codec *property = NULL;
+	uint64_t flags = bt_u64(inode->flags);
+	enum btrfs_compression mount = transaction->io.compression;
+	enum btrfs_result error;
+
+	*codec = BTRFS_COMPRESSION_NONE;
+	if (transaction->io.compress == NULL ||
+	    (flags & (BT_INODE_NODATACOW | BT_INODE_NODATASUM_FLAG | BT_INODE_NOCOMPRESS)) != 0) {
+		return BTRFS_OK;
 	}
+	error = bt_ns_inherited_codec(transaction, tree, ino, flags, &property);
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	staged->bytes = env->allocate(env->context, (size_t)length);
-	if (staged->bytes == NULL) {
-		return BTRFS_NO_MEMORY;
+	if (property != NULL) {
+		*codec = property->codec;
+	} else if ((flags & BT_INODE_COMPRESS) != 0 || mount != BTRFS_COMPRESSION_NONE) {
+		*codec = mount != BTRFS_COMPRESSION_NONE ? mount : BTRFS_COMPRESSION_ZLIB;
 	}
-	bt_copy(staged->bytes, bytes, (size_t)length);
-	transaction->staged_count++;
-	transaction->staged_bytes += length;
+	if (*codec != BTRFS_COMPRESSION_ZLIB && *codec != BTRFS_COMPRESSION_ZSTD) {
+		*codec = BTRFS_COMPRESSION_NONE;
+	}
 	return BTRFS_OK;
 }
 
-/* Writes [start, end) of the file from buffer as new extents. The range is
- * sector aligned and holds no file extent items. */
+/* One new extent at logical: its disk bytes (compressed or not), extent item
+ * with the file's data reference, checksums of the stored bytes, and the file
+ * extent item covering [position, position + length). */
 static enum btrfs_result
-bt_tx_cow(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
-    const struct bt_disk_inode *inode, uint64_t ino, uint64_t start, uint64_t end,
-    const uint8_t *buffer)
+bt_tx_extent(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    const struct bt_disk_inode *inode, uint64_t ino, uint64_t position, uint64_t length,
+    uint64_t logical, const uint8_t *stored, uint64_t stored_size, enum btrfs_compression codec)
 {
 	struct {
 		struct bt_disk_extent_item item;
@@ -493,59 +460,137 @@ bt_tx_cow(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	struct bt_disk_extent file;
 	struct bt_key key;
 	uint64_t generation = transaction->base->info.generation + 1;
-	uint64_t position;
-	uint64_t logical;
-	uint64_t size;
-	uint64_t want;
-	enum btrfs_result error = BTRFS_OK;
+	enum btrfs_result error;
 
 	_Static_assert(sizeof(wire) ==
 		sizeof(struct bt_disk_extent_item) + 1 + sizeof(struct bt_disk_data_ref),
 	    "inline data reference layout");
-	for (position = start; error == BTRFS_OK && position < end; position += size) {
-		want = end - position < BT_DATA_EXTENT ? end - position : BT_DATA_EXTENT;
-		error = bt_space_reserve_data(transaction->space, want, &logical, &size);
-		if (error == BTRFS_OK) {
-			error =
-			    bt_tx_stage(transaction, logical, buffer + (position - start), size);
+	error = bt_tx_write_data(transaction, logical, stored, stored_size);
+	if (error == BTRFS_OK) {
+		error = bt_space_change_used(transaction->space, logical, stored_size, 1);
+	}
+	if (error == BTRFS_OK) {
+		bt_zero(&wire, sizeof(wire));
+		bt_put64(&wire.item.refs, 1);
+		bt_put64(&wire.item.generation, generation);
+		bt_put64(&wire.item.flags, BT_EXTENT_FLAG_DATA);
+		wire.type = BT_EXTENT_DATA_REF;
+		bt_put64(&wire.reference.root, tree->root.owner);
+		bt_put64(&wire.reference.objectid, ino);
+		bt_put64(&wire.reference.offset, position);
+		bt_put32(&wire.reference.count, 1);
+		key = (struct bt_key){
+			.objectid = logical, .type = BT_EXTENT_ITEM, .offset = stored_size
+		};
+		error = bt_tx_edit(
+		    transaction, &transaction->extents.root, key, &wire, sizeof(wire), BT_INSERT);
+	}
+	if (error == BTRFS_OK && !(bt_u64(inode->flags) & BT_INODE_NODATASUM_FLAG)) {
+		error = bt_csum_insert(transaction->mutation, &transaction->checksums.root, logical,
+		    stored, stored_size);
+	}
+	if (error == BTRFS_OK) {
+		bt_zero(&file, sizeof(file));
+		bt_put64(&file.header.generation, generation);
+		bt_put64(&file.header.ram_bytes, length);
+		file.header.compression = (uint8_t)codec;
+		file.header.type = BT_EXTENT_REGULAR;
+		bt_put64(&file.disk_bytenr, logical);
+		bt_put64(&file.disk_bytes, stored_size);
+		bt_put64(&file.length, length);
+		key =
+		    (struct bt_key){ .objectid = ino, .type = BT_EXTENT_DATA, .offset = position };
+		error = bt_tx_edit(transaction, &tree->root, key, &file, sizeof(file), BT_INSERT);
+	}
+	if (error == BTRFS_OK && codec == BTRFS_COMPRESSION_ZSTD) {
+		bt_ns_require_feature(transaction, BT_FEATURE_COMPRESS_ZSTD);
+	}
+	return error;
+}
+
+/* Compresses length bytes into compressed (BT_COMPRESS_CHUNK bytes): the
+ * stream padded to whole sectors, kept only when it saves at least one sector,
+ * as compress_file_range decides; *stored is 0 otherwise. */
+static enum btrfs_result
+bt_tx_compress(struct btrfs_transaction *transaction, enum btrfs_compression codec,
+    const uint8_t *bytes, uint64_t length, uint8_t *compressed, uint64_t *stored)
+{
+	uint64_t sector = transaction->base->info.sector_size;
+	size_t size = 0;
+	enum btrfs_result error;
+
+	*stored = 0;
+	error = transaction->io.compress(transaction->io.context, codec, bytes, (size_t)length,
+	    compressed, BT_COMPRESS_CHUNK, &size);
+	if (error == BTRFS_RANGE || error == BTRFS_UNSUPPORTED) {
+		return BTRFS_OK;
+	}
+	if (error != BTRFS_OK || size > BT_COMPRESS_CHUNK) {
+		return error == BTRFS_OK ? BTRFS_CORRUPT : error;
+	}
+	if (size + (sector - size % sector) % sector + sector <= length) {
+		*stored = size + (sector - size % sector) % sector;
+		bt_zero(compressed + size, (size_t)(*stored - size));
+	}
+	return BTRFS_OK;
+}
+
+/* Writes [start, end) of the file from buffer as new extents. The range is
+ * sector aligned and holds no file extent items. A file that compresses is
+ * written in BT_COMPRESS_CHUNK pieces, each compressed when that saves a
+ * sector; other data goes into extents of up to BT_DATA_EXTENT bytes. */
+static enum btrfs_result
+bt_tx_cow(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    const struct bt_disk_inode *inode, uint64_t ino, uint64_t start, uint64_t end,
+    const uint8_t *buffer)
+{
+	const struct btrfs_environment *env = &transaction->base->env;
+	enum btrfs_compression codec = BTRFS_COMPRESSION_NONE;
+	uint8_t *compressed = NULL;
+	uint64_t position;
+	uint64_t piece_end;
+	uint64_t logical;
+	uint64_t stored = 0;
+	uint64_t size;
+	uint64_t want;
+	enum btrfs_result error;
+
+	error = bt_tx_codec(transaction, tree, ino, inode, &codec);
+	if (error == BTRFS_OK && codec != BTRFS_COMPRESSION_NONE) {
+		compressed = env->allocate(env->context, BT_COMPRESS_CHUNK);
+		error = compressed == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+	}
+	for (position = start; error == BTRFS_OK && position < end; position = piece_end) {
+		piece_end = end;
+		if (compressed != NULL) {
+			piece_end =
+			    end - position < BT_COMPRESS_CHUNK ? end : position + BT_COMPRESS_CHUNK;
+			error = bt_tx_compress(transaction, codec, buffer + (position - start),
+			    piece_end - position, compressed, &stored);
+			if (error == BTRFS_OK && stored != 0) {
+				error =
+				    bt_space_reserve_exact(transaction->space, stored, &logical);
+				if (error == BTRFS_OK) {
+					error = bt_tx_extent(transaction, tree, inode, ino,
+					    position, piece_end - position, logical, compressed,
+					    stored, codec);
+				}
+				continue;
+			}
 		}
-		if (error == BTRFS_OK) {
-			error = bt_space_change_used(transaction->space, logical, size, 1);
+		for (; error == BTRFS_OK && position < piece_end; position += size) {
+			want = piece_end - position < BT_DATA_EXTENT ? piece_end - position
+								     : BT_DATA_EXTENT;
+			error = bt_space_reserve_data(transaction->space, want, &logical, &size);
+			if (error == BTRFS_OK) {
+				error = bt_tx_extent(transaction, tree, inode, ino, position, size,
+				    logical, buffer + (position - start), size,
+				    BTRFS_COMPRESSION_NONE);
+			}
 		}
-		if (error == BTRFS_OK) {
-			bt_zero(&wire, sizeof(wire));
-			bt_put64(&wire.item.refs, 1);
-			bt_put64(&wire.item.generation, generation);
-			bt_put64(&wire.item.flags, BT_EXTENT_FLAG_DATA);
-			wire.type = BT_EXTENT_DATA_REF;
-			bt_put64(&wire.reference.root, tree->root.owner);
-			bt_put64(&wire.reference.objectid, ino);
-			bt_put64(&wire.reference.offset, position);
-			bt_put32(&wire.reference.count, 1);
-			key = (struct bt_key){
-				.objectid = logical, .type = BT_EXTENT_ITEM, .offset = size
-			};
-			error = bt_tx_edit(transaction, &transaction->extents.root, key, &wire,
-			    sizeof(wire), BT_INSERT);
-		}
-		if (error == BTRFS_OK && !(bt_u64(inode->flags) & BT_INODE_NODATASUM_FLAG)) {
-			error = bt_csum_insert(transaction->mutation, &transaction->checksums.root,
-			    logical, buffer + (position - start), size);
-		}
-		if (error == BTRFS_OK) {
-			bt_zero(&file, sizeof(file));
-			bt_put64(&file.header.generation, generation);
-			bt_put64(&file.header.ram_bytes, size);
-			file.header.type = BT_EXTENT_REGULAR;
-			bt_put64(&file.disk_bytenr, logical);
-			bt_put64(&file.disk_bytes, size);
-			bt_put64(&file.length, size);
-			key = (struct bt_key){
-				.objectid = ino, .type = BT_EXTENT_DATA, .offset = position
-			};
-			error = bt_tx_edit(
-			    transaction, &tree->root, key, &file, sizeof(file), BT_INSERT);
-		}
+	}
+	if (compressed != NULL) {
+		env->release(env->context, compressed, BT_COMPRESS_CHUNK);
 	}
 	return error;
 }
@@ -596,45 +641,145 @@ bt_tx_store_inode(struct btrfs_transaction *transaction, struct bt_owned_root *t
 
 /* Rewrites one or more whole sectors [start, end) holding the file's current
  * bytes, with bytes[offset, offset + size) replaced and everything at or past
- * limit zeroed. Inline extents are rewritten from offset 0. */
+ * limit zeroed. Inline extents are rewritten from offset 0. Pieces of at most
+ * BT_REWRITE_CHUNK bytes keep the memory bound: each reads the bytes it keeps,
+ * then replaces its range. */
 static enum btrfs_result
 bt_tx_rewrite(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     struct bt_disk_inode *inode, uint64_t ino, uint64_t start, uint64_t end, uint64_t offset,
     const void *bytes, size_t size, uint64_t limit)
 {
 	const struct btrfs_environment *env = &transaction->base->env;
-	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t piece;
+	uint64_t piece_end;
+	uint64_t from;
+	uint64_t to;
 	uint8_t *buffer;
-	size_t length;
+	size_t capacity = (size_t)(end - start < BT_REWRITE_CHUNK ? end - start : BT_REWRITE_CHUNK);
 	enum btrfs_result error = BTRFS_OK;
 
-	if (end - start > BT_TRANSACTION_DATA) {
-		return BTRFS_UNSUPPORTED;
+	buffer = env->allocate(env->context, capacity);
+	if (buffer == NULL) {
+		return BTRFS_NO_MEMORY;
 	}
-	length = (size_t)(end - start);
+	for (piece = start; error == BTRFS_OK && piece < end; piece = piece_end) {
+		piece_end = end - piece < BT_REWRITE_CHUNK ? end : piece + BT_REWRITE_CHUNK;
+		bt_zero(buffer, (size_t)(piece_end - piece));
+		/* The bytes this piece keeps: before the new bytes and after them. */
+		to = offset < piece_end ? offset : piece_end;
+		if (to > piece) {
+			error =
+			    bt_tx_read(transaction, tree, ino, piece, buffer, (size_t)(to - piece));
+		}
+		from = offset + size > piece ? offset + size : piece;
+		if (error == BTRFS_OK && from < piece_end) {
+			error = bt_tx_read(transaction, tree, ino, from, buffer + (from - piece),
+			    (size_t)(piece_end - from));
+		}
+		from = offset > piece ? offset : piece;
+		to = offset + size < piece_end ? offset + size : piece_end;
+		if (error == BTRFS_OK && from < to) {
+			bt_copy(buffer + (from - piece), (const uint8_t *)bytes + (from - offset),
+			    (size_t)(to - from));
+		}
+		if (error == BTRFS_OK && limit < piece_end) {
+			from = limit > piece ? limit : piece;
+			bt_zero(buffer + (from - piece), (size_t)(piece_end - from));
+		}
+		if (error == BTRFS_OK) {
+			error =
+			    bt_tx_replace(transaction, tree, inode, ino, piece, piece_end, buffer);
+		}
+	}
+	env->release(env->context, buffer, capacity);
+	return error;
+}
+
+/* Stores a file whose bytes fit its first sector as one inline extent, as
+ * Linux's cow_file_range_inline does when a write reaches EOF: compressed when
+ * the file compresses and its stream fits the inline limit, else as is when
+ * the file fits the limit and does not fill the sector. *stored stays 0 when
+ * neither applies or the file has data beyond its first sector. */
+static enum btrfs_result
+bt_tx_small(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, uint64_t offset, const void *bytes, size_t size,
+    uint64_t old_size, uint64_t final, int *stored)
+{
+	const struct btrfs_environment *env = &transaction->base->env;
+	struct bt_disk_extent_header *extent;
+	struct bt_file_item item;
+	struct bt_key key = { .objectid = ino, .type = BT_EXTENT_DATA, .offset = 0 };
+	enum btrfs_compression codec = BTRFS_COMPRESSION_NONE;
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t removed = 0;
+	uint8_t *buffer;
+	uint8_t *data;
+	size_t data_size = 0;
+	size_t length;
+	int found = 0;
+	enum btrfs_result error;
+
+	*stored = 0;
+	error = bt_tx_file_item(transaction, tree, ino, sector, UINT64_MAX, &item, &found);
+	if (error != BTRFS_OK || found) {
+		return error;
+	}
+	error = bt_tx_codec(transaction, tree, ino, inode, &codec);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	/* The file's bytes, then the extent item (header and data). */
+	length = (size_t)sector + sizeof(*extent) + BT_INLINE_WRITE_LIMIT;
 	buffer = env->allocate(env->context, length);
 	if (buffer == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
 	bt_zero(buffer, length);
-	/* Only partially replaced edge sectors need their current bytes. */
-	if (offset > start) {
-		error = bt_tx_read(transaction, tree, ino, start, buffer,
-		    (size_t)(offset - start < sector ? sector : offset - start));
-	}
-	if (error == BTRFS_OK && offset + size < end) {
-		error = bt_tx_read(transaction, tree, ino, end - sector, buffer + (length - sector),
-		    (size_t)sector);
+	extent = (void *)(buffer + sector);
+	data = (uint8_t *)(extent + 1);
+	if (old_size != 0) {
+		error = bt_tx_read(transaction, tree, ino, 0, buffer, (size_t)old_size);
 	}
 	if (error == BTRFS_OK) {
-		if (size != 0) {
-			bt_copy(buffer + (offset - start), bytes, size);
+		bt_copy(buffer + offset, bytes, size);
+		if (codec != BTRFS_COMPRESSION_NONE) {
+			error = transaction->io.compress(transaction->io.context, codec, buffer,
+			    (size_t) final, data, BT_INLINE_WRITE_LIMIT, &data_size);
+			if (error == BTRFS_RANGE || error == BTRFS_UNSUPPORTED ||
+			    data_size >= final) {
+				error = BTRFS_OK;
+				codec = BTRFS_COMPRESSION_NONE;
+			}
 		}
-		if (limit < end) {
-			bt_zero(buffer + (limit > start ? limit - start : 0),
-			    (size_t)(end - (limit > start ? limit : start)));
+	}
+	if (error == BTRFS_OK && codec == BTRFS_COMPRESSION_NONE) {
+		if (final > BT_INLINE_WRITE_LIMIT || final % sector == 0) {
+			env->release(env->context, buffer, length);
+			return BTRFS_OK;
 		}
-		error = bt_tx_replace(transaction, tree, inode, ino, start, end, buffer);
+		data_size = (size_t) final;
+		bt_copy(data, buffer, data_size);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_tx_drop_range(transaction, tree, ino, 0, sector, &removed);
+	}
+	if (error == BTRFS_OK && bt_u64(inode->nbytes) < removed) {
+		error = BTRFS_CORRUPT;
+	}
+	if (error == BTRFS_OK) {
+		bt_put64(&extent->generation, transaction->base->info.generation + 1);
+		bt_put64(&extent->ram_bytes, final);
+		extent->compression = (uint8_t)codec;
+		extent->type = BT_EXTENT_INLINE;
+		error = bt_tx_edit(
+		    transaction, &tree->root, key, extent, sizeof(*extent) + data_size, BT_INSERT);
+	}
+	if (error == BTRFS_OK) {
+		bt_put64(&inode->nbytes, bt_u64(inode->nbytes) - removed + final);
+		if (codec == BTRFS_COMPRESSION_ZSTD) {
+			bt_ns_require_feature(transaction, BT_FEATURE_COMPRESS_ZSTD);
+		}
+		*stored = 1;
 	}
 	env->release(env->context, buffer, length);
 	return error;
@@ -677,10 +822,12 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	struct bt_disk_inode inode;
 	uint64_t sector;
 	uint64_t old_size;
+	uint64_t final;
 	uint64_t inline_end;
 	uint64_t start;
 	uint64_t end;
 	uint64_t tail;
+	int stored = 0;
 	enum btrfs_result error;
 
 	if (transaction == NULL || (bytes == NULL && size != 0) ||
@@ -701,6 +848,28 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	}
 	sector = transaction->base->info.sector_size;
 	old_size = bt_u64(inode.size);
+	final = offset + size > old_size ? offset + size : old_size;
+	/* The whole range's data space is checked before any change, as Linux
+	 * reserves it at write time; compression may need less. */
+	if (!bt_space_data_available(
+		transaction->space, size + 2 * sector - (uint64_t)size % sector)) {
+		return BTRFS_NO_SPACE;
+	}
+	/* A file that fits its first sector may become one inline extent. */
+	if (final <= sector) {
+		error = bt_tx_small(transaction, tree, &inode, id.inode, offset, bytes, size,
+		    old_size, final, &stored);
+		if (error == BTRFS_OK && stored) {
+			error =
+			    bt_tx_store_inode(transaction, tree, id.inode, &inode, final, modified);
+		}
+		if (error != BTRFS_OK || stored) {
+			if (error != BTRFS_OK) {
+				transaction->failure = error;
+			}
+			return error;
+		}
+	}
 	start = offset - offset % sector;
 	end = offset + size + (sector - (offset + size) % sector) % sector;
 	/* An inline extent becomes part of the first regular extent. */

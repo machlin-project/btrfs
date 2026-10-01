@@ -654,6 +654,40 @@ extref_join(char *path, size_t size, const char *directory, const char *name)
 	REQUIRE(snprintf(path, size, "%s/%s", directory, name) < (int)size);
 }
 
+/* New files in a directory with the zstd property inherit it and are written
+ * as zstd extents: 128 KiB pieces and a compressed inline extent; a 4 KiB
+ * overwrite that cannot save a sector splits a compressed extent around an
+ * uncompressed one. */
+static void
+namespace_zstd_plan(struct context *context)
+{
+	static uint8_t text[ZSTD_TEXT_BYTES];
+	static uint8_t small[ZSTD_SMALL_BYTES];
+	static uint8_t patch[ZSTD_PATCH_BYTES];
+	static uint8_t patched[ZSTD_TEXT_BYTES];
+	struct plan plan;
+
+	fill_text(text, sizeof(text), 11);
+	fill_text(small, sizeof(small), 12);
+	fill_random(patch, sizeof(patch), 13);
+	memcpy(patched, text, sizeof(text));
+	memcpy(patched + ZSTD_PATCH_OFFSET, patch, sizeof(patch));
+	namespace_plan(context, &plan, "namespace-zstd");
+	plan_create(&plan, 1, "/ns/zstd/large", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/ns/zstd/large", 0, text, sizeof(text));
+	plan_create(&plan, 1, "/ns/zstd/small", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/ns/zstd/small", 0, small, sizeof(small));
+	plan_write_new(&plan, 2, "/ns/zstd/large", ZSTD_PATCH_OFFSET, patch, sizeof(patch));
+	expect_xattr(&plan, 1, LAST_STAGE, "/ns/zstd/large", "btrfs.compression", "zstd", 4);
+	expect_compressed(&plan, 1, 1, "/ns/zstd/large", BTRFS_COMPRESSION_ZSTD, 2, 0);
+	expect_compressed(&plan, 2, LAST_STAGE, "/ns/zstd/large", BTRFS_COMPRESSION_ZSTD, 3, 0);
+	expect_file(&plan, 1, 1, "/ns/zstd/large", text, sizeof(text));
+	expect_file(&plan, 2, LAST_STAGE, "/ns/zstd/large", patched, sizeof(patched));
+	expect_compressed(&plan, 1, LAST_STAGE, "/ns/zstd/small", BTRFS_COMPRESSION_ZSTD, 0, 1);
+	expect_file(&plan, 1, LAST_STAGE, "/ns/zstd/small", small, sizeof(small));
+	run_plan(context, &plan);
+}
+
 /* Names beyond the full INODE_REF item of /ns/extref/target: new extended
  * references (also in a colliding item, and appended to one Linux wrote),
  * unlinks of extended names from the middle and end of packed items, renames
@@ -1428,7 +1462,9 @@ namespace_flag_refusals(struct context *context)
 	REQUIRE(btrfs_transaction_write(transaction, id, 0, "x", 1, time) == BTRFS_OK);
 	btrfs_transaction_destroy(transaction);
 	btrfs_unmount(fs);
-	REQUIRE(context->device->count == 0);
+	/* The aborted transaction wrote only new data, to unreferenced space. */
+	require_data_writes(context, 0, context->device->count);
+	truncate_writes(context->device, 0);
 	REQUIRE(context->image.live_allocations == 0);
 	printf("immutable, append-only and set-id refusals PASS\n");
 }
@@ -1455,4 +1491,5 @@ namespace_scenarios(struct context *context)
 	namespace_full_item_plan(context);
 	namespace_extref_plan(context);
 	namespace_extref_full_plan(context);
+	namespace_zstd_plan(context);
 }

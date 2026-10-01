@@ -253,6 +253,50 @@ check_subvolume(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
 	}
 }
 
+/* Counts the inode's compressed file extent items by codec and kind. */
+static void
+check_compressed(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
+    const struct expectation *e, const struct btrfs_inode *inode)
+{
+	const struct bt_disk_extent_header *extent;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key = { inode->id.inode, 0, BT_EXTENT_DATA };
+	uint32_t regular = 0;
+	uint32_t inline_extents = 0;
+	uint32_t other = 0;
+	enum btrfs_result result;
+
+	REQUIRE(bt_find_root(fs, inode->id.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != inode->id.inode || record.key.type != BT_EXTENT_DATA) {
+			break;
+		}
+		REQUIRE(record.size >= sizeof(*extent));
+		extent = (const void *)record.data;
+		if (extent->compression != BTRFS_COMPRESSION_NONE) {
+			if (extent->compression != e->value) {
+				other++;
+			} else if (extent->type == BT_EXTENT_INLINE) {
+				inline_extents++;
+			} else {
+				regular++;
+			}
+		}
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	if (regular != e->links || inline_extents != e->mode || other != 0) {
+		fprintf(stderr, "%s stage %zu: %s: %u compressed extents, %u inline, %u other\n",
+		    plan->name, stage, e->path, regular, inline_extents, other);
+		exit(1);
+	}
+}
+
 static void
 check_subvolumes(
     struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e)
@@ -388,6 +432,9 @@ check_expectation(
 		if (count_subvolumes(fs, 1) != e->value) {
 			expectation_failed(plan, stage, e, "deleted subvolumes");
 		}
+		return;
+	case EXPECT_COMPRESSED:
+		check_compressed(fs, plan, stage, e, &inode);
 		return;
 	default:
 		REQUIRE(0);
@@ -630,6 +677,40 @@ fill_pattern(uint8_t *data, size_t size, unsigned seed)
 
 	for (i = 0; i < size; i++) {
 		data[i] = (uint8_t)(seed + i * 131U + (i >> 9));
+	}
+}
+
+/* Compressible bytes: numbered lines of one sentence. */
+void
+fill_text(uint8_t *data, size_t size, unsigned seed)
+{
+	char line[96];
+	size_t done = 0;
+	size_t length;
+	unsigned number = 0;
+
+	while (done < size) {
+		length = (size_t)snprintf(line, sizeof(line),
+		    "line %06u of %u: the quick brown fox jumps over the lazy dog\n", number++,
+		    seed);
+		length = length < size - done ? length : size - done;
+		memcpy(data + done, line, length);
+		done += length;
+	}
+}
+
+/* Incompressible bytes from a xorshift generator. */
+void
+fill_random(uint8_t *data, size_t size, unsigned seed)
+{
+	uint32_t state = 0x9e3779b9U ^ seed;
+	size_t i;
+
+	for (i = 0; i < size; i++) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		data[i] = (uint8_t)(state >> 24);
 	}
 }
 
@@ -1054,6 +1135,17 @@ expect_subvolume(struct plan *plan, size_t first, size_t last, const char *path,
 		e->other = strdup(source);
 		REQUIRE(e->other != NULL);
 	}
+}
+
+void
+expect_compressed(struct plan *plan, size_t first, size_t last, const char *path,
+    enum btrfs_compression codec, uint32_t regular, uint32_t inline_extents)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_COMPRESSED, path);
+
+	e->value = (uint64_t)codec;
+	e->links = regular;
+	e->mode = inline_extents;
 }
 
 void

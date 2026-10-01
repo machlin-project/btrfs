@@ -11,9 +11,7 @@
 
 #define BT_TRANSACTION_NODES 4096U
 #define BT_TRANSACTION_TREES 16U
-/* Staged data and queued file reference changes of one transaction. */
-#define BT_TRANSACTION_DATA (UINT64_C(64) * 1024 * 1024)
-#define BT_TRANSACTION_EXTENTS 4096U
+/* Queued file reference changes of one transaction. */
 #define BT_TRANSACTION_REFERENCES 65536U
 #define BT_INLINE_WRITE_LIMIT 2048U
 #define BT_TRANSACTION_INDEXES 256U
@@ -37,17 +35,6 @@ struct bt_owned_root {
 	/* A read-only subvolume opened as a snapshot source: its root item may
 	 * change, its tree may not. */
 	int read_only;
-};
-
-/* A new data extent held in memory until publication writes it before the
- * first barrier. Its physical copies serve reads through the private view. */
-struct bt_staged {
-	uint64_t logical;
-	uint64_t length;
-	uint64_t physical[2];
-	unsigned mirrors;
-	uint8_t *bytes;
-	int freed;
 };
 
 /* A file extent item reference change, applied after the CoW-derived changes
@@ -128,9 +115,6 @@ struct btrfs_transaction {
 	 * changed and the encoding of a new entry. */
 	uint8_t *item;
 	uint8_t *entry;
-	struct bt_staged *staged;
-	size_t staged_count;
-	uint64_t staged_bytes;
 	struct bt_file_ref *refs;
 	size_t ref_count;
 	/* Inode numbers and directory indexes handed out in this transaction stay
@@ -181,7 +165,6 @@ enum btrfs_result bt_tx_queue(struct btrfs_transaction *transaction, struct bt_k
 /* Applies queued file references; a data extent whose last reference goes
  * loses its checksums and its block-group space. */
 enum btrfs_result bt_tx_apply_refs(struct btrfs_transaction *transaction);
-enum btrfs_result bt_tx_write_staged(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_drop_range(struct btrfs_transaction *transaction,
     struct bt_owned_root *tree, uint64_t inode, uint64_t start, uint64_t end, uint64_t *removed);
 void bt_tx_release_data(struct btrfs_transaction *transaction);

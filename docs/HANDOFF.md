@@ -49,7 +49,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission, reference/accounting fixed point, root/backup updates, three barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
 | Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, log/foreign-copy refusal, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
 | Free-space tree | Verification against the extent tree, logged allocation changes applied in the fixed point, extents and bitmaps | `core/fst.c`, `core/space.c` |
-| File data / checksums | CoW writes and truncation, drop-extents splitting, staged data, private read view, checksum items | `core/data.c`, `core/csum.c` |
+| File data / checksums | CoW writes and truncation, drop-extents splitting, data written as extents are created, compression on write, inline small files, private read view, checksum items | `core/data.c`, `core/csum.c` |
 | Namespace mutations / audit | Create of every type, link, unlink with orphans, rename with replacement, packed collision items, xattrs and the compression property; independent namespace audit | `core/namespace.c`, `tests/namespace_audit.c` |
 | Subvolumes / cleaner | Subvolume and snapshot creation, deletion with root references and UUID tree entries, resumable drop walk with Linux's FULL_BACKREF conversion | `core/subvolume.c`, `core/drop.c` |
 | Shared references / audit | Linux CoW reference rules, inline/keyed placement and ordering, FULL_BACKREF conversion; independent whole-filesystem reference audit | `core/backref.c`, `tests/references.c` |
@@ -87,9 +87,10 @@ only after successful durable publication; `seal` alone is not a commit.
    with checksums, holes, preallocated and compressed input, inline conversion
    and snapshot-safe frees (`core/data.c`, `core/csum.c`). Remaining: in-place
    preallocation conversion and NODATACOW overwrite for unshared extents (both
-   need their own crash cases), compression on write, data DUP and 64 KiB-sector
-   fixtures, explicit hole items for filesystems without NO_HOLES, and lifting
-   the 64 MiB staging bound with streaming writeback once native writers exist.
+   need their own crash cases), data DUP and 64 KiB-sector fixtures, explicit
+   hole items for filesystems without NO_HOLES, and a compressor in the kernel
+   adapter. New data is written as its extents are created, and files compress
+   on write as Linux decides.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
    siblings, and data and metadata chunks grow from unallocated device space

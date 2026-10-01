@@ -115,6 +115,25 @@ list_names() {
     done | LC_ALL=C sort
 }
 
+# CODEC:REGULAR:INLINE: the file's extents compressed with CODEC, by kind, in
+# Linux's own tree dump, and none with another codec.
+check_compressed() {
+    inode=$(stat -c '%i' "$1")
+    codec=1
+    [ "${2%%:*}" = zstd ] && codec=3
+    counts=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+        awk -v inode="$inode" -v codec="$codec" '
+        $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
+        inside && /inline extent data size/ && match($0, /compression [0-9]+/) {
+            c = substr($0, RSTART + 12, RLENGTH - 12) + 0
+            if (c == codec) inline++; else if (c != 0) other++ }
+        inside && $1 == "extent" && $2 == "compression" {
+            c = $3 + 0
+            if (c == codec) regular++; else if (c != 0) other++ }
+        END { printf "%d:%d:%d", regular, inline, other }')
+    test "$counts" = "${2#*:}:0"
+}
+
 namespace_checks=0
 
 check_namespace() {
@@ -143,6 +162,7 @@ check_namespace() {
         subvolumes) btrfs subvolume list /mnt | awk '{ print $NF }' | LC_ALL=C sort > /tmp/listing &&
             cmp /tmp/listing "$1/$payload" ;;
         deleted) test "$(btrfs subvolume list -d /mnt | wc -l)" -eq "$arg" ;;
+        compressed) check_compressed "$target" "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"

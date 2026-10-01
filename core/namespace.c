@@ -3,8 +3,9 @@
 
 /* Linux's compression property: a value starting with a codec name (a level
  * may follow), or "no"/"none" to disable compression. */
-static const struct bt_codec bt_ns_codecs[] = { { "zlib", 0 }, { "lzo", BT_FEATURE_COMPRESS_LZO },
-	{ "zstd", BT_FEATURE_COMPRESS_ZSTD } };
+static const struct bt_codec bt_ns_codecs[] = { { "zlib", 0, BTRFS_COMPRESSION_ZLIB },
+	{ "lzo", BT_FEATURE_COMPRESS_LZO, BTRFS_COMPRESSION_LZO },
+	{ "zstd", BT_FEATURE_COMPRESS_ZSTD, BTRFS_COMPRESSION_ZSTD } };
 
 uint8_t
 bt_ns_type(uint32_t mode)

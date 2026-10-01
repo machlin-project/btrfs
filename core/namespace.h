@@ -50,6 +50,7 @@ struct bt_packed {
 struct bt_codec {
 	const char *name;
 	uint64_t feature;
+	enum btrfs_compression codec;
 };
 
 /* Namespace records shared by the namespace and subvolume editors

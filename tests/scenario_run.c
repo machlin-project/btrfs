@@ -125,7 +125,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
 		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
-		"subvolumes", "deleted" };
+		"subvolumes", "deleted", "compressed" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -134,7 +134,8 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	size_t stage;
 	size_t i;
 
-	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_DELETED + 1, "expectation kinds");
+	_Static_assert(
+	    sizeof(kinds) / sizeof(kinds[0]) == EXPECT_COMPRESSED + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
@@ -180,6 +181,14 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 			    e->value == BT_FEATURE_COMPRESS_LZO ? "COMPRESS_LZO" : "COMPRESS_ZSTD";
 		} else if (e->kind == EXPECT_REFERENCE) {
 			detail = e->value != 0 ? "extended" : "inode";
+		} else if (e->kind == EXPECT_COMPRESSED) {
+			/* codec:regular:inline */
+			REQUIRE(e->value == BTRFS_COMPRESSION_ZLIB ||
+			    e->value == BTRFS_COMPRESSION_ZSTD);
+			REQUIRE(snprintf(argument, sizeof(argument), "%s:%u:%u",
+				    e->value == BTRFS_COMPRESSION_ZLIB ? "zlib" : "zstd", e->links,
+				    e->mode) < (int)sizeof(argument));
+			detail = argument;
 		} else if (e->kind == EXPECT_DELETED) {
 			REQUIRE(snprintf(argument, sizeof(argument), "%llu",
 				    (unsigned long long)e->value) < (int)sizeof(argument));
@@ -798,6 +807,7 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	context->image.fail_allocate = fault == FAULT_ALLOCATE ? allocations + point : 0;
 	context->image.fail_read = fault == FAULT_READ ? reads + point : 0;
 	result = btrfs_transaction_begin(fs, &context->writer, &transaction);
+	device->coherent = 1;
 	for (i = 0; result == BTRFS_OK && i < plan->operation_count[commit]; i++) {
 		result = execute(transaction, &table, &plan->operations[commit][i], time);
 		if (plan->operations[commit][i].expected != BTRFS_OK &&
@@ -816,6 +826,7 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 			    btrfs_result_string(plan->operations[commit][i].expected));
 		}
 	}
+	device->before_commit = device->count;
 	if (result == BTRFS_OK) {
 		result = btrfs_transaction_commit(transaction);
 	}
@@ -837,10 +848,59 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 		REQUIRE(device->count == i);
 	}
 	btrfs_transaction_destroy(transaction);
+	device->coherent = 0;
 	btrfs_unmount(fs);
 	path_table_release(&table);
 	REQUIRE(context->image.live_allocations == 0);
 	return result;
+}
+
+/* Writes [first, last) of the device are new data: they touch no superblock
+ * copy and no metadata or system chunk (a data chunk grown in the transaction
+ * lies outside every committed chunk). */
+void
+require_data_writes(struct context *context, size_t first, size_t last)
+{
+	const struct saved_write *write;
+	struct btrfs_fs *fs;
+	uint64_t physical;
+	size_t i;
+	size_t c;
+	unsigned mirror;
+	unsigned mirrors;
+	int metadata;
+
+	if (first == last) {
+		return;
+	}
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	for (i = first; i < last; i++) {
+		write = &context->device->writes[i];
+		metadata = 0;
+		for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
+			physical = bt_super_offset(mirror);
+			metadata |= write->offset < physical + BT_SUPER_SIZE &&
+			    physical < write->offset + write->length;
+		}
+		for (c = 0; !metadata && c < fs->chunk_count; c++) {
+			if ((fs->chunks[c].type & BT_BLOCK_DATA) != 0) {
+				continue;
+			}
+			mirrors = 1;
+			for (mirror = 0; !metadata && mirror < mirrors; mirror++) {
+				REQUIRE(bt_map(fs, fs->chunks[c].logical, 1, fs->chunks[c].type,
+					    mirror, &physical, &mirrors) == BTRFS_OK);
+				metadata = write->offset < physical + fs->chunks[c].length &&
+				    physical < write->offset + write->length;
+			}
+		}
+		if (metadata) {
+			fprintf(stderr, "write %zu at %llu before the commit is not new data\n", i,
+			    (unsigned long long)write->offset);
+			exit(1);
+		}
+	}
+	btrfs_unmount(fs);
 }
 
 static void
@@ -882,12 +942,15 @@ fault_sweeps(struct context *context, const struct plan *plan, size_t commit, si
 			if (result != BTRFS_OK) {
 				failures[fault]++;
 			}
+			/* A failed allocation or read stops before the commit's first
+			 * write; only new data reached unreferenced space. */
 			if (fault == FAULT_ALLOCATE ||
 			    (fault == FAULT_READ && result != BTRFS_OK)) {
-				REQUIRE(device->count == first);
+				REQUIRE(device->count == device->before_commit);
+				require_data_writes(context, first, device->count);
 			}
 			resolve(context, plan, commit - 1, commit, &outcome);
-			REQUIRE(result == BTRFS_OK || device->count != first ||
+			REQUIRE(result == BTRFS_OK || device->count != device->before_commit ||
 			    outcome.resolved == commit - 1);
 			outcome_release(&outcome);
 			truncate_writes(device, first);

@@ -46,7 +46,8 @@ void btrfs_volume_unpin(struct btrfs_volume *volume, struct btrfs_volume_view *v
 
 /* Exclusive writer. begin waits for any other writer and for older views to
  * drain. commit publishes the transaction and opens its view; abort discards a
- * transaction (nothing reached media while it was open). Both end the writer's
+ * transaction (only its new data reached media, in space no committed root
+ * references). Both end the writer's
  * turn and destroy the transaction. A transaction that changed nothing commits
  * without writes. The caller must not hold a pin while beginning. */
 enum btrfs_result btrfs_volume_begin(

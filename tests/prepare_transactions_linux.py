@@ -35,7 +35,8 @@ NAMESPACE_ARGUMENT = {
     "reference": re.compile(r"^(inode|extended)$"),
     "subvolume": re.compile(r"^(ro|rw):(-|/|(/[A-Za-z0-9._-]{1,255})+)$"),
     "subvolumes": re.compile(r"^-$"),
-    "deleted": re.compile(r"^[0-9]+$")}
+    "deleted": re.compile(r"^[0-9]+$"),
+    "compressed": re.compile(r"^(zlib|zstd):[0-9]+:[0-9]+$")}
 PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr", "subvolumes"}
 # Facts that may name the top-level directory itself.
 ROOT_KINDS = {"dir", "stat", "xattr", "noxattr", "flags", "times", "feature", "subvolume",

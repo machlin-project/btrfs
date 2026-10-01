@@ -75,6 +75,10 @@
 #define CRC32C_REFLECTED_POLYNOMIAL UINT32_C(0x82f63b78)
 #define FORGE_ATTEMPTS 1000000U
 #define FORGE_COUNTER_BYTES 6U
+#define ZSTD_TEXT_BYTES (200U * 1024U)
+#define ZSTD_SMALL_BYTES 2000U
+#define ZSTD_PATCH_OFFSET 65536U
+#define ZSTD_PATCH_BYTES 4096U
 #define COLLISION_BLOCK_BYTES 8U
 #define COLLISION_BLOCKS 10U
 #define COLLISION_NAME_BYTES (COLLISION_BLOCK_BYTES * COLLISION_BLOCKS)
@@ -104,7 +108,14 @@ struct device {
 	size_t flushes;
 	size_t fail_write;
 	size_t fail_flush;
+	/* Writes recorded before the commit began: new data in unreferenced
+	 * space, written when its extents were created. */
+	size_t before_commit;
 	int immediate;
+	/* While a transaction runs, reads see every issued write, as a block
+	 * device returns written data before a flush makes it durable; crash
+	 * states see only durable or chosen sectors. */
+	int coherent;
 };
 
 struct tracked {
@@ -175,7 +186,8 @@ enum expectation_kind {
 	EXPECT_REFERENCE,
 	EXPECT_SUBVOLUME,
 	EXPECT_SUBVOLUMES,
-	EXPECT_DELETED
+	EXPECT_DELETED,
+	EXPECT_COMPRESSED
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -201,7 +213,9 @@ struct expectation {
 	 * a subvolume, read-only when value is 1, a snapshot of the subvolume at
 	 * other (NULL: of none). EXPECT_SUBVOLUMES: bytes list every subvolume's
 	 * path below the top level, as btrfs subvolume list prints them.
-	 * EXPECT_DELETED: value deleted subvolumes wait for the cleaner. */
+	 * EXPECT_DELETED: value deleted subvolumes wait for the cleaner.
+	 * EXPECT_COMPRESSED: the file's extents compressed with codec value:
+	 * links regular and mode inline ones, and none with another codec. */
 	/* EXPECT_TIMES: seconds of the access and modification times. */
 	int64_t access_seconds;
 	int64_t modify_seconds;
@@ -317,6 +331,8 @@ void plan_truncate(
 void plan_finish(struct plan *plan);
 void plan_destroy(struct plan *plan);
 void fill_pattern(uint8_t *data, size_t size, unsigned seed);
+void fill_text(uint8_t *data, size_t size, unsigned seed);
+void fill_random(uint8_t *data, size_t size, unsigned seed);
 void plan_create(
     struct plan *plan, size_t commit, const char *path, uint32_t mode, const char *symlink);
 void plan_device(
@@ -382,11 +398,16 @@ void expect_subvolume(struct plan *plan, size_t first, size_t last, const char *
     const char *source, int read_only);
 void expect_subvolumes(struct plan *plan, size_t first, size_t last, const char **paths);
 void expect_deleted(struct plan *plan, size_t first, size_t last, size_t count);
+void expect_compressed(struct plan *plan, size_t first, size_t last, const char *path,
+    enum btrfs_compression codec, uint32_t regular, uint32_t inline_extents);
 
 /* Execution, crash states, fault sweeps and export (tests/scenario_run.c). */
 size_t chunk_count(struct context *context);
 void audit_state(struct context *context, const char *name);
 void run_plan(struct context *context, struct plan *plan);
+/* Writes [first, last) of the device are new data only (no superblock copy,
+ * metadata or system chunk). */
+void require_data_writes(struct context *context, size_t first, size_t last);
 
 /* Scenario sets. */
 void plan_scenarios(struct context *context);

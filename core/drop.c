@@ -620,7 +620,7 @@ btrfs_transaction_clean_subvolumes(
 		if (error == BTRFS_OK) {
 			error = bt_drop_tree(drop, budget - spent, &finished);
 			spent += drop->visited;
-			*dropped += finished;
+			*dropped += finished ? 1U : 0U;
 		}
 		if (drop != NULL) {
 			bt_drop_release(drop);

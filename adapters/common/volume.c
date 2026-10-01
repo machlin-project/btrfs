@@ -301,6 +301,10 @@ btrfs_volume_commit(struct btrfs_volume *volume, struct btrfs_transaction *trans
 	if (transaction == NULL || transaction != volume->open) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
+	/* Data written while the transaction ran went to space no committed root
+	 * references; only the commit's own writes can make the medium
+	 * uncertain. */
+	volume->issued = 0;
 	error = btrfs_transaction_commit(transaction);
 	btrfs_transaction_destroy(transaction);
 	if (error == BTRFS_OK && volume->issued != 0) {

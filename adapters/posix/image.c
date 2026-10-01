@@ -11,6 +11,7 @@
 #include <zlib.h>
 #ifdef BTRFS_HAVE_ZSTD
 #include <zstd.h>
+#include <zstd_errors.h>
 #endif
 
 static enum btrfs_result
@@ -109,6 +110,56 @@ image_decompress(void *context, enum btrfs_compression codec, const void *input,
 		}
 		decoded = ZSTD_decompress(output, output_size, input, frame);
 		return !ZSTD_isError(decoded) && decoded == output_size ? BTRFS_OK : BTRFS_CORRUPT;
+	}
+#endif
+	return BTRFS_UNSUPPORTED;
+}
+
+/* Linux's default levels: zlib 3 and zstd 3. */
+#define BTRFS_IMAGE_ZLIB_LEVEL 3
+#define BTRFS_IMAGE_ZSTD_LEVEL 3
+
+enum btrfs_result
+btrfs_image_compress(void *context, enum btrfs_compression codec, const void *input,
+    size_t input_size, void *output, size_t capacity, size_t *size)
+{
+	z_stream stream;
+	int result;
+#ifdef BTRFS_HAVE_ZSTD
+	size_t encoded;
+#endif
+
+	(void)context;
+	*size = 0;
+	if (codec == BTRFS_COMPRESSION_ZLIB) {
+		if (input_size > UINT_MAX || capacity > UINT_MAX) {
+			return BTRFS_RANGE;
+		}
+		memset(&stream, 0, sizeof(stream));
+		result = deflateInit(&stream, BTRFS_IMAGE_ZLIB_LEVEL);
+		if (result != Z_OK) {
+			return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_IO;
+		}
+		stream.next_in = (Bytef *)input;
+		stream.avail_in = (uInt)input_size;
+		stream.next_out = output;
+		stream.avail_out = (uInt)capacity;
+		result = deflate(&stream, Z_FINISH);
+		*size = stream.total_out;
+		(void)deflateEnd(&stream);
+		return result == Z_STREAM_END ? BTRFS_OK : BTRFS_RANGE;
+	}
+#ifdef BTRFS_HAVE_ZSTD
+	if (codec == BTRFS_COMPRESSION_ZSTD) {
+		encoded =
+		    ZSTD_compress(output, capacity, input, input_size, BTRFS_IMAGE_ZSTD_LEVEL);
+		if (ZSTD_isError(encoded)) {
+			return ZSTD_getErrorCode(encoded) == ZSTD_error_dstSize_tooSmall
+			    ? BTRFS_RANGE
+			    : BTRFS_IO;
+		}
+		*size = encoded;
+		return BTRFS_OK;
 	}
 #endif
 	return BTRFS_UNSUPPORTED;

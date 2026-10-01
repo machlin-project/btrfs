@@ -226,7 +226,7 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 | `keyed-*` (`--keyed`) | The same decisions on blocks and extents whose references are partly keyed items |
 | `grow-*` (`--grow`) | Metadata and data chunk growth from unallocated device space |
 | `fst-*` (`--fragment`) | Frees between bitmap holes and a write that spills from extent-mode free space into bitmap holes |
-| `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes |
+| `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes; compression on write by property (128 KiB zlib extents, incompressible data, compressed and plain inline files, an overwrite splitting a compressed extent, truncation) and by the zstd mount option (ZSTD feature, `no` property, NODATASUM) |
 | `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); names beyond a full INODE_REF item in new INODE_EXTREF items, a colliding one and one Linux wrote, unlinked from packed and last entries, renamed into and out of the INODE_REF item and across directories, and an INODE_EXTREF item filled to the largest item; unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item |
 | `subvolume-*` (`--subvolume`) | Subvolumes at the top level, in a directory and in another subvolume, inheriting the parent subvolume's compression property; writable and read-only snapshots of a subvolume, of the multi-level top level, of a read-only snapshot and of a snapshot, edited on either side; copied subvolume entries as stubs; deletion of subvolumes, snapshots and a stub entry; the cleaner resuming a partial drop across commits, and fully dropping a subvolume whose leaves a snapshot shares and an unshared one with data |
 | `random-N` (`--random FIRST COUNT`, `--random-quick FIRST COUNT`) | Seeded differential sequences: 24 operations in three commits drawn from create of every type, link, unlink, rename (also over files and between names of one inode), xattr set/remove, write, truncation, attribute changes, orphan cleanup and expected refusals under `/fuzz`, over a name pool with real CRC32C collisions; a separate model predicts each stage's namespace facts |
@@ -268,6 +268,15 @@ again; with a mount's `btrfs_counters` both continue, also past an aborted
 transaction, until the full directory table forgets a directory, and a stale
 counter never numbers a new directory that reuses an inode number.
 
+`--data` also writes 80 MiB in one transaction and requires the transaction to
+hold less than 16 MiB afterwards (new data reaches the device as its extents
+are created), the file to read back exactly and both audits to pass. With
+`--namespace`, files in a directory with the zstd property inherit it.
+Allocation and read faults may leave writes issued before the commit, but only
+of new data (no superblock copy, metadata or system chunk); the state must
+still resolve to the previous stage. While a transaction runs, the recorded
+device returns every issued write, as a block device does before a flush.
+
 `tests/scenario_random.c` adds differential coverage. Seed N draws operations
 with fixed weights against a model of `/fuzz` (inodes, names, link counts,
 owners, modes, times, data, symlink targets and xattrs), including refusals the
@@ -303,7 +312,8 @@ writes this implementation's recovery chose. Namespace scenarios add
 `namespace.tsv`: per stage, absent paths, file contents, exact sorted directory
 listings with their sizes, symlink targets, hard-link identity, xattr values and
 absence, mode/owner/link counts, device numbers, inode flags, incompat features
-whether INODE_REF or INODE_EXTREF holds a name, a subvolume's read-only flag and
+whether INODE_REF or INODE_EXTREF holds a name, how many of a file's regular and
+inline extents a codec compressed, a subvolume's read-only flag and
 snapshot source, the list of subvolumes and the number of deleted ones waiting
 for the cleaner, with payload files for expected bytes. These are generated
 test inputs, not

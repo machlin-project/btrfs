@@ -263,28 +263,51 @@ longer exist are left as Linux leaves them.
 `btrfs_transaction_write` and `btrfs_transaction_truncate` change regular files
 as copy-on-write data on filesystems with NO_HOLES (`core/data.c`). The range is
 widened to whole sectors; partially covered sectors are read through a private
-view (mutation metadata overlay, staged data, the transaction's own checksum and
-file trees, and the adapter's codec), so later operations see earlier ones and
+view (mutation metadata overlay, new data from the device, the transaction's own
+checksum and file trees, and the adapter's codec), so later operations see
+earlier ones and
 compressed or preallocated input reads correctly. Existing coverage is removed
 the way `btrfs_drop_extents` does: covered items go, overlapping ones are
 trimmed, moved or split, keeping the reference key (file offset minus extent
 offset). New extents come from data block-group gaps, at most 128 MiB each, with
 a data extent item carrying the first reference inline, checksum items unless
-the inode is NODATASUM, and a regular file extent item. Inline files become
-regular extents. A write past an unaligned EOF clears the old EOF sector's tail;
+the inode is NODATASUM, and a regular file extent item. A file whose bytes fit
+its first sector becomes one inline extent when a write reaches its end, as
+Linux's `cow_file_range_inline` decides: compressed when it compresses to the
+2 KiB inline limit, else as is when it is at most 2 KiB and does not fill the
+sector; larger files convert inline extents to regular ones. A write past an unaligned EOF clears the old EOF sector's tail;
 truncation clears the new EOF sector's tail and drops coverage beyond it. Inode
 size, `nbytes`, times, transid and sequence change together.
 
-New data stays in memory (at most 64 MiB and 4,096 extents per transaction) and
-is written during commit before the metadata, ahead of the first barrier, so a
-destroyed transaction leaves media untouched and a crash leaves new data
-unreferenced. File extent reference changes are queued and applied after the
+New data is written to its extent when the extent is created, before the
+commit writes any metadata: the allocator never hands out space a committed
+root references or this transaction freed, so the write disturbs no committed
+state, and the commit's first barrier makes it durable before any superblock
+names it. A destroyed transaction leaves only unreferenced data; a failed data
+write fails the transaction. A rewrite holds at most 8 MiB in memory and
+processes longer ranges in pieces, so a transaction's data has no size bound
+beyond free space, which a write checks for its whole range before any change
+(Linux reserves it at write time; NO_SPACE then leaves the transaction
+usable). File extent reference changes are queued and applied after the
 CoW-derived references of the same commit, additions before drops. A data
 extent losing its last reference loses its checksum items and block-group space
 in the same commit; ranges freed or allocated in a transaction are never reused
 by it, and the owner must retire readers of the old root before the next one.
 Preallocated ranges are rewritten by CoW, not converted in place; NODATACOW files
-are also written by CoW; data is never compressed on write. Writing or
+are also written by CoW.
+
+Compression follows Linux's `inode_need_compress` and `compress_file_range`.
+NODATACOW, NODATASUM and NOCOMPRESS files are never compressed. Otherwise a
+file's `btrfs.compression` property names the codec; without one, the COMPRESS
+flag or the adapter's compress mount option selects the mount's codec (zlib
+when it names none). The adapter supplies the compressor (`compress` in the
+write environment); without it nothing is compressed. Data is compressed in
+pieces of at most 128 KiB, each one extent whose stream, padded to whole
+sectors, is kept only when that saves at least a sector; its file extent item
+records the codec, the uncompressed length and the stored size, and checksums
+cover the stored bytes. Writing ZSTD data records the ZSTD incompat feature.
+Linux's compressibility heuristic is not reproduced: compression is attempted
+and its result judged. LZO files are written uncompressed. Writing or
 truncating a set-id file needs the caller's settled privilege decision
 (`btrfs_transaction_drop_privileges` or `_keep_privileges`, Linux's
 `file_remove_privs`); immutable inodes refuse every change and append-only

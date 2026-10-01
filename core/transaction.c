@@ -1010,12 +1010,8 @@ bt_tx_persist(struct btrfs_transaction *transaction)
 	unsigned level;
 	enum btrfs_result error;
 
-	/* New data precedes the metadata that references it; both are durable at
-	 * the first barrier. */
-	error = bt_tx_write_staged(transaction);
-	if (error != BTRFS_OK) {
-		return error;
-	}
+	/* New data was written when its extents were created; it and the
+	 * metadata naming it are durable at the first barrier. */
 	for (level = 0; level < BT_MAX_LEVEL; level++) {
 		for (i = 0; i < bt_mutation_count(transaction->mutation); i++) {
 			error = bt_mutation_block(transaction->mutation, i, &block);

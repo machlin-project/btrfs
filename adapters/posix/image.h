@@ -13,6 +13,9 @@ struct btrfs_image {
 
 int btrfs_image_open(const char *path, struct btrfs_image *image);
 void btrfs_image_close(struct btrfs_image *image);
+/* zlib and Zstd compression for the write environment's compress callback. */
+enum btrfs_result btrfs_image_compress(void *context, enum btrfs_compression codec,
+    const void *input, size_t input_size, void *output, size_t capacity, size_t *size);
 enum btrfs_result btrfs_image_lookup(
     struct btrfs_fs *fs, const char *path, struct btrfs_inode *inode);
 #endif

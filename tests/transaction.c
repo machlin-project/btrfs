@@ -67,8 +67,8 @@ main(int argc, char **argv)
 	context->env.allocate = allocate;
 	context->env.release = release;
 	context->env.decompress = decompress_device;
-	context->writer =
-	    (struct btrfs_write_environment){ context->device, write_device, flush_device };
+	context->writer = (struct btrfs_write_environment){ context->device, write_device,
+		flush_device, btrfs_image_compress, BTRFS_COMPRESSION_NONE };
 	context->seed = UINT32_C(0x142857);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	btrfs_get_info(fs, &info);
