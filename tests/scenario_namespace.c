@@ -1463,6 +1463,7 @@ namespace_counters(struct context *context)
 static void
 namespace_audit_self_test(struct context *context)
 {
+	static const char *const targets[] = { "/ns/one", "/ns/tree", "/ns/data" };
 	struct namespace_audit audit;
 	struct bt_disk_inode inode;
 	struct bt_owned_root *tree;
@@ -1472,18 +1473,19 @@ namespace_audit_self_test(struct context *context)
 	size_t length;
 	size_t pass;
 
-	for (pass = 0; pass < 2; pass++) {
+	for (pass = 0; pass < sizeof(targets) / sizeof(targets[0]); pass++) {
 		REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
-		key = (struct bt_key){ object(fs, pass == 0 ? "/ns/one" : "/ns/tree").inode, 0,
-			BT_INODE_ITEM };
+		key = (struct bt_key){ object(fs, targets[pass]).inode, 0, BT_INODE_ITEM };
 		REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
 		REQUIRE(bt_tx_tree(transaction, BTRFS_TOP_LEVEL_TREE, &tree) == BTRFS_OK);
 		REQUIRE(bt_mutation_find(transaction->mutation, tree->root, key, &inode,
 			    sizeof(inode), &length) == BTRFS_OK);
 		if (pass == 0) {
 			bt_put32(&inode.links, bt_u32(inode.links) + 1);
-		} else {
+		} else if (pass == 1) {
 			bt_put64(&inode.size, bt_u64(inode.size) + 2);
+		} else {
+			bt_put64(&inode.nbytes, bt_u64(inode.nbytes) + context->sector_size);
 		}
 		REQUIRE(bt_tx_edit(transaction, &tree->root, key, &inode, sizeof(inode),
 			    BT_REPLACE) == BTRFS_OK);

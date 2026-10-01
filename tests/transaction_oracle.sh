@@ -151,6 +151,18 @@ check_extents() {
     test "$counts" = "$2" || { echo "extents of $1: $counts" >&2; return 1; }
 }
 
+# The file's hole items (disk byte 0) in Linux's own tree dump.
+check_holes() {
+    inode=$(stat -c '%i' "$1")
+    count=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+        awk -v inode="$inode" '
+        BEGIN { holes = 0 }
+        $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
+        inside && $1 == "extent" && $2 == "data" && $3 == "disk" && $4 == "byte" && $5 == 0 { holes++ }
+        END { printf "%d", holes }')
+    test "$count" = "$2" || { echo "holes of $1: $count" >&2; return 1; }
+}
+
 # A NODATACOW overwrite reaches the disk before its commit: a state of commit
 # $commit resolving to the previous stage may hold, device sector by sector, the
 # old or the new bytes inside the scenario's volatile ranges (volatile.tsv).
@@ -207,6 +219,7 @@ check_namespace() {
         deleted) test "$(btrfs subvolume list -d /mnt | wc -l)" -eq "$arg" ;;
         compressed) check_compressed "$target" "$arg" ;;
         extents) check_extents "$target" "$arg" ;;
+        holes) check_holes "$target" "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"
@@ -283,7 +296,8 @@ for scenario in /transaction/*; do
     test "$(btrfs subvolume list -d /mnt | wc -l)" -eq 0
     btrfs filesystem sync /mnt
     umount /mnt
-    btrfs check --readonly /dev/vda < /dev/null
+    # Every copy of every checksummed data sector, DUP included.
+    btrfs check --readonly --check-data-csum /dev/vda < /dev/null
     test "$(btrfs inspect-internal dump-tree -t 5 /dev/vda | grep -c ORPHAN_ITEM || true)" = 0
     dd if=/dev/vdb of=/dev/vda bs=1048576 conv=notrunc 2>/dev/null
     refresh

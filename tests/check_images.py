@@ -78,6 +78,16 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
         assert stat(path)["tree"] == 5 and stat(path)["inode"] == 256
     assert run("cat", "../value", tree=sub["tree"]) == b"subvolume changed\n"
     cases += 6
+    if manifest["profile"] == "transactions-holes":
+        # Without NO_HOLES Linux splits hole items around written sectors and
+        # keeps their offsets; a file grown by truncation is one hole item.
+        sparse = bytearray(4194304)
+        sparse[1048576:1048582] = b"HOLE-A"
+        sparse[3145728:3145734] = b"HOLE-B"
+        assert run("cat", "data/sparse") == sparse
+        assert run("cat", "data/sparse", "1048570", "4200") == sparse[1048570:1052770]
+        assert run("cat", "data/grown") == bytes(1048576)
+        cases += 3
     return cases
 
 
@@ -86,7 +96,8 @@ def main() -> None:
     parser.add_argument("--tool", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path, required=True)
     args = parser.parse_args()
-    profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "default-subvolume"]
+    profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "default-subvolume",
+                "transactions-holes"]
     total = 0
     for profile in profiles:
         image = args.fixtures / f"{profile}.raw"

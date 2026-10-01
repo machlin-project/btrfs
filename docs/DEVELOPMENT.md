@@ -44,15 +44,16 @@ the image helper is not an implementation of host or Linux namei.
 ## Linux-authored fixtures
 
 The six reader profiles are `plain`, `small-nodes`, `large-nodes`, `zlib`, `zstd`
-and `default-subvolume`. The transaction suites require seven writable profiles
+and `default-subvolume`. The transaction suites require eight writable profiles
 without a free-space tree and mounted with `nospace_cache`, plus
 `transactions-fst` and `transactions-grow` with mkfs and mount defaults (16 KiB
 nodes, DUP metadata and a free-space tree) and `transactions-namespace` (mkfs
 defaults with 4 KiB nodes and single metadata): `transactions` (4 KiB
 nodes, single metadata), `transactions-dup` (16 KiB nodes, DUP metadata),
 `transactions-large` (64 KiB nodes, DUP metadata), `transactions-full` (4 KiB
-nodes, single metadata, 128 MiB), and `transactions-shared`, `transactions-keyed`
-and `transactions-data` (4 KiB nodes, single metadata). The full profile first fills all unallocated
+nodes, single metadata, 128 MiB), `transactions-shared`, `transactions-keyed`
+and `transactions-data` (4 KiB nodes, single metadata), and `transactions-holes`
+(4 KiB nodes, DUP metadata and data, `-O ^no-holes`, 512 MiB). The full profile first fills all unallocated
 space with data, then metadata with inline files carrying leaf-sized xattrs until
 Linux reports ENOSPC, then removes every seventh filler so the remaining free
 metadata is scattered. The shared profile adds a level-2 subvolume with a
@@ -79,6 +80,10 @@ NODATACOW and a COMPRESS directory, directories with `btrfs.compression`
 properties `zstd` and `no`, two directory entries and two xattrs whose names
 share one CRC32C hash, and a file with 41 links whose 200-byte names exceed its
 INODE_REF item, so Linux stores 22 of them as extended references.
+The holes profile repeats the data payload without NO_HOLES, so Linux writes
+explicit hole items (split around the sparse file's sectors, with their
+offsets) and every data sector has two copies; it adds a 1 MiB file grown by
+truncation alone and a NODATACOW directory.
 Other profiles use 256 MiB. Each uses a separate disposable
 raw image and the payload in `tests/prepare_linux.py`. The payload formats **guest
 `/dev/vda`**, fills files, takes a snapshot, verifies Linux-visible contents,
@@ -133,9 +138,11 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all sixteen
-profiles, then run the portable image and transaction suites. It hashes each complete image before
-and after reading, verifies 312 contracts, and fails if any byte changed.
+Linux checks and a completed VM exit before consuming the image. Repeat all seventeen
+profiles (512 MiB for `transactions-holes`), then run the portable image and
+transaction suites. It hashes each complete image before and after reading,
+verifies 367 contracts (the six reader profiles and `transactions-holes`, whose
+split hole items it reads), and fails if any byte changed.
 
 ## Fuzzing and concurrency
 
@@ -226,6 +233,7 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 | `keyed-*` (`--keyed`) | The same decisions on blocks and extents whose references are partly keyed items |
 | `grow-*` (`--grow`) | Metadata and data chunk growth from unallocated device space |
 | `fst-*` (`--fragment`) | Frees between bitmap holes and a write that spills from extent-mode free space into bitmap holes |
+| `holes-*` (`--holes`) | Without NO_HOLES and on DUP data: truncation and writes past EOF covered by hole items, a write splitting a hole, truncation inside a hole, an inline file written far beyond its sector, Linux's split hole items and a file grown by truncation alone, a write into a 16 GiB hole item, and writes in place into Linux's preallocated file and a new NODATACOW file on both copies |
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes; compression on write by property (128 KiB zlib extents, incompressible data, compressed and plain inline files, an overwrite splitting a compressed extent, truncation) and by the zstd mount option (ZSTD feature, `no` property, NODATASUM) |
 | `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); names beyond a full INODE_REF item in new INODE_EXTREF items, a colliding one and one Linux wrote, unlinked from packed and last entries, renamed into and out of the INODE_REF item and across directories, and an INODE_EXTREF item filled to the largest item; unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item; zstd by an inherited property; writes in place into Linux's preallocated file (item split) and into an unshared NODATACOW extent, copied on write once a snapshot shares it or another reference exists |
 | `subvolume-*` (`--subvolume`) | Subvolumes at the top level, in a directory and in another subvolume, inheriting the parent subvolume's compression property; writable and read-only snapshots of a subvolume, of the multi-level top level, of a read-only snapshot and of a snapshot, edited on either side; copied subvolume entries as stubs; deletion of subvolumes, snapshots and a stub entry; the cleaner resuming a partial drop across commits, and fully dropping a subvolume whose leaves a snapshot shares and an unshared one with data |
@@ -235,15 +243,20 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 suite. It walks every tree from the superblock and root items, derives the
 backreference every parent pointer and file extent item requires (shared forms
 under FULL_BACKREF parents), and compares the multiset and totals exactly with
-the extent tree, including leaks. It runs on every Linux fixture, after every
-scenario commit, and against deliberately damaged references.
+the extent tree, including leaks. Its checksum pass verifies every copy of
+each checksummed sector, so a DUP write that misses one copy fails. It runs on
+every Linux fixture, after every scenario commit, and against deliberately
+damaged references.
 `tests/namespace_audit.c` is the matching namespace oracle: in every file tree
 each name must exist exactly once as DIR_ITEM, DIR_INDEX and inode or extended
 reference with equal index, inode and type; link counts must equal names,
 directory sizes twice their name lengths, and unlinked inodes must have orphan
-items. It runs on every Linux fixture, after every commit, in every crash state
-of the namespace scenarios, and against a committed wrong link count and wrong
-directory size.
+items. As `btrfs check` does, the file extent items of a regular file or
+symlink must not overlap and must count its `nbytes` (hole items excluded), and
+without NO_HOLES they must cover every byte below its size. It runs on every
+Linux fixture, after every commit, in every crash state of the namespace
+scenarios, and against a committed wrong link count, directory size and
+`nbytes`; dropping the hole items fails it on `transactions-holes`.
 
 Each scenario's last commit runs allocation, read, write and barrier fault
 points: every point up to 512 per class, and a deterministic stride that keeps
@@ -299,8 +312,8 @@ Export a profile's crash cases into a new generated directory. Pass the same
 profile flag Meson uses: `--full` for `transactions-full`, `--shared` for
 `transactions-shared`, `--keyed` for `transactions-keyed`, `--data` for
 `transactions-data`, `--data --fragment` for `transactions-fst`, `--grow`
-for `transactions-grow` and `--namespace` or `--subvolume` for
-`transactions-namespace`. Reader
+for `transactions-grow`, `--data --holes` for `transactions-holes` and
+`--namespace` or `--subvolume` for `transactions-namespace`. Reader
 profiles with a free-space tree (`plain`, `small-nodes`) also run the default
 scenarios:
 
@@ -359,8 +372,9 @@ this implementation's recovery writes and requires Linux to find every copy
 valid. After each scenario's cases Linux mounts its newest root read-write
 (cleaning any orphans the scenario left), finishes every subvolume drop this
 implementation left (`btrfs subvolume sync`, then no deleted subvolume
-remains), writes, syncs and passes `btrfs check` with no orphan item left in
-the top-level tree; the guest then copies the
+remains), writes, syncs and passes `btrfs check --check-data-csum`, which
+reads every copy of checksummed data, with no orphan item left in the
+top-level tree; the guest then copies the
 pristine disk back whole. Require `BTRFS_TRANSACTION_NAMESPACE_CHECKS:M` and
 `BTRFS_TRANSACTION_PASS:N` with the counts printed by the preparer and in its
 JSON (the guest also compares the namespace count itself), and an unchanged

@@ -512,6 +512,97 @@ data_scenarios(struct context *context)
 	data_compress_mount_plan(context);
 }
 
+/* A filesystem without NO_HOLES and with DUP data. Growing a file by
+ * truncation or by a write past EOF covers the new range with hole items as
+ * btrfs_cont_expand does; an inline file converts its own sector before a
+ * distant write; writes into Linux's hole items split them and truncation
+ * trims them; every data write reaches both copies, in place included. */
+void
+holes_scenarios(struct context *context)
+{
+	static uint8_t data[HOLES_WRITE_BYTES];
+	static uint8_t first[NOCOW_FILE_BYTES];
+	static uint8_t second[NOCOW_FILE_BYTES];
+	struct plan plan;
+
+	fill_pattern(data, sizeof(data), 41);
+	plan_init(&plan);
+	plan.name = "holes-grow";
+	track_data(context, &plan, "small");
+	track_data(context, &plan, "inline");
+	track_data(context, &plan, "big");
+	plan_truncate(context, &plan, 1, "/data/small", HOLES_SMALL_SIZE);
+	plan_write(
+	    context, &plan, 1, "/data/inline", HOLES_INLINE_OFFSET, data, HOLES_INLINE_BYTES);
+	plan_write(context, &plan, 2, "/data/small", HOLES_SMALL_PATCH, data, 4096);
+	plan_truncate(context, &plan, 2, "/data/inline", HOLES_INLINE_SIZE);
+	plan_write(context, &plan, 3, "/data/big", HOLES_BIG_OFFSET, data, 4096);
+	expect_holes(&plan, 0, 0, "/data/small", 0);
+	/* The EOF sector is rewritten, then one hole covers the growth. */
+	expect_holes(&plan, 1, 1, "/data/small", 1);
+	expect_extents(&plan, 1, 1, "/data/small", 2, 0, 2);
+	/* A write inside the hole splits it. */
+	expect_holes(&plan, 2, LAST_STAGE, "/data/small", 2);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/small", 3, 0, 3);
+	/* The inline sector becomes its own extent, then a hole, then the data. */
+	expect_holes(&plan, 1, 1, "/data/inline", 1);
+	expect_extents(&plan, 1, 1, "/data/inline", 2, 0, 2);
+	/* Truncation inside the hole: its EOF sector holds zeros as data. */
+	expect_holes(&plan, 2, LAST_STAGE, "/data/inline", 1);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/inline", 2, 0, 2);
+	expect_holes(&plan, 2, 2, "/data/big", 0);
+	expect_holes(&plan, 3, LAST_STAGE, "/data/big", 1);
+	run_plan(context, &plan);
+
+	plan_init(&plan);
+	plan.name = "holes-linux";
+	track_data(context, &plan, "sparse");
+	(void)plan_file(context, &plan, "/data/grown");
+	plan_write(context, &plan, 1, "/data/sparse", HOLES_SPARSE_PATCH, data, 4096);
+	plan_truncate(context, &plan, 1, "/data/grown", HOLES_GROWN_SHRUNK);
+	plan_truncate(context, &plan, 2, "/data/sparse", HOLES_SPARSE_SIZE);
+	plan_truncate(context, &plan, 2, "/data/grown", HOLES_GROWN_SIZE);
+	plan_write_new(&plan, 3, "/huge", HOLES_HUGE_OFFSET, data, 4096);
+	/* Linux's holes around its two data sectors. */
+	expect_holes(&plan, 0, 0, "/data/sparse", 3);
+	expect_holes(&plan, 1, 1, "/data/sparse", 4);
+	/* The new EOF sector takes the head of the last hole; the rest goes. */
+	expect_holes(&plan, 2, LAST_STAGE, "/data/sparse", 3);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/sparse", 4, 0, 4);
+	expect_holes(&plan, 0, 1, "/data/grown", 1);
+	expect_extents(&plan, 1, 1, "/data/grown", 1, 0, 1);
+	expect_holes(&plan, 2, LAST_STAGE, "/data/grown", 2);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/grown", 1, 0, 1);
+	/* One sector written into the middle of a 16 GiB hole item. */
+	expect_holes(&plan, 0, 2, "/huge", 1);
+	expect_holes(&plan, 3, LAST_STAGE, "/huge", 2);
+	expect_extents(&plan, 3, LAST_STAGE, "/huge", 1, 0, 1);
+	run_plan(context, &plan);
+
+	/* In place on DUP data: Linux's preallocated file and a new NODATACOW
+	 * file, whose overwrite may be torn on either copy. */
+	fill_random(first, sizeof(first), 42);
+	memcpy(second, first, sizeof(second));
+	fill_random(second + NOCOW_PATCH_OFFSET, NOCOW_PATCH_BYTES, 43);
+	plan_init(&plan);
+	plan.name = "holes-in-place";
+	(void)plan_file(context, &plan, "/preallocated");
+	plan_write(context, &plan, 1, "/preallocated", NOCOW_PREALLOC_FIRST, data,
+	    NOCOW_PREALLOC_FIRST_BYTES);
+	plan_create(&plan, 1, "/data/nocow/file", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/data/nocow/file", 0, first, sizeof(first));
+	plan_write_new(&plan, 2, "/data/nocow/file", NOCOW_PATCH_OFFSET,
+	    second + NOCOW_PATCH_OFFSET, NOCOW_PATCH_BYTES);
+	plan_volatile(&plan, 2, "/data/nocow/file", NOCOW_PATCH_OFFSET, NOCOW_PATCH_BYTES);
+	expect_extents(&plan, 1, LAST_STAGE, "/preallocated", 1, 2, 1);
+	expect_file(&plan, 1, 1, "/data/nocow/file", first, sizeof(first));
+	expect_file(&plan, 2, LAST_STAGE, "/data/nocow/file", second, sizeof(second));
+	expect_flags(
+	    &plan, 1, LAST_STAGE, "/data/nocow/file", BT_INODE_NODATACOW, BT_INODE_NODATACOW);
+	expect_extents(&plan, 1, LAST_STAGE, "/data/nocow/file", 1, 0, 1);
+	run_plan(context, &plan);
+}
+
 /* A data block group whose free space Linux keeps as bitmaps: freeing a file
  * between two holes merges runs, and a write larger than the first group's
  * free tail allocates the remaining sectors from bitmap holes. */

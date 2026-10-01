@@ -93,16 +93,19 @@ enum btrfs_result btrfs_transaction_use_counters(
  * extents. Payloads are bounded by Btrfs's 2 KiB default inline-write policy. */
 enum btrfs_result btrfs_transaction_write_inline(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, const void *bytes, size_t size, struct btrfs_time modified);
-/* Copy-on-write file data for regular files on filesystems with NO_HOLES.
- * Immutable files refuse writes and append-only files accept data only at
- * their end (NOT_PERMITTED); set-id files need a privilege decision. Partially covered sectors
- * are read from this transaction's own view and rewritten; old extents keep
- * their references until commit drops them and are never reused before the
- * next transaction. New data stays in memory (at most 64 MiB per transaction)
- * and reaches media during commit before the first barrier. Checksums follow
- * the inode's NODATASUM flag. Inline files become regular extents. Writes past
+/* File data of regular files. Immutable files refuse writes and append-only
+ * files accept data only at their end (NOT_PERMITTED); set-id files need a
+ * privilege decision. Partially covered sectors are read from this
+ * transaction's own view and rewritten; data is copied on write except into
+ * preallocated and unshared NODATACOW extents, which are written in place as
+ * Linux does. Old extents keep their references until commit drops them and
+ * are never reused before the next transaction. New data reaches the device as
+ * its extents are created; the commit's first barrier makes it durable before
+ * any metadata names it. Checksums follow the inode's NODATASUM flag; files
+ * compress as Linux decides. Inline files become regular extents. Writes past
  * an unaligned EOF clear the old EOF sector's tail; truncation clears the new
- * EOF sector's tail and drops coverage beyond it. */
+ * EOF sector's tail and drops coverage beyond it. Without NO_HOLES, a file
+ * grown by a write or truncation has the new range covered by hole items. */
 enum btrfs_result btrfs_transaction_write(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, uint64_t offset, const void *bytes, size_t size,
     struct btrfs_time modified);

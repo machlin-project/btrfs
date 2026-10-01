@@ -316,7 +316,8 @@ match_chunk(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
 
 	(void)fs;
 	(void)cursor;
-	return record->key.type == BT_CHUNK_ITEM && bt_u64(chunk->type) == *type;
+	return record->key.type == BT_CHUNK_ITEM &&
+	    (bt_u64(chunk->type) & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) == *type;
 }
 
 static void

@@ -15,11 +15,19 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", ""),
             "transactions-data": (4096, "single", ""), "transactions-fst": (16384, "dup", ""),
             "transactions-grow": (16384, "dup", ""),
-            "transactions-namespace": (4096, "single", "")}
+            "transactions-namespace": (4096, "single", ""),
+            "transactions-holes": (4096, "dup", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
-            "transactions-shared", "transactions-keyed", "transactions-data"}
+            "transactions-shared", "transactions-keyed", "transactions-data",
+            "transactions-holes"}
+# The holes profile repeats the data payload without NO_HOLES, so Linux writes
+# explicit hole items, and with DUP data, so every data sector has two copies;
+# it adds a file grown by truncation alone and a NODATACOW directory.
+DATA_PROFILES = {"transactions-holes": "dup"}
+MKFS_FEATURES = {"transactions-holes": "-O ^no-holes"}
+HOLES_GROWN_BYTES = 1048576
 # Enough inline files for a level-2 subvolume tree with 4 KiB nodes, so that a
 # snapshot shares internal nodes as well as leaves.
 SHARED_INLINE_FILES = 1600
@@ -62,7 +70,8 @@ NAMESPACE_DATA_BYTES = 65536
 # remaining links of the inode as extended references.
 EXTREF_NAME_BYTES = 200
 EXTREF_LINKS = 40
-DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024}
+DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
+                "transactions-holes": 512 * 1024 * 1024}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
 FILL_REMOVE_STRIDE = 7
@@ -82,7 +91,9 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
     (inputs / "SHA256SUMS").write_text("".join(
         f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in contents.items()))
     options = f"compress-force={compression}" if compression else "compress=no"
-    features = "-R ^free-space-tree" if profile in WRITABLE else ""
+    features = " ".join(part for part in ("-R ^free-space-tree" if profile in WRITABLE else "",
+                                          MKFS_FEATURES.get(profile, "")) if part)
+    data_profile = DATA_PROFILES.get(profile, "single")
     if profile in WRITABLE:
         options += ",nospace_cache"
     set_default = "btrfs subvolume set-default /mnt/subvol" if profile == "default-subvolume" else ":"
@@ -189,7 +200,7 @@ btrfs filesystem sync /mnt
 cmp /mnt/keyed-29/r29 /mnt/keyed/origin
 btrfs inspect-internal dump-tree -t extent /dev/vda > /tmp/extent.txt
 echo BTRFS_REFERENCE_KEYED_REFS:$(grep -cE 'key \\([0-9]+ (TREE_BLOCK_REF|EXTENT_DATA_REF|SHARED_BLOCK_REF|SHARED_DATA_REF) ' /tmp/extent.txt || true)'''
-    if profile in ("transactions-data", "transactions-fst"):
+    if profile in ("transactions-data", "transactions-fst", "transactions-holes"):
         fill = f'''btrfs subvolume create /mnt/data
 head -c {DATA_BIG_BYTES} /input/big > /mnt/data/big
 head -c {DATA_SMALL_BYTES} /input/random > /mnt/data/small
@@ -214,6 +225,21 @@ btrfs inspect-internal dump-tree /dev/vda > /tmp/tree.txt
 echo BTRFS_REFERENCE_DATA_COMPRESSED:$(grep -c 'compression 1 (zlib)' /tmp/tree.txt || true)
 echo BTRFS_REFERENCE_DATA_PREALLOC:$(grep -c 'prealloc' /tmp/tree.txt || true)
 lsattr /mnt/data/nodatasum'''
+    if profile == "transactions-holes":
+        fill += f'''
+truncate -s {HOLES_GROWN_BYTES} /mnt/data/grown
+mkdir /mnt/data/nocow
+chattr +C /mnt/data/nocow
+lsattr -d /mnt/data/nocow
+btrfs filesystem sync /mnt
+if btrfs inspect-internal dump-super /dev/vda | grep -qw NO_HOLES; then
+    exit 1
+fi
+btrfs filesystem df /mnt | grep 'Data, DUP'
+btrfs inspect-internal dump-tree /dev/vda > /tmp/tree.txt
+holes=$(grep -c 'extent data disk byte 0 nr 0' /tmp/tree.txt || true)
+echo BTRFS_REFERENCE_HOLE_ITEMS:$holes
+test "$holes" -gt 0'''
     if profile == "transactions-grow":
         # Fill data, then metadata until Linux reports ENOSPC; delete the data and
         # the newest fillers (whole leaves of room for balance's own transaction),
@@ -306,7 +332,7 @@ for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c btrfs; d
 done
 uname -r
 mkfs.btrfs --version
-mkfs.btrfs -f -s 4096 -n {node_size} -m {metadata} -d single {features} -L machlin-btrfs /dev/vda
+mkfs.btrfs -f -s 4096 -n {node_size} -m {metadata} -d {data_profile} {features} -L machlin-btrfs /dev/vda
 mount -t btrfs -o {options} /dev/vda /mnt
 cp /input/greeting /input/big /input/random /mnt/
 chmod 0640 /mnt/greeting
@@ -358,6 +384,7 @@ poweroff -f
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root,
                        input=paths, stdout=output, check=True)
     manifest = {"profile": profile, "node_size": node_size, "metadata": metadata,
+                "data": data_profile,
                 "compression": compression, "device_bytes": device_bytes, "files": {
                     name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                     for name, data in contents.items()}}

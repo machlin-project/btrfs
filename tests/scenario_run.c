@@ -127,7 +127,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
 		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
-		"subvolumes", "deleted", "compressed", "extents" };
+		"subvolumes", "deleted", "compressed", "extents", "holes" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -136,7 +136,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	size_t stage;
 	size_t i;
 
-	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_EXTENTS + 1, "expectation kinds");
+	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_HOLES + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
@@ -195,7 +195,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 			REQUIRE(snprintf(argument, sizeof(argument), "%u:%u:%llu", e->links,
 				    e->mode, (unsigned long long)e->value) < (int)sizeof(argument));
 			detail = argument;
-		} else if (e->kind == EXPECT_DELETED) {
+		} else if (e->kind == EXPECT_DELETED || e->kind == EXPECT_HOLES) {
 			REQUIRE(snprintf(argument, sizeof(argument), "%llu",
 				    (unsigned long long)e->value) < (int)sizeof(argument));
 			detail = argument;

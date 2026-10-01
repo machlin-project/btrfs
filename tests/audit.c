@@ -34,10 +34,11 @@ main(int argc, char **argv)
 			    "%s: %zu trees, %zu blocks, %zu data extents; refs tree %zu, shared "
 			    "block "
 			    "%zu, data %zu, shared data %zu, keyed %zu; %zu full-backref blocks; "
-			    "%zu checksums PASS\n",
+			    "%zu checksums (%zu sector copies) PASS\n",
 			    argv[i], audit.trees, audit.blocks, audit.data_extents, audit.tree_refs,
 			    audit.shared_block_refs, audit.data_refs, audit.shared_data_refs,
-			    audit.keyed_refs, audit.full_backref_blocks, audit.checksums);
+			    audit.keyed_refs, audit.full_backref_blocks, audit.checksums,
+			    audit.checked_copies);
 		}
 		if (namespace_audit(fs, &names) != 0) {
 			fprintf(stderr, "%s: namespace: %s\n", argv[i], names.failure);
@@ -45,10 +46,10 @@ main(int argc, char **argv)
 		} else {
 			printf("%s: %zu file trees (%zu deleted), %zu inodes, %zu names (%zu "
 			       "extended), %zu subvolume entries, %zu root references, %zu "
-			       "collision items, %zu xattrs, %zu orphans PASS\n",
+			       "collision items, %zu xattrs, %zu orphans, %zu hole items PASS\n",
 			    argv[i], names.trees, names.dead_trees, names.inodes, names.names,
 			    names.extended_names, names.subvolume_entries, names.subvolume_refs,
-			    names.collisions, names.xattrs, names.orphans);
+			    names.collisions, names.xattrs, names.orphans, names.hole_items);
 		}
 		btrfs_unmount(fs);
 		btrfs_image_close(&image);

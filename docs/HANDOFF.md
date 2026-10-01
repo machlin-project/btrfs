@@ -20,16 +20,17 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require twenty-three passing test processes and all six reader profiles (312
-contracts). Ten writable images are required by the transaction suites:
+Require twenty-four passing test processes and all seven reader profiles (367
+contracts). Eleven writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
 fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
 references), `transactions-keyed` (keyed backreferences), `transactions-data`
 (file data inputs with snapshots), `transactions-fst` (mkfs defaults with a
 free-space tree in extent and bitmap form), `transactions-grow` (nearly full
-metadata with unallocated device space) and `transactions-namespace` (name-hash
-collisions, extended references, compression properties). Missing fixtures
+metadata with unallocated device space), `transactions-namespace` (name-hash
+collisions, extended references, compression properties) and
+`transactions-holes` (no NO_HOLES, DUP data). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -86,10 +87,10 @@ only after successful durable publication; `seal` alone is not a commit.
 3. **Extend file data.** `btrfs_transaction_write`/`_truncate` write CoW data
    with checksums, holes, preallocated and compressed input, inline conversion
    and snapshot-safe frees (`core/data.c`, `core/csum.c`), in place into
-   preallocated and unshared NODATACOW extents. Remaining: data DUP and 64
-   KiB-sector fixtures, an fallocate operation, explicit
-   hole items for filesystems without NO_HOLES, and a compressor in the kernel
-   adapter. New data is written as its extents are created, and files compress
+   preallocated and unshared NODATACOW extents, with hole items on filesystems
+   without NO_HOLES and both copies of DUP data. Remaining: a 64 KiB-sector
+   fixture, an fallocate operation, an inode-flags operation (`chattr`) and a
+   compressor in the kernel adapter. New data is written as its extents are created, and files compress
    on write as Linux decides.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull

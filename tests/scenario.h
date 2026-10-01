@@ -89,6 +89,19 @@
 #define NOCOW_PREALLOC_SECOND 16384U
 #define NOCOW_PREALLOC_SECOND_BYTES 16384U
 #define NOCOW_OTHER_INODE UINT64_C(999999)
+/* The holes scenarios on transactions-holes: see tests/scenario_sets.c. */
+#define HOLES_WRITE_BYTES 16384U
+#define HOLES_SMALL_SIZE (1024U * 1024U + 5U)
+#define HOLES_SMALL_PATCH (512U * 1024U)
+#define HOLES_INLINE_OFFSET 65539U
+#define HOLES_INLINE_BYTES 100U
+#define HOLES_INLINE_SIZE 30000U
+#define HOLES_BIG_OFFSET (1024U * 1024U + 12288U)
+#define HOLES_SPARSE_PATCH (2U * 1024U * 1024U)
+#define HOLES_SPARSE_SIZE (3U * 1024U * 1024U + 4096U + 100U)
+#define HOLES_GROWN_SHRUNK 100000U
+#define HOLES_GROWN_SIZE (2U * 1024U * 1024U + 1U)
+#define HOLES_HUGE_OFFSET (UINT64_C(8) * 1024 * 1024 * 1024)
 #define COLLISION_BLOCK_BYTES 8U
 #define COLLISION_BLOCKS 10U
 #define COLLISION_NAME_BYTES (COLLISION_BLOCK_BYTES * COLLISION_BLOCKS)
@@ -198,7 +211,8 @@ enum expectation_kind {
 	EXPECT_SUBVOLUMES,
 	EXPECT_DELETED,
 	EXPECT_COMPRESSED,
-	EXPECT_EXTENTS
+	EXPECT_EXTENTS,
+	EXPECT_HOLES
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -228,7 +242,8 @@ struct expectation {
 	 * EXPECT_COMPRESSED: the file's extents compressed with codec value:
 	 * links regular and mode inline ones, and none with another codec.
 	 * EXPECT_EXTENTS: links regular and mode preallocated file extent items,
-	 * referencing value distinct disk extents. */
+	 * referencing value distinct disk extents. EXPECT_HOLES: value hole
+	 * items (disk_bytenr 0). */
 	/* EXPECT_TIMES: seconds of the access and modification times. */
 	int64_t access_seconds;
 	int64_t modify_seconds;
@@ -435,6 +450,7 @@ void expect_compressed(struct plan *plan, size_t first, size_t last, const char 
     enum btrfs_compression codec, uint32_t regular, uint32_t inline_extents);
 void expect_extents(struct plan *plan, size_t first, size_t last, const char *path,
     uint32_t regular, uint32_t prealloc, uint64_t distinct);
+void expect_holes(struct plan *plan, size_t first, size_t last, const char *path, uint64_t holes);
 void plan_volatile(
     struct plan *plan, size_t commit, const char *path, uint64_t offset, uint64_t length);
 
@@ -452,6 +468,7 @@ void shared_scenarios(struct context *context);
 void keyed_scenarios(struct context *context);
 void data_scenarios(struct context *context);
 void fragment_scenarios(struct context *context);
+void holes_scenarios(struct context *context);
 void grow_scenarios(struct context *context);
 
 /* Scenario sets. */

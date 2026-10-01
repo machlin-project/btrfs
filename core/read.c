@@ -177,9 +177,10 @@ bt_extent_length(const struct btrfs_fs *fs, const struct bt_record *record,
 	    disk_bytes % fs->info.sector_size != 0 || disk_bytes > UINT64_MAX - physical) {
 		return BTRFS_CORRUPT;
 	}
+	/* A hole item. Linux keeps the offset it had when btrfs_drop_extents
+	 * splits or trims one, so a hole may start inside its original range. */
 	if (physical == 0) {
-		return disk_bytes == 0 && offset == 0 &&
-			header->compression == BTRFS_COMPRESSION_NONE &&
+		return disk_bytes == 0 && header->compression == BTRFS_COMPRESSION_NONE &&
 			header->type == BT_EXTENT_REGULAR
 		    ? BTRFS_OK
 		    : BTRFS_CORRUPT;

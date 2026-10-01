@@ -426,6 +426,39 @@ check_extents(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
 }
 
 static void
+check_holes(struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e,
+    const struct btrfs_inode *inode)
+{
+	const struct bt_disk_extent *extent;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key = { inode->id.inode, 0, BT_EXTENT_DATA };
+	uint64_t holes = 0;
+	enum btrfs_result result;
+
+	REQUIRE(bt_find_root(fs, inode->id.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != inode->id.inode || record.key.type != BT_EXTENT_DATA) {
+			break;
+		}
+		extent = (const void *)record.data;
+		holes += record.size == sizeof(*extent) &&
+		    extent->header.type == BT_EXTENT_REGULAR && bt_u64(extent->disk_bytenr) == 0;
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	if (holes != e->value) {
+		fprintf(stderr, "%s stage %zu: %s: %llu hole items\n", plan->name, stage, e->path,
+		    (unsigned long long)holes);
+		exit(1);
+	}
+}
+
+static void
 check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, size_t crash_commit,
     const struct expectation *e)
 {
@@ -535,6 +568,9 @@ check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, si
 		return;
 	case EXPECT_EXTENTS:
 		check_extents(fs, plan, stage, e, &inode);
+		return;
+	case EXPECT_HOLES:
+		check_holes(fs, plan, stage, e, &inode);
 		return;
 	default:
 		REQUIRE(0);
@@ -1262,6 +1298,12 @@ expect_extents(struct plan *plan, size_t first, size_t last, const char *path, u
 	e->links = regular;
 	e->mode = prealloc;
 	e->value = distinct;
+}
+
+void
+expect_holes(struct plan *plan, size_t first, size_t last, const char *path, uint64_t holes)
+{
+	expect(plan, first, last, EXPECT_HOLES, path)->value = holes;
 }
 
 void

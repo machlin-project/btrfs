@@ -83,6 +83,9 @@ if fixtures != ''
     args: ['--shared', join_paths(fixtures, 'transactions-shared.raw')], timeout: 300, suite: 'images')
   test('data-extents', transaction_test,
     args: ['--data', join_paths(fixtures, 'transactions-data.raw')], timeout: 300, suite: 'images')
+  test('holes-and-dup-data', transaction_test,
+    args: ['--data', '--holes', join_paths(fixtures, 'transactions-holes.raw')], timeout: 600,
+    suite: 'images')
   test('free-space-tree', transaction_test,
     args: ['--data', '--fragment', join_paths(fixtures, 'transactions-fst.raw')], timeout: 600,
     suite: 'images')
@@ -100,7 +103,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-shared.raw'), join_paths(fixtures, 'transactions-keyed.raw'),
     join_paths(fixtures, 'transactions-data.raw'), join_paths(fixtures, 'transactions-fst.raw'),
     join_paths(fixtures, 'transactions-grow.raw'),
-    join_paths(fixtures, 'transactions-namespace.raw')],
+    join_paths(fixtures, 'transactions-namespace.raw'),
+    join_paths(fixtures, 'transactions-holes.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

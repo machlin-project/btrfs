@@ -299,7 +299,8 @@ bt_tx_reference(struct btrfs_transaction *transaction, const struct bt_owned_roo
 
 /* Removes file coverage of [start, end) the way btrfs_drop_extents does:
  * covered items go, overlapping ones are trimmed, moved or split, and the
- * file references change accordingly. removed reports the dropped bytes. */
+ * file references change accordingly. removed reports the dropped bytes the
+ * inode counts: inline and allocated ones, not those of hole items. */
 enum btrfs_result
 bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
     uint64_t start, uint64_t end, uint64_t *removed)
@@ -310,6 +311,7 @@ bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tr
 	uint64_t a;
 	uint64_t b;
 	uint64_t steps;
+	int counted;
 	int found = 1;
 	enum btrfs_result error = BTRFS_OK;
 
@@ -335,8 +337,9 @@ bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tr
 		}
 		piece = item.extent;
 		key = item.key;
+		counted = bt_u64(item.extent.disk_bytenr) != 0;
 		if (a >= start && b <= end) {
-			*removed += b - a;
+			*removed += counted ? b - a : 0;
 			error = bt_tx_edit(transaction, &tree->root, item.key, NULL, 0, BT_DELETE);
 			if (error == BTRFS_OK) {
 				error = bt_tx_reference(transaction, tree, &item, a, 0);
@@ -346,7 +349,7 @@ bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tr
 		if (a < start) {
 			/* Keep the head [a, start); a tail past end becomes a second item. */
 			bt_put64(&piece.length, start - a);
-			*removed += (b < end ? b : end) - start;
+			*removed += counted ? (b < end ? b : end) - start : 0;
 			error = bt_tx_edit(
 			    transaction, &tree->root, item.key, &piece, sizeof(piece), BT_REPLACE);
 			if (error == BTRFS_OK && b > end) {
@@ -364,7 +367,7 @@ bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tr
 		}
 		/* start <= a < end < b: the remainder moves to end; its reference key
 		 * (file offset minus extent offset) is unchanged. */
-		*removed += end - a;
+		*removed += counted ? end - a : 0;
 		bt_put64(&piece.offset, bt_u64(item.extent.offset) + (end - a));
 		bt_put64(&piece.length, b - end);
 		key.offset = end;
@@ -934,6 +937,67 @@ bt_tx_small(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	return error;
 }
 
+/* Without NO_HOLES every sector below a file's size is covered by a file
+ * extent item. Growing a file from old_size to size covers [old_size, size),
+ * extended to sectors, as Linux's btrfs_cont_expand does: each gap and each
+ * item other than a preallocated one becomes one hole item (a regular item
+ * with disk_bytenr 0), which the inode's bytes do not count. */
+static enum btrfs_result
+bt_tx_expand(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, uint64_t old_size, uint64_t size)
+{
+	struct bt_file_item item;
+	struct bt_disk_extent hole;
+	struct bt_key key = { .objectid = ino, .type = BT_EXTENT_DATA };
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t position = old_size + (sector - old_size % sector) % sector;
+	uint64_t end = size + (sector - size % sector) % sector;
+	uint64_t next;
+	uint64_t removed;
+	uint64_t steps;
+	int found = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	if ((transaction->base->info.incompat_features & BT_FEATURE_NO_HOLES) != 0) {
+		return BTRFS_OK;
+	}
+	for (steps = 0; error == BTRFS_OK && position < end; position = next, steps++) {
+		if (steps == BT_MAX_TREE_ITEMS) {
+			return BTRFS_UNSUPPORTED;
+		}
+		error = bt_tx_file_item(transaction, tree, ino, position, end, &item, &found);
+		if (error != BTRFS_OK) {
+			break;
+		}
+		if (!found || item.key.offset > position) {
+			next = found ? item.key.offset : end;
+		} else {
+			next = item.end < end ? item.end : end;
+			if (item.extent.header.type == BT_EXTENT_PREALLOC) {
+				continue;
+			}
+			error = bt_tx_drop_range(transaction, tree, ino, position, next, &removed);
+			if (error == BTRFS_OK && bt_u64(inode->nbytes) < removed) {
+				error = BTRFS_CORRUPT;
+			}
+			if (error == BTRFS_OK) {
+				bt_put64(&inode->nbytes, bt_u64(inode->nbytes) - removed);
+			}
+		}
+		if (error == BTRFS_OK) {
+			bt_zero(&hole, sizeof(hole));
+			bt_put64(&hole.header.generation, transaction->base->info.generation + 1);
+			bt_put64(&hole.header.ram_bytes, next - position);
+			hole.header.type = BT_EXTENT_REGULAR;
+			bt_put64(&hole.length, next - position);
+			key.offset = position;
+			error = bt_tx_edit(
+			    transaction, &tree->root, key, &hole, sizeof(hole), BT_INSERT);
+		}
+	}
+	return error;
+}
+
 static enum btrfs_result
 bt_tx_data_begin(struct btrfs_transaction *transaction, struct btrfs_object_id id,
     struct bt_owned_root **tree, struct bt_disk_inode *inode, uint64_t *inline_end)
@@ -944,10 +1008,6 @@ bt_tx_data_begin(struct btrfs_transaction *transaction, struct btrfs_object_id i
 
 	if (transaction->failure != BTRFS_OK || transaction->finished) {
 		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
-	}
-	/* Holes are implicit only with NO_HOLES; explicit hole items are not written. */
-	if (!(transaction->base->info.incompat_features & BT_FEATURE_NO_HOLES)) {
-		return BTRFS_UNSUPPORTED;
 	}
 	error = bt_tx_tree(transaction, id.tree, tree);
 	if (error == BTRFS_OK) {
@@ -1021,9 +1081,11 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	}
 	start = offset - offset % sector;
 	end = offset + size + (sector - (offset + size) % sector) % sector;
-	/* An inline extent becomes part of the first regular extent. */
-	if (inline_end != 0) {
-		tail = inline_end + (sector - inline_end % sector) % sector;
+	/* An inline extent becomes part of the first regular extent when the write
+	 * starts in its sector or the next one, as Linux's adjacent dirty ranges
+	 * do; otherwise its sector is converted on its own below. */
+	tail = inline_end + (sector - inline_end % sector) % sector;
+	if (inline_end != 0 && start <= tail) {
 		end = end > tail ? end : tail;
 		start = 0;
 	}
@@ -1033,6 +1095,9 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	if (old_size % sector != 0 && offset > old_size && tail < start) {
 		error = bt_tx_rewrite(transaction, tree, &inode, id.inode, tail, tail + sector,
 		    tail, NULL, 0, old_size);
+	}
+	if (error == BTRFS_OK && offset > old_size) {
+		error = bt_tx_expand(transaction, tree, &inode, id.inode, old_size, start);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_tx_rewrite(transaction, tree, &inode, id.inode, start, end, offset,
@@ -1093,6 +1158,9 @@ btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_o
 		edge = old_size - old_size % sector;
 		error = bt_tx_rewrite(transaction, tree, &inode, id.inode, edge, edge + sector,
 		    edge, NULL, 0, old_size);
+	}
+	if (error == BTRFS_OK && size > old_size) {
+		error = bt_tx_expand(transaction, tree, &inode, id.inode, old_size, size);
 	}
 	if (error == BTRFS_OK && size < old_size) {
 		edge = size + (sector - size % sector) % sector;

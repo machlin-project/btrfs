@@ -16,6 +16,7 @@ main(int argc, char **argv)
 	int keyed = 0;
 	int data = 0;
 	int fragment = 0;
+	int holes = 0;
 	int grow = 0;
 	int names = 0;
 	int subvolumes = 0;
@@ -39,6 +40,8 @@ main(int argc, char **argv)
 			data = 1;
 		} else if (strcmp(argv[i], "--fragment") == 0) {
 			fragment = 1;
+		} else if (strcmp(argv[i], "--holes") == 0) {
+			holes = 1;
 		} else if (strcmp(argv[i], "--grow") == 0) {
 			grow = 1;
 		} else if (strcmp(argv[i], "--namespace") == 0) {
@@ -96,6 +99,9 @@ main(int argc, char **argv)
 	}
 	if (fragment) {
 		fragment_scenarios(context);
+	}
+	if (holes) {
+		holes_scenarios(context);
 	}
 	if (grow) {
 		grow_scenarios(context);

@@ -114,8 +114,9 @@ visible to its caller. An I/O failure or checksum mismatch may retry a DUP copy
 with the same logical identity; no repair is written. A successful prefix before
 a later failure is reported explicitly; bytes beyond `completed` are invalid.
 
-Inline data is protected by its leaf checksum. Sparse holes and unwritten
-preallocation return zeroes. Shared regular extents honor the recorded extent
+Inline data is protected by its leaf checksum. Sparse holes, hole items and
+unwritten preallocation return zeroes; a hole item may carry the nonzero offset
+Linux leaves when it splits or trims one. Shared regular extents honor the recorded extent
 offset, not just disk_bytenr. Compressed extents verify their stored bytes before
 calling the adapter codec; input and decoded allocation are bounded independently.
 An absent codec returns unsupported. NODATASUM is honored as an explicit on-disk
@@ -261,7 +262,7 @@ longer exist are left as Linux leaves them.
 ## File data
 
 `btrfs_transaction_write` and `btrfs_transaction_truncate` change regular files
-as copy-on-write data on filesystems with NO_HOLES (`core/data.c`). The range is
+(`core/data.c`). The range is
 widened to whole sectors; partially covered sectors are read through a private
 view (mutation metadata overlay, new data from the device, the transaction's own
 checksum and file trees, and the adapter's codec), so later operations see
@@ -278,6 +279,16 @@ Linux's `cow_file_range_inline` decides: compressed when it compresses to the
 sector; larger files convert inline extents to regular ones. A write past an unaligned EOF clears the old EOF sector's tail;
 truncation clears the new EOF sector's tail and drops coverage beyond it. Inode
 size, `nbytes`, times, transid and sequence change together.
+
+Without the NO_HOLES feature every sector below a file's size is covered by a
+file extent item. A write past EOF or a truncation that grows a file covers the
+new range as Linux's `btrfs_cont_expand` does: each gap and each item other
+than a preallocated one becomes one hole item (a regular item with disk_bytenr
+0), later trimmed or split by writes and truncations like any other item, with
+the offset Linux keeps. Hole items never count toward `nbytes`. An inline file
+written beyond its sector and the next converts its own sector first, so the gap
+becomes a hole rather than zeros on disk. On DUP data every write, in place
+included, reaches both copies.
 
 New data is written to its extent when the extent is created, before the
 commit writes any metadata: the allocator never hands out space a committed

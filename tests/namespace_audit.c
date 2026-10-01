@@ -35,14 +35,21 @@ struct name_list {
 	size_t capacity;
 };
 
+/* File extent coverage of an inode as btrfs check's process_file_extent
+ * tracks it: the bytes its items count, where the last one ends and where the
+ * first gap starts. */
 struct inode_record {
 	uint64_t inode;
 	uint64_t size;
+	uint64_t nbytes;
 	uint32_t mode;
 	uint32_t links;
 	uint32_t names;
 	uint32_t orphan;
 	uint64_t name_bytes;
+	uint64_t extent_bytes;
+	uint64_t extent_end;
+	uint64_t first_gap;
 };
 
 struct tree_state {
@@ -301,6 +308,54 @@ extended_refs(struct tree_state *state, const struct bt_record *record)
 	return 0;
 }
 
+/* Items arrive in key order, so an inode's file extents follow its inode
+ * item; items of a missing inode are reported by check_inodes. Inline extents
+ * count their decoded bytes and cover whole sectors; hole items (disk_bytenr
+ * 0) cover their range without counting. */
+static int
+file_extent(struct tree_state *state, const struct bt_record *record)
+{
+	const struct bt_disk_extent *extent = (const void *)record->data;
+	struct inode_record *inode = NULL;
+	uint64_t sector = state->fs->info.sector_size;
+	uint64_t length;
+
+	if (state->inode_count != 0 &&
+	    state->inodes[state->inode_count - 1].inode == record->key.objectid) {
+		inode = &state->inodes[state->inode_count - 1];
+	}
+	if (inode == NULL) {
+		return 0;
+	}
+	if (record->size < sizeof(extent->header) ||
+	    (extent->header.type != BT_EXTENT_INLINE && record->size != sizeof(*extent))) {
+		return fail(state, "malformed file extent %llu:%llu",
+		    (unsigned long long)record->key.objectid,
+		    (unsigned long long)record->key.offset);
+	}
+	if (record->key.offset < inode->extent_end) {
+		return fail(state, "file extents of inode %llu overlap at %llu",
+		    (unsigned long long)inode->inode, (unsigned long long)record->key.offset);
+	}
+	if (record->key.offset > inode->extent_end && inode->first_gap == UINT64_MAX) {
+		inode->first_gap = inode->extent_end;
+	}
+	if (extent->header.type == BT_EXTENT_INLINE) {
+		length = bt_u64(extent->header.ram_bytes);
+		inode->extent_bytes += length;
+		length += (sector - length % sector) % sector;
+	} else {
+		length = bt_u64(extent->length);
+		if (bt_u64(extent->disk_bytenr) != 0) {
+			inode->extent_bytes += length;
+		} else {
+			state->audit->hole_items++;
+		}
+	}
+	inode->extent_end = record->key.offset + length;
+	return 0;
+}
+
 static int
 collect(struct tree_state *state, struct bt_root root)
 {
@@ -338,8 +393,10 @@ collect(struct tree_state *state, struct bt_root root)
 				memset(inode, 0, sizeof(*inode));
 				inode->inode = record.key.objectid;
 				inode->size = bt_u64(item->size);
+				inode->nbytes = bt_u64(item->nbytes);
 				inode->mode = bt_u32(item->mode);
 				inode->links = bt_u32(item->links);
+				inode->first_gap = UINT64_MAX;
 				break;
 			case BT_INODE_REF:
 				result = inode_refs(state, &record);
@@ -351,6 +408,9 @@ collect(struct tree_state *state, struct bt_root root)
 			case BT_DIR_INDEX:
 			case BT_XATTR_ITEM:
 				result = directory_entries(state, &record);
+				break;
+			case BT_EXTENT_DATA:
+				result = file_extent(state, &record);
 				break;
 			default:
 				break;
@@ -487,6 +547,24 @@ check_inodes(struct tree_state *state)
 		} else if (inode->links == 0 && !inode->orphan) {
 			return fail(state, "unlinked inode %llu has no orphan item",
 			    (unsigned long long)inode->inode);
+		}
+		if ((inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_REGULAR ||
+		    (inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_SYMLINK) {
+			if (inode->extent_bytes != inode->nbytes) {
+				return fail(state, "inode %llu counts %llu bytes, its extents %llu",
+				    (unsigned long long)inode->inode,
+				    (unsigned long long)inode->nbytes,
+				    (unsigned long long)inode->extent_bytes);
+			}
+			/* Without NO_HOLES, items cover every byte below the size. */
+			if (!(state->fs->info.incompat_features & BT_FEATURE_NO_HOLES) &&
+			    inode->links != 0 &&
+			    (inode->extent_end < inode->size || inode->first_gap < inode->size)) {
+				return fail(state,
+				    "file extents of inode %llu leave a gap below %llu",
+				    (unsigned long long)inode->inode,
+				    (unsigned long long)inode->size);
+			}
 		}
 		if ((inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_DIRECTORY) {
 			if (inode->names > 1) {

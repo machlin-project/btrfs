@@ -674,6 +674,7 @@ audit_checksums(struct audit_state *state)
 	uint64_t end;
 	uint64_t i;
 	unsigned mirrors;
+	unsigned mirror;
 	enum btrfs_result error;
 
 	sector = malloc(fs->info.sector_size);
@@ -709,25 +710,29 @@ audit_checksums(struct audit_state *state)
 		}
 		add_range(&state->checksummed, record.key.offset, record.key.offset + length);
 		state->audit->checksums += record.size / sizeof(stored);
+		/* Every copy of a DUP data chunk holds the checksummed bytes. */
 		for (i = 0; i < record.size / sizeof(stored) && !state->failed; i++) {
-			mirrors = 1;
-			if (bt_map(fs, record.key.offset + i * fs->info.sector_size,
-				fs->info.sector_size, BT_BLOCK_DATA, 0, &physical,
-				&mirrors) != BTRFS_OK ||
-			    bt_read_physical(fs, physical, sector, fs->info.sector_size) !=
-				BTRFS_OK) {
-				fail(state, "unreadable checksummed sector %llu",
-				    (unsigned long long)(record.key.offset +
-					i * fs->info.sector_size));
-				break;
-			}
 			memcpy(&stored, record.data + i * sizeof(stored), sizeof(stored));
-			if (bt_u32(stored) !=
-			    ~bt_crc32c(UINT32_MAX, sector, fs->info.sector_size)) {
-				fail(state, "checksum mismatch at %llu",
-				    (unsigned long long)(record.key.offset +
-					i * fs->info.sector_size));
+			mirrors = 1;
+			for (mirror = 0; mirror < mirrors && !state->failed; mirror++) {
+				if (bt_map(fs, record.key.offset + i * fs->info.sector_size,
+					fs->info.sector_size, BT_BLOCK_DATA, mirror, &physical,
+					&mirrors) != BTRFS_OK ||
+				    bt_read_physical(fs, physical, sector, fs->info.sector_size) !=
+					BTRFS_OK) {
+					fail(state, "unreadable checksummed sector %llu copy %u",
+					    (unsigned long long)(record.key.offset +
+						i * fs->info.sector_size),
+					    mirror);
+				} else if (bt_u32(stored) !=
+				    ~bt_crc32c(UINT32_MAX, sector, fs->info.sector_size)) {
+					fail(state, "checksum mismatch at %llu copy %u",
+					    (unsigned long long)(record.key.offset +
+						i * fs->info.sector_size),
+					    mirror);
+				}
 			}
+			state->audit->checked_copies += mirrors;
 		}
 		error = bt_cursor_next(&cursor);
 	}
