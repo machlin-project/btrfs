@@ -32,8 +32,14 @@ NAMESPACE_ARGUMENT = {
     "device": re.compile(r"^[0-9a-f]+:[0-9a-f]+$"), "flags": re.compile(r"^0x[0-9a-f]+:0x[0-9a-f]+$"),
     "feature": re.compile(r"^COMPRESS_(LZO|ZSTD)$"),
     "times": re.compile(r"^-?[0-9]+:-?[0-9]+$"),
-    "reference": re.compile(r"^(inode|extended)$")}
-PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr"}
+    "reference": re.compile(r"^(inode|extended)$"),
+    "subvolume": re.compile(r"^(ro|rw):(-|/|(/[A-Za-z0-9._-]{1,255})+)$"),
+    "subvolumes": re.compile(r"^-$"),
+    "deleted": re.compile(r"^[0-9]+$")}
+PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr", "subvolumes"}
+# Facts that may name the top-level directory itself.
+ROOT_KINDS = {"dir", "stat", "xattr", "noxattr", "flags", "times", "feature", "subvolume",
+              "subvolumes", "deleted"}
 
 
 def safe_path(path):
@@ -92,7 +98,7 @@ def load_scenario(directory, device_bytes):
         for line in namespace.read_text().splitlines():
             stage, kind, path, argument, payload = fields(line, 5)
             if (int(stage) not in stages or kind not in NAMESPACE_ARGUMENT or
-                    not (safe_path(path) or (kind == "feature" and path == "/")) or
+                    not (safe_path(path) or (kind in ROOT_KINDS and path == "/")) or
                     not NAMESPACE_ARGUMENT[kind].match(argument) or
                     (kind == "same" and not safe_path(argument))):
                 raise ValueError(f"Invalid namespace record {line!r}")

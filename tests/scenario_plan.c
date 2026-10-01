@@ -172,12 +172,116 @@ reference_kind(struct btrfs_fs *fs, const char *path, const struct btrfs_inode *
 	return kind;
 }
 
+/* The newest root item of tree. */
+static void
+root_item(struct btrfs_fs *fs, uint64_t tree, struct bt_disk_root_full *item)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { tree, UINT64_MAX, BT_ROOT_ITEM };
+
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	REQUIRE(bt_cursor_seek(&cursor, key, 1) == BTRFS_OK);
+	REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+	REQUIRE(record.key.objectid == tree && record.key.type == BT_ROOT_ITEM &&
+	    record.size == sizeof(*item));
+	memcpy(item, record.data, sizeof(*item));
+	bt_cursor_fini(&cursor);
+}
+
+/* The number of live subvolumes below the top level (or, with dead, of
+ * deleted ones the cleaner has not dropped). */
+static size_t
+count_subvolumes(struct btrfs_fs *fs, int dead)
+{
+	const struct bt_disk_root *item;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key first = { 0, 0, 0 };
+	size_t count = 0;
+	enum btrfs_result result;
+
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	result = bt_cursor_seek(&cursor, first, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		item = (const void *)record.data;
+		count += record.key.type == BT_ROOT_ITEM &&
+		    record.key.objectid >= BTRFS_ROOT_INODE &&
+		    record.key.objectid < BT_LAST_FREE_OBJECTID &&
+		    (bt_u32(item->refs) == 0) == dead;
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	return count;
+}
+
 static void
 expectation_failed(
     const struct plan *plan, size_t stage, const struct expectation *expectation, const char *what)
 {
 	fprintf(stderr, "%s stage %zu: %s: %s\n", plan->name, stage, expectation->path, what);
 	exit(1);
+}
+
+static void
+check_subvolume(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
+    const struct expectation *e, const struct btrfs_inode *inode)
+{
+	static const uint8_t none[BTRFS_UUID_SIZE];
+	struct bt_disk_root_full item;
+	struct bt_disk_root_full source;
+	struct btrfs_inode origin;
+
+	if (inode->id.inode != BTRFS_ROOT_INODE || inode->id.tree < BTRFS_ROOT_INODE) {
+		expectation_failed(plan, stage, e, "not a subvolume");
+	}
+	root_item(fs, inode->id.tree, &item);
+	if (((bt_u64(item.legacy.flags) & BT_ROOT_SUBVOL_READ_ONLY) != 0) != (e->value != 0)) {
+		expectation_failed(plan, stage, e, "read-only flag");
+	}
+	if (e->other == NULL) {
+		if (memcmp(item.parent_uuid, none, sizeof(none)) != 0) {
+			expectation_failed(plan, stage, e, "parent UUID");
+		}
+		return;
+	}
+	REQUIRE(btrfs_image_lookup(fs, e->other, &origin) == BTRFS_OK);
+	root_item(fs, origin.id.tree, &source);
+	if (memcmp(item.parent_uuid, source.uuid, sizeof(source.uuid)) != 0) {
+		expectation_failed(plan, stage, e, "parent UUID");
+	}
+}
+
+static void
+check_subvolumes(
+    struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e)
+{
+	struct btrfs_inode inode;
+	char path[LINUX_PATH_MAX];
+	size_t start = 0;
+	size_t end;
+	size_t count = 0;
+
+	while (start < e->size) {
+		for (end = start; end < e->size && e->bytes[end] != '\n'; end++) {
+		}
+		REQUIRE(end - start + 2 <= sizeof(path));
+		path[0] = '/';
+		memcpy(path + 1, e->bytes + start, end - start);
+		path[end - start + 1] = '\0';
+		if (btrfs_image_lookup(fs, path, &inode) != BTRFS_OK ||
+		    inode.id.inode != BTRFS_ROOT_INODE || inode.id.tree < BTRFS_ROOT_INODE) {
+			fprintf(stderr, "%s stage %zu: %s is not a subvolume\n", plan->name, stage,
+			    path);
+			exit(1);
+		}
+		count++;
+		start = end + 1;
+	}
+	if (count != count_subvolumes(fs, 0)) {
+		expectation_failed(plan, stage, e, "subvolume count");
+	}
 }
 
 static void
@@ -272,6 +376,17 @@ check_expectation(
 	case EXPECT_REFERENCE:
 		if (reference_kind(fs, e->path, &inode) != (int)e->value) {
 			expectation_failed(plan, stage, e, "back reference kind");
+		}
+		return;
+	case EXPECT_SUBVOLUME:
+		check_subvolume(fs, plan, stage, e, &inode);
+		return;
+	case EXPECT_SUBVOLUMES:
+		check_subvolumes(fs, plan, stage, e);
+		return;
+	case EXPECT_DELETED:
+		if (count_subvolumes(fs, 1) != e->value) {
+			expectation_failed(plan, stage, e, "deleted subvolumes");
 		}
 		return;
 	default:
@@ -574,6 +689,61 @@ plan_device(struct plan *plan, size_t commit, const char *path, uint32_t mode, u
 	plan->operations[commit][plan->operation_count[commit] - 1].device = device;
 }
 
+/* A UUID for each new subvolume, unique within one test process. */
+static void
+subvolume_uuid(struct operation *operation)
+{
+	static uint32_t counter;
+	uint8_t uuid[BTRFS_UUID_SIZE];
+	unsigned i;
+
+	counter++;
+	for (i = 0; i < BTRFS_UUID_SIZE; i++) {
+		uuid[i] = (uint8_t)(UINT32_C(0x9e3779b9) * (counter + i) >> 24);
+	}
+	memcpy(uuid, &counter, sizeof(counter));
+	operation_data(operation, uuid, sizeof(uuid));
+}
+
+void
+plan_subvolume(struct plan *plan, size_t commit, const char *path)
+{
+	struct operation *operation = plan_namespace(plan, commit, OPERATION_SUBVOLUME, path, NULL);
+
+	operation->mode = BTRFS_MODE_DIRECTORY | 0755;
+	operation->uid = NAMESPACE_UID;
+	operation->gid = NAMESPACE_GID;
+	subvolume_uuid(operation);
+}
+
+void
+plan_delete_subvolume(struct plan *plan, size_t commit, const char *path)
+{
+	(void)plan_namespace(plan, commit, OPERATION_DELETE_SUBVOLUME, path, NULL);
+}
+
+void
+plan_clean_subvolumes(struct plan *plan, size_t commit, size_t budget, size_t dropped, int pending)
+{
+	struct operation *operation =
+	    plan_namespace(plan, commit, OPERATION_CLEAN_SUBVOLUMES, "/", NULL);
+
+	operation->offset = budget;
+	operation->size = dropped;
+	operation->flags = pending;
+}
+
+void
+plan_snapshot(
+    struct plan *plan, size_t commit, const char *source, const char *target, int read_only)
+{
+	struct operation *operation =
+	    plan_namespace(plan, commit, OPERATION_SNAPSHOT, source, target);
+
+	operation->flags = read_only;
+	subvolume_uuid(operation);
+}
+
 void
 plan_link(struct plan *plan, size_t commit, const char *path, const char *target)
 {
@@ -873,11 +1043,56 @@ expect_names(struct plan *plan, size_t first, size_t last, const char *path, con
 	}
 }
 
+void
+expect_subvolume(struct plan *plan, size_t first, size_t last, const char *path, const char *source,
+    int read_only)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_SUBVOLUME, path);
+
+	e->value = (uint64_t)read_only;
+	if (source != NULL) {
+		e->other = strdup(source);
+		REQUIRE(e->other != NULL);
+	}
+}
+
+void
+expect_deleted(struct plan *plan, size_t first, size_t last, size_t count)
+{
+	expect(plan, first, last, EXPECT_DELETED, "/")->value = count;
+}
+
+/* paths: NULL-terminated subvolume paths below the top level, without the
+ * leading slash. */
+void
+expect_subvolumes(struct plan *plan, size_t first, size_t last, const char **paths)
+{
+	struct expectation *e;
+	size_t count = 0;
+
+	while (paths[count] != NULL) {
+		count++;
+	}
+	expect_names(plan, first, last, "/", paths, count);
+	e = &plan->expectations[plan->expectation_count - 1];
+	e->kind = EXPECT_SUBVOLUMES;
+	e->value = 0;
+}
+
 /* The committed listing of path with names added and removed (NULL-terminated
  * lists, either may be NULL). */
 void
 expect_listing(struct context *context, struct plan *plan, size_t first, size_t last,
     const char *path, const char *const *added, const char *const *removed)
+{
+	expect_listing_from(context, plan, first, last, path, path, added, removed);
+}
+
+/* The committed listing of base, changed as expect_listing describes, for the
+ * directory at path (a snapshot of base, for example). */
+void
+expect_listing_from(struct context *context, struct plan *plan, size_t first, size_t last,
+    const char *path, const char *base, const char *const *added, const char *const *removed)
 {
 	struct btrfs_inode directory;
 	const char **names;
@@ -888,7 +1103,7 @@ expect_listing(struct context *context, struct plan *plan, size_t first, size_t 
 	size_t i;
 	size_t j;
 
-	REQUIRE(btrfs_image_lookup(plan_mount(context), path, &directory) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(plan_mount(context), base, &directory) == BTRFS_OK);
 	listing = list_directory(context->plan_fs, &directory, &size);
 	names = calloc(size + 64, sizeof(*names));
 	REQUIRE(names != NULL);

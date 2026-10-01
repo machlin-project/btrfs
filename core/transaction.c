@@ -152,6 +152,11 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 		    bt_fst_verify(base, transaction->free_space.root, transaction->extents.root);
 	}
 	if (error == BTRFS_OK) {
+		error = bt_tx_root(base, BT_UUID_TREE, &transaction->uuids);
+		transaction->has_uuids = error == BTRFS_OK;
+		error = error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
+	}
+	if (error == BTRFS_OK) {
 		error = bt_find_root(base, BTRFS_TOP_LEVEL_TREE, &transaction->top);
 	}
 	if (error == BTRFS_OK) {
@@ -190,7 +195,7 @@ bt_tx_tree(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned
 	for (i = 0; i < transaction->tree_count; i++) {
 		if (transaction->trees[i].root.owner == tree) {
 			*result = &transaction->trees[i];
-			return BTRFS_OK;
+			return transaction->trees[i].read_only ? BTRFS_READ_ONLY : BTRFS_OK;
 		}
 	}
 	if (!bt_file_tree(tree)) {
@@ -206,6 +211,127 @@ bt_tx_tree(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned
 		*result = owned;
 	}
 	return error;
+}
+
+enum btrfs_result
+bt_tx_source(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root **result)
+{
+	struct bt_owned_root *owned;
+	size_t i;
+	enum btrfs_result error;
+
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == tree) {
+			*result = &transaction->trees[i];
+			return BTRFS_OK;
+		}
+	}
+	if (!bt_file_tree(tree)) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (transaction->tree_count == BT_TRANSACTION_TREES) {
+		return BTRFS_UNSUPPORTED;
+	}
+	owned = &transaction->trees[transaction->tree_count];
+	error = bt_tx_root(transaction->base, tree, owned);
+	owned->read_only = error == BTRFS_READ_ONLY;
+	if (error == BTRFS_OK || error == BTRFS_READ_ONLY) {
+		transaction->tree_count++;
+		*result = owned;
+		error = BTRFS_OK;
+	}
+	return error;
+}
+
+enum btrfs_result
+bt_tx_root_item(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root *result)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { tree, UINT64_MAX, BT_ROOT_ITEM };
+	enum btrfs_result error;
+
+	bt_cursor_init(&cursor, bt_mutation_view(transaction->mutation), transaction->roots);
+	error = bt_cursor_seek(&cursor, key, 1);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.objectid != tree || record.key.type != BT_ROOT_ITEM) {
+			error = BTRFS_NOT_FOUND;
+		} else if (record.size != sizeof(result->item)) {
+			error = BTRFS_UNSUPPORTED;
+		} else {
+			bt_copy(&result->item, record.data, record.size);
+			result->size = record.size;
+			result->key = record.key;
+			result->root = (struct bt_root){ bt_u64(result->item.legacy.bytenr),
+				bt_u64(result->item.legacy.generation), tree,
+				result->item.legacy.level };
+		}
+	}
+	bt_cursor_fini(&cursor);
+	return error;
+}
+
+enum btrfs_result
+bt_tx_add_tree(struct btrfs_transaction *transaction, const struct bt_owned_root *owned,
+    struct bt_owned_root **result)
+{
+	size_t i;
+
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == owned->root.owner) {
+			return BTRFS_CORRUPT;
+		}
+	}
+	if (transaction->tree_count == BT_TRANSACTION_TREES) {
+		return BTRFS_UNSUPPORTED;
+	}
+	transaction->trees[transaction->tree_count] = *owned;
+	*result = &transaction->trees[transaction->tree_count++];
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+bt_tx_root_id(struct btrfs_transaction *transaction, uint64_t *result)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { BT_LAST_FREE_OBJECTID, 0, 0 };
+	uint64_t next = transaction->next_root;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (next == 0 && transaction->counters != NULL) {
+		next = transaction->counters->next_root;
+	}
+	if (next == 0) {
+		next = BTRFS_ROOT_INODE;
+		bt_cursor_init(
+		    &cursor, bt_mutation_view(transaction->mutation), transaction->roots);
+		error = bt_cursor_seek(&cursor, key, 1);
+		if (error == BTRFS_OK) {
+			(void)bt_cursor_record(&cursor, &record);
+			if (record.key.objectid >= BTRFS_ROOT_INODE &&
+			    record.key.objectid < BT_LAST_FREE_OBJECTID) {
+				next = record.key.objectid + 1;
+			}
+		}
+		bt_cursor_fini(&cursor);
+		if (error == BTRFS_NOT_FOUND) {
+			error = BTRFS_OK;
+		}
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	if (next >= BT_ROOT_ID_LIMIT) {
+		return BTRFS_NO_SPACE;
+	}
+	*result = next;
+	transaction->next_root = next + 1;
+	if (transaction->counters != NULL) {
+		transaction->counters->next_root = next + 1;
+	}
+	return BTRFS_OK;
 }
 
 enum btrfs_result
@@ -331,7 +457,7 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 /* Adds or removes the references a tree block's content holds: child blocks for
  * nodes, regular and preallocated data extents for leaves. full selects the
  * shared form naming this block as parent; otherwise references name root. */
-static enum btrfs_result
+enum btrfs_result
 bt_tx_children(struct btrfs_transaction *transaction, const uint8_t *node, uint64_t address,
     int full, uint64_t root, int add)
 {
@@ -785,6 +911,10 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 	    transaction->checksums.root.address !=
 		bt_u64(transaction->checksums.item.legacy.bytenr)) {
 		error = bt_tx_update_root(transaction, &transaction->checksums);
+	}
+	if (error == BTRFS_OK && transaction->has_uuids &&
+	    transaction->uuids.root.address != bt_u64(transaction->uuids.item.legacy.bytenr)) {
+		error = bt_tx_update_root(transaction, &transaction->uuids);
 	}
 	if (error != BTRFS_OK) {
 		return error;

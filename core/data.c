@@ -38,7 +38,7 @@ bt_tx_release_data(struct btrfs_transaction *transaction)
 	transaction->ref_count = 0;
 }
 
-static enum btrfs_result
+enum btrfs_result
 bt_tx_queue(struct btrfs_transaction *transaction, struct bt_key extent,
     const struct bt_backref *reference, int add)
 {

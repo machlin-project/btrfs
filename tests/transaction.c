@@ -18,6 +18,7 @@ main(int argc, char **argv)
 	int fragment = 0;
 	int grow = 0;
 	int names = 0;
+	int subvolumes = 0;
 	uint32_t random_first = 0;
 	uint32_t random_count = 0;
 	int random_quick = 0;
@@ -42,6 +43,8 @@ main(int argc, char **argv)
 			grow = 1;
 		} else if (strcmp(argv[i], "--namespace") == 0) {
 			names = 1;
+		} else if (strcmp(argv[i], "--subvolume") == 0) {
+			subvolumes = 1;
 		} else if ((strcmp(argv[i], "--random") == 0 ||
 			       strcmp(argv[i], "--random-quick") == 0) &&
 		    i + 2 < argc) {
@@ -99,6 +102,9 @@ main(int argc, char **argv)
 	}
 	if (names) {
 		namespace_scenarios(context);
+	}
+	if (subvolumes) {
+		subvolume_scenarios(context);
 	}
 	if (random_count != 0) {
 		random_scenarios(context, random_first, random_count, random_quick);

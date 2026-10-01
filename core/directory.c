@@ -38,6 +38,61 @@ bt_dir_record(const struct bt_record *record, size_t *offset, const struct bt_di
 	return BTRFS_OK;
 }
 
+/* Whether tree's ROOT_REF to child names this entry (directory and name), as
+ * Linux's fixup_tree_root_location requires before entering a subvolume. */
+static enum btrfs_result
+bt_dir_root_ref(const struct btrfs_fs *fs, uint64_t tree, uint64_t child, uint64_t directory,
+    const uint8_t *name, size_t length, int *referenced)
+{
+	const struct bt_disk_root_ref *ref;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { tree, child, BT_ROOT_REF };
+	enum btrfs_result error;
+
+	*referenced = 0;
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	error = bt_cursor_seek(&cursor, key, 0);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		ref = (const void *)record.data;
+		if (bt_key_compare(record.key, key) != 0) {
+			error = BTRFS_NOT_FOUND;
+		} else if (record.size < sizeof(*ref) ||
+		    record.size != sizeof(*ref) + bt_u16(ref->name_length)) {
+			error = BTRFS_CORRUPT;
+		} else {
+			*referenced = bt_u64(ref->directory) == directory &&
+			    bt_u16(ref->name_length) == length && bt_equal(ref + 1, name, length);
+		}
+	}
+	bt_cursor_fini(&cursor);
+	return error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
+}
+
+/* The object a directory entry names. A subvolume entry enters the
+ * subvolume only when tree's root reference names the entry; otherwise it is
+ * the empty stub directory. */
+static enum btrfs_result
+bt_dir_resolve(const struct btrfs_fs *fs, uint64_t tree, uint64_t directory,
+    const struct bt_disk_dir *header, const uint8_t *name, struct btrfs_object_id *id)
+{
+	int referenced;
+	enum btrfs_result error;
+
+	error = bt_dir_identity(tree, header, id);
+	if (error != BTRFS_OK || id->tree == tree) {
+		return error;
+	}
+	error = bt_dir_root_ref(
+	    fs, tree, id->tree, directory, name, bt_u16(header->name_length), &referenced);
+	if (error == BTRFS_OK && !referenced) {
+		id->tree = tree;
+		id->inode = BTRFS_EMPTY_SUBVOLUME_INODE;
+	}
+	return error;
+}
+
 enum btrfs_result
 bt_dir_identity(uint64_t tree, const struct bt_disk_dir *header, struct btrfs_object_id *id)
 {
@@ -59,7 +114,7 @@ bt_dir_identity(uint64_t tree, const struct bt_disk_dir *header, struct btrfs_ob
 
 static enum btrfs_result
 bt_lookup_record(struct bt_cursor *cursor, uint64_t directory, const void *name, size_t length,
-    struct btrfs_object_id *id)
+    int resolve, struct btrfs_object_id *id)
 {
 	struct bt_key key = { .objectid = directory, .type = BT_DIR_ITEM };
 	struct bt_record record;
@@ -86,7 +141,9 @@ bt_lookup_record(struct bt_cursor *cursor, uint64_t directory, const void *name,
 			if (matched) {
 				return BTRFS_CORRUPT;
 			}
-			error = bt_dir_identity(cursor->root.owner, header, &found);
+			error = resolve ? bt_dir_resolve(cursor->fs, cursor->root.owner, directory,
+					      header, entry_name, &found)
+					: bt_dir_identity(cursor->root.owner, header, &found);
 			if (error != BTRFS_OK) {
 				return error;
 			}
@@ -116,7 +173,8 @@ bt_default_tree(const struct btrfs_fs *fs, uint64_t *tree)
 		return BTRFS_OK;
 	}
 	bt_cursor_init(&cursor, fs, fs->root_tree);
-	error = bt_lookup_record(&cursor, BT_ROOT_DIR_OBJECTID, name, sizeof(name) - 1, &id);
+	/* The root tree's default entry has no root reference. */
+	error = bt_lookup_record(&cursor, BT_ROOT_DIR_OBJECTID, name, sizeof(name) - 1, 0, &id);
 	bt_cursor_fini(&cursor);
 	if (error == BTRFS_OK) {
 		*tree = id.tree;
@@ -145,11 +203,14 @@ btrfs_lookup(const struct btrfs_fs *fs, const struct btrfs_inode *directory, con
 	if (length == 2 && bt_equal(name, "..", 2)) {
 		return btrfs_parent(fs, directory, inode);
 	}
+	if (directory->id.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		return BTRFS_NOT_FOUND;
+	}
 	error = bt_inode_cursor(fs, directory, &cursor);
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	error = bt_lookup_record(&cursor, directory->id.inode, name, length, &id);
+	error = bt_lookup_record(&cursor, directory->id.inode, name, length, 1, &id);
 	bt_cursor_fini(&cursor);
 	return error == BTRFS_OK ? btrfs_get_inode(fs, id, inode) : error;
 }
@@ -166,6 +227,7 @@ btrfs_directory_open(const struct btrfs_fs *fs, const struct btrfs_inode *direct
     uint64_t cookie, struct btrfs_directory **result)
 {
 	struct btrfs_directory *stream;
+	struct bt_root root;
 	struct bt_key key;
 	enum btrfs_result error;
 
@@ -184,7 +246,18 @@ btrfs_directory_open(const struct btrfs_fs *fs, const struct btrfs_inode *direct
 		return BTRFS_NO_MEMORY;
 	}
 	bt_zero(stream, sizeof(*stream));
-	error = bt_inode_cursor(fs, directory, &stream->cursor);
+	if (directory->id.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		/* The stub directory has no entries. */
+		error = bt_find_root(fs, directory->id.tree, &root);
+		if (error == BTRFS_OK) {
+			bt_cursor_init(&stream->cursor, fs, root);
+			stream->end = 1;
+			*result = stream;
+			return BTRFS_OK;
+		}
+	} else {
+		error = bt_inode_cursor(fs, directory, &stream->cursor);
+	}
 	if (error != BTRFS_OK) {
 		fs->env.release(fs->env.context, stream, sizeof(*stream));
 		return error;
@@ -239,7 +312,8 @@ btrfs_directory_next(
 		stream->end = 1;
 		return error == BTRFS_OK || error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
 	}
-	error = bt_dir_identity(stream->cursor.root.owner, header, &decoded.id);
+	error = bt_dir_resolve(
+	    stream->cursor.fs, stream->cursor.root.owner, stream->inode, header, name, &decoded.id);
 	if (error != BTRFS_OK) {
 		stream->end = 1;
 		return error;

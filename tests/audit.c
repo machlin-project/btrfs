@@ -43,11 +43,12 @@ main(int argc, char **argv)
 			fprintf(stderr, "%s: namespace: %s\n", argv[i], names.failure);
 			failures++;
 		} else {
-			printf("%s: %zu file trees, %zu inodes, %zu names (%zu extended), %zu "
-			       "subvolume entries, %zu collision items, %zu xattrs, %zu orphans "
-			       "PASS\n",
-			    argv[i], names.trees, names.inodes, names.names, names.extended_names,
-			    names.subvolume_entries, names.collisions, names.xattrs, names.orphans);
+			printf("%s: %zu file trees (%zu deleted), %zu inodes, %zu names (%zu "
+			       "extended), %zu subvolume entries, %zu root references, %zu "
+			       "collision items, %zu xattrs, %zu orphans PASS\n",
+			    argv[i], names.trees, names.dead_trees, names.inodes, names.names,
+			    names.extended_names, names.subvolume_entries, names.subvolume_refs,
+			    names.collisions, names.xattrs, names.orphans);
 		}
 		btrfs_unmount(fs);
 		btrfs_image_close(&image);

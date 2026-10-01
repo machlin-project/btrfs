@@ -24,12 +24,21 @@ btrfs_get_inode(const struct btrfs_fs *fs, struct btrfs_object_id id, struct btr
 	struct bt_key key = { .objectid = id.inode, .type = BT_INODE_ITEM };
 	enum btrfs_result error;
 
-	if (fs == NULL || inode == NULL || !bt_file_tree(id.tree) || id.inode < BTRFS_ROOT_INODE) {
+	if (fs == NULL || inode == NULL || !bt_file_tree(id.tree) ||
+	    (id.inode < BTRFS_ROOT_INODE && id.inode != BTRFS_EMPTY_SUBVOLUME_INODE)) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	error = bt_find_root(fs, id.tree, &root);
 	if (error != BTRFS_OK) {
 		return error;
+	}
+	if (id.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		/* Linux's new_simple_dir: an empty directory, mode 0755, one link. */
+		bt_zero(inode, sizeof(*inode));
+		inode->id = id;
+		inode->mode = BTRFS_MODE_DIRECTORY | BT_EMPTY_SUBVOLUME_MODE;
+		inode->links = 1;
+		return BTRFS_OK;
 	}
 	bt_cursor_init(&cursor, fs, root);
 	error = bt_cursor_seek(&cursor, key, 0);

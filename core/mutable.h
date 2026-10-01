@@ -44,6 +44,11 @@ enum btrfs_result bt_mutation_create(const struct btrfs_fs *base,
     const struct bt_mutation_allocator *allocator, struct bt_mutation **result);
 enum btrfs_result bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root,
     struct bt_key key, const void *value, size_t length, enum bt_edit edit);
+/* A new tree root owned by owner: with copy, a copy of source's node (a
+ * snapshot's root, with the same items and child pointers); otherwise an
+ * empty leaf whose header identifies this filesystem as source's does. */
+enum btrfs_result bt_mutation_new_root(struct bt_mutation *mutation, struct bt_root source,
+    uint64_t owner, int copy, struct bt_root *result);
 enum btrfs_result bt_mutation_find(struct bt_mutation *mutation, struct bt_root root,
     struct bt_key key, void *value, size_t capacity, size_t *length);
 const struct btrfs_fs *bt_mutation_view(const struct bt_mutation *mutation);

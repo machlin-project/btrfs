@@ -34,6 +34,9 @@ struct bt_owned_root {
 	struct bt_key key;
 	struct bt_disk_root_full item;
 	size_t size;
+	/* A read-only subvolume opened as a snapshot source: its root item may
+	 * change, its tree may not. */
+	int read_only;
 };
 
 /* A new data extent held in memory until publication writes it before the
@@ -81,6 +84,8 @@ struct btrfs_counters {
 	struct btrfs_environment environment;
 	struct bt_tree_counter trees[BT_COUNTER_TREES];
 	size_t tree_count;
+	/* The next tree id; 0 until a transaction derived it. */
+	uint64_t next_root;
 	struct bt_directory_counter directories[BT_COUNTER_SLOTS];
 	size_t directory_count;
 	/* How often the directory table was emptied. */
@@ -104,6 +109,13 @@ struct btrfs_transaction {
 	struct bt_owned_root extents;
 	struct bt_owned_root checksums;
 	struct bt_owned_root free_space;
+	/* Subvolume UUIDs, when the filesystem has the tree. */
+	struct bt_owned_root uuids;
+	int has_uuids;
+	/* The next tree id this transaction hands out; 0 until derived. */
+	uint64_t next_root;
+	/* The deleted subvolume the cleaner works on. */
+	struct bt_owned_root dropping;
 	size_t free_space_applied;
 	size_t chunks_published;
 	int has_free_space;
@@ -142,8 +154,30 @@ struct bt_directory_counter *bt_counters_directory(
     struct btrfs_counters *counters, uint64_t tree, uint64_t directory, int add);
 enum btrfs_result bt_tx_tree(
     struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root **result);
+/* Opens a subvolume as a snapshot source: a read-only one too, without
+ * admitting edits of its tree. */
+enum btrfs_result bt_tx_source(
+    struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root **result);
+/* Registers a tree created in this transaction, whose root item is already
+ * inserted under owned->key. */
+enum btrfs_result bt_tx_add_tree(struct btrfs_transaction *transaction,
+    const struct bt_owned_root *owned, struct bt_owned_root **result);
+/* The current root item of tree, without admitting edits of the tree. */
+enum btrfs_result bt_tx_root_item(
+    struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root *result);
+/* The next free tree id: after the highest object of the root tree below
+ * BTRFS_LAST_FREE_OBJECTID, and after every id the mount's counters handed out. */
+enum btrfs_result bt_tx_root_id(struct btrfs_transaction *transaction, uint64_t *result);
+/* Adds or removes the references a tree block's content holds: child blocks
+ * for nodes, regular and preallocated data extents for leaves. full selects
+ * the shared form naming address as parent; otherwise references name root. */
+enum btrfs_result bt_tx_children(struct btrfs_transaction *transaction, const uint8_t *node,
+    uint64_t address, int full, uint64_t root, int add);
 enum btrfs_result bt_tx_edit(struct btrfs_transaction *transaction, struct bt_root *root,
     struct bt_key key, const void *data, size_t size, enum bt_edit edit);
+/* Queues a file reference change for bt_tx_apply_refs. */
+enum btrfs_result bt_tx_queue(struct btrfs_transaction *transaction, struct bt_key extent,
+    const struct bt_backref *reference, int add);
 /* Applies queued file references; a data extent whose last reference goes
  * loses its checksums and its block-group space. */
 enum btrfs_result bt_tx_apply_refs(struct btrfs_transaction *transaction);

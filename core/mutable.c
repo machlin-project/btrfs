@@ -866,6 +866,50 @@ bt_mutation_create(const struct btrfs_fs *base, const struct bt_mutation_allocat
 }
 
 enum btrfs_result
+bt_mutation_new_root(struct bt_mutation *mutation, struct bt_root source, uint64_t owner, int copy,
+    struct bt_root *result)
+{
+	struct bt_mutable_node *node;
+	struct bt_disk_header *header;
+	struct bt_root created = { 0, 0, owner, 0 };
+	enum btrfs_result error = BTRFS_OK;
+
+	if (mutation == NULL || result == NULL || owner == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (mutation->failure != BTRFS_OK) {
+		return mutation->failure;
+	}
+	node = bt_mut_find_node(mutation, source.address);
+	if (node != NULL) {
+		if (node->discarded) {
+			error = BTRFS_CORRUPT;
+		} else {
+			bt_copy(mutation->scratch, node->bytes, mutation->view.info.node_size);
+		}
+	} else {
+		error = bt_tree_read(mutation->base, source, mutation->scratch);
+	}
+	if (error == BTRFS_OK) {
+		header = (struct bt_disk_header *)mutation->scratch;
+		if (copy) {
+			created.level = header->level;
+		} else {
+			bt_zero(header + 1, mutation->view.info.node_size - sizeof(*header));
+			bt_put32(&header->count, 0);
+		}
+		error = bt_mut_new(mutation, created, mutation->scratch, 0, &node);
+	}
+	if (error != BTRFS_OK) {
+		mutation->failure = error;
+		return error;
+	}
+	*result =
+	    (struct bt_root){ node->address, mutation->view.info.generation, owner, created.level };
+	return BTRFS_OK;
+}
+
+enum btrfs_result
 bt_mutation_find(struct bt_mutation *mutation, struct bt_root root, struct bt_key key, void *value,
     size_t capacity, size_t *length)
 {

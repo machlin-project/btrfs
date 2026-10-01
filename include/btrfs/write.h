@@ -193,6 +193,45 @@ enum btrfs_result btrfs_transaction_drop_privileges(
     struct btrfs_transaction *transaction, struct btrfs_object_id id, struct btrfs_time time);
 enum btrfs_result btrfs_transaction_keep_privileges(
     struct btrfs_transaction *transaction, struct btrfs_object_id id);
+/* Creates an empty subvolume named name in directory parent, as Linux's
+ * create_subvol: a new tree whose root directory (inode 256) has the caller's
+ * directory mode, owner and time, its root item, root references, a UUID
+ * tree entry for uuid (the caller's random UUID) and the directory entry. The
+ * root directory inherits the parent subvolume's compression property, not
+ * inode flags. result receives the new tree id. */
+enum btrfs_result btrfs_transaction_create_subvolume(struct btrfs_transaction *transaction,
+    struct btrfs_object_id parent, const void *name, size_t length,
+    const struct btrfs_new_inode *attributes, const uint8_t uuid[BTRFS_UUID_SIZE],
+    uint64_t *result);
+/* Snapshots subvolume source into directory parent, as Linux's
+ * create_pending_snapshot: the snapshot's root node is a copy of the source's,
+ * every block below it gains a reference, both root items record this
+ * transaction as their last snapshot, and the snapshot's parent UUID names the
+ * source. A read-only snapshot keeps the source's received UUID. A source
+ * changed earlier in this transaction is refused (UNSUPPORTED): its new
+ * blocks have no references yet. */
+enum btrfs_result btrfs_transaction_snapshot(struct btrfs_transaction *transaction, uint64_t source,
+    struct btrfs_object_id parent, const void *name, size_t length, int read_only,
+    struct btrfs_time time, const uint8_t uuid[BTRFS_UUID_SIZE], uint64_t *result);
+/* Deletes the subvolume named name in directory parent, as Linux's
+ * btrfs_delete_subvolume: the entry and root references go, the root item
+ * keeps refs 0 and the dead flag, an orphan item hands the tree to
+ * btrfs_transaction_clean_subvolumes, and its UUID tree entries go. The
+ * default subvolume is NOT_PERMITTED, a subvolume holding subvolumes is
+ * NOT_EMPTY, a name that is not a subvolume entry INVALID_ARGUMENT, and a
+ * subvolume this transaction opened UNSUPPORTED. A stub entry (copied by a
+ * snapshot) is removed alone. Adapters keep mounted or busy subvolumes. */
+enum btrfs_result btrfs_transaction_delete_subvolume(struct btrfs_transaction *transaction,
+    struct btrfs_object_id parent, const void *name, size_t length, struct btrfs_time time);
+/* Drops deleted subvolumes, as Linux's cleaner does with btrfs_drop_snapshot:
+ * references of their blocks and file extents go, blocks other trees share
+ * are first converted to parent references when the deleted tree owns them,
+ * and unshared blocks and data are freed. At most budget tree blocks are
+ * visited per call; the root item records the drop progress, so a later
+ * transaction resumes there. A fully dropped subvolume loses its root item
+ * and orphan item. dropped counts them; pending reports remaining work. */
+enum btrfs_result btrfs_transaction_clean_subvolumes(
+    struct btrfs_transaction *transaction, size_t budget, size_t *dropped, int *pending);
 /* Deletes an orphaned inode after its last native reference closes. */
 enum btrfs_result btrfs_transaction_evict(
     struct btrfs_transaction *transaction, struct btrfs_object_id id);

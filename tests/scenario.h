@@ -127,7 +127,11 @@ enum operation_kind {
 	OPERATION_CLEAN_ORPHANS,
 	OPERATION_SET_ATTRIBUTES,
 	OPERATION_KEEP_PRIVILEGES,
-	OPERATION_DROP_PRIVILEGES
+	OPERATION_DROP_PRIVILEGES,
+	OPERATION_SUBVOLUME,
+	OPERATION_SNAPSHOT,
+	OPERATION_DELETE_SUBVOLUME,
+	OPERATION_CLEAN_SUBVOLUMES
 };
 
 /* Operations name objects by path. A path created, renamed or removed by an
@@ -168,7 +172,10 @@ enum expectation_kind {
 	EXPECT_FLAGS,
 	EXPECT_FEATURE,
 	EXPECT_TIMES,
-	EXPECT_REFERENCE
+	EXPECT_REFERENCE,
+	EXPECT_SUBVOLUME,
+	EXPECT_SUBVOLUMES,
+	EXPECT_DELETED
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -190,7 +197,11 @@ struct expectation {
 	/* EXPECT_FLAGS: the inode flags in mask must equal value. */
 	uint64_t mask;
 	/* EXPECT_REFERENCE: value 1 when the path's name is held by an
-	 * INODE_EXTREF item, 0 by its INODE_REF item. */
+	 * INODE_EXTREF item, 0 by its INODE_REF item. EXPECT_SUBVOLUME: path is
+	 * a subvolume, read-only when value is 1, a snapshot of the subvolume at
+	 * other (NULL: of none). EXPECT_SUBVOLUMES: bytes list every subvolume's
+	 * path below the top level, as btrfs subvolume list prints them.
+	 * EXPECT_DELETED: value deleted subvolumes wait for the cleaner. */
 	/* EXPECT_TIMES: seconds of the access and modification times. */
 	int64_t access_seconds;
 	int64_t modify_seconds;
@@ -326,6 +337,14 @@ void plan_set_attributes(struct plan *plan, size_t commit, const char *path, uns
 void plan_privileges(struct plan *plan, size_t commit, const char *path, int keep);
 void plan_expect_refusal(struct plan *plan, size_t commit, enum btrfs_result result);
 void plan_truncate_new(struct plan *plan, size_t commit, const char *path, uint64_t size);
+void plan_subvolume(struct plan *plan, size_t commit, const char *path);
+void plan_delete_subvolume(struct plan *plan, size_t commit, const char *path);
+/* Runs the cleaner with budget; it must drop dropped subvolumes and leave
+ * pending work as stated. */
+void plan_clean_subvolumes(
+    struct plan *plan, size_t commit, size_t budget, size_t dropped, int pending);
+void plan_snapshot(
+    struct plan *plan, size_t commit, const char *source, const char *target, int read_only);
 void namespace_plan(struct context *context, struct plan *plan, const char *name);
 void random_scenarios(struct context *context, uint32_t first, uint32_t count, int quick);
 struct expectation *expect(
@@ -357,6 +376,12 @@ void expect_names(struct plan *plan, size_t first, size_t last, const char *path
     const char **names, size_t count);
 void expect_listing(struct context *context, struct plan *plan, size_t first, size_t last,
     const char *path, const char *const *added, const char *const *removed);
+void expect_listing_from(struct context *context, struct plan *plan, size_t first, size_t last,
+    const char *path, const char *base, const char *const *added, const char *const *removed);
+void expect_subvolume(struct plan *plan, size_t first, size_t last, const char *path,
+    const char *source, int read_only);
+void expect_subvolumes(struct plan *plan, size_t first, size_t last, const char **paths);
+void expect_deleted(struct plan *plan, size_t first, size_t last, size_t count);
 
 /* Execution, crash states, fault sweeps and export (tests/scenario_run.c). */
 size_t chunk_count(struct context *context);
@@ -374,6 +399,7 @@ void grow_scenarios(struct context *context);
 /* Scenario sets. */
 struct btrfs_object_id object(struct btrfs_fs *fs, const char *path);
 void namespace_scenarios(struct context *context);
+void subvolume_scenarios(struct context *context);
 
 /* Scenario sets. */
 void admission_tests(struct context *context);

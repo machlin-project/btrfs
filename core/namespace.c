@@ -1,60 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-#include "transaction.h"
-
-/* Linux's PATH_MAX less the terminating NUL. */
-#define BT_SYMLINK_LIMIT 4095U
-#define BT_NANOSECONDS 1000000000U
-#define BT_MODE_PERMISSIONS 07777U
-#define BT_NAME_HASH_SEED (UINT32_MAX - 1U)
-#define BT_PROPERTY_PREFIX "btrfs."
-#define BT_COMPRESSION_PROPERTY "btrfs.compression"
-#define BT_CAPABILITY_XATTR "security.capability"
-#define BT_MODE_SET_UID 04000U
-#define BT_MODE_SET_GID 02000U
-#define BT_MODE_GROUP_EXECUTE 00010U
-#define BT_ATTRIBUTE_MASK                                                                          \
-	(BTRFS_ATTRIBUTE_MODE | BTRFS_ATTRIBUTE_UID | BTRFS_ATTRIBUTE_GID |                        \
-	    BTRFS_ATTRIBUTE_ACCESS_TIME | BTRFS_ATTRIBUTE_MODIFY_TIME |                            \
-	    BTRFS_ATTRIBUTE_REMOVE_CAPABILITY)
-
-/* One name in a directory, resolved through DIR_ITEM, its back reference
- * (INODE_REF, or INODE_EXTREF when extended) and DIR_INDEX. */
-struct bt_entry {
-	uint64_t inode;
-	uint64_t index;
-	uint8_t type;
-	int extended;
-};
-
-/* A name removed before another is added in one operation (a rename's old
- * name): its bytes leave the items it shares with the new name. */
-struct bt_removed {
-	uint64_t directory;
-	const void *name;
-	size_t length;
-	int extended;
-};
-
-/* A packed item (DIR_ITEM, DIR_INDEX, INODE_REF or XATTR_ITEM) loaded into the
- * transaction's namespace item buffer. An absent item has size 0. */
-struct bt_packed {
-	struct bt_key key;
-	uint8_t *bytes;
-	size_t size;
-	int present;
-};
-
-struct bt_codec {
-	const char *name;
-	uint64_t feature;
-};
+#include "namespace.h"
 
 /* Linux's compression property: a value starting with a codec name (a level
  * may follow), or "no"/"none" to disable compression. */
 static const struct bt_codec bt_ns_codecs[] = { { "zlib", 0 }, { "lzo", BT_FEATURE_COMPRESS_LZO },
 	{ "zstd", BT_FEATURE_COMPRESS_ZSTD } };
 
-static uint8_t
+uint8_t
 bt_ns_type(uint32_t mode)
 {
 	switch (mode & BTRFS_MODE_TYPE) {
@@ -77,7 +29,7 @@ bt_ns_type(uint32_t mode)
 	}
 }
 
-static int
+int
 bt_ns_is_directory(const struct bt_disk_inode *item)
 {
 	return (bt_u32(item->mode) & BTRFS_MODE_TYPE) == BTRFS_MODE_DIRECTORY;
@@ -85,19 +37,19 @@ bt_ns_is_directory(const struct bt_disk_inode *item)
 
 /* Linux refuses changes to immutable inodes; append-only inodes keep their
  * names and attributes and only grow. */
-static int
+int
 bt_ns_immutable(const struct bt_disk_inode *item)
 {
 	return (bt_u64(item->flags) & BT_INODE_IMMUTABLE) != 0;
 }
 
-static int
+int
 bt_ns_frozen(const struct bt_disk_inode *item)
 {
 	return (bt_u64(item->flags) & (BT_INODE_IMMUTABLE | BT_INODE_APPEND)) != 0;
 }
 
-static size_t
+size_t
 bt_ns_length(const char *text)
 {
 	size_t length = 0;
@@ -108,7 +60,7 @@ bt_ns_length(const char *text)
 	return length;
 }
 
-static uint64_t
+uint64_t
 bt_ns_hash(const void *name, size_t length)
 {
 	return bt_crc32c(BT_NAME_HASH_SEED, name, length);
@@ -121,7 +73,7 @@ bt_ns_extref_hash(uint64_t directory, const void *name, size_t length)
 	return bt_crc32c((uint32_t)directory, name, length);
 }
 
-static enum btrfs_result
+enum btrfs_result
 bt_ns_name(const void *name, size_t length)
 {
 	const uint8_t *bytes = name;
@@ -136,14 +88,14 @@ bt_ns_name(const void *name, size_t length)
 	return BTRFS_OK;
 }
 
-static size_t
+size_t
 bt_ns_item_limit(const struct btrfs_transaction *transaction)
 {
 	return transaction->base->info.node_size - sizeof(struct bt_disk_header) -
 	    sizeof(struct bt_disk_item);
 }
 
-static uint64_t
+uint64_t
 bt_ns_transid(const struct btrfs_transaction *transaction)
 {
 	return transaction->base->info.generation + 1;
@@ -151,7 +103,7 @@ bt_ns_transid(const struct btrfs_transaction *transaction)
 
 /* The key of the first item at or after key (before: the last at or before
  * it); found is 0 when the tree holds none. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_neighbor(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     struct bt_key key, int before, struct bt_key *result, int *found)
 {
@@ -172,7 +124,7 @@ bt_ns_neighbor(struct btrfs_transaction *transaction, const struct bt_owned_root
 }
 
 /* Loads one packed item into the item buffer; an absent item is not an error. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_load(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     struct bt_key key, struct bt_packed *packed)
 {
@@ -191,7 +143,7 @@ bt_ns_load(struct btrfs_transaction *transaction, const struct bt_owned_root *tr
 }
 
 /* Finds name among the entries of a packed DIR_ITEM, DIR_INDEX or XATTR_ITEM. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_dir_find(const struct bt_packed *packed, const void *name, size_t length, size_t *offset,
     size_t *entry_size, const struct bt_disk_dir **header)
 {
@@ -281,7 +233,7 @@ bt_ns_extref_find(const struct bt_packed *packed, uint64_t directory, const void
 
 /* Appends one entry to a packed item, creating the item when absent. Linux
  * extends a colliding item, so later names follow earlier ones. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_append(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     struct bt_packed *packed, const uint8_t *entry, size_t entry_size)
 {
@@ -302,7 +254,7 @@ bt_ns_append(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 
 /* Removes [offset, offset + length) of a packed item, deleting the item when
  * nothing remains. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_cut(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     struct bt_packed *packed, size_t offset, size_t length)
 {
@@ -323,7 +275,7 @@ bt_ns_cut(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	return error;
 }
 
-static size_t
+size_t
 bt_ns_dir_entry(uint8_t *out, struct bt_key location, uint64_t transid, const void *name,
     size_t name_length, const void *data, size_t data_length, uint8_t type)
 {
@@ -342,7 +294,7 @@ bt_ns_dir_entry(uint8_t *out, struct bt_key location, uint64_t transid, const vo
 	return sizeof(*header) + name_length + data_length;
 }
 
-static enum btrfs_result
+enum btrfs_result
 bt_ns_inode(struct btrfs_transaction *transaction, const struct bt_owned_root *tree, uint64_t inode,
     struct bt_disk_inode *item)
 {
@@ -369,7 +321,7 @@ bt_ns_named_inode(struct btrfs_transaction *transaction, const struct bt_owned_r
 	return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
 }
 
-static enum btrfs_result
+enum btrfs_result
 bt_ns_parent(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     uint64_t directory, struct bt_disk_inode *item)
 {
@@ -383,7 +335,7 @@ bt_ns_parent(struct btrfs_transaction *transaction, const struct bt_owned_root *
 }
 
 /* Stores an inode changed now: transid, change counter and ctime advance. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_store(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
     struct bt_disk_inode *item, struct btrfs_time time)
 {
@@ -405,7 +357,7 @@ bt_ns_store(struct btrfs_transaction *transaction, struct bt_owned_root *tree, u
 
 /* A directory gains or loses a name: Linux keeps its size at twice the sum
  * of its name lengths and updates its modification and change times. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_directory(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     uint64_t directory, size_t length, int add, struct btrfs_time time)
 {
@@ -570,7 +522,7 @@ bt_ns_objectid(struct btrfs_transaction *transaction, struct bt_owned_root *tree
 /* Directory indexes continue after the highest DIR_INDEX, starting at 2, and
  * are never handed out twice in one transaction; a mount's counters keep
  * them monotonic across transactions while the directory stays remembered. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_index(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t directory,
     uint64_t *result)
 {
@@ -627,7 +579,7 @@ bt_ns_index(struct btrfs_transaction *transaction, struct bt_owned_root *tree, u
 
 /* A new directory reuses no forgotten counter of an earlier inode with its
  * number. */
-static void
+void
 bt_ns_new_directory(struct btrfs_transaction *transaction, uint64_t tree, uint64_t directory)
 {
 	struct bt_directory_counter *counter;
@@ -716,7 +668,7 @@ bt_ns_lookup(struct btrfs_transaction *transaction, struct bt_owned_root *tree, 
 }
 
 /* Turns a lookup into a check that the name is free. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_absent(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t directory,
     const void *name, size_t length)
 {
@@ -794,7 +746,7 @@ bt_ns_ref_place(struct btrfs_transaction *transaction, struct bt_owned_root *tre
 
 /* Checks before any change that the new name fits its packed DIR_ITEM (Linux
  * reports EOVERFLOW: RANGE) and, for inode != 0, a back reference item. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_room(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t directory,
     const void *name, size_t length, int item, uint64_t inode, const struct bt_removed *removed)
 {
@@ -856,26 +808,21 @@ bt_ns_add_ref(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	return bt_ns_append(transaction, tree, &packed, transaction->entry, size);
 }
 
-/* Adds name -> inode with a preallocated index: the back reference, DIR_ITEM
- * and DIR_INDEX, then the directory's size and times, as btrfs_add_link does. */
-static enum btrfs_result
-bt_ns_add_entry(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
-    uint64_t directory, const void *name, size_t length, uint64_t inode, uint8_t type,
-    uint64_t index, struct btrfs_time time)
+/* Inserts name's DIR_ITEM entry (appended to a colliding item) and its
+ * DIR_INDEX item, both naming location. */
+enum btrfs_result
+bt_ns_insert_entry(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, const void *name, size_t length, struct bt_key location, uint8_t type,
+    uint64_t index)
 {
 	struct bt_packed packed;
-	struct bt_key location = { .objectid = inode, .type = BT_INODE_ITEM };
-	struct bt_key key;
-	size_t entry_size = 0;
+	struct bt_key key = { directory, bt_ns_hash(name, length), BT_DIR_ITEM };
+	size_t entry_size;
 	enum btrfs_result error;
 
-	error = bt_ns_add_ref(transaction, tree, directory, name, length, inode, index);
-	if (error == BTRFS_OK) {
-		entry_size = bt_ns_dir_entry(transaction->entry, location,
-		    bt_ns_transid(transaction), name, length, NULL, 0, type);
-		key = (struct bt_key){ directory, bt_ns_hash(name, length), BT_DIR_ITEM };
-		error = bt_ns_load(transaction, tree, key, &packed);
-	}
+	entry_size = bt_ns_dir_entry(
+	    transaction->entry, location, bt_ns_transid(transaction), name, length, NULL, 0, type);
+	error = bt_ns_load(transaction, tree, key, &packed);
 	if (error == BTRFS_OK) {
 		error = bt_ns_append(transaction, tree, &packed, transaction->entry, entry_size);
 	}
@@ -886,6 +833,24 @@ bt_ns_add_entry(struct btrfs_transaction *transaction, struct bt_owned_root *tre
 		if (error == BTRFS_EXISTS) {
 			error = BTRFS_CORRUPT;
 		}
+	}
+	return error;
+}
+
+/* Adds name -> inode with a preallocated index: the back reference, DIR_ITEM
+ * and DIR_INDEX, then the directory's size and times, as btrfs_add_link does. */
+static enum btrfs_result
+bt_ns_add_entry(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, const void *name, size_t length, uint64_t inode, uint8_t type,
+    uint64_t index, struct btrfs_time time)
+{
+	struct bt_key location = { .objectid = inode, .type = BT_INODE_ITEM };
+	enum btrfs_result error;
+
+	error = bt_ns_add_ref(transaction, tree, directory, name, length, inode, index);
+	if (error == BTRFS_OK) {
+		error = bt_ns_insert_entry(
+		    transaction, tree, directory, name, length, location, type, index);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_directory(transaction, tree, directory, length, 1, time);
@@ -1051,7 +1016,7 @@ bt_ns_compressible_type(const struct bt_disk_inode *item)
 	return type == BTRFS_MODE_REGULAR || type == BTRFS_MODE_DIRECTORY;
 }
 
-static int
+int
 bt_ns_can_compress(uint64_t flags)
 {
 	return (flags & (BT_INODE_NODATACOW | BT_INODE_NODATASUM)) == 0;
@@ -1059,7 +1024,7 @@ bt_ns_can_compress(uint64_t flags)
 
 /* Applying a codec property records the codec's incompat feature, as Linux's
  * btrfs_set_fs_incompat does. */
-static void
+void
 bt_ns_require_feature(struct btrfs_transaction *transaction, uint64_t feature)
 {
 	uint64_t incompat = bt_u64(transaction->super.incompat);
@@ -1072,7 +1037,7 @@ bt_ns_require_feature(struct btrfs_transaction *transaction, uint64_t feature)
 
 /* The codec a directory's valid compression property passes to new regular
  * files and directories, as btrfs_inode_inherit_props does. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_inherited_codec(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     uint64_t directory, uint64_t flags, const struct bt_codec **codec)
 {
@@ -1136,7 +1101,7 @@ bt_ns_buffers(struct btrfs_transaction *transaction)
 }
 
 /* Opens the operation's tree. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_begin(struct btrfs_transaction *transaction, uint64_t tree_id, struct bt_owned_root **tree)
 {
 	enum btrfs_result error;
@@ -1153,7 +1118,7 @@ bt_ns_begin(struct btrfs_transaction *transaction, uint64_t tree_id, struct bt_o
 
 /* Records a failure after the first change: the private trees may hold part
  * of the operation, so the transaction can no longer commit. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_poison(struct btrfs_transaction *transaction, enum btrfs_result error)
 {
 	if (error != BTRFS_OK) {

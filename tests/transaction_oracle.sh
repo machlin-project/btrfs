@@ -47,12 +47,23 @@ primary_generation() {
     btrfs inspect-internal dump-super /dev/vda | awk '$1 == "generation" { print $2; exit }'
 }
 
-# MASK:VALUE: the flags of the path's inode item in the top-level tree equal
+# The id of the subvolume holding a path: its nearest directory with the
+# subvolume root inode number, as btrfs subvolume show reports it.
+tree_of() {
+    holder=$1
+    while [ "$(stat -c '%i' "$holder")" != 256 ]; do
+        holder=$(dirname "$holder")
+    done
+    btrfs subvolume show "$holder" | awk '$1 == "Subvolume" && $2 == "ID:" { print $3 }'
+}
+
+# MASK:VALUE: the flags of the path's inode item in its subvolume's tree equal
 # VALUE in the bits of MASK. Busybox lsattr shows no NOCOMPRESS flag, and
 # `btrfs inspect-internal rootid` needs a writable mount.
 check_flags() {
     inode=$(stat -c '%i' "$1")
-    flags=$(btrfs inspect-internal dump-tree -t 5 /dev/vda | awk -v key="key ($inode INODE_ITEM 0)" '
+    flags=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+        awk -v key="key ($inode INODE_ITEM 0)" '
         index($0, key) && index($0, "itemoff") { found = 1 }
         found && match($0, /flags 0x[0-9a-f]+/) { print substr($0, RSTART + 6, RLENGTH - 6); exit }')
     test -n "$flags" && test $((flags & ${2%%:*})) -eq $((${2#*:}))
@@ -63,7 +74,7 @@ check_flags() {
 check_reference() {
     inode=$(stat -c '%i' "$1")
     parent=$(stat -c '%i' "$(dirname "$1")")
-    kind=$(btrfs inspect-internal dump-tree -t 5 /dev/vda | awk -v inode="$inode" \
+    kind=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda | awk -v inode="$inode" \
         -v parent="$parent" -v name="$(basename "$1")" '
         $1 == "item" && $3 == "key" {
             object = substr($4, 2); type = $5; offset = $6; sub(/\)$/, "", offset); next }
@@ -72,6 +83,36 @@ check_reference() {
             if (type == "INODE_EXTREF" && $3 == "parent" && $4 == parent) {
                 print "extended"; exit } }')
     test "$kind" = "$2"
+}
+
+# ro|rw:SOURCE: the path is a subvolume with that read-only flag, a snapshot
+# of the subvolume at SOURCE or of none (-), as btrfs subvolume show reports.
+check_subvolume() {
+    btrfs subvolume show "$1" > /tmp/show || return 1
+    flags=$(awk '$1 == "Flags:" { print $2 }' /tmp/show)
+    parent=$(awk '$1 == "Parent" && $2 == "UUID:" { print $3 }' /tmp/show)
+    case "${2%%:*}" in
+    ro) test "$flags" = readonly ;;
+    rw) test "$flags" = - ;;
+    *) false ;;
+    esac || return 1
+    source=${2#*:}
+    if [ "$source" = - ]; then
+        test "$parent" = -
+    else
+        btrfs subvolume show "/mnt$source" > /tmp/source &&
+            test "$parent" = "$(awk '$1 == "UUID:" { print $2 }' /tmp/source)"
+    fi
+}
+
+# A directory's names exactly as stored, one per line in byte order. Shell
+# globbing keeps every byte; BusyBox ls rewrites names it cannot print.
+list_names() {
+    for name in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        if [ -e "$name" ] || [ -L "$name" ]; then
+            printf '%s\n' "${name##*/}"
+        fi
+    done | LC_ALL=C sort
 }
 
 namespace_checks=0
@@ -86,7 +127,7 @@ check_namespace() {
         absent) test ! -e "$target" && test ! -L "$target" ;;
         file) test -f "$target" && test ! -L "$target" && cmp "$target" "$1/$payload" ;;
         symlink) test -L "$target" && test "$(readlink "$target")" = "$(cat "$1/$payload")" ;;
-        dir) test -d "$target" && ls -A1 "$target" | LC_ALL=C sort > /tmp/listing &&
+        dir) test -d "$target" && list_names "$target" > /tmp/listing &&
             cmp /tmp/listing "$1/$payload" && test "$(stat -c '%s' "$target")" = "$arg" ;;
         same) test "$(stat -c '%d:%i' "$target")" = "$(stat -c '%d:%i' "/mnt$arg")" ;;
         xattr) getfattr --only-values -n "$arg" "$target" > /tmp/value &&
@@ -98,6 +139,10 @@ check_namespace() {
         feature) btrfs inspect-internal dump-super /dev/vda | grep -qw "$arg" ;;
         times) test "$(stat -c '%X:%Y' "$target")" = "$arg" ;;
         reference) check_reference "$target" "$arg" ;;
+        subvolume) check_subvolume "$target" "$arg" ;;
+        subvolumes) btrfs subvolume list /mnt | awk '{ print $NF }' | LC_ALL=C sort > /tmp/listing &&
+            cmp /tmp/listing "$1/$payload" ;;
+        deleted) test "$(btrfs subvolume list -d /mnt | wc -l)" -eq "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"
@@ -167,6 +212,9 @@ for scenario in /transaction/*; do
     fi
     mount -t btrfs -o "$options" /dev/vda /mnt
     printf 'Linux accepted the new root\n' > /mnt/after-machlin
+    # Linux's cleaner drops what this implementation's deletions left.
+    btrfs subvolume sync /mnt
+    test "$(btrfs subvolume list -d /mnt | wc -l)" -eq 0
     btrfs filesystem sync /mnt
     umount /mnt
     btrfs check --readonly /dev/vda < /dev/null

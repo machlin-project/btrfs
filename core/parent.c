@@ -20,6 +20,10 @@ btrfs_parent(
 	if ((directory->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_DIRECTORY) {
 		return BTRFS_NOT_DIRECTORY;
 	}
+	/* A stub directory may stand for any subvolume entry of its tree. */
+	if (directory->id.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		return BTRFS_NOT_FOUND;
+	}
 	if (directory->id.inode == BTRFS_ROOT_INODE &&
 	    (directory->id.tree == fs->info.default_tree ||
 		directory->id.tree == BTRFS_TOP_LEVEL_TREE)) {

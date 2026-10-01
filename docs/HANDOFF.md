@@ -20,7 +20,7 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require twenty-two passing test processes and all six reader profiles (312
+Require twenty-three passing test processes and all six reader profiles (312
 contracts). Ten writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
@@ -51,6 +51,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Free-space tree | Verification against the extent tree, logged allocation changes applied in the fixed point, extents and bitmaps | `core/fst.c`, `core/space.c` |
 | File data / checksums | CoW writes and truncation, drop-extents splitting, staged data, private read view, checksum items | `core/data.c`, `core/csum.c` |
 | Namespace mutations / audit | Create of every type, link, unlink with orphans, rename with replacement, packed collision items, xattrs and the compression property; independent namespace audit | `core/namespace.c`, `tests/namespace_audit.c` |
+| Subvolumes / cleaner | Subvolume and snapshot creation, deletion with root references and UUID tree entries, resumable drop walk with Linux's FULL_BACKREF conversion | `core/subvolume.c`, `core/drop.c` |
 | Shared references / audit | Linux CoW reference rules, inline/keyed placement and ordering, FULL_BACKREF conversion; independent whole-filesystem reference audit | `core/backref.c`, `tests/references.c` |
 | Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/scenario_*.c`, `tests/prepare_transactions_linux.py`, `tests/transaction_oracle.sh` |
 | Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
@@ -77,8 +78,9 @@ only after successful durable publication; `seal` alone is not a commit.
 2. **Extend shared references.** CoW of shared blocks follows Linux's
    `update_ref_for_cow` with inline and keyed references (`core/backref.c`), and
    the independent audit in `tests/references.c` checks every committed state.
-   Remaining: relocation trees and snapshot deletion (dead roots, drop progress)
-   stay unsupported; data reference edits from file writes must join the same
+   Deleted subvolumes are dropped as `btrfs_drop_snapshot` does (`core/drop.c`).
+   Remaining: relocation trees stay unsupported; data reference edits from file
+   writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
 3. **Extend file data.** `btrfs_transaction_write`/`_truncate` write CoW data
@@ -105,8 +107,9 @@ only after successful durable publication; `seal` alone is not a commit.
    crash states are covered and Linux agrees (see ACCEPTANCE.md), including
    names held in extended inode references. `btrfs_counters` keeps inode numbers
    and directory indexes unique across a mount's transactions; the native volume
-   layer attaches them. Remaining: subvolume and snapshot creation and deletion;
-   O_TMPFILE links, rename exchange/whiteout; truncation orphans of pre-3.12
+   layer attaches them. Subvolumes and snapshots are created and deleted
+   (`core/subvolume.c`), and the reader resolves unreferenced subvolume entries
+   to stubs; native writers still need a cleaner. Remaining: O_TMPFILE links, rename exchange/whiteout; truncation orphans of pre-3.12
    kernels are dropped as Linux does. Native writers supply time, mode, owner,
    set-id and ACL decisions.
 6. **Connect native writers.** Define versioned operation views, read pins,

@@ -56,6 +56,8 @@ struct audit_state {
 	size_t visited_capacity;
 	struct range_list required;
 	struct range_list checksummed;
+	/* Walking a deleted subvolume: its inodes may already be dropped. */
+	int deleted;
 	int failed;
 };
 
@@ -412,7 +414,7 @@ expect_data(struct audit_state *state, uint64_t tree, uint64_t leaf, uint64_t ow
 	extent->matched = 1;
 	/* Written data of a checksummed file needs checksums for the stored bytes
 	 * it uses: the whole extent when compressed, else its referenced range. */
-	if (bt_file_tree(tree) && file->header.type == BT_EXTENT_REGULAR) {
+	if (bt_file_tree(tree) && file->header.type == BT_EXTENT_REGULAR && !state->deleted) {
 		id.tree = tree;
 		id.inode = record->key.objectid;
 		if (btrfs_get_inode(state->fs, id, &inode) != BTRFS_OK) {
@@ -509,6 +511,81 @@ walk(struct audit_state *state, struct bt_root root, uint64_t parent, uint64_t o
 	return result;
 }
 
+/* A deleted subvolume the cleaner dropped in part (Linux's drop_progress and
+ * drop_level): the path from the root to the progress key at the drop level
+ * keeps its references, as does every child after the path; children before
+ * it are gone. */
+static int
+walk_dropped(struct audit_state *state, struct bt_root root, struct bt_key progress, uint8_t bottom)
+{
+	const struct btrfs_fs *fs = state->fs;
+	const struct bt_disk_header *header;
+	const struct bt_disk_pointer *pointers;
+	struct extent_record *extent;
+	struct bt_root child;
+	uint64_t parent = 0;
+	uint64_t owner = root.owner;
+	uint8_t *node;
+	uint32_t count;
+	uint32_t slot;
+	uint32_t i;
+	int result = 0;
+
+	if (bottom == 0 || bottom > root.level) {
+		return fail(state, "deleted tree %llu has drop level %u",
+		    (unsigned long long)root.owner, bottom);
+	}
+	node = malloc(fs->info.node_size);
+	if (node == NULL) {
+		abort();
+	}
+	for (;;) {
+		expect_tree(state, root.address, parent, owner);
+		extent = find_extent(state, root.address);
+		if (!visit(state, root.address) || extent == NULL ||
+		    !(extent->flags & BT_EXTENT_FLAG_TREE) ||
+		    extent->length != fs->info.node_size) {
+			result =
+			    fail(state, "dropped path block %llu of tree %llu is shared or missing",
+				(unsigned long long)root.address, (unsigned long long)root.owner);
+			break;
+		}
+		extent->matched = 1;
+		state->audit->blocks++;
+		if (bt_tree_read(fs, root, node) != BTRFS_OK) {
+			result = fail(
+			    state, "tree block %llu unreadable", (unsigned long long)root.address);
+			break;
+		}
+		header = (const void *)node;
+		pointers = (const void *)(header + 1);
+		count = bt_u32(header->count);
+		for (slot = 0; slot + 1 < count &&
+		    bt_key_compare(bt_key_decode(&pointers[slot + 1].key), progress) <= 0;
+		    slot++) {
+		}
+		for (i = root.level == bottom ? slot : slot + 1; i < count && result == 0; i++) {
+			child = root;
+			child.address = bt_u64(pointers[i].bytenr);
+			child.generation = bt_u64(pointers[i].generation);
+			child.level = (uint8_t)(root.level - 1);
+			result = walk(state, child, root.address, bt_u64(header->owner));
+		}
+		if (result != 0 || root.level == bottom) {
+			break;
+		}
+		parent = root.address;
+		owner = bt_u64(header->owner);
+		child = root;
+		child.address = bt_u64(pointers[slot].bytenr);
+		child.generation = bt_u64(pointers[slot].generation);
+		child.level = (uint8_t)(root.level - 1);
+		root = child;
+	}
+	free(node);
+	return result;
+}
+
 static int
 walk_roots(struct audit_state *state)
 {
@@ -518,6 +595,7 @@ walk_roots(struct audit_state *state)
 	struct bt_record record;
 	struct bt_root root;
 	struct bt_key first = { 0 };
+	struct bt_key progress;
 	enum btrfs_result error;
 
 	if (walk(state, fs->root_tree, 0, BT_ROOT_TREE) != 0 ||
@@ -541,9 +619,14 @@ walk_roots(struct audit_state *state)
 			root.level = item->level;
 			root.owner = record.key.objectid;
 			state->audit->trees++;
-			if (walk(state, root, 0, record.key.objectid) != 0) {
+			progress = bt_key_decode(&item->drop_progress);
+			state->deleted = bt_u32(item->refs) == 0;
+			if (state->deleted && progress.objectid != 0
+				? walk_dropped(state, root, progress, item->drop_level) != 0
+				: walk(state, root, 0, record.key.objectid) != 0) {
 				break;
 			}
+			state->deleted = 0;
 		}
 		error = bt_cursor_next(&cursor);
 	}
@@ -709,6 +792,50 @@ describe(struct audit_state *state, const char *what, const struct reference *re
 	    (unsigned long long)reference->count);
 }
 
+/* Whether tree has a root item (the root and chunk trees live in the
+ * superblock). */
+static int
+root_exists(const struct btrfs_fs *fs, uint64_t tree)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { tree, UINT64_MAX, BT_ROOT_ITEM };
+	int exists = 0;
+
+	if (tree == BT_ROOT_TREE || tree == BT_CHUNK_TREE) {
+		return 1;
+	}
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	if (bt_cursor_seek(&cursor, key, 1) == BTRFS_OK &&
+	    bt_cursor_record(&cursor, &record) == BTRFS_OK) {
+		exists = record.key.objectid == tree && record.key.type == BT_ROOT_ITEM;
+	}
+	bt_cursor_fini(&cursor);
+	return exists;
+}
+
+/* Keyed references must name trees that exist: a dropped tree's references
+ * go before its root item, and blocks it shared switch to parent references
+ * first. */
+static int
+check_reference_roots(struct audit_state *state)
+{
+	const struct reference *reference;
+	size_t i;
+
+	for (i = 0; i < state->actual.count; i++) {
+		reference = &state->actual.items[i];
+		if ((reference->type == BT_TREE_BLOCK_REF ||
+			reference->type == BT_EXTENT_DATA_REF) &&
+		    !root_exists(state->fs, reference->root)) {
+			return fail(state, "extent %llu has a reference from missing tree %llu",
+			    (unsigned long long)reference->target,
+			    (unsigned long long)reference->root);
+		}
+	}
+	return 0;
+}
+
 int
 reference_audit(const struct btrfs_fs *fs, struct reference_audit *audit)
 {
@@ -729,6 +856,9 @@ reference_audit(const struct btrfs_fs *fs, struct reference_audit *audit)
 			    (unsigned long long)state.extents[i].refs,
 			    (unsigned long long)state.extents[i].counted);
 		}
+	}
+	if (result == 0) {
+		result = check_reference_roots(&state);
 	}
 	if (result == 0) {
 		result = walk_roots(&state);

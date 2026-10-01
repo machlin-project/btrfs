@@ -76,7 +76,15 @@ Core identity is always `(tree ID, inode ID)`. Snapshots can share both inode
 numbers and backing blocks while remaining distinct objects. Default subvolume
 selection follows the root tree's `default` entry; explicit tree 5 exposes the top
 level. Crossing a subvolume directory entry resolves a new root, preserving its
-identity and generation. Symlink payload reading is separate from platform namei.
+identity and generation, only when the containing tree's ROOT_REF names that
+entry (directory and name), as Linux's `fixup_tree_root_location` requires.
+Otherwise (an entry a snapshot copied, or one whose subvolume was deleted) it
+resolves, as Linux's `new_simple_dir` presents it, to an empty stub directory:
+inode `BTRFS_EMPTY_SUBVOLUME_INODE` (2) of the containing tree, mode 0755, one
+link, no xattrs and no parent of its own (`btrfs_parent` reports NOT_FOUND;
+adapters keep the path they came from). A deleted subvolume cannot be opened
+(NOT_FOUND, Linux's ENOENT). Symlink payload reading is separate from platform
+namei.
 
 Lookup hashes raw names using Btrfs's CRC32C name hash, then compares full byte
 strings and validates collision records. Enumeration uses persistent DIR_INDEX
@@ -170,8 +178,8 @@ from the failing edit, before any media write.
 File data and namespace operations are described in their own sections below.
 Its own operation is replacing an existing uncompressed inline regular file,
 up to 2 KiB, in any writable file tree: the top level, subvolumes and writable
-snapshots. Read-only snapshots return READ_ONLY; dead or partially dropped trees
-are unsupported. Empty replacement removes the inline extent. One transaction may
+snapshots. Read-only snapshots return READ_ONLY; deleted trees are only
+dropped (see Subvolumes and snapshots). Empty replacement removes the inline extent. One transaction may
 replace many inodes in up to 16 trees. It updates inode and root change metadata,
 tree references, block-group totals, root items and backup roots. Accounting
 changes may CoW the extent/root trees; a bounded fixed point resolves those
@@ -346,10 +354,63 @@ otherwise uninterpreted; native policy decides which namespaces callers may use.
 Every refusal (existing or missing name, wrong type, non-empty directory, full
 packed item, exhausted numbering, read-only snapshot, crossing a subvolume entry
 or tree) is decided before the first change and leaves the transaction usable. A
-failure after a change poisons the transaction. Subvolume and snapshot creation
-or deletion,
-O_TMPFILE links of unlinked inodes, rename exchange and whiteouts are not part
-of this interface.
+failure after a change poisons the transaction. O_TMPFILE links of unlinked
+inodes, rename exchange and whiteouts are not part of this interface.
+
+## Subvolumes and snapshots
+
+`core/subvolume.c` creates, snapshots and deletes subvolumes; `core/drop.c`
+drops deleted ones. A new tree id continues after the root tree's highest
+object below `BTRFS_LAST_FREE_OBJECTID` and after every id the mount's counters
+handed out; ids stay below 2^48, the level-zero qgroup range. The UUID tree
+must exist, as Linux creates it at mount.
+
+Creation follows Linux's `create_subvol`: an empty leaf owned by the new tree,
+its root item (one reference, this transaction's generation, ctransid and
+otransid, the caller's UUID and time, root directory 256 and Linux's
+placeholder inode fields), a UUID tree entry, and a root directory with one
+link and its `..` INODE_REF. The root directory takes the caller's mode, owner
+and time and no inode flags; it inherits the compression property of the parent
+subvolume's root directory, not of the directory that holds it. The entry is a
+DIR_ITEM and DIR_INDEX locating `(id, ROOT_ITEM, 0)`, with a ROOT_REF from the
+parent tree and a matching ROOT_BACKREF holding the directory, index and name.
+
+A snapshot follows `create_pending_snapshot`: its root node is a copy of the
+source's (`btrfs_copy_root`), every child of that node gains a reference from
+the snapshot (`btrfs_inc_ref`), and both root items record this transaction as
+their last snapshot, so later CoW on either side applies the shared-block
+rules. The snapshot's root item is keyed by its creation transaction and copies
+the source's with a new UUID, the source's UUID as parent, the creation time
+and transaction, and the read-only flag; a writable snapshot drops the received
+UUID and send/receive times. Its entry locates `(id, ROOT_ITEM, -1)`. A source
+changed earlier in the same transaction is refused, because its new blocks
+have no references yet; a read-only source is allowed, and both sides may
+change later in the same transaction.
+
+Deletion follows `btrfs_delete_subvolume`: after `may_destroy_subvol` (the
+default subvolume is NOT_PERMITTED, one holding subvolumes NOT_EMPTY), the entry
+and root references go, the root item keeps refs 0, the dead flag and no drop
+progress, an orphan item in the root tree hands the tree to the cleaner, and
+its UUID tree entries go. A stub entry goes alone. A subvolume the same
+transaction opened is refused, since its root item would be rewritten at
+commit.
+
+`btrfs_transaction_clean_subvolumes` drops deleted trees in orphan order with
+`btrfs_drop_snapshot`'s walk. An unshared block (one reference) is entered; a
+leaf's file extent references are released (data and checksums go with their
+last reference) and the block is freed. A shared block is not entered; only this
+tree's reference to it goes. When the dying tree owns a shared block newer than
+its snapshot point, the block's children first switch to parent references and
+the block gets FULL_BACKREF (the UPDATE_BACKREF stage), so the trees that keep
+it never depend on references keyed by a deleted tree. The deleted tree's
+committed blocks are only read. Progress is the key of the next child at a
+level (`drop_progress`, `drop_level`), recorded in the root item at every
+subtree boundary; the next call, in this or a later transaction, rebuilds the
+path to it. A budget bounds the blocks visited per call and keeps room for
+another leaf's file references; a run of shared children is skipped in one
+step, as in Linux. A fully dropped tree loses its root item and orphan item;
+stale orphan items go. Native writers still have to run the cleaner, as Linux's
+cleaner thread does.
 
 ## Native writers
 

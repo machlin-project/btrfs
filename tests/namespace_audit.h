@@ -10,6 +10,8 @@ struct namespace_audit {
 	size_t names;
 	size_t extended_names;
 	size_t subvolume_entries;
+	size_t subvolume_refs;
+	size_t dead_trees;
 	size_t collisions;
 	size_t xattrs;
 	size_t orphans;

@@ -10,7 +10,7 @@ add_project_arguments(cc.get_supported_arguments(warnings), language: 'c')
 sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
-  'core/data.c', 'core/fst.c', 'core/namespace.c')
+  'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -33,7 +33,7 @@ inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: in
 transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
-  'tests/scenario_random.c',
+  'tests/scenario_random.c', 'tests/scenario_subvolume.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
   dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
@@ -104,6 +104,9 @@ if fixtures != ''
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,
+    suite: 'images')
+  test('subvolume-transactions', transaction_test,
+    args: ['--subvolume', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,
     suite: 'images')
   test('random-writer', transaction_test,
     args: ['--random', '1', '16', join_paths(fixtures, 'transactions-namespace.raw')],

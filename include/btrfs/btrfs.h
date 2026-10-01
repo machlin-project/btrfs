@@ -10,6 +10,10 @@
 #define BTRFS_LABEL_SIZE 256U
 #define BTRFS_TOP_LEVEL_TREE UINT64_C(5)
 #define BTRFS_ROOT_INODE UINT64_C(256)
+/* A subvolume entry whose subvolume this tree does not reference (copied by
+ * a snapshot, or deleted) resolves, as on Linux, to an empty read-only stub
+ * directory with this inode number in the containing tree. */
+#define BTRFS_EMPTY_SUBVOLUME_INODE UINT64_C(2)
 #define BTRFS_COOKIE_END UINT64_MAX
 
 enum btrfs_result {

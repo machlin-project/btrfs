@@ -18,6 +18,10 @@ bt_xattr_scan(const struct btrfs_fs *fs, const struct btrfs_inode *inode, const 
 	int found = 0;
 	enum btrfs_result error;
 
+	/* The stub directory of an unreferenced subvolume entry has no xattrs. */
+	if (inode != NULL && inode->id.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		return wanted == NULL ? BTRFS_OK : BTRFS_NOT_FOUND;
+	}
 	error = bt_inode_cursor(fs, inode, &cursor);
 	if (error != BTRFS_OK) {
 		return error;

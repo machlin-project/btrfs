@@ -342,10 +342,12 @@ bt_find_root(const struct btrfs_fs *fs, uint64_t tree, struct bt_root *root)
 			root->owner = tree;
 			if (root->level >= BT_MAX_LEVEL || root->generation == 0 ||
 			    root->generation > fs->info.generation ||
-			    (bt_file_tree(tree) &&
-				(bt_u64(disk->root_dir) != BTRFS_ROOT_INODE ||
-				    bt_u32(disk->refs) == 0))) {
+			    (bt_file_tree(tree) && bt_u64(disk->root_dir) != BTRFS_ROOT_INODE)) {
 				error = BTRFS_CORRUPT;
+			} else if (bt_file_tree(tree) && bt_u32(disk->refs) == 0) {
+				/* A deleted subvolume waiting for the cleaner, as
+				 * btrfs_get_fs_root reports it (ENOENT). */
+				error = BTRFS_NOT_FOUND;
 			}
 		}
 	}

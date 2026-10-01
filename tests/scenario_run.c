@@ -124,7 +124,8 @@ static void
 export_namespace(struct context *context, const struct plan *plan, struct exporter *exporter)
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
-		"noxattr", "stat", "device", "flags", "feature", "times", "reference" };
+		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
+		"subvolumes", "deleted" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -133,13 +134,15 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	size_t stage;
 	size_t i;
 
+	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_DELETED + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
 		e = &plan->expectations[i];
 		strcpy(payload, "-");
 		if (e->kind == EXPECT_FILE || e->kind == EXPECT_SYMLINK ||
-		    e->kind == EXPECT_DIRECTORY || e->kind == EXPECT_XATTR) {
+		    e->kind == EXPECT_DIRECTORY || e->kind == EXPECT_XATTR ||
+		    e->kind == EXPECT_SUBVOLUMES) {
 			REQUIRE(snprintf(payload, sizeof(payload), "expect-%03zu.bin", i) <
 			    (int)sizeof(payload));
 			export_bytes(exporter, payload, e->bytes, e->size);
@@ -177,6 +180,16 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 			    e->value == BT_FEATURE_COMPRESS_LZO ? "COMPRESS_LZO" : "COMPRESS_ZSTD";
 		} else if (e->kind == EXPECT_REFERENCE) {
 			detail = e->value != 0 ? "extended" : "inode";
+		} else if (e->kind == EXPECT_DELETED) {
+			REQUIRE(snprintf(argument, sizeof(argument), "%llu",
+				    (unsigned long long)e->value) < (int)sizeof(argument));
+			detail = argument;
+		} else if (e->kind == EXPECT_SUBVOLUME) {
+			/* read-only flag and the snapshot source's path */
+			REQUIRE(snprintf(argument, sizeof(argument), "%s:%s",
+				    e->value != 0 ? "ro" : "rw",
+				    e->other != NULL ? e->other : "-") < (int)sizeof(argument));
+			detail = argument;
 		} else if (e->kind == EXPECT_TIMES) {
 			/* stat -c '%X:%Y' */
 			REQUIRE(snprintf(argument, sizeof(argument), "%lld:%lld",
@@ -579,6 +592,16 @@ prepare_paths(struct path_table *table, struct btrfs_fs *fs, const struct operat
 	case OPERATION_EVICT:
 	case OPERATION_CLEAN_ORPHANS:
 		break;
+	case OPERATION_SUBVOLUME:
+	case OPERATION_DELETE_SUBVOLUME:
+		path_prepare(table, fs, operation->path, 1);
+		break;
+	case OPERATION_CLEAN_SUBVOLUMES:
+		break;
+	case OPERATION_SNAPSHOT:
+		path_prepare(table, fs, operation->path, 0);
+		path_prepare(table, fs, operation->target, 1);
+		break;
 	default:
 		path_prepare(table, fs, operation->path, 0);
 		break;
@@ -598,7 +621,9 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 	const char *new_leaf = NULL;
 	struct btrfs_attributes changes;
 	struct path_entry *replaced;
+	uint64_t tree;
 	size_t cleaned;
+	int pending;
 	enum btrfs_result result;
 
 	switch (operation->kind) {
@@ -696,6 +721,48 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 	case OPERATION_DROP_PRIVILEGES:
 		return btrfs_transaction_drop_privileges(
 		    transaction, path_object(table, operation->path, 0, NULL), time);
+	case OPERATION_SUBVOLUME:
+		parent = path_object(table, operation->path, 1, &leaf);
+		memset(&attributes, 0, sizeof(attributes));
+		attributes.mode = operation->mode;
+		attributes.uid = operation->uid;
+		attributes.gid = operation->gid;
+		attributes.time = time;
+		result = btrfs_transaction_create_subvolume(
+		    transaction, parent, leaf, strlen(leaf), &attributes, operation->data, &tree);
+		if (result == BTRFS_OK) {
+			path_set(table, operation->path,
+			    (struct btrfs_object_id){ tree, BTRFS_ROOT_INODE }, 1);
+		}
+		return result;
+	case OPERATION_DELETE_SUBVOLUME:
+		parent = path_object(table, operation->path, 1, &leaf);
+		result = btrfs_transaction_delete_subvolume(
+		    transaction, parent, leaf, strlen(leaf), time);
+		if (result == BTRFS_OK) {
+			path_set(table, operation->path, none, 0);
+		}
+		return result;
+	case OPERATION_CLEAN_SUBVOLUMES:
+		result = btrfs_transaction_clean_subvolumes(
+		    transaction, (size_t)operation->offset, &cleaned, &pending);
+		if (result == BTRFS_OK &&
+		    (cleaned != operation->size || pending != operation->flags)) {
+			fprintf(stderr, "dropped %zu subvolumes (pending %d), expected %zu (%d)\n",
+			    cleaned, pending, operation->size, operation->flags);
+			exit(1);
+		}
+		return result;
+	case OPERATION_SNAPSHOT:
+		id = path_object(table, operation->path, 0, NULL);
+		parent = path_object(table, operation->target, 1, &leaf);
+		result = btrfs_transaction_snapshot(transaction, id.tree, parent, leaf,
+		    strlen(leaf), operation->flags, time, operation->data, &tree);
+		if (result == BTRFS_OK) {
+			path_set(table, operation->target,
+			    (struct btrfs_object_id){ tree, BTRFS_ROOT_INODE }, 1);
+		}
+		return result;
 	}
 	return BTRFS_INVALID_ARGUMENT;
 }

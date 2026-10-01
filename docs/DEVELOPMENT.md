@@ -228,6 +228,7 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 | `fst-*` (`--fragment`) | Frees between bitmap holes and a write that spills from extent-mode free space into bitmap holes |
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes |
 | `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); names beyond a full INODE_REF item in new INODE_EXTREF items, a colliding one and one Linux wrote, unlinked from packed and last entries, renamed into and out of the INODE_REF item and across directories, and an INODE_EXTREF item filled to the largest item; unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item |
+| `subvolume-*` (`--subvolume`) | Subvolumes at the top level, in a directory and in another subvolume, inheriting the parent subvolume's compression property; writable and read-only snapshots of a subvolume, of the multi-level top level, of a read-only snapshot and of a snapshot, edited on either side; copied subvolume entries as stubs; deletion of subvolumes, snapshots and a stub entry; the cleaner resuming a partial drop across commits, and fully dropping a subvolume whose leaves a snapshot shares and an unshared one with data |
 | `random-N` (`--random FIRST COUNT`, `--random-quick FIRST COUNT`) | Seeded differential sequences: 24 operations in three commits drawn from create of every type, link, unlink, rename (also over files and between names of one inode), xattr set/remove, write, truncation, attribute changes, orphan cleanup and expected refusals under `/fuzz`, over a name pool with real CRC32C collisions; a separate model predicts each stage's namespace facts |
 
 `btrfs-reference-audit` is an independent reference oracle in the portable
@@ -285,7 +286,8 @@ Export a profile's crash cases into a new generated directory. Pass the same
 profile flag Meson uses: `--full` for `transactions-full`, `--shared` for
 `transactions-shared`, `--keyed` for `transactions-keyed`, `--data` for
 `transactions-data`, `--data --fragment` for `transactions-fst`, `--grow`
-for `transactions-grow` and `--namespace` for `transactions-namespace`. Reader
+for `transactions-grow` and `--namespace` or `--subvolume` for
+`transactions-namespace`. Reader
 profiles with a free-space tree (`plain`, `small-nodes`) also run the default
 scenarios:
 
@@ -301,7 +303,10 @@ writes this implementation's recovery chose. Namespace scenarios add
 `namespace.tsv`: per stage, absent paths, file contents, exact sorted directory
 listings with their sizes, symlink targets, hard-link identity, xattr values and
 absence, mode/owner/link counts, device numbers, inode flags, incompat features
-and whether INODE_REF or INODE_EXTREF holds a name, with payload files for expected bytes. These are generated test inputs, not
+whether INODE_REF or INODE_EXTREF holds a name, a subvolume's read-only flag and
+snapshot source, the list of subvolumes and the number of deleted ones waiting
+for the cleaner, with payload files for expected bytes. These are generated
+test inputs, not
 a source ledger. About sixteen prefixes, ten metadata states and all superblock
 tear patterns are exported per commit; the portable test checks all of them.
 
@@ -328,15 +333,19 @@ case and compares both disks after each scenario. For each case it applies the
 exported sector runs, then requires Linux to agree with the recorded outcome:
 `btrfs check --readonly`, the primary generation, exact tracked contents,
 invariants and the stage's namespace facts for a valid primary (with Linux's
-`ls`, `stat`, `readlink`, `getfattr` and its own `dump-tree` for inode flags
-and back references),
+`stat`, `readlink`, `getfattr`, its own `dump-tree` for inode flags and back
+references, `btrfs subvolume show` for flags and parent UUIDs, and
+`btrfs subvolume list` with and without `-d`; listings use shell globbing, which
+keeps every byte of a name),
 or a failed mount for a torn primary. For each
 recovery case it runs `btrfs rescue super-recover -y`, requires status 2 and the
 same resolved generation and contents, then repeats from the crash state with
 this implementation's recovery writes and requires Linux to find every copy
 valid. After each scenario's cases Linux mounts its newest root read-write
-(cleaning any orphans the scenario left), writes, syncs and passes `btrfs check`
-with no orphan item left in the top-level tree; the guest then copies the
+(cleaning any orphans the scenario left), finishes every subvolume drop this
+implementation left (`btrfs subvolume sync`, then no deleted subvolume
+remains), writes, syncs and passes `btrfs check` with no orphan item left in
+the top-level tree; the guest then copies the
 pristine disk back whole. Require `BTRFS_TRANSACTION_NAMESPACE_CHECKS:M` and
 `BTRFS_TRANSACTION_PASS:N` with the counts printed by the preparer and in its
 JSON (the guest also compares the namespace count itself), and an unchanged

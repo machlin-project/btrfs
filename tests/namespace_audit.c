@@ -540,6 +540,264 @@ audit_tree(const struct btrfs_fs *fs, struct namespace_audit *audit, struct bt_r
 	return result;
 }
 
+/* The entry of name in a packed DIR_ITEM or DIR_INDEX record, if present. */
+static const struct bt_disk_dir *
+packed_entry(const struct bt_record *record, const uint8_t *name, size_t length)
+{
+	const struct bt_disk_dir *header;
+	const uint8_t *entry_name;
+	const uint8_t *data;
+	size_t position = 0;
+
+	while (bt_dir_record(record, &position, &header, &entry_name, &data) == BTRFS_OK) {
+		if (bt_u16(header->name_length) == length &&
+		    memcmp(entry_name, name, length) == 0) {
+			return header;
+		}
+	}
+	return NULL;
+}
+
+/* Whether tree holds a DIR_ITEM and a DIR_INDEX entry for name in directory
+ * at index whose location is the root of child. */
+static int
+subvolume_entry(const struct btrfs_fs *fs, uint64_t tree, uint64_t directory, uint64_t index,
+    uint64_t child, const uint8_t *name, size_t length)
+{
+	const struct bt_disk_dir *header;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key keys[2];
+	struct bt_key location;
+	int found = 0;
+	int pass;
+
+	if (bt_find_root(fs, tree, &root) != BTRFS_OK) {
+		return 0;
+	}
+	keys[0] =
+	    (struct bt_key){ directory, bt_crc32c(UINT32_MAX - 1U, name, length), BT_DIR_ITEM };
+	keys[1] = (struct bt_key){ directory, index, BT_DIR_INDEX };
+	for (pass = 0; pass < 2; pass++) {
+		bt_cursor_init(&cursor, fs, root);
+		header = NULL;
+		if (bt_cursor_seek(&cursor, keys[pass], 0) == BTRFS_OK &&
+		    bt_cursor_record(&cursor, &record) == BTRFS_OK &&
+		    bt_key_compare(record.key, keys[pass]) == 0) {
+			header = packed_entry(&record, name, length);
+		}
+		if (header != NULL) {
+			location = bt_key_decode(&header->location);
+			found += location.objectid == child && location.type == BT_ROOT_ITEM;
+		}
+		bt_cursor_fini(&cursor);
+	}
+	return found == 2;
+}
+
+struct root_record {
+	uint64_t id;
+	uint32_t refs;
+	uint32_t backrefs;
+	int orphan;
+	uint8_t uuid[BTRFS_UUID_SIZE];
+	uint8_t received[BTRFS_UUID_SIZE];
+};
+
+static struct root_record *
+find_root_record(struct root_record *roots, size_t count, uint64_t id)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		if (roots[i].id == id) {
+			return &roots[i];
+		}
+	}
+	return NULL;
+}
+
+/* Checks the UUID tree against the live roots: every listed id is a live
+ * root with that UUID (or received UUID), and every live root's UUIDs are
+ * listed. */
+static int
+audit_uuids(const struct btrfs_fs *fs, struct namespace_audit *audit, struct root_record *roots,
+    size_t count)
+{
+	static const uint8_t empty[BTRFS_UUID_SIZE];
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key first = { 0, 0, 0 };
+	struct root_record *found;
+	uint8_t uuid[BTRFS_UUID_SIZE];
+	size_t listed = 0;
+	size_t expected = 0;
+	size_t i;
+	size_t j;
+	enum btrfs_result error;
+
+	if (bt_find_root(fs, BT_UUID_TREE, &root) != BTRFS_OK) {
+		return 0;
+	}
+	bt_cursor_init(&cursor, fs, root);
+	error = bt_cursor_seek(&cursor, first, 0);
+	while (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		/* The key holds the UUID's two little-endian halves. */
+		for (j = 0; j < sizeof(uuid) / 2; j++) {
+			uuid[j] = (uint8_t)(record.key.objectid >> (8 * j));
+			uuid[j + sizeof(uuid) / 2] = (uint8_t)(record.key.offset >> (8 * j));
+		}
+		if ((record.key.type != BT_UUID_SUBVOL &&
+			record.key.type != BT_UUID_RECEIVED_SUBVOL) ||
+		    record.size == 0 || record.size % sizeof(struct bt_le64) != 0) {
+			bt_cursor_fini(&cursor);
+			snprintf(audit->failure, sizeof(audit->failure), "malformed UUID item");
+			return -1;
+		}
+		for (j = 0; j < record.size / sizeof(struct bt_le64); j++) {
+			found = find_root_record(
+			    roots, count, bt_u64(((const struct bt_le64 *)record.data)[j]));
+			if (found == NULL || found->refs == 0 ||
+			    memcmp(
+				record.key.type == BT_UUID_SUBVOL ? found->uuid : found->received,
+				uuid, sizeof(uuid)) != 0) {
+				bt_cursor_fini(&cursor);
+				snprintf(audit->failure, sizeof(audit->failure),
+				    "UUID tree names %llu, which is not a live root with that UUID",
+				    (unsigned long long)bt_u64(
+					((const struct bt_le64 *)record.data)[j]));
+				return -1;
+			}
+			listed++;
+		}
+		error = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	for (i = 0; i < count; i++) {
+		if (roots[i].refs != 0) {
+			expected += memcmp(roots[i].uuid, empty, sizeof(empty)) != 0;
+			expected += memcmp(roots[i].received, empty, sizeof(empty)) != 0;
+		}
+	}
+	if (error != BTRFS_NOT_FOUND || listed != expected) {
+		snprintf(audit->failure, sizeof(audit->failure),
+		    "UUID tree lists %zu live root UUIDs, expected %zu", listed, expected);
+		return -1;
+	}
+	return 0;
+}
+
+/* Cross-tree subvolume records: each ROOT_REF has an identical ROOT_BACKREF
+ * and names the DIR_ITEM and DIR_INDEX entry of the child in its parent tree;
+ * a live subvolume has refs back references (the top level none), a dead one
+ * (refs 0) none and an orphan item. Entries without root references are
+ * placeholders that snapshots copied, which Linux allows. */
+static int
+audit_subvolumes(const struct btrfs_fs *fs, struct namespace_audit *audit)
+{
+	const struct bt_disk_root_full *item;
+	const struct bt_disk_root_ref *ref;
+	struct root_record *roots = NULL;
+	struct root_record *found;
+	struct bt_cursor cursor;
+	struct bt_cursor mirror;
+	struct bt_record record;
+	struct bt_record other;
+	struct bt_key first = { 0, 0, 0 };
+	struct bt_key key;
+	size_t count = 0;
+	size_t capacity = 0;
+	size_t i;
+	enum btrfs_result error;
+	int result = 0;
+
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	error = bt_cursor_seek(&cursor, first, 0);
+	while (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.type == BT_ROOT_ITEM && bt_file_tree(record.key.objectid) &&
+		    record.size >= sizeof(*item)) {
+			item = (const void *)record.data;
+			roots = grow(roots, &capacity, count, sizeof(*roots));
+			memset(&roots[count], 0, sizeof(roots[count]));
+			roots[count].id = record.key.objectid;
+			roots[count].refs = bt_u32(item->legacy.refs);
+			memcpy(roots[count].uuid, item->uuid, BTRFS_UUID_SIZE);
+			memcpy(roots[count].received, item->received_uuid, BTRFS_UUID_SIZE);
+			count++;
+		}
+		error = bt_cursor_next(&cursor);
+	}
+	error = bt_cursor_seek(&cursor, first, 0);
+	while (error == BTRFS_OK && result == 0) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.type == BT_ROOT_REF || record.key.type == BT_ROOT_BACKREF) {
+			ref = (const void *)record.data;
+			key = (struct bt_key){ record.key.offset, record.key.objectid,
+				record.key.type == BT_ROOT_REF ? BT_ROOT_BACKREF : BT_ROOT_REF };
+			bt_cursor_init(&mirror, fs, fs->root_tree);
+			result = record.size < sizeof(*ref) ||
+				record.size != sizeof(*ref) + bt_u16(ref->name_length) ||
+				bt_cursor_seek(&mirror, key, 0) != BTRFS_OK ||
+				bt_cursor_record(&mirror, &other) != BTRFS_OK ||
+				bt_key_compare(other.key, key) != 0 || other.size != record.size ||
+				memcmp(other.data, record.data, record.size) != 0
+			    ? -1
+			    : 0;
+			bt_cursor_fini(&mirror);
+			if (result == 0 && record.key.type == BT_ROOT_REF) {
+				audit->subvolume_refs++;
+				result =
+				    subvolume_entry(fs, record.key.objectid, bt_u64(ref->directory),
+					bt_u64(ref->index), record.key.offset,
+					(const uint8_t *)(ref + 1), bt_u16(ref->name_length))
+				    ? 0
+				    : -1;
+			} else if (result == 0) {
+				found = find_root_record(roots, count, record.key.objectid);
+				result = found == NULL ? -1 : 0;
+				if (found != NULL) {
+					found->backrefs++;
+				}
+			}
+			if (result != 0) {
+				snprintf(audit->failure, sizeof(audit->failure),
+				    "root reference (%llu %u %llu) without its pair, entry or root",
+				    (unsigned long long)record.key.objectid, record.key.type,
+				    (unsigned long long)record.key.offset);
+			}
+		} else if (record.key.objectid == BT_ORPHAN_OBJECTID &&
+		    record.key.type == BT_ORPHAN_ITEM) {
+			found = find_root_record(roots, count, record.key.offset);
+			if (found != NULL) {
+				found->orphan = 1;
+			}
+		}
+		error = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	for (i = 0; result == 0 && i < count; i++) {
+		if (roots[i].id == BTRFS_TOP_LEVEL_TREE ? roots[i].backrefs != 0
+			: roots[i].refs != 0 ? roots[i].backrefs != roots[i].refs || roots[i].orphan
+					     : roots[i].backrefs != 0 || !roots[i].orphan) {
+			snprintf(audit->failure, sizeof(audit->failure),
+			    "root %llu has %u references, %u back references%s",
+			    (unsigned long long)roots[i].id, roots[i].refs, roots[i].backrefs,
+			    roots[i].orphan ? " and an orphan item" : "");
+			result = -1;
+		}
+		audit->dead_trees += roots[i].refs == 0;
+	}
+	if (result == 0) {
+		result = audit_uuids(fs, audit, roots, count);
+	}
+	free(roots);
+	return result;
+}
+
 int
 namespace_audit(const struct btrfs_fs *fs, struct namespace_audit *audit)
 {
@@ -569,8 +827,12 @@ namespace_audit(const struct btrfs_fs *fs, struct namespace_audit *audit)
 			root.generation = bt_u64(item->generation);
 			root.level = item->level;
 			root.owner = record.key.objectid;
-			audit->trees++;
-			result = audit_tree(fs, audit, root);
+			/* A deleted subvolume has no names; the cleaner may have freed
+			 * part of its tree. */
+			if (bt_u32(item->refs) != 0) {
+				audit->trees++;
+				result = audit_tree(fs, audit, root);
+			}
 		}
 		error = bt_cursor_next(&cursor);
 	}
@@ -579,6 +841,9 @@ namespace_audit(const struct btrfs_fs *fs, struct namespace_audit *audit)
 		snprintf(audit->failure, sizeof(audit->failure), "root tree walk: %s",
 		    btrfs_result_string(error));
 		result = -1;
+	}
+	if (result == 0) {
+		result = audit_subvolumes(fs, audit);
 	}
 	return result;
 }

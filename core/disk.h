@@ -40,11 +40,13 @@ struct bt_le64 {
 #define BT_FREE_SPACE_TREE UINT64_C(10)
 #define BT_DATA_RELOC_TREE (UINT64_MAX - UINT64_C(8))
 #define BT_DEV_TREE UINT64_C(4)
+#define BT_UUID_TREE UINT64_C(9)
 #define BT_FIRST_CHUNK_OBJECTID UINT64_C(256)
 #define BT_DEV_ITEMS_OBJECTID UINT64_C(1)
 /* Linux leaves the first MiB of every device unallocated. */
 #define BT_DEVICE_RESERVED (UINT64_C(1) << 20)
 #define BT_ROOT_DIR_OBJECTID UINT64_C(6)
+#define BT_EMPTY_SUBVOLUME_MODE 0755U
 #define BT_CSUM_OBJECTID (UINT64_MAX - UINT64_C(9))
 #define BT_LAST_FREE_OBJECTID (UINT64_MAX - UINT64_C(255))
 #define BT_ORPHAN_OBJECTID (UINT64_MAX - UINT64_C(4))
@@ -82,6 +84,12 @@ struct bt_le64 {
 #define BT_HEADER_BACKREF_SHIFT 56U
 #define BT_HEADER_MIXED_BACKREF (UINT64_C(1) << BT_HEADER_BACKREF_SHIFT)
 #define BT_ROOT_SUBVOL_READ_ONLY UINT64_C(1)
+/* A deleted subvolume's root item, until the cleaner drops it. */
+#define BT_ROOT_SUBVOL_DEAD (UINT64_C(1) << 48)
+/* Marks root items whose flags and byte limit are initialized. */
+#define BT_INODE_ROOT_ITEM_INIT (UINT64_C(1) << 31)
+/* Tree ids are qgroup ids of level zero: below 2^48. */
+#define BT_ROOT_ID_LIMIT (UINT64_C(1) << 48)
 #define BT_BACKUP_ROOTS 4U
 #define BT_EXTENT_FLAG_DATA UINT64_C(1)
 #define BT_EXTENT_FLAG_TREE UINT64_C(2)
@@ -103,6 +111,7 @@ enum bt_item_type {
 	BT_EXTENT_CSUM = 128,
 	BT_ROOT_ITEM = 132,
 	BT_ROOT_BACKREF = 144,
+	BT_ROOT_REF = 156,
 	BT_EXTENT_ITEM = 168,
 	BT_METADATA_ITEM = 169,
 	BT_TREE_BLOCK_REF = 176,
@@ -115,7 +124,9 @@ enum bt_item_type {
 	BT_FREE_SPACE_BITMAP = 200,
 	BT_DEV_EXTENT = 204,
 	BT_DEV_ITEM = 216,
-	BT_CHUNK_ITEM = 228
+	BT_CHUNK_ITEM = 228,
+	BT_UUID_SUBVOL = 251,
+	BT_UUID_RECEIVED_SUBVOL = 252
 };
 
 enum bt_extent_type { BT_EXTENT_INLINE = 0, BT_EXTENT_REGULAR = 1, BT_EXTENT_PREALLOC = 2 };
