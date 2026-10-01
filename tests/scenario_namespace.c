@@ -591,6 +591,274 @@ namespace_full_item_plan(struct context *context)
 	run_plan(context, &plan);
 }
 
+/* Linux's btrfs_extref_hash: CRC32C seeded with the parent's number. */
+static uint32_t
+extref_hash(uint64_t directory, const char *name)
+{
+	return bt_crc32c((uint32_t)directory, name, strlen(name));
+}
+
+/* Undoes 32 bit steps of the reflected CRC32C register. */
+static uint32_t
+crc32c_unshift(uint32_t value)
+{
+	unsigned i;
+
+	for (i = 0; i < 32; i++) {
+		value = (value & UINT32_C(0x80000000)) != 0
+		    ? ((value ^ CRC32C_REFLECTED_POLYNOMIAL) << 1) | 1U
+		    : value << 1;
+	}
+	return value;
+}
+
+/* A name of length bytes, starting with prefix and a counter, whose extended
+ * reference hash under directory is hash. CRC32C is linear: the last four
+ * bytes follow from the register before them, and the counter changes until
+ * they are portable filename characters (the Linux oracle's path set). */
+static void
+forge_extref_name(char *name, size_t length, const char *prefix, uint64_t directory, uint32_t hash)
+{
+	static const char portable[] =
+	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+	uint32_t word;
+	size_t used;
+	unsigned attempt;
+	unsigned i;
+	int valid;
+
+	REQUIRE(length <= BTRFS_NAME_MAX && length > strlen(prefix) + FORGE_COUNTER_BYTES + 4U);
+	for (attempt = 0; attempt < FORGE_ATTEMPTS; attempt++) {
+		used = (size_t)snprintf(
+		    name, length + 1, "%s%0*u", prefix, (int)FORGE_COUNTER_BYTES, attempt);
+		memset(name + used, 'y', length - 4U - used);
+		word = crc32c_unshift(hash) ^ bt_crc32c((uint32_t)directory, name, length - 4U);
+		valid = 1;
+		for (i = 0; i < 4U; i++) {
+			name[length - 4U + i] = (char)(uint8_t)(word >> (8U * i));
+			valid = valid && name[length - 4U + i] != '\0' &&
+			    strchr(portable, name[length - 4U + i]) != NULL;
+		}
+		name[length] = '\0';
+		if (valid) {
+			REQUIRE(extref_hash(directory, name) == hash);
+			return;
+		}
+	}
+	REQUIRE(0);
+}
+
+static void
+extref_join(char *path, size_t size, const char *directory, const char *name)
+{
+	REQUIRE(snprintf(path, size, "%s/%s", directory, name) < (int)size);
+}
+
+/* Names beyond the full INODE_REF item of /ns/extref/target: new extended
+ * references (also in a colliding item, and appended to one Linux wrote),
+ * unlinks of extended names from the middle and end of packed items, renames
+ * that move a name into the INODE_REF item where it has room and out of it
+ * where it does not, across directories, and links that use the room an
+ * unlinked INODE_REF name leaves. */
+static void
+namespace_extref_plan(struct context *context)
+{
+	static const char *const ns_added[] = { "l032moved", NULL };
+	const char *first_added[6];
+	const char *first_removed[4];
+	const char *second_added[5];
+	const char *second_removed[5];
+	char names[12][BTRFS_NAME_MAX + 1];
+	char paths[12][320];
+	struct btrfs_fs *fs;
+	uint64_t directory;
+	size_t i;
+
+	enum {
+		L040,
+		COLLIDE_NEW,
+		COLLIDE_LINUX,
+		L030,
+		L031,
+		L032,
+		L000,
+		L041,
+		L042,
+		L043,
+		L017,
+		L018
+	};
+
+	static const unsigned numbered[] = { 40, 0, 0, 30, 31, 32, 0, 41, 42, 43, 17, 18 };
+	struct plan plan;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	directory = object(fs, "/ns/extref").inode;
+	btrfs_unmount(fs);
+	for (i = 0; i < 12; i++) {
+		extref_path(paths[i], sizeof(paths[i]), numbered[i]);
+		strcpy(names[i], strrchr(paths[i], '/') + 1);
+	}
+	extref_path(paths[COLLIDE_LINUX], sizeof(paths[COLLIDE_LINUX]), EXTREF_LINKS - 1);
+	forge_extref_name(names[COLLIDE_NEW], EXTREF_NAME_BYTES + 4U, "ca", directory,
+	    extref_hash(directory, names[L040]));
+	forge_extref_name(names[COLLIDE_LINUX], EXTREF_NAME_BYTES + 4U, "cb", directory,
+	    extref_hash(directory, strrchr(paths[COLLIDE_LINUX], '/') + 1));
+	extref_join(
+	    paths[COLLIDE_NEW], sizeof(paths[COLLIDE_NEW]), "/ns/extref", names[COLLIDE_NEW]);
+	extref_join(
+	    paths[COLLIDE_LINUX], sizeof(paths[COLLIDE_LINUX]), "/ns/extref", names[COLLIDE_LINUX]);
+
+	namespace_plan(context, &plan, "namespace-extref");
+	plan_link(&plan, 1, "/ns/extref/target", paths[L040]);
+	plan_link(&plan, 1, "/ns/extref/target", paths[COLLIDE_NEW]);
+	plan_link(&plan, 1, "/ns/extref/target", paths[COLLIDE_LINUX]);
+	plan_unlink(&plan, 1, paths[L030], 0);
+	plan_rename(&plan, 1, paths[L031], "/ns/extref/r031", 0);
+	plan_rename(&plan, 1, paths[L032], "/ns/l032moved", 0);
+	plan_link(&plan, 1, "/ns/extref/target", "/ns/extref/s1");
+	plan_unlink(&plan, 2, paths[COLLIDE_NEW], 0);
+	plan_unlink(&plan, 2, paths[L040], 0);
+	plan_unlink(&plan, 2, paths[L000], 0);
+	plan_link(&plan, 2, "/ns/extref/target", paths[L041]);
+	plan_rename(&plan, 2, paths[COLLIDE_LINUX], paths[L042], 0);
+	plan_rename(&plan, 2, "/ns/extref/r031", paths[L043], 0);
+
+	first_added[0] = names[L040];
+	first_added[1] = names[COLLIDE_NEW];
+	first_added[2] = names[COLLIDE_LINUX];
+	first_added[3] = "r031";
+	first_added[4] = "s1";
+	first_added[5] = NULL;
+	first_removed[0] = names[L030];
+	first_removed[1] = names[L031];
+	first_removed[2] = names[L032];
+	first_removed[3] = NULL;
+	second_added[0] = "s1";
+	second_added[1] = names[L041];
+	second_added[2] = names[L042];
+	second_added[3] = names[L043];
+	second_added[4] = NULL;
+	for (i = 0; i < 3; i++) {
+		second_removed[i] = first_removed[i];
+	}
+	second_removed[3] = names[L000];
+	second_removed[4] = NULL;
+	expect_listing(context, &plan, 0, 0, "/ns/extref", NULL, NULL);
+	expect_listing(context, &plan, 1, 1, "/ns/extref", first_added, first_removed);
+	expect_listing(context, &plan, 2, LAST_STAGE, "/ns/extref", second_added, second_removed);
+	expect_listing(context, &plan, 1, LAST_STAGE, "/ns", ns_added, NULL);
+	/* Linux filled the INODE_REF item through l017. */
+	expect_value(&plan, 0, LAST_STAGE, EXPECT_REFERENCE, paths[L017], 0);
+	expect_value(&plan, 0, LAST_STAGE, EXPECT_REFERENCE, paths[L018], 1);
+	expect_value(&plan, 1, 1, EXPECT_REFERENCE, paths[L040], 1);
+	expect_value(&plan, 1, 1, EXPECT_REFERENCE, paths[COLLIDE_NEW], 1);
+	expect_value(&plan, 1, 1, EXPECT_REFERENCE, paths[COLLIDE_LINUX], 1);
+	expect_value(&plan, 1, 1, EXPECT_REFERENCE, "/ns/extref/r031", 0);
+	expect_value(&plan, 1, LAST_STAGE, EXPECT_REFERENCE, "/ns/l032moved", 0);
+	expect_value(&plan, 1, LAST_STAGE, EXPECT_REFERENCE, "/ns/extref/s1", 0);
+	expect_value(&plan, 2, LAST_STAGE, EXPECT_REFERENCE, paths[L041], 0);
+	expect_value(&plan, 2, LAST_STAGE, EXPECT_REFERENCE, paths[L042], 1);
+	expect_value(&plan, 2, LAST_STAGE, EXPECT_REFERENCE, paths[L043], 1);
+	expect_same(&plan, 1, 1, paths[COLLIDE_NEW], "/ns/extref/target");
+	expect_same(&plan, 1, LAST_STAGE, "/ns/l032moved", "/ns/extref/target");
+	expect_same(&plan, 2, LAST_STAGE, paths[L043], "/ns/extref/target");
+	expect_absent(&plan, 2, LAST_STAGE, paths[L040]);
+	expect_links(
+	    context, &plan, 1, 1, "/ns/extref/target", "/ns/extref/target", EXTREF_LINKS + 4);
+	expect_links(context, &plan, 2, LAST_STAGE, "/ns/extref/target", "/ns/extref/target",
+	    EXTREF_LINKS + 2);
+	run_plan(context, &plan);
+}
+
+/* Colliding names fill one INODE_EXTREF item; the next link is refused before
+ * any change (Linux reports EOVERFLOW), a rename between two colliding names
+ * reuses the old name's bytes, and a rename out of the INODE_REF item makes
+ * room for a long name there. CRC32C is affine in its seed, so names of one
+ * length that collide under the parent's seed also share a DIR_ITEM: the
+ * names here have distinct lengths, except the rename target, which replaces
+ * the only other name of its length. */
+static void
+namespace_extref_full_plan(struct context *context)
+{
+	const char **added;
+	const char *removed[2];
+	char (*names)[BTRFS_NAME_MAX + 1];
+	char path[320];
+	char l001[320];
+	char renamed[320];
+	char replaced[320];
+	char prefix[8];
+	struct btrfs_fs *fs;
+	struct plan plan;
+	uint64_t directory;
+	uint32_t hash;
+	size_t limit = item_limit(context);
+	size_t used = 0;
+	size_t fits = 0;
+	size_t i;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	directory = object(fs, "/ns/extref").inode;
+	btrfs_unmount(fs);
+	while (used + sizeof(struct bt_disk_inode_extref) + BTRFS_NAME_MAX - fits <= limit) {
+		used += sizeof(struct bt_disk_inode_extref) + BTRFS_NAME_MAX - fits;
+		fits++;
+	}
+	/* names[i] has BTRFS_NAME_MAX - i bytes for i <= fits (the last one is
+	 * refused); names[fits + 1] is the rename target of names[0] and
+	 * names[fits + 2] replaces l001 in the INODE_REF item. */
+	names = calloc(fits + 3U, sizeof(*names));
+	added = calloc(fits + 2U, sizeof(*added));
+	REQUIRE(names != NULL && added != NULL);
+	hash = extref_hash(directory, "extref-full");
+	for (i = 0; i < fits + 3U; i++) {
+		REQUIRE(snprintf(prefix, sizeof(prefix), "f%02zu", i) < (int)sizeof(prefix));
+		forge_extref_name(names[i],
+		    i <= fits		 ? BTRFS_NAME_MAX - i
+			: i == fits + 1U ? BTRFS_NAME_MAX
+					 : BTRFS_NAME_MAX - fits - 1U,
+		    prefix, directory, hash);
+	}
+	extref_path(l001, sizeof(l001), 1);
+	namespace_plan(context, &plan, "namespace-extref-full");
+	for (i = 0; i <= fits; i++) {
+		extref_join(path, sizeof(path), "/ns/extref", names[i]);
+		plan_link(&plan, 1, "/ns/extref/target", path);
+		if (i == fits) {
+			plan_expect_refusal(&plan, 1, BTRFS_RANGE);
+		}
+		if (i != 0 && i != fits) {
+			expect_value(&plan, 1, LAST_STAGE, EXPECT_REFERENCE, path, 1);
+		}
+	}
+	expect_absent(&plan, 1, LAST_STAGE, path);
+	extref_join(path, sizeof(path), "/ns/extref", names[0]);
+	extref_join(renamed, sizeof(renamed), "/ns/extref", names[fits + 1]);
+	extref_join(replaced, sizeof(replaced), "/ns/extref", names[fits + 2]);
+	plan_rename(&plan, 1, path, renamed, 0);
+	plan_rename(&plan, 1, l001, replaced, 0);
+	expect_absent(&plan, 1, LAST_STAGE, path);
+	expect_value(&plan, 1, LAST_STAGE, EXPECT_REFERENCE, renamed, 1);
+	expect_value(&plan, 1, LAST_STAGE, EXPECT_REFERENCE, replaced, 0);
+	expect_same(&plan, 1, LAST_STAGE, replaced, "/ns/extref/target");
+	for (i = 1; i < fits; i++) {
+		added[i - 1] = names[i];
+	}
+	added[fits - 1] = names[fits + 1];
+	added[fits] = names[fits + 2];
+	added[fits + 1] = NULL;
+	removed[0] = strrchr(l001, '/') + 1;
+	removed[1] = NULL;
+	expect_listing(context, &plan, 1, LAST_STAGE, "/ns/extref", added, removed);
+	expect_links(context, &plan, 1, LAST_STAGE, "/ns/extref/target", "/ns/extref/target",
+	    EXTREF_LINKS + 1 + (uint32_t)fits);
+	run_plan(context, &plan);
+	printf("namespace extended references: %zu colliding names per INODE_EXTREF PASS\n", fits);
+	free(added);
+	free(names);
+}
+
 static void
 refused(struct btrfs_transaction *transaction, enum btrfs_result result, enum btrfs_result expected,
     const char *what)
@@ -644,7 +912,6 @@ namespace_refusals(struct context *context)
 	struct btrfs_fs *fs;
 	struct btrfs_transaction *transaction;
 	struct btrfs_time time = { 1800000000, 0 };
-	char extref[320];
 	char xattr[64];
 	uint8_t *value;
 	size_t limit = item_limit(context);
@@ -699,25 +966,12 @@ namespace_refusals(struct context *context)
 	    BTRFS_CROSS_TREE, "link across trees");
 	refused(transaction, btrfs_transaction_link(transaction, one, ns, "victim", 6, time),
 	    BTRFS_EXISTS, "link over a name");
-	/* A short name still fits the INODE_REF item; a long one needs an
-	 * extended reference. */
-	extref_path(extref, sizeof(extref), EXTREF_LINKS);
-	refused(transaction,
-	    btrfs_transaction_link(transaction, object(fs, "/ns/extref/target"),
-		object(fs, "/ns/extref"), strrchr(extref, '/') + 1,
-		strlen(strrchr(extref, '/') + 1), time),
-	    BTRFS_UNSUPPORTED, "link beyond a full INODE_REF");
 	refused(transaction, btrfs_transaction_unlink(transaction, ns, "missing", 7, time, 0),
 	    BTRFS_NOT_FOUND, "unlink a missing name");
 	refused(transaction, btrfs_transaction_unlink(transaction, ns, "full", 4, time, 0),
 	    BTRFS_NOT_EMPTY, "unlink a non-empty directory");
 	refused(transaction, btrfs_transaction_unlink(transaction, root, "subvol", 6, time, 0),
 	    BTRFS_CROSS_TREE, "unlink a subvolume");
-	extref_path(extref, sizeof(extref), EXTREF_LINKS - 1);
-	refused(transaction,
-	    btrfs_transaction_unlink(transaction, object(fs, "/ns/extref"),
-		strrchr(extref, '/') + 1, strlen(strrchr(extref, '/') + 1), time, 0),
-	    BTRFS_UNSUPPORTED, "unlink an extended reference");
 	refused(transaction, btrfs_transaction_unlink(transaction, snapshot, "value", 5, time, 0),
 	    BTRFS_READ_ONLY, "unlink in a read-only snapshot");
 	refused(transaction,
@@ -907,6 +1161,132 @@ namespace_limits(struct context *context)
 	printf("namespace limits: %zu colliding names per DIR_ITEM PASS\n", fits);
 }
 
+/* The highest DIR_INDEX of directory, 0 for none. */
+static uint64_t
+last_index(struct btrfs_fs *fs, struct btrfs_object_id directory)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key = { directory.inode, UINT64_MAX, BT_DIR_INDEX };
+	uint64_t index = 0;
+
+	REQUIRE(bt_find_root(fs, directory.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	if (bt_cursor_seek(&cursor, key, 1) == BTRFS_OK &&
+	    bt_cursor_record(&cursor, &record) == BTRFS_OK &&
+	    record.key.objectid == directory.inode && record.key.type == BT_DIR_INDEX) {
+		index = record.key.offset;
+	}
+	bt_cursor_fini(&cursor);
+	return index;
+}
+
+/* One transaction on the current state: creates (mode != 0) or unlinks name
+ * in directory path, then commits, or aborts when commit is 0. Returns the
+ * created object and the directory's highest index after the transaction. */
+static struct btrfs_object_id
+counters_step(struct context *context, struct btrfs_counters *counters, const char *path,
+    const char *name, uint32_t mode, int commit, uint64_t *index)
+{
+	struct btrfs_new_inode attributes = new_inode(mode);
+	struct btrfs_object_id id = { 0, 0 };
+	struct btrfs_object_id directory;
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct btrfs_time time = { 1800000000, 0 };
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	directory = object(fs, path);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	if (counters != NULL) {
+		REQUIRE(btrfs_transaction_use_counters(transaction, counters) == BTRFS_OK);
+		REQUIRE(btrfs_transaction_use_counters(transaction, counters) ==
+		    BTRFS_INVALID_ARGUMENT);
+	}
+	if (mode != 0) {
+		REQUIRE(btrfs_transaction_create(transaction, directory, name, strlen(name),
+			    &attributes, &id) == BTRFS_OK);
+	} else {
+		REQUIRE(btrfs_transaction_unlink(
+			    transaction, directory, name, strlen(name), time, 0) == BTRFS_OK);
+	}
+	if (commit) {
+		REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
+	}
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	*index = last_index(fs, directory);
+	btrfs_unmount(fs);
+	return id;
+}
+
+/* Without counters a removed and committed highest inode number and directory
+ * index are handed out again, as after Linux evicts the inode; a mount's
+ * counters continue after them, also across an aborted transaction, until
+ * the directory table fills and forgets its directories. A forgotten counter
+ * of a removed directory does not number a new directory with its inode. */
+static void
+namespace_counters(struct context *context)
+{
+	const uint32_t file = BTRFS_MODE_REGULAR | 0644;
+	const uint32_t directory = BTRFS_MODE_DIRECTORY | 0755;
+	struct bt_directory_counter *stale;
+	struct btrfs_counters *counters;
+	struct btrfs_object_id first;
+	struct btrfs_object_id second;
+	struct btrfs_object_id third;
+	struct btrfs_object_id made;
+	uint64_t first_index;
+	uint64_t second_index;
+	uint64_t index;
+	size_t i;
+
+	first = counters_step(context, NULL, "/ns/empty", "c1", file, 1, &first_index);
+	(void)counters_step(context, NULL, "/ns/empty", "c1", 0, 1, &index);
+	second = counters_step(context, NULL, "/ns/empty", "c2", file, 1, &second_index);
+	REQUIRE(second.inode == first.inode && second_index == first_index);
+	truncate_writes(context->device, 0);
+
+	REQUIRE(btrfs_counters_create(&context->env, &counters) == BTRFS_OK);
+	first = counters_step(context, counters, "/ns/empty", "c1", file, 1, &first_index);
+	(void)counters_step(context, counters, "/ns/empty", "c1", 0, 1, &index);
+	second = counters_step(context, counters, "/ns/empty", "c2", file, 1, &second_index);
+	REQUIRE(second.inode == first.inode + 1 && second_index == first_index + 1);
+	(void)counters_step(context, counters, "/ns/empty", "c3", file, 0, &index);
+	third = counters_step(context, counters, "/ns/empty", "c4", file, 1, &index);
+	REQUIRE(third.inode == second.inode + 2 && index == second_index + 2);
+
+	/* A full table forgets /ns/empty when /ns/tree claims a slot. */
+	(void)counters_step(context, counters, "/ns/empty", "c4", 0, 1, &index);
+	REQUIRE(counters->forgotten == 0);
+	counters->directory_count = BT_COUNTER_LOAD;
+	made = counters_step(context, counters, "/ns/tree", "x", file, 1, &index);
+	REQUIRE(counters->forgotten == 1 && made.inode == third.inode + 1);
+	made = counters_step(context, counters, "/ns/empty", "c5", file, 1, &index);
+	REQUIRE(made.inode == third.inode + 2 && index == second_index + 1);
+
+	/* A stale counter under the next inode number. */
+	for (i = 0; i < counters->tree_count && counters->trees[i].tree != BTRFS_TOP_LEVEL_TREE;
+	    i++) {
+	}
+	REQUIRE(i < counters->tree_count);
+	stale = bt_counters_directory(counters, BTRFS_TOP_LEVEL_TREE, counters->trees[i].next, 1);
+	REQUIRE(stale != NULL);
+	stale->next = 1000;
+	stale->known = 1;
+	made = counters_step(context, counters, "/ns/empty", "fresh", directory, 1, &index);
+	REQUIRE(made.inode == stale->directory);
+	(void)counters_step(context, counters, "/ns/empty/fresh", "f", file, 1, &index);
+	REQUIRE(index == BT_DIR_START_INDEX);
+	btrfs_counters_destroy(counters);
+	truncate_writes(context->device, 0);
+	REQUIRE(context->image.live_allocations == 0);
+	printf(
+	    "namespace counters: inode numbers and directory indexes across transactions PASS\n");
+}
+
 /* The namespace audit rejects committed states that Linux would reject. */
 static void
 namespace_audit_self_test(struct context *context)
@@ -1059,6 +1439,7 @@ namespace_scenarios(struct context *context)
 	namespace_refusals(context);
 	namespace_flag_refusals(context);
 	namespace_limits(context);
+	namespace_counters(context);
 	namespace_audit_self_test(context);
 	namespace_create_plan(context);
 	namespace_collide_plan(context);
@@ -1072,4 +1453,6 @@ namespace_scenarios(struct context *context)
 	namespace_property_plan(context);
 	namespace_attributes_plan(context);
 	namespace_full_item_plan(context);
+	namespace_extref_plan(context);
+	namespace_extref_full_plan(context);
 }

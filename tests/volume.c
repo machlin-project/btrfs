@@ -229,6 +229,32 @@ create_file(struct btrfs_volume *volume, struct btrfs_transaction *transaction, 
 	return result;
 }
 
+static struct btrfs_object_id
+root_id(struct btrfs_volume *volume)
+{
+	struct btrfs_volume_view *view;
+	struct btrfs_inode root;
+	const struct btrfs_fs *fs;
+
+	fs = btrfs_volume_pin(volume, &view);
+	REQUIRE(btrfs_root(fs, &root) == BTRFS_OK);
+	btrfs_volume_unpin(volume, view);
+	return root.id;
+}
+
+static uint64_t
+inode_number(struct btrfs_volume *volume, const char *path)
+{
+	struct btrfs_volume_view *view;
+	struct btrfs_inode inode;
+	const struct btrfs_fs *fs;
+
+	fs = btrfs_volume_pin(volume, &view);
+	REQUIRE(btrfs_image_lookup((struct btrfs_fs *)fs, path, &inode) == BTRFS_OK);
+	btrfs_volume_unpin(volume, view);
+	return inode.id.inode;
+}
+
 static void *
 second_writer(void *context)
 {
@@ -308,8 +334,10 @@ views_test(struct harness *harness)
 	struct writer writer;
 	const struct btrfs_fs *old_fs;
 	const struct btrfs_fs *new_fs;
+	struct btrfs_time time = { 1800000001, 0 };
 	pthread_t thread;
 	uint64_t generation;
+	uint64_t removed;
 
 	/* A read-only volume serves views and refuses writers. */
 	REQUIRE(btrfs_volume_open(environment, NULL, &harness->callbacks, BTRFS_TOP_LEVEL_TREE,
@@ -360,6 +388,21 @@ views_test(struct harness *harness)
 	REQUIRE(btrfs_volume_commit(volume, writer.transaction) == BTRFS_OK);
 	REQUIRE(btrfs_volume_generation(volume) == generation + 2);
 
+	/* The mount's counters do not hand out a removed inode number again. */
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_file(volume, transaction, "numbered") == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	removed = inode_number(volume, "/numbered");
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_unlink(transaction, root_id(volume), "numbered", 8, time, 0) ==
+	    BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_file(volume, transaction, "renumbered") == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	REQUIRE(inode_number(volume, "/renumbered") == removed + 1);
+	generation = btrfs_volume_generation(volume);
+
 	/* A failed commit that issued writes leaves the volume failed. */
 	old_fs = btrfs_volume_pin(volume, &old_view);
 	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
@@ -367,12 +410,13 @@ views_test(struct harness *harness)
 	harness->overlay.fail_write = harness->overlay.writes + 2;
 	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_IO);
 	REQUIRE(btrfs_volume_failure(volume) == BTRFS_IO);
-	REQUIRE(btrfs_volume_generation(volume) == generation + 2);
+	REQUIRE(btrfs_volume_generation(volume) == generation);
 	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_IO);
 	REQUIRE(exists(old_fs, "/second") && !exists(old_fs, "/uncertain"));
 	btrfs_volume_unpin(volume, old_view);
 	btrfs_volume_close(volume);
-	printf("native volume views: pins, draining, abort, empty and failed commits PASS\n");
+	printf("native volume views: pins, draining, abort, empty and failed commits, counters "
+	       "PASS\n");
 }
 
 /* Every regular file of version v holds stress_size(v) copies of

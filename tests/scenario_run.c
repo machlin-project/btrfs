@@ -124,7 +124,7 @@ static void
 export_namespace(struct context *context, const struct plan *plan, struct exporter *exporter)
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
-		"noxattr", "stat", "device", "flags", "feature", "times" };
+		"noxattr", "stat", "device", "flags", "feature", "times", "reference" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -175,6 +175,8 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 			    e->value == BT_FEATURE_COMPRESS_ZSTD);
 			detail =
 			    e->value == BT_FEATURE_COMPRESS_LZO ? "COMPRESS_LZO" : "COMPRESS_ZSTD";
+		} else if (e->kind == EXPECT_REFERENCE) {
+			detail = e->value != 0 ? "extended" : "inode";
 		} else if (e->kind == EXPECT_TIMES) {
 			/* stat -c '%X:%Y' */
 			REQUIRE(snprintf(argument, sizeof(argument), "%lld:%lld",

@@ -278,6 +278,13 @@ struct bt_disk_inode_ref {
 	struct bt_le16 name_length;
 };
 
+/* An INODE_EXTREF entry; the item key's offset is btrfs_extref_hash. */
+struct bt_disk_inode_extref {
+	struct bt_le64 parent;
+	struct bt_le64 index;
+	struct bt_le16 name_length;
+};
+
 struct bt_disk_root_ref {
 	struct bt_le64 directory, index;
 	struct bt_le16 name_length;
@@ -300,6 +307,7 @@ _Static_assert(sizeof(struct bt_disk_root_backup) == 168, "backup root layout");
 _Static_assert(offsetof(struct bt_disk_super, system_array) == 811, "system array layout");
 _Static_assert(sizeof(struct bt_disk_key) == 17, "key layout");
 _Static_assert(sizeof(struct bt_disk_header) == 101, "tree header layout");
+_Static_assert(sizeof(struct bt_disk_inode_extref) == 18, "extended reference layout");
 _Static_assert(sizeof(struct bt_disk_chunk) == 48, "chunk layout");
 _Static_assert(sizeof(struct bt_disk_stripe) == 32, "stripe layout");
 _Static_assert(sizeof(struct bt_disk_device) == 98, "device item layout");

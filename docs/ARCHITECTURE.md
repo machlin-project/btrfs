@@ -276,8 +276,11 @@ extent losing its last reference loses its checksum items and block-group space
 in the same commit; ranges freed or allocated in a transaction are never reused
 by it, and the owner must retire readers of the old root before the next one.
 Preallocated ranges are rewritten by CoW, not converted in place; NODATACOW files
-are also written by CoW; data is never compressed on write. Set-id, immutable
-and append-only inodes are refused until their policy contracts exist.
+are also written by CoW; data is never compressed on write. Writing or
+truncating a set-id file needs the caller's settled privilege decision
+(`btrfs_transaction_drop_privileges` or `_keep_privileges`, Linux's
+`file_remove_privs`); immutable inodes refuse every change and append-only
+inodes everything but growth (NOT_PERMITTED), as Linux does.
 
 ## Namespace mutations
 
@@ -291,10 +294,26 @@ and removed entries are cut out of the item, as Linux extends and truncates it.
 Xattrs use the same packing in XATTR_ITEM. Every lookup cross-checks all three
 records, so an inconsistent name fails as CORRUPT instead of being edited.
 
+A new name's back reference goes where `btrfs_insert_inode_ref` puts it: into the
+inode's INODE_REF item for the parent while that item has room, otherwise, with
+the extended-reference feature, into an INODE_EXTREF item keyed by inode and
+`btrfs_extref_hash` (CRC32C seeded with the parent's number), appended to a
+colliding item. A full INODE_EXTREF item is EOVERFLOW (RANGE); without the
+feature the link is EMLINK (TOO_MANY_LINKS). Removal finds a name in either
+item, and a rename's room check counts the bytes its old name frees in an item
+it shares with the new one. CRC32C is affine in its seed, so names of one length
+that collide under one parent's seed also share a DIR_ITEM.
+
 New inode numbers continue after the highest object below
 `BTRFS_LAST_FREE_OBJECTID`, and directory indexes after the directory's highest
 DIR_INDEX, from 2. Both never repeat within a transaction, which caches the next
-index of up to 256 directories; more are refused before any change. A directory
+index of up to 256 directories; more are refused before any change. Attached
+`btrfs_counters` continue both across transactions, as Linux keeps a root's
+highest inode number and a cached directory's `index_cnt` in memory: up to 64
+trees, and up to 768 directories in a 1,024-slot table that forgets every
+directory when it fills, as eviction would. A forgotten directory continues
+after its highest DIR_INDEX again; a new directory never inherits a counter left
+under its inode number. The native volume layer attaches one set per mount. A directory
 whose index reached `UINT64_MAX` is full (RANGE). A new inode has one link, all
 four times set to the caller's time, this transaction's generation and Linux's
 inherited flags: NOCOMPRESS or COMPRESS, and NODATACOW (with NODATASUM for
@@ -327,10 +346,8 @@ otherwise uninterpreted; native policy decides which namespaces callers may use.
 Every refusal (existing or missing name, wrong type, non-empty directory, full
 packed item, exhausted numbering, read-only snapshot, crossing a subvolume entry
 or tree) is decided before the first change and leaves the transaction usable. A
-failure after a change poisons the transaction. Names stored only in extended
-inode references (INODE_EXTREF), and new names that would need one, are refused
-as UNSUPPORTED on filesystems with that feature; Linux refuses such links with
-EMLINK otherwise (TOO_MANY_LINKS). Subvolume and snapshot creation or deletion,
+failure after a change poisons the transaction. Subvolume and snapshot creation
+or deletion,
 O_TMPFILE links of unlinked inodes, rename exchange and whiteouts are not part
 of this interface.
 

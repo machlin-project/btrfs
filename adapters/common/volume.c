@@ -15,6 +15,8 @@ struct btrfs_volume {
 	 * from an uncertain one when a commit fails. */
 	struct btrfs_write_environment counted;
 	struct btrfs_volume_locks locks;
+	/* Inode numbers and directory indexes stay unique for the mount. */
+	struct btrfs_counters *counters;
 	uint64_t tree;
 	struct btrfs_volume_view *current;
 	struct btrfs_transaction *open;
@@ -129,6 +131,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	volume->locks = *locks;
 	volume->tree = tree;
 	volume->current = NULL;
+	volume->counters = NULL;
 	volume->open = NULL;
 	volume->issued = 0;
 	volume->failure = BTRFS_OK;
@@ -145,6 +148,9 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 		error =
 		    btrfs_transaction_begin(volume->current->fs, &volume->counted, &transaction);
 		btrfs_transaction_destroy(transaction);
+	}
+	if (error == BTRFS_OK && volume->writable) {
+		error = btrfs_counters_create(environment, &volume->counters);
 	}
 	if (error != BTRFS_OK) {
 		if (volume->current != NULL) {
@@ -164,6 +170,7 @@ btrfs_volume_close(struct btrfs_volume *volume)
 		return;
 	}
 	volume_release_list(volume, volume->current);
+	btrfs_counters_destroy(volume->counters);
 	volume->environment.release(volume->environment.context, volume, sizeof(*volume));
 }
 
@@ -243,6 +250,13 @@ btrfs_volume_begin(struct btrfs_volume *volume, struct btrfs_transaction **trans
 	if (error == BTRFS_OK) {
 		volume->issued = 0;
 		error = btrfs_transaction_begin(volume->current->fs, &volume->counted, transaction);
+	}
+	if (error == BTRFS_OK) {
+		error = btrfs_transaction_use_counters(*transaction, volume->counters);
+		if (error != BTRFS_OK) {
+			btrfs_transaction_destroy(*transaction);
+			*transaction = NULL;
+		}
 	}
 	if (error != BTRFS_OK) {
 		volume->locks.lock(volume->locks.context);

@@ -114,6 +114,64 @@ list_directory(struct btrfs_fs *fs, const struct btrfs_inode *directory, size_t 
 	return listing;
 }
 
+/* Which back reference holds the last name of path: 0 for INODE_REF, 1 for
+ * INODE_EXTREF, -1 for none. */
+static int
+reference_kind(struct btrfs_fs *fs, const char *path, const struct btrfs_inode *inode)
+{
+	const struct bt_disk_inode_ref *ref;
+	const struct bt_disk_inode_extref *extref;
+	struct btrfs_inode parent;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key;
+	char directory[LINUX_PATH_MAX];
+	const char *name = strrchr(path, '/') + 1;
+	size_t length = strlen(name);
+	size_t position;
+	size_t entry;
+	int kind = -1;
+	int pass;
+
+	REQUIRE(name - path < (ptrdiff_t)sizeof(directory));
+	memcpy(directory, path, (size_t)(name - path));
+	directory[name - path == 1 ? 1 : name - path - 1] = '\0';
+	REQUIRE(btrfs_image_lookup(fs, directory, &parent) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, inode->id.tree, &root) == BTRFS_OK);
+	for (pass = 0; pass < 2 && kind < 0; pass++) {
+		key = pass == 0
+		    ? (struct bt_key){ inode->id.inode, parent.id.inode, BT_INODE_REF }
+		    : (struct bt_key){ inode->id.inode,
+			      bt_crc32c((uint32_t)parent.id.inode, name, length), BT_INODE_EXTREF };
+		bt_cursor_init(&cursor, fs, root);
+		if (bt_cursor_seek(&cursor, key, 0) == BTRFS_OK &&
+		    bt_cursor_record(&cursor, &record) == BTRFS_OK &&
+		    bt_key_compare(record.key, key) == 0) {
+			for (position = 0; kind < 0 && position < record.size; position += entry) {
+				if (pass == 0) {
+					ref = (const void *)(record.data + position);
+					entry = sizeof(*ref) + bt_u16(ref->name_length);
+					kind = bt_u16(ref->name_length) == length &&
+						memcmp(ref + 1, name, length) == 0
+					    ? 0
+					    : -1;
+				} else {
+					extref = (const void *)(record.data + position);
+					entry = sizeof(*extref) + bt_u16(extref->name_length);
+					kind = bt_u64(extref->parent) == parent.id.inode &&
+						bt_u16(extref->name_length) == length &&
+						memcmp(extref + 1, name, length) == 0
+					    ? 1
+					    : -1;
+				}
+			}
+		}
+		bt_cursor_fini(&cursor);
+	}
+	return kind;
+}
+
 static void
 expectation_failed(
     const struct plan *plan, size_t stage, const struct expectation *expectation, const char *what)
@@ -209,6 +267,11 @@ check_expectation(
 		btrfs_get_info(fs, &info);
 		if ((info.incompat_features & e->value) == 0) {
 			expectation_failed(plan, stage, e, "incompat feature");
+		}
+		return;
+	case EXPECT_REFERENCE:
+		if (reference_kind(fs, e->path, &inode) != (int)e->value) {
+			expectation_failed(plan, stage, e, "back reference kind");
 		}
 		return;
 	default:

@@ -31,7 +31,8 @@ NAMESPACE_ARGUMENT = {
     "stat": re.compile(r"^[0-9a-f]+:[0-9]+:[0-9]+:[0-9]+$"),
     "device": re.compile(r"^[0-9a-f]+:[0-9a-f]+$"), "flags": re.compile(r"^0x[0-9a-f]+:0x[0-9a-f]+$"),
     "feature": re.compile(r"^COMPRESS_(LZO|ZSTD)$"),
-    "times": re.compile(r"^-?[0-9]+:-?[0-9]+$")}
+    "times": re.compile(r"^-?[0-9]+:-?[0-9]+$"),
+    "reference": re.compile(r"^(inode|extended)$")}
 PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr"}
 
 

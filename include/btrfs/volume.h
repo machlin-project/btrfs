@@ -7,7 +7,8 @@
 /* A mounted volume shared by native adapters. Readers use versioned views:
  * each committed root set is one immutable btrfs_fs, pinned for the duration
  * of an operation. One writer at a time runs a transaction on the current
- * view; a successful commit publishes the next view, and older views are
+ * view, with the mount's inode-number and directory-index counters attached;
+ * a successful commit publishes the next view, and older views are
  * retired when their last pin goes. The next transaction waits until no view
  * older than its base is pinned, because it may reuse blocks those views still
  * reference. A commit that may have reached media and failed leaves the

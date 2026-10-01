@@ -61,6 +61,25 @@ enum btrfs_result btrfs_recover_supers(const struct btrfs_environment *environme
  * acknowledged generation or later; btrfs_recover_supers selects it. */
 enum btrfs_result btrfs_transaction_begin(const struct btrfs_fs *base,
     const struct btrfs_write_environment *environment, struct btrfs_transaction **result);
+/* Inode numbers and directory indexes that stay unique across the transactions
+ * of one mount, as Linux keeps each root's highest inode number and each
+ * cached directory's next index (index_cnt) in memory. Without counters a
+ * transaction continues after the highest number in its base tree, so a number
+ * whose inode or entry was removed and committed may be handed out again, as
+ * Linux does after evicting the inode or at the next mount. Directory counters
+ * live in a bounded table that forgets every directory when it fills, as
+ * eviction would; trees beyond its tree capacity fall back to the base tree.
+ * Counters advance as numbers are handed out, also in transactions that are
+ * later aborted. Every transaction of a mounted volume uses the same counters,
+ * one transaction at a time. */
+struct btrfs_counters;
+
+enum btrfs_result btrfs_counters_create(
+    const struct btrfs_environment *environment, struct btrfs_counters **result);
+void btrfs_counters_destroy(struct btrfs_counters *counters);
+/* Attaches counters before the transaction's first namespace change. */
+enum btrfs_result btrfs_transaction_use_counters(
+    struct btrfs_transaction *transaction, struct btrfs_counters *counters);
 /* Replace an existing, uncompressed inline regular file (including hardlinks).
  * No file creation, external extent conversion or implicit truncation of other
  * extents. Payloads are bounded by Btrfs's 2 KiB default inline-write policy. */

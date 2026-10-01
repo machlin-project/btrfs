@@ -58,6 +58,22 @@ check_flags() {
     test -n "$flags" && test $((flags & ${2%%:*})) -eq $((${2#*:}))
 }
 
+# inode|extended: the path's name is held by its inode's INODE_REF item for
+# the parent directory, or by an INODE_EXTREF item naming that parent.
+check_reference() {
+    inode=$(stat -c '%i' "$1")
+    parent=$(stat -c '%i' "$(dirname "$1")")
+    kind=$(btrfs inspect-internal dump-tree -t 5 /dev/vda | awk -v inode="$inode" \
+        -v parent="$parent" -v name="$(basename "$1")" '
+        $1 == "item" && $3 == "key" {
+            object = substr($4, 2); type = $5; offset = $6; sub(/\)$/, "", offset); next }
+        $1 == "index" && object == inode && $NF == name && $(NF - 1) == "name:" {
+            if (type == "INODE_REF" && offset == parent) { print "inode"; exit }
+            if (type == "INODE_EXTREF" && $3 == "parent" && $4 == parent) {
+                print "extended"; exit } }')
+    test "$kind" = "$2"
+}
+
 namespace_checks=0
 
 check_namespace() {
@@ -81,6 +97,7 @@ check_namespace() {
         flags) check_flags "$target" "$arg" ;;
         feature) btrfs inspect-internal dump-super /dev/vda | grep -qw "$arg" ;;
         times) test "$(stat -c '%X:%Y' "$target")" = "$arg" ;;
+        reference) check_reference "$target" "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"

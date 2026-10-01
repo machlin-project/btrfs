@@ -227,7 +227,7 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 | `grow-*` (`--grow`) | Metadata and data chunk growth from unallocated device space |
 | `fst-*` (`--fragment`) | Frees between bitmap holes and a write that spills from extent-mode free space into bitmap holes |
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes |
-| `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item |
+| `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); names beyond a full INODE_REF item in new INODE_EXTREF items, a colliding one and one Linux wrote, unlinked from packed and last entries, renamed into and out of the INODE_REF item and across directories, and an INODE_EXTREF item filled to the largest item; unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item |
 | `random-N` (`--random FIRST COUNT`, `--random-quick FIRST COUNT`) | Seeded differential sequences: 24 operations in three commits drawn from create of every type, link, unlink, rename (also over files and between names of one inode), xattr set/remove, write, truncation, attribute changes, orphan cleanup and expected refusals under `/fuzz`, over a name pool with real CRC32C collisions; a separate model predicts each stage's namespace facts |
 
 `btrfs-reference-audit` is an independent reference oracle in the portable
@@ -257,22 +257,26 @@ checks admission, stale copies, recovery refusals and checksum-correct damaged
 allocation maps. `--full` adds the metadata-exhaustion case: the full profile's
 remaining metadata cannot hold a batch of all inline files, so the edit returns
 NO_SPACE without any write. `--namespace` also checks that every refusal (about
-forty: names, types, read-only snapshots, subvolume entries, extended references,
-xattr limits, properties) and numbering or packed-item limit (last directory
-index, last inode number, the per-transaction directory bound, a full colliding
-DIR_ITEM) is decided before the first change and leaves the transaction able to
-commit.
+forty: names, types, read-only snapshots, subvolume entries, xattr limits,
+properties) and numbering or packed-item limit (last directory index, last inode
+number, the per-transaction directory bound, full colliding DIR_ITEM and
+INODE_EXTREF items) is decided before the first change and leaves the transaction
+able to commit. It also checks numbering across committed transactions: without
+counters a removed highest inode number and directory index are handed out
+again; with a mount's `btrfs_counters` both continue, also past an aborted
+transaction, until the full directory table forgets a directory, and a stale
+counter never numbers a new directory that reuses an inode number.
 
 `tests/scenario_random.c` adds differential coverage. Seed N draws operations
 with fixed weights against a model of `/fuzz` (inodes, names, link counts,
 owners, modes, times, data, symlink targets and xattrs), including refusals the
 model predicts (existing and missing names and xattrs under create/replace
 flags, non-empty directories, a directory renamed below itself, a linked
-directory); an operation that must be refused and succeeds fails the test. After every commit the model's state
-becomes the stage's expectations: the reader, the reference audit and the
-namespace audit check them, and `--random` samples twelve prefixes and 24 fault
-points per commit plus the reorder and tear epochs, while `--random-quick`
-checks each committed stage only. `BTRFS_RANDOM_TRACE=1` prints each drawn
+directory); an operation that must be refused and succeeds fails the test.
+After every commit the model's state becomes the stage's expectations: the
+reader, the reference audit and the namespace audit check them, and `--random`
+samples twelve prefixes and 24 fault points per commit plus the reorder and tear
+epochs, while `--random-quick` checks each committed stage only. `BTRFS_RANDOM_TRACE=1` prints each drawn
 operation. Meson runs seeds 1-16 on `transactions-namespace` and quick seeds
 1-500 on `transactions-dup`; export seeds with `--random 1 16 --export DIR`
 on `transactions-namespace` for the Linux oracle.
@@ -296,8 +300,8 @@ contents (`stages.tsv`), and one sector-run list per case plus the superblock
 writes this implementation's recovery chose. Namespace scenarios add
 `namespace.tsv`: per stage, absent paths, file contents, exact sorted directory
 listings with their sizes, symlink targets, hard-link identity, xattr values and
-absence, mode/owner/link counts, device numbers, inode flags and incompat
-features, with payload files for expected bytes. These are generated test inputs, not
+absence, mode/owner/link counts, device numbers, inode flags, incompat features
+and whether INODE_REF or INODE_EXTREF holds a name, with payload files for expected bytes. These are generated test inputs, not
 a source ledger. About sixteen prefixes, ten metadata states and all superblock
 tear patterns are exported per commit; the portable test checks all of them.
 
@@ -324,7 +328,8 @@ case and compares both disks after each scenario. For each case it applies the
 exported sector runs, then requires Linux to agree with the recorded outcome:
 `btrfs check --readonly`, the primary generation, exact tracked contents,
 invariants and the stage's namespace facts for a valid primary (with Linux's
-`ls`, `stat`, `readlink`, `getfattr` and its own `dump-tree` for inode flags),
+`ls`, `stat`, `readlink`, `getfattr` and its own `dump-tree` for inode flags
+and back references),
 or a failed mount for a torn primary. For each
 recovery case it runs `btrfs rescue super-recover -y`, requires status 2 and the
 same resolved generation and contents, then repeats from the crash state with

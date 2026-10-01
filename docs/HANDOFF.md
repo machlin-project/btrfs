@@ -102,16 +102,13 @@ only after successful durable publication; `seal` alone is not a commit.
    (replacement, cross-directory, between names of one inode), xattrs and the
    `btrfs.compression` property update all coupled records in one transaction
    (`core/namespace.c`); real CRC32C collisions, numbering limits, refusals and
-   crash states are covered and Linux agrees (see ACCEPTANCE.md). Remaining:
-   editing extended inode references (names only there, and links beyond a full
-   INODE_REF, are UNSUPPORTED); subvolume and snapshot creation and deletion;
+   crash states are covered and Linux agrees (see ACCEPTANCE.md), including
+   names held in extended inode references. `btrfs_counters` keeps inode numbers
+   and directory indexes unique across a mount's transactions; the native volume
+   layer attaches them. Remaining: subvolume and snapshot creation and deletion;
    O_TMPFILE links, rename exchange/whiteout; truncation orphans of pre-3.12
-   kernels are dropped as Linux does. Directory indexes are monotonic only within
-   one transaction: after the highest entry is removed and committed, a later
-   transaction may reuse its index, which Linux avoids within a mount through
-   its in-memory `index_cnt`; native writers must carry that counter across
-   transactions before open directory streams can rely on it. They also supply
-   time, mode, owner, set-id and ACL decisions.
+   kernels are dropped as Linux does. Native writers supply time, mode, owner,
+   set-id and ACL decisions.
 6. **Connect native writers.** Define versioned operation views, read pins,
    publication locks and UBC/FSKit dirty-page ownership first. Supply real exact
    write and durable flush callbacks, order pageout/truncate/invalidate/fsync,

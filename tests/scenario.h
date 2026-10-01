@@ -72,6 +72,9 @@
 /* The namespace fixture's extended references: see tests/prepare_linux.py. */
 #define EXTREF_NAME_BYTES 200U
 #define EXTREF_LINKS 40U
+#define CRC32C_REFLECTED_POLYNOMIAL UINT32_C(0x82f63b78)
+#define FORGE_ATTEMPTS 1000000U
+#define FORGE_COUNTER_BYTES 6U
 #define COLLISION_BLOCK_BYTES 8U
 #define COLLISION_BLOCKS 10U
 #define COLLISION_NAME_BYTES (COLLISION_BLOCK_BYTES * COLLISION_BLOCKS)
@@ -164,7 +167,8 @@ enum expectation_kind {
 	EXPECT_DEVICE,
 	EXPECT_FLAGS,
 	EXPECT_FEATURE,
-	EXPECT_TIMES
+	EXPECT_TIMES,
+	EXPECT_REFERENCE
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -185,6 +189,8 @@ struct expectation {
 	uint64_t value;
 	/* EXPECT_FLAGS: the inode flags in mask must equal value. */
 	uint64_t mask;
+	/* EXPECT_REFERENCE: value 1 when the path's name is held by an
+	 * INODE_EXTREF item, 0 by its INODE_REF item. */
 	/* EXPECT_TIMES: seconds of the access and modification times. */
 	int64_t access_seconds;
 	int64_t modify_seconds;
