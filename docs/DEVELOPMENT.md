@@ -198,7 +198,10 @@ or LXNU tests. See HANDOFF.md for those mandatory gates.
 
 The public writer interface is `include/btrfs/write.h`; both native adapters
 currently stay read-only. `btrfs-transaction-test` runs source-controlled
-scenarios on a recorded device. It never writes the source fixture.
+scenarios on a recorded device. It never writes the source fixture. Its
+recorded device, plan model and runner are `tests/scenario_{device,plan,run}.c`;
+the scenario sets are `tests/scenario_{sets,namespace,checks}.c`. The Linux
+oracle's guest script is `tests/transaction_oracle.sh`.
 
 | Scenario | Operations |
 | --- | --- |

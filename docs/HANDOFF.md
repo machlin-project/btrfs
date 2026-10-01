@@ -52,7 +52,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | File data / checksums | CoW writes and truncation, drop-extents splitting, staged data, private read view, checksum items | `core/data.c`, `core/csum.c` |
 | Namespace mutations / audit | Create of every type, link, unlink with orphans, rename with replacement, packed collision items, xattrs and the compression property; independent namespace audit | `core/namespace.c`, `tests/namespace_audit.c` |
 | Shared references / audit | Linux CoW reference rules, inline/keyed placement and ordering, FULL_BACKREF conversion; independent whole-filesystem reference audit | `core/backref.c`, `tests/references.c` |
-| Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
+| Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/scenario_*.c`, `tests/prepare_transactions_linux.py`, `tests/transaction_oracle.sh` |
 | Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
 
 The mutation view supports metadata traversal; it does not magically update all
@@ -71,7 +71,7 @@ only after successful durable publication; `seal` alone is not a commit.
    Linux-written crash state (Linux as writer, this implementation recovering),
    and adapter use of recovery: report RECOVERY_REQUIRED with the dry-run
    decision, persist the acknowledged generation, and never recover implicitly at
-   mount. Extend every new writer feature with scenarios in `tests/transaction.c`
+   mount. Extend every new writer feature with scenarios in `tests/scenario_*.c`
    and export them to the Linux oracle.
 2. **Extend shared references.** CoW of shared blocks follows Linux's
    `update_ref_for_cow` with inline and keyed references (`core/backref.c`), and

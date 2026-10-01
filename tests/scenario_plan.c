@@ -1,0 +1,783 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/* Source-controlled plans: operations per commit, the byte model of tracked
+ * files, namespace expectations, and the checks of a stage. */
+#define _POSIX_C_SOURCE 200809L
+#include "scenario.h"
+
+static void
+check_text(struct btrfs_fs *fs, const char *path, const char *expected)
+{
+	struct btrfs_inode inode;
+	uint8_t buffer[64];
+	size_t completed;
+
+	REQUIRE(btrfs_image_lookup(fs, path, &inode) == BTRFS_OK);
+	REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
+	REQUIRE(completed == strlen(expected) && memcmp(buffer, expected, completed) == 0);
+}
+
+/* Objects outside the transaction's write set keep their Linux contents. */
+void
+check_invariants(struct btrfs_fs *fs)
+{
+	struct btrfs_inode inode;
+	struct btrfs_inode link;
+	uint8_t value[32];
+	size_t length;
+
+	REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(fs, "/hardlink", &link) == BTRFS_OK);
+	REQUIRE(inode.id.tree == link.id.tree && inode.id.inode == link.id.inode);
+	REQUIRE(inode.links == 2 && inode.uid == 1001 && inode.gid == 1002 &&
+	    (inode.mode & 07777U) == 0640);
+	REQUIRE(btrfs_get_xattr(fs, &inode, "user.text", strlen("user.text"), value, sizeof(value),
+		    &length) == BTRFS_OK);
+	REQUIRE(length == strlen("Linux xattr") && memcmp(value, "Linux xattr", length) == 0);
+	check_text(fs, "/snapshot/value", "snapshot original\n");
+	check_text(fs, "/subvol/value", "subvolume changed\n");
+}
+
+static uint8_t *
+read_file(struct btrfs_fs *fs, const char *path, size_t *size)
+{
+	struct btrfs_inode inode;
+	uint8_t *buffer;
+	size_t completed;
+
+	REQUIRE(btrfs_image_lookup(fs, path, &inode) == BTRFS_OK);
+	REQUIRE(inode.size <= MAX_FILE_BYTES);
+	buffer = malloc((size_t)inode.size + 1);
+	REQUIRE(buffer != NULL);
+	REQUIRE(btrfs_read(fs, &inode, 0, buffer, (size_t)inode.size, &completed) == BTRFS_OK);
+	REQUIRE(completed == inode.size);
+	*size = completed;
+	return buffer;
+}
+
+static int
+compare_entries(const void *left, const void *right)
+{
+	const struct btrfs_dir_entry *a = left;
+	const struct btrfs_dir_entry *b = right;
+	size_t length = a->name_length < b->name_length ? a->name_length : b->name_length;
+	int order = memcmp(a->name, b->name, length);
+
+	if (order != 0) {
+		return order;
+	}
+	return (a->name_length > b->name_length) - (a->name_length < b->name_length);
+}
+
+/* Lists a directory through DIR_INDEX enumeration and confirms that each name
+ * resolves through its DIR_ITEM to the same object. */
+static uint8_t *
+list_directory(struct btrfs_fs *fs, const struct btrfs_inode *directory, size_t *size)
+{
+	struct btrfs_dir_entry *entries = NULL;
+	struct btrfs_inode child;
+	uint8_t *listing;
+	uint64_t cookie = 0;
+	size_t count = 0;
+	size_t capacity = 0;
+	size_t used = 0;
+	size_t i;
+	enum btrfs_result result;
+
+	for (;;) {
+		if (count == capacity) {
+			capacity = capacity == 0 ? 64 : capacity * 2;
+			entries = realloc(entries, capacity * sizeof(*entries));
+			REQUIRE(entries != NULL);
+		}
+		result = btrfs_next_dir(fs, directory, &cookie, &entries[count]);
+		if (result == BTRFS_NOT_FOUND) {
+			break;
+		}
+		REQUIRE(result == BTRFS_OK);
+		REQUIRE(btrfs_lookup(fs, directory, entries[count].name, entries[count].name_length,
+			    &child) == BTRFS_OK);
+		REQUIRE(child.id.tree == entries[count].id.tree &&
+		    child.id.inode == entries[count].id.inode);
+		used += entries[count].name_length + 1U;
+		count++;
+	}
+	qsort(entries, count, sizeof(*entries), compare_entries);
+	listing = malloc(used + 1);
+	REQUIRE(listing != NULL);
+	*size = 0;
+	for (i = 0; i < count; i++) {
+		memcpy(listing + *size, entries[i].name, entries[i].name_length);
+		*size += entries[i].name_length;
+		listing[(*size)++] = '\n';
+	}
+	free(entries);
+	return listing;
+}
+
+static void
+expectation_failed(
+    const struct plan *plan, size_t stage, const struct expectation *expectation, const char *what)
+{
+	fprintf(stderr, "%s stage %zu: %s: %s\n", plan->name, stage, expectation->path, what);
+	exit(1);
+}
+
+static void
+check_expectation(
+    struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e)
+{
+	struct btrfs_inode inode;
+	struct btrfs_inode other;
+	struct btrfs_info info;
+	uint8_t *bytes = NULL;
+	size_t size = 0;
+	enum btrfs_result result;
+
+	result = btrfs_image_lookup(fs, e->path, &inode);
+	if (e->kind == EXPECT_ABSENT) {
+		if (result != BTRFS_NOT_FOUND) {
+			expectation_failed(plan, stage, e, "present");
+		}
+		return;
+	}
+	if (result != BTRFS_OK) {
+		expectation_failed(plan, stage, e, btrfs_result_string(result));
+	}
+	switch (e->kind) {
+	case EXPECT_FILE:
+		REQUIRE((inode.mode & BTRFS_MODE_TYPE) == BTRFS_MODE_REGULAR);
+		bytes = read_file(fs, e->path, &size);
+		break;
+	case EXPECT_SYMLINK:
+		REQUIRE((inode.mode & BTRFS_MODE_TYPE) == BTRFS_MODE_SYMLINK);
+		bytes = read_file(fs, e->path, &size);
+		break;
+	case EXPECT_DIRECTORY:
+		REQUIRE((inode.mode & BTRFS_MODE_TYPE) == BTRFS_MODE_DIRECTORY);
+		if (inode.size != e->value) {
+			expectation_failed(plan, stage, e, "directory size");
+		}
+		bytes = list_directory(fs, &inode, &size);
+		break;
+	case EXPECT_XATTR:
+		bytes = malloc(XATTR_VALUE_LIMIT + 1);
+		REQUIRE(bytes != NULL);
+		result = btrfs_get_xattr(
+		    fs, &inode, e->other, strlen(e->other), bytes, XATTR_VALUE_LIMIT, &size);
+		if (result != BTRFS_OK) {
+			expectation_failed(plan, stage, e, btrfs_result_string(result));
+		}
+		break;
+	case EXPECT_NO_XATTR:
+		result = btrfs_get_xattr(fs, &inode, e->other, strlen(e->other), NULL, 0, &size);
+		if (result != BTRFS_NOT_FOUND) {
+			expectation_failed(plan, stage, e, "xattr present");
+		}
+		return;
+	case EXPECT_SAME:
+		REQUIRE(btrfs_image_lookup(fs, e->other, &other) == BTRFS_OK);
+		if (inode.id.tree != other.id.tree || inode.id.inode != other.id.inode) {
+			expectation_failed(plan, stage, e, "different object");
+		}
+		return;
+	case EXPECT_STAT:
+		if (inode.mode != e->mode || inode.uid != e->uid || inode.gid != e->gid ||
+		    inode.links != e->links) {
+			fprintf(stderr, "%s stage %zu: %s: mode %o uid %u gid %u links %u\n",
+			    plan->name, stage, e->path, inode.mode, inode.uid, inode.gid,
+			    inode.links);
+			exit(1);
+		}
+		return;
+	case EXPECT_DEVICE:
+		if (inode.device != e->value) {
+			expectation_failed(plan, stage, e, "device number");
+		}
+		return;
+	case EXPECT_FLAGS:
+		if ((inode.flags & e->mask) != e->value) {
+			expectation_failed(plan, stage, e, "inode flags");
+		}
+		return;
+	case EXPECT_FEATURE:
+		btrfs_get_info(fs, &info);
+		if ((info.incompat_features & e->value) == 0) {
+			expectation_failed(plan, stage, e, "incompat feature");
+		}
+		return;
+	default:
+		REQUIRE(0);
+	}
+	if (size != e->size || (size != 0 && memcmp(bytes, e->bytes, size) != 0)) {
+		expectation_failed(plan, stage, e, "contents differ");
+	}
+	free(bytes);
+}
+
+static void
+check_namespace(struct btrfs_fs *fs, const struct plan *plan, size_t stage)
+{
+	struct namespace_audit audit;
+	size_t i;
+
+	for (i = 0; i < plan->expectation_count; i++) {
+		if (plan->expectations[i].first <= stage && stage <= plan->expectations[i].last) {
+			check_expectation(fs, plan, stage, &plan->expectations[i]);
+		}
+	}
+	if (namespace_audit(fs, &audit) != 0) {
+		fprintf(stderr, "%s stage %zu: namespace audit: %s\n", plan->name, stage,
+		    audit.failure);
+		exit(1);
+	}
+}
+
+void
+check_stage(struct context *context, struct btrfs_fs *fs, const struct plan *plan, size_t stage)
+{
+	struct btrfs_info info;
+	const struct tracked *file;
+	uint8_t *contents;
+	size_t size;
+	size_t i;
+
+	btrfs_get_info(fs, &info);
+	REQUIRE(info.generation == context->base_generation + stage);
+	for (i = 0; i < plan->file_count; i += plan->verify_stride == 0 ? 1 : plan->verify_stride) {
+		file = &plan->files[i];
+		contents = read_file(fs, file->path, &size);
+		if (size != file->size[stage] ||
+		    (size != 0 && memcmp(contents, file->data[stage], size) != 0)) {
+			fprintf(stderr, "%s stage %zu: %s differs (%zu bytes, expected %zu)\n",
+			    plan->name, stage, file->path, size, file->size[stage]);
+			exit(1);
+		}
+		free(contents);
+	}
+	check_invariants(fs);
+	if (plan->namespace) {
+		check_namespace(fs, plan, stage);
+	}
+}
+
+void
+plan_init(struct plan *plan)
+{
+	size_t stage;
+
+	memset(plan, 0, sizeof(*plan));
+	plan->files = calloc(MAX_FILES, sizeof(*plan->files));
+	REQUIRE(plan->files != NULL);
+	for (stage = 1; stage < MAX_STAGES; stage++) {
+		plan->operations[stage] = calloc(MAX_OPERATIONS, sizeof(*plan->operations[stage]));
+		REQUIRE(plan->operations[stage] != NULL);
+	}
+	plan->fault_points = FAULT_POINTS;
+	plan->expectations = calloc(MAX_EXPECTATIONS, sizeof(*plan->expectations));
+	REQUIRE(plan->expectations != NULL);
+}
+
+/* Plans are built against the committed state, which no write changes until
+ * run_plan releases this mount. */
+static struct btrfs_fs *
+plan_mount(struct context *context)
+{
+	if (context->plan_fs == NULL) {
+		REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &context->plan_fs) ==
+		    BTRFS_OK);
+	}
+	return context->plan_fs;
+}
+
+size_t
+plan_file(struct context *context, struct plan *plan, const char *path)
+{
+	struct btrfs_fs *fs;
+	struct tracked *file;
+	size_t i;
+
+	for (i = 0; i < plan->file_count; i++) {
+		if (strcmp(plan->files[i].path, path) == 0) {
+			return i;
+		}
+	}
+	REQUIRE(plan->file_count < MAX_FILES && strlen(path) < sizeof(file->path));
+	file = &plan->files[plan->file_count];
+	memset(file, 0, sizeof(*file));
+	strcpy(file->path, path);
+	fs = plan_mount(context);
+	file->data[0] = read_file(fs, path, &file->size[0]);
+	return plan->file_count++;
+}
+
+static void
+plan_operation(struct context *context, struct plan *plan, size_t commit, const char *path,
+    enum operation_kind kind, uint64_t offset, const void *data, size_t size)
+{
+	struct operation *operation;
+
+	REQUIRE(
+	    commit > 0 && commit < MAX_STAGES && plan->operation_count[commit] < MAX_OPERATIONS);
+	REQUIRE(kind != OPERATION_INLINE || size <= INLINE_LIMIT);
+	operation = &plan->operations[commit][plan->operation_count[commit]++];
+	operation->file = plan_file(context, plan, path);
+	operation->path = strdup(path);
+	REQUIRE(operation->path != NULL);
+	operation->kind = kind;
+	operation->offset = offset;
+	operation->size = size;
+	operation->data = malloc(size + 1);
+	REQUIRE(operation->data != NULL);
+	if (size != 0) {
+		memcpy(operation->data, data, size);
+	}
+	if (commit > plan->commits) {
+		plan->commits = commit;
+	}
+}
+
+void
+plan_update(struct context *context, struct plan *plan, size_t commit, const char *path,
+    const void *data, size_t size)
+{
+	plan_operation(context, plan, commit, path, OPERATION_INLINE, 0, data, size);
+}
+
+void
+plan_write(struct context *context, struct plan *plan, size_t commit, const char *path,
+    uint64_t offset, const void *data, size_t size)
+{
+	plan_operation(context, plan, commit, path, OPERATION_WRITE, offset, data, size);
+}
+
+void
+plan_truncate(
+    struct context *context, struct plan *plan, size_t commit, const char *path, uint64_t size)
+{
+	plan_operation(context, plan, commit, path, OPERATION_TRUNCATE, size, NULL, 0);
+}
+
+static void
+model_resize(struct tracked *file, size_t stage, uint64_t size)
+{
+	uint8_t *grown;
+
+	REQUIRE(size <= MAX_FILE_BYTES);
+	grown = realloc(file->data[stage], (size_t)size + 1);
+	REQUIRE(grown != NULL);
+	if (size > file->size[stage]) {
+		memset(grown + file->size[stage], 0, (size_t)size - file->size[stage]);
+	}
+	file->data[stage] = grown;
+	file->size[stage] = (size_t)size;
+}
+
+void
+plan_finish(struct plan *plan)
+{
+	const struct operation *operation;
+	struct tracked *file;
+	size_t stage;
+	size_t i;
+
+	for (stage = 1; stage <= plan->commits; stage++) {
+		for (i = 0; i < plan->file_count; i++) {
+			file = &plan->files[i];
+			file->size[stage] = file->size[stage - 1];
+			file->data[stage] = malloc(file->size[stage] + 1);
+			REQUIRE(file->data[stage] != NULL);
+			memcpy(file->data[stage], file->data[stage - 1], file->size[stage]);
+		}
+		for (i = 0; i < plan->operation_count[stage]; i++) {
+			operation = &plan->operations[stage][i];
+			if (operation->file == NO_FILE || operation->kind > OPERATION_TRUNCATE) {
+				continue;
+			}
+			file = &plan->files[operation->file];
+			if (operation->kind == OPERATION_INLINE) {
+				model_resize(file, stage, operation->size);
+				memcpy(file->data[stage], operation->data, operation->size);
+			} else if (operation->kind == OPERATION_WRITE) {
+				if (operation->offset + operation->size > file->size[stage]) {
+					model_resize(
+					    file, stage, operation->offset + operation->size);
+				}
+				memcpy(file->data[stage] + operation->offset, operation->data,
+				    operation->size);
+			} else {
+				model_resize(file, stage, operation->offset);
+			}
+		}
+	}
+}
+
+void
+plan_destroy(struct plan *plan)
+{
+	size_t stage;
+	size_t i;
+
+	for (i = 0; i < plan->file_count; i++) {
+		for (stage = 0; stage < MAX_STAGES; stage++) {
+			free(plan->files[i].data[stage]);
+		}
+	}
+	for (stage = 0; stage < MAX_STAGES; stage++) {
+		for (i = 0; i < plan->operation_count[stage]; i++) {
+			free(plan->operations[stage][i].data);
+			free(plan->operations[stage][i].path);
+			free(plan->operations[stage][i].target);
+		}
+		free(plan->operations[stage]);
+	}
+	for (i = 0; i < plan->expectation_count; i++) {
+		free(plan->expectations[i].path);
+		free(plan->expectations[i].other);
+		free(plan->expectations[i].bytes);
+	}
+	free(plan->expectations);
+	free(plan->files);
+}
+
+void
+fill_pattern(uint8_t *data, size_t size, unsigned seed)
+{
+	size_t i;
+
+	for (i = 0; i < size; i++) {
+		data[i] = (uint8_t)(seed + i * 131U + (i >> 9));
+	}
+}
+
+static struct operation *
+plan_namespace(struct plan *plan, size_t commit, enum operation_kind kind, const char *path,
+    const char *target)
+{
+	struct operation *operation;
+
+	REQUIRE(
+	    commit > 0 && commit < MAX_STAGES && plan->operation_count[commit] < MAX_OPERATIONS);
+	operation = &plan->operations[commit][plan->operation_count[commit]++];
+	memset(operation, 0, sizeof(*operation));
+	operation->file = NO_FILE;
+	operation->kind = kind;
+	operation->path = strdup(path);
+	operation->target = target == NULL ? NULL : strdup(target);
+	operation->data = malloc(1);
+	REQUIRE(operation->path != NULL && (target == NULL || operation->target != NULL) &&
+	    operation->data != NULL);
+	if (commit > plan->commits) {
+		plan->commits = commit;
+	}
+	plan->namespace = 1;
+	return operation;
+}
+
+static void
+operation_data(struct operation *operation, const void *data, size_t size)
+{
+	free(operation->data);
+	operation->data = malloc(size + 1);
+	REQUIRE(operation->data != NULL);
+	if (size != 0) {
+		memcpy(operation->data, data, size);
+	}
+	operation->size = size;
+}
+
+void
+plan_create(struct plan *plan, size_t commit, const char *path, uint32_t mode, const char *symlink)
+{
+	struct operation *operation = plan_namespace(plan, commit, OPERATION_CREATE, path, NULL);
+
+	operation->mode = mode;
+	operation->uid = NAMESPACE_UID;
+	operation->gid = NAMESPACE_GID;
+	if (symlink != NULL) {
+		operation_data(operation, symlink, strlen(symlink));
+	}
+}
+
+void
+plan_device(struct plan *plan, size_t commit, const char *path, uint32_t mode, uint64_t device)
+{
+	plan_create(plan, commit, path, mode, NULL);
+	plan->operations[commit][plan->operation_count[commit] - 1].device = device;
+}
+
+void
+plan_link(struct plan *plan, size_t commit, const char *path, const char *target)
+{
+	(void)plan_namespace(plan, commit, OPERATION_LINK, path, target);
+}
+
+void
+plan_unlink(struct plan *plan, size_t commit, const char *path, int open)
+{
+	plan_namespace(plan, commit, OPERATION_UNLINK, path, NULL)->flags = open;
+}
+
+void
+plan_rename(struct plan *plan, size_t commit, const char *path, const char *target, int target_open)
+{
+	plan_namespace(plan, commit, OPERATION_RENAME, path, target)->flags = target_open;
+}
+
+void
+plan_set_xattr(struct plan *plan, size_t commit, const char *path, const char *name,
+    const void *value, size_t size, int flags)
+{
+	struct operation *operation = plan_namespace(plan, commit, OPERATION_SET_XATTR, path, name);
+
+	operation_data(operation, value, size);
+	operation->flags = flags;
+}
+
+void
+plan_remove_xattr(struct plan *plan, size_t commit, const char *path, const char *name)
+{
+	(void)plan_namespace(plan, commit, OPERATION_REMOVE_XATTR, path, name);
+}
+
+void
+plan_write_new(struct plan *plan, size_t commit, const char *path, uint64_t offset,
+    const void *data, size_t size)
+{
+	struct operation *operation = plan_namespace(plan, commit, OPERATION_WRITE, path, NULL);
+
+	operation_data(operation, data, size);
+	operation->offset = offset;
+}
+
+/* The inode is named at plan time; it has no name when the commit runs. */
+void
+plan_evict(struct context *context, struct plan *plan, size_t commit, const char *path)
+{
+	struct btrfs_inode inode;
+
+	REQUIRE(btrfs_image_lookup(plan_mount(context), path, &inode) == BTRFS_OK);
+	plan_namespace(plan, commit, OPERATION_EVICT, path, NULL)->id = inode.id;
+}
+
+void
+plan_clean(struct plan *plan, size_t commit, uint64_t tree, size_t expected)
+{
+	struct operation *operation =
+	    plan_namespace(plan, commit, OPERATION_CLEAN_ORPHANS, "/", NULL);
+
+	operation->id.tree = tree;
+	operation->size = expected;
+}
+
+struct expectation *
+expect(struct plan *plan, size_t first, size_t last, enum expectation_kind kind, const char *path)
+{
+	struct expectation *e;
+
+	REQUIRE(plan->expectation_count < MAX_EXPECTATIONS && first <= last);
+	e = &plan->expectations[plan->expectation_count++];
+	memset(e, 0, sizeof(*e));
+	e->first = first;
+	e->last = last;
+	e->kind = kind;
+	e->path = strdup(path);
+	REQUIRE(e->path != NULL);
+	plan->namespace = 1;
+	return e;
+}
+
+static void
+expectation_bytes(struct expectation *e, const void *bytes, size_t size)
+{
+	e->bytes = malloc(size + 1);
+	REQUIRE(e->bytes != NULL);
+	if (size != 0) {
+		memcpy(e->bytes, bytes, size);
+	}
+	e->size = size;
+}
+
+void
+expect_absent(struct plan *plan, size_t first, size_t last, const char *path)
+{
+	(void)expect(plan, first, last, EXPECT_ABSENT, path);
+}
+
+void
+expect_file(
+    struct plan *plan, size_t first, size_t last, const char *path, const void *bytes, size_t size)
+{
+	expectation_bytes(expect(plan, first, last, EXPECT_FILE, path), bytes, size);
+}
+
+void
+expect_text(struct plan *plan, size_t first, size_t last, const char *path, const char *text)
+{
+	expect_file(plan, first, last, path, text, strlen(text));
+}
+
+/* Contents of source in the committed state, expected at path. */
+void
+expect_current(struct context *context, struct plan *plan, size_t first, size_t last,
+    const char *path, const char *source)
+{
+	uint8_t *bytes;
+	size_t size;
+
+	bytes = read_file(plan_mount(context), source, &size);
+	expect_file(plan, first, last, path, bytes, size);
+	free(bytes);
+}
+
+void
+expect_symlink(struct plan *plan, size_t first, size_t last, const char *path, const char *target)
+{
+	expectation_bytes(expect(plan, first, last, EXPECT_SYMLINK, path), target, strlen(target));
+}
+
+void
+expect_same(struct plan *plan, size_t first, size_t last, const char *path, const char *other)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_SAME, path);
+
+	e->other = strdup(other);
+	REQUIRE(e->other != NULL);
+}
+
+/* value NULL expects the xattr to be absent. */
+void
+expect_xattr(struct plan *plan, size_t first, size_t last, const char *path, const char *name,
+    const void *value, size_t size)
+{
+	struct expectation *e =
+	    expect(plan, first, last, value == NULL ? EXPECT_NO_XATTR : EXPECT_XATTR, path);
+
+	e->other = strdup(name);
+	REQUIRE(e->other != NULL);
+	if (value != NULL) {
+		expectation_bytes(e, value, size);
+	}
+}
+
+void
+expect_stat(
+    struct plan *plan, size_t first, size_t last, const char *path, uint32_t mode, uint32_t links)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_STAT, path);
+
+	e->mode = mode;
+	e->uid = NAMESPACE_UID;
+	e->gid = NAMESPACE_GID;
+	e->links = links;
+}
+
+/* Owner and mode of source in the committed state, with links at path. */
+void
+expect_links(struct context *context, struct plan *plan, size_t first, size_t last,
+    const char *path, const char *source, uint32_t links)
+{
+	struct btrfs_inode inode;
+	struct expectation *e = expect(plan, first, last, EXPECT_STAT, path);
+
+	REQUIRE(btrfs_image_lookup(plan_mount(context), source, &inode) == BTRFS_OK);
+	e->mode = inode.mode;
+	e->uid = inode.uid;
+	e->gid = inode.gid;
+	e->links = links;
+}
+
+void
+expect_value(struct plan *plan, size_t first, size_t last, enum expectation_kind kind,
+    const char *path, uint64_t value)
+{
+	struct expectation *e = expect(plan, first, last, kind, path);
+
+	e->value = value;
+	e->mask = value;
+}
+
+/* The inode flags in mask equal value. */
+void
+expect_flags(
+    struct plan *plan, size_t first, size_t last, const char *path, uint64_t mask, uint64_t value)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_FLAGS, path);
+
+	e->value = value;
+	e->mask = mask;
+}
+
+static int
+compare_names(const void *left, const void *right)
+{
+	const char *a = *(const char *const *)left;
+	const char *b = *(const char *const *)right;
+
+	return strcmp(a, b);
+}
+
+/* A directory listing: names (sorted bytewise, each followed by a newline)
+ * and the size Linux keeps, twice the length of the names. */
+void
+expect_names(struct plan *plan, size_t first, size_t last, const char *path, const char **names,
+    size_t count)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_DIRECTORY, path);
+	size_t used = 0;
+	size_t i;
+
+	if (count > 1) {
+		qsort(names, count, sizeof(*names), compare_names);
+	}
+	for (i = 0; i < count; i++) {
+		used += strlen(names[i]) + 1;
+	}
+	e->bytes = malloc(used + 1);
+	REQUIRE(e->bytes != NULL);
+	for (i = 0; i < count; i++) {
+		memcpy(e->bytes + e->size, names[i], strlen(names[i]));
+		e->size += strlen(names[i]);
+		e->bytes[e->size++] = '\n';
+		e->value += 2 * (uint64_t)strlen(names[i]);
+	}
+}
+
+/* The committed listing of path with names added and removed (NULL-terminated
+ * lists, either may be NULL). */
+void
+expect_listing(struct context *context, struct plan *plan, size_t first, size_t last,
+    const char *path, const char *const *added, const char *const *removed)
+{
+	struct btrfs_inode directory;
+	const char **names;
+	uint8_t *listing;
+	size_t size;
+	size_t count = 0;
+	size_t start = 0;
+	size_t i;
+	size_t j;
+
+	REQUIRE(btrfs_image_lookup(plan_mount(context), path, &directory) == BTRFS_OK);
+	listing = list_directory(context->plan_fs, &directory, &size);
+	names = calloc(size + 64, sizeof(*names));
+	REQUIRE(names != NULL);
+	for (i = 0; i < size; i++) {
+		if (listing[i] == '\n') {
+			listing[i] = '\0';
+			names[count++] = (const char *)listing + start;
+			start = i + 1;
+		}
+	}
+	for (i = 0; removed != NULL && removed[i] != NULL; i++) {
+		for (j = 0; j < count && strcmp(names[j], removed[i]) != 0; j++) {
+		}
+		REQUIRE(j < count);
+		names[j] = names[--count];
+	}
+	for (i = 0; added != NULL && added[i] != NULL; i++) {
+		names[count++] = added[i];
+	}
+	expect_names(plan, first, last, path, names, count);
+	free(names);
+	free(listing);
+}
