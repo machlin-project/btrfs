@@ -80,6 +80,9 @@ if fixtures != ''
   test('free-space-tree', transaction_test,
     args: ['--data', '--fragment', join_paths(fixtures, 'transactions-fst.raw')], timeout: 600,
     suite: 'images')
+  test('block-group-growth', transaction_test,
+    args: ['--grow', join_paths(fixtures, 'transactions-grow.raw')], timeout: 900,
+    suite: 'images')
   test('keyed-references', transaction_test,
     args: ['--keyed', join_paths(fixtures, 'transactions-keyed.raw')], timeout: 300, suite: 'images')
   test('linux-reference-audit', reference_audit, args: [
@@ -89,7 +92,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions.raw'), join_paths(fixtures, 'transactions-dup.raw'),
     join_paths(fixtures, 'transactions-large.raw'), join_paths(fixtures, 'transactions-full.raw'),
     join_paths(fixtures, 'transactions-shared.raw'), join_paths(fixtures, 'transactions-keyed.raw'),
-    join_paths(fixtures, 'transactions-data.raw'), join_paths(fixtures, 'transactions-fst.raw')],
+    join_paths(fixtures, 'transactions-data.raw'), join_paths(fixtures, 'transactions-fst.raw'),
+    join_paths(fixtures, 'transactions-grow.raw')],
     suite: 'images')
   test('metadata-exhaustion', transaction_test,
     args: ['--full', join_paths(fixtures, 'transactions-full.raw')], timeout: 180, suite: 'images')

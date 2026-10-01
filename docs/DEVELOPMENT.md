@@ -46,8 +46,8 @@ the image helper is not an implementation of host or Linux namei.
 The six reader profiles are `plain`, `small-nodes`, `large-nodes`, `zlib`, `zstd`
 and `default-subvolume`. The transaction suites require seven writable profiles
 without a free-space tree and mounted with `nospace_cache`, plus
-`transactions-fst` with mkfs and mount defaults (16 KiB nodes, DUP metadata and a
-free-space tree): `transactions` (4 KiB
+`transactions-fst` and `transactions-grow` with mkfs and mount defaults (16 KiB
+nodes, DUP metadata and a free-space tree): `transactions` (4 KiB
 nodes, single metadata), `transactions-dup` (16 KiB nodes, DUP metadata),
 `transactions-large` (64 KiB nodes, DUP metadata), `transactions-full` (4 KiB
 nodes, single metadata, 128 MiB), and `transactions-shared`, `transactions-keyed`
@@ -67,8 +67,11 @@ unaligned 10,000-byte file, a 4 MiB sparse file, a 256 KiB preallocation, a zlib
 property file, a NODATASUM (`chattr +C`) file, an inline file and a reflink of
 the large file, then a writable and a read-only snapshot. The free-space-tree
 profile repeats the data payload, then writes 256 small files and removes every
-other one so Linux keeps that data block group's free space as bitmaps. Other
-profiles use 256 MiB. Each uses a separate disposable
+other one so Linux keeps that data block group's free space as bitmaps. The
+growth profile fills data, then metadata with leaf-sized xattr files until
+ENOSPC, deletes the data and the newest 600 fillers, and runs `btrfs balance
+start -dusage=0`, leaving nearly full metadata and unallocated device space.
+Other profiles use 256 MiB. Each uses a separate disposable
 raw image and the payload in `tests/prepare_linux.py`. The payload formats **guest
 `/dev/vda`**, fills files, takes a snapshot, verifies Linux-visible contents,
 unmounts, and requires `btrfs check --readonly` to succeed. Never attach a valuable
@@ -122,7 +125,7 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all fourteen
+Linux checks and a completed VM exit before consuming the image. Repeat all fifteen
 profiles, then run the portable image and transaction suites. It hashes each complete image before
 and after reading, verifies 312 contracts, and fails if any byte changed.
 
@@ -198,6 +201,7 @@ scenarios on a recorded device. It never writes the source fixture.
 | `repeated` | Two commits; the second starts from the first Machlin root set |
 | `shared-*`, `pair-convert` (`--shared`) | Writes in a snapshot source, its writable snapshot, alternately, and across three trees; leaves with reflinked and offset data references; FULL_BACKREF conversion and release |
 | `keyed-*` (`--keyed`) | The same decisions on blocks and extents whose references are partly keyed items |
+| `grow-*` (`--grow`) | Metadata and data chunk growth from unallocated device space |
 | `fst-*` (`--fragment`) | Frees between bitmap holes and a write that spills from extent-mode free space into bitmap holes |
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes |
 
@@ -210,10 +214,11 @@ scenario commit, and against deliberately damaged references.
 
 Each scenario's last commit runs allocation, read, write and barrier fault
 points: every point up to 512 per class, and a deterministic stride that keeps
-the first and last point for larger commits. Every recorded commit is then cut at each issue-order prefix and in each
-barrier epoch: 32 seeded metadata states persist arbitrary subsets of whole,
-missing, sector-subset or torn writes; each superblock epoch tries six tear
-patterns. Every state is classified by mounting the primary and by explicit
+the first and last point for larger commits. Every recorded commit is then cut
+at each issue-order prefix (the growth scenarios check 64 evenly spaced prefixes
+and every 50th of their 2,000 files) and in each barrier epoch: 32 seeded
+metadata states persist arbitrary subsets of whole, missing, sector-subset or
+torn writes; each superblock epoch tries six tear patterns. Every state is classified by mounting the primary and by explicit
 recovery. It must resolve to the acknowledged or new stage with exact contents,
 invariant snapshots/xattrs/links, and admit the next transaction. The suite also
 checks admission, stale copies, recovery refusals and checksum-correct damaged
@@ -224,7 +229,8 @@ NO_SPACE without any write.
 Export a profile's crash cases into a new generated directory. Pass the same
 profile flag Meson uses: `--full` for `transactions-full`, `--shared` for
 `transactions-shared`, `--keyed` for `transactions-keyed`, `--data` for
-`transactions-data` and `--data --fragment` for `transactions-fst`. Reader
+`transactions-data`, `--data --fragment` for `transactions-fst` and `--grow`
+for `transactions-grow`. Reader
 profiles with a free-space tree (`plain`, `small-nodes`) also run the default
 scenarios:
 

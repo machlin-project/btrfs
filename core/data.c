@@ -215,6 +215,7 @@ bt_tx_view(
 	view->env.allocate = bt_view_allocate;
 	view->env.release = bt_view_release;
 	view->env.decompress = bt_view_decompress;
+	view->chunk_count = transaction->fs.chunk_count;
 	view->checksum_tree = transaction->checksums.root;
 	view->selected_tree = tree->root;
 	return BTRFS_OK;
@@ -460,7 +461,7 @@ bt_tx_stage(
 	staged->length = length;
 	staged->mirrors = 1;
 	for (mirror = 0; error == BTRFS_OK && mirror < staged->mirrors; mirror++) {
-		error = bt_map(transaction->base, logical, (size_t)length, BT_BLOCK_DATA, mirror,
+		error = bt_map(&transaction->fs, logical, (size_t)length, BT_BLOCK_DATA, mirror,
 		    &staged->physical[mirror], &staged->mirrors);
 	}
 	if (error != BTRFS_OK) {

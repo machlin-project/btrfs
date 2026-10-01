@@ -2,6 +2,10 @@
 #include "space.h"
 
 #define BT_SPACE_MAX_GAPS 131072U
+/* New chunks: a tenth of the device, at most Linux's class limits. */
+#define BT_CHUNK_ALIGN (UINT64_C(1) << 20)
+#define BT_CHUNK_DATA_MAX (UINT64_C(1) << 30)
+#define BT_CHUNK_METADATA_MAX (UINT64_C(256) << 20)
 
 struct bt_gap {
 	uint64_t start, end;
@@ -17,10 +21,15 @@ struct bt_gaps {
 };
 
 struct bt_space {
-	const struct btrfs_fs *fs;
+	struct btrfs_fs *fs;
 	struct bt_gaps metadata;
 	struct bt_gaps data;
+	struct bt_gaps system;
+	/* Unallocated physical ranges of the device, known after verification. */
+	struct bt_gaps device;
 	uint64_t *used;
+	size_t original_chunks;
+	int growth;
 	struct bt_space_change *changes;
 	size_t change_count;
 	size_t change_capacity;
@@ -32,6 +41,9 @@ bt_space_class(struct bt_space *space, const struct bt_chunk *chunk)
 {
 	if (chunk->type & BT_BLOCK_METADATA) {
 		return &space->metadata;
+	}
+	if (chunk->type & BT_BLOCK_SYSTEM) {
+		return &space->system;
 	}
 	return chunk->type & BT_BLOCK_DATA ? &space->data : NULL;
 }
@@ -66,53 +78,46 @@ bt_space_gap(struct bt_space *space, struct bt_gaps *list, uint64_t start, uint6
 	return BTRFS_OK;
 }
 
-/* Exclude every physical superblock's whole stripe from allocation, including
- * each DUP mapping. Extent trees do not describe these reserved stripes. */
+/* Exclude every physical superblock's whole stripe of one chunk from
+ * allocation, including each DUP mapping. Extent trees do not describe these
+ * reserved stripes. */
 static enum btrfs_result
-bt_space_exclude_supers(struct bt_space *space)
+bt_space_exclude_chunk(struct bt_space *space, size_t chunk_index)
 {
-	const struct bt_chunk *chunk;
-	struct bt_gaps *list;
+	const struct bt_chunk *chunk = &space->fs->chunks[chunk_index];
+	struct bt_gaps *list = bt_space_class(space, chunk);
 	uint64_t physical;
 	uint64_t start;
 	uint64_t end;
 	uint64_t old_end;
-	size_t chunk_index;
 	size_t i;
 	unsigned mirror;
 	unsigned copy;
 	enum btrfs_result error;
 
-	for (chunk_index = 0; chunk_index < space->fs->chunk_count; chunk_index++) {
-		chunk = &space->fs->chunks[chunk_index];
-		list = bt_space_class(space, chunk);
-		for (copy = 0; list != NULL && copy < chunk->mirrors; copy++) {
-			for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
-				physical = bt_super_offset(mirror) & ~(BT_STRIPE_LENGTH - 1);
-				if (physical + BT_STRIPE_LENGTH <= chunk->physical[copy] ||
-				    physical >= chunk->physical[copy] + chunk->length) {
-					continue;
-				}
-				start = chunk->logical +
-				    (physical > chunk->physical[copy]
-					    ? physical - chunk->physical[copy]
-					    : 0);
-				end = physical + BT_STRIPE_LENGTH - chunk->physical[copy];
-				end = chunk->logical + (end < chunk->length ? end : chunk->length);
-				for (i = 0; i < list->count; i++) {
-					if (start < list->items[i].end &&
-					    end > list->items[i].start) {
-						old_end = list->items[i].end;
-						if (start <= list->items[i].start) {
-							list->items[i].start =
-							    end < old_end ? end : old_end;
-						} else {
-							list->items[i].end = start;
-							error =
-							    bt_space_gap(space, list, end, old_end);
-							if (error != BTRFS_OK) {
-								return error;
-							}
+	for (copy = 0; list != NULL && copy < chunk->mirrors; copy++) {
+		for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
+			physical = bt_super_offset(mirror) & ~(BT_STRIPE_LENGTH - 1);
+			if (physical + BT_STRIPE_LENGTH <= chunk->physical[copy] ||
+			    physical >= chunk->physical[copy] + chunk->length) {
+				continue;
+			}
+			start = chunk->logical +
+			    (physical > chunk->physical[copy] ? physical - chunk->physical[copy]
+							      : 0);
+			end = physical + BT_STRIPE_LENGTH - chunk->physical[copy];
+			end = chunk->logical + (end < chunk->length ? end : chunk->length);
+			for (i = 0; i < list->count; i++) {
+				if (start < list->items[i].end && end > list->items[i].start) {
+					old_end = list->items[i].end;
+					if (start <= list->items[i].start) {
+						list->items[i].start =
+						    end < old_end ? end : old_end;
+					} else {
+						list->items[i].end = start;
+						error = bt_space_gap(space, list, end, old_end);
+						if (error != BTRFS_OK) {
+							return error;
 						}
 					}
 				}
@@ -256,33 +261,148 @@ bt_space_load(struct bt_space *space, struct bt_root root)
 	return error;
 }
 
+/* Takes length bytes, aligned, from the first device gap that holds them. */
+static int
+bt_space_take(struct bt_gaps *device, uint64_t length, uint64_t *physical)
+{
+	struct bt_gap *gap;
+	uint64_t start;
+	size_t i;
+
+	for (i = 0; i < device->count; i++) {
+		gap = &device->items[i];
+		start = (gap->start + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
+		if (start >= gap->start && start <= gap->end && length <= gap->end - start) {
+			/* Alignment padding stays unallocated and is simply not reused. */
+			*physical = start;
+			gap->start = start + length;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Creates a chunk of the given class from unallocated device space, in memory
+ * only: the chunk map, block-group accounting and gaps grow now, and the
+ * transaction publishes chunk, device-extent, device, block-group and
+ * free-space items before writing. Profiles copy an existing chunk of the
+ * class. Undone with the whole transaction. */
+enum btrfs_result
+bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
+{
+	struct btrfs_fs *fs = space->fs;
+	struct bt_gaps saved = space->device;
+	struct bt_chunk *chunk;
+	struct bt_gap *copy;
+	uint64_t type = 0;
+	uint64_t logical = 0;
+	uint64_t length;
+	uint64_t limit = kind == BT_BLOCK_DATA ? BT_CHUNK_DATA_MAX : BT_CHUNK_METADATA_MAX;
+	uint64_t physical[2];
+	size_t i;
+	unsigned stripes;
+	unsigned stripe;
+	int fits;
+	enum btrfs_result error;
+
+	if (!space->growth || fs->chunk_count == BT_MAX_CHUNKS) {
+		return BTRFS_NO_SPACE;
+	}
+	for (i = 0; i < fs->chunk_count; i++) {
+		if ((fs->chunks[i].type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) ==
+			kind &&
+		    type == 0) {
+			type = fs->chunks[i].type;
+		}
+		if (fs->chunks[i].logical + fs->chunks[i].length > logical) {
+			logical = fs->chunks[i].logical + fs->chunks[i].length;
+		}
+	}
+	if (type == 0 || logical > UINT64_MAX - limit - BT_CHUNK_ALIGN) {
+		return BTRFS_NO_SPACE;
+	}
+	logical = (logical + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
+	stripes = type & BT_BLOCK_DUP ? 2 : 1;
+	length = fs->device_size / 10 & ~(BT_CHUNK_ALIGN - 1);
+	length = length > limit ? limit : length;
+	length = length < BT_CHUNK_ALIGN ? BT_CHUNK_ALIGN : length;
+	minimum = (minimum + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
+	length = length < minimum ? minimum : length;
+	/* Device gaps are copied so a failed attempt leaves them untouched. */
+	copy = fs->env.allocate(fs->env.context, (saved.count + 1) * sizeof(*copy));
+	if (copy == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	for (fits = 0; !fits && length >= minimum && length >= BT_CHUNK_ALIGN;
+	    length = (length / 2) & ~(BT_CHUNK_ALIGN - 1)) {
+		bt_copy(copy, saved.items, saved.count * sizeof(*copy));
+		space->device.items = copy;
+		fits = 1;
+		for (stripe = 0; fits && stripe < stripes; stripe++) {
+			fits = bt_space_take(&space->device, length, &physical[stripe]);
+		}
+		if (fits) {
+			break;
+		}
+	}
+	space->device.items = saved.items;
+	if (!fits) {
+		fs->env.release(fs->env.context, copy, (saved.count + 1) * sizeof(*copy));
+		return BTRFS_NO_SPACE;
+	}
+	bt_copy(saved.items, copy, saved.count * sizeof(*copy));
+	fs->env.release(fs->env.context, copy, (saved.count + 1) * sizeof(*copy));
+	chunk = &fs->chunks[fs->chunk_count];
+	bt_zero(chunk, sizeof(*chunk));
+	chunk->logical = logical;
+	chunk->length = length;
+	chunk->type = type;
+	chunk->mirrors = (uint8_t)stripes;
+	chunk->confirmed = 1;
+	for (stripe = 0; stripe < stripes; stripe++) {
+		chunk->physical[stripe] = physical[stripe];
+	}
+	space->used[fs->chunk_count] = 0;
+	fs->chunk_count++;
+	error = bt_space_gap(space, bt_space_class(space, chunk), logical, logical + length);
+	return error == BTRFS_OK ? bt_space_exclude_chunk(space, fs->chunk_count - 1) : error;
+}
+
 static enum btrfs_result
 bt_space_reserve(void *context, uint64_t owner, uint8_t level, uint64_t *logical)
 {
 	struct bt_space *space = context;
+	struct bt_gaps *list = owner == BT_CHUNK_TREE ? &space->system : &space->metadata;
 	struct bt_gap *gap;
 	uint64_t start;
 	uint64_t size = space->fs->info.node_size;
+	enum btrfs_result error;
 
 	(void)level;
-	if (owner == BT_CHUNK_TREE) {
-		return BTRFS_UNSUPPORTED;
-	}
-	while (space->metadata.next < space->metadata.count) {
-		gap = &space->metadata.items[space->metadata.next];
-		if (gap->start > UINT64_MAX - (size - 1)) {
-			space->metadata.next++;
-			continue;
+	for (;;) {
+		while (list->next < list->count) {
+			gap = &list->items[list->next];
+			if (gap->start > UINT64_MAX - (size - 1)) {
+				list->next++;
+				continue;
+			}
+			start = (gap->start + size - 1) & ~(size - 1);
+			if (start <= gap->end && size <= gap->end - start) {
+				*logical = start;
+				gap->start = start + size;
+				return BTRFS_OK;
+			}
+			list->next++;
 		}
-		start = (gap->start + size - 1) & ~(size - 1);
-		if (start <= gap->end && size <= gap->end - start) {
-			*logical = start;
-			gap->start = start + size;
-			return BTRFS_OK;
+		/* System chunks would need superblock bootstrap updates; never grown. */
+		if (owner == BT_CHUNK_TREE) {
+			return BTRFS_NO_SPACE;
 		}
-		space->metadata.next++;
+		error = bt_space_grow(space, BT_BLOCK_METADATA, size);
+		if (error != BTRFS_OK) {
+			return error;
+		}
 	}
-	return BTRFS_NO_SPACE;
 }
 
 enum btrfs_result
@@ -290,22 +410,29 @@ bt_space_reserve_data(struct bt_space *space, uint64_t length, uint64_t *logical
 {
 	struct bt_gap *gap;
 	uint64_t sector = space->fs->info.sector_size;
+	enum btrfs_result error;
 
 	if (length == 0 || length % sector != 0) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	while (space->data.next < space->data.count) {
-		gap = &space->data.items[space->data.next];
-		if (gap->end - gap->start >= sector) {
-			*logical = gap->start;
-			*size = gap->end - gap->start < length ? gap->end - gap->start : length;
-			*size -= *size % sector;
-			gap->start += *size;
-			return BTRFS_OK;
+	for (;;) {
+		while (space->data.next < space->data.count) {
+			gap = &space->data.items[space->data.next];
+			if (gap->end - gap->start >= sector) {
+				*logical = gap->start;
+				*size =
+				    gap->end - gap->start < length ? gap->end - gap->start : length;
+				*size -= *size % sector;
+				gap->start += *size;
+				return BTRFS_OK;
+			}
+			space->data.next++;
 		}
-		space->data.next++;
+		error = bt_space_grow(space, BT_BLOCK_DATA, length);
+		if (error != BTRFS_OK) {
+			return error;
+		}
 	}
-	return BTRFS_NO_SPACE;
 }
 
 static void
@@ -318,8 +445,8 @@ bt_space_release(void *context, uint64_t address)
 }
 
 enum btrfs_result
-bt_space_create(const struct btrfs_fs *fs, struct bt_root extent_root, size_t node_limit,
-    struct bt_space **result)
+bt_space_create(
+    struct btrfs_fs *fs, struct bt_root extent_root, size_t node_limit, struct bt_space **result)
 {
 	struct bt_space *space;
 	const struct bt_chunk *a;
@@ -354,10 +481,11 @@ bt_space_create(const struct btrfs_fs *fs, struct bt_root extent_root, size_t no
 	bt_zero(space, sizeof(*space));
 	space->fs = fs;
 	space->node_limit = node_limit;
-	space->used = fs->env.allocate(fs->env.context, fs->chunk_count * sizeof(*space->used));
+	space->original_chunks = fs->chunk_count;
+	space->used = fs->env.allocate(fs->env.context, BT_MAX_CHUNKS * sizeof(*space->used));
 	error = space->used == NULL ? BTRFS_NO_MEMORY : bt_space_load(space, extent_root);
-	if (error == BTRFS_OK) {
-		error = bt_space_exclude_supers(space);
+	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
+		error = bt_space_exclude_chunk(space, i);
 	}
 	if (error != BTRFS_OK) {
 		bt_space_destroy(space);
@@ -365,6 +493,131 @@ bt_space_create(const struct btrfs_fs *fs, struct bt_root extent_root, size_t no
 	}
 	*result = space;
 	return BTRFS_OK;
+}
+
+static struct bt_chunk *
+bt_space_chunk_at(struct btrfs_fs *fs, uint64_t logical)
+{
+	size_t low = 0;
+	size_t high = fs->chunk_count;
+	size_t middle;
+
+	while (low < high) {
+		middle = low + (high - low) / 2;
+		if (fs->chunks[middle].logical < logical) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low < fs->chunk_count && fs->chunks[low].logical == logical ? &fs->chunks[low]
+									   : NULL;
+}
+
+enum btrfs_result
+bt_space_devices(struct bt_space *space, struct bt_root chunk_tree, struct bt_root device_tree)
+{
+	struct btrfs_fs *fs = space->fs;
+	const struct bt_disk_device *device;
+	const struct bt_disk_dev_extent *extent;
+	struct bt_chunk *chunk;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = {
+		.objectid = BT_DEV_ITEMS_OBJECTID, .type = BT_DEV_ITEM, .offset = fs->device_id
+	};
+	uint8_t *seen;
+	uint64_t total = 0;
+	uint64_t used = 0;
+	uint64_t position = BT_DEVICE_RESERVED;
+	uint64_t sum = 0;
+	size_t i;
+	unsigned stripe;
+	enum btrfs_result error;
+
+	bt_cursor_init(&cursor, fs, chunk_tree);
+	error = bt_cursor_seek(&cursor, key, 0);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		device = (const void *)record.data;
+		if (bt_key_compare(record.key, key) != 0 || record.size != sizeof(*device) ||
+		    bt_u64(device->id) != fs->device_id ||
+		    !bt_equal(device->uuid, fs->device_uuid, BTRFS_UUID_SIZE)) {
+			error = BTRFS_CORRUPT;
+		} else {
+			total = bt_u64(device->total_bytes);
+			used = bt_u64(device->used_bytes);
+			error = total != fs->device_size || used > total ? BTRFS_CORRUPT : BTRFS_OK;
+		}
+	}
+	bt_cursor_fini(&cursor);
+	if (error != BTRFS_OK) {
+		return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
+	}
+	seen = fs->env.allocate(fs->env.context, fs->chunk_count);
+	if (seen == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	bt_zero(seen, fs->chunk_count);
+	/* Every device extent maps exactly one chunk stripe, in ascending order. */
+	key = (struct bt_key){ .objectid = fs->device_id, .type = BT_DEV_EXTENT };
+	bt_cursor_init(&cursor, fs, device_tree);
+	error = bt_cursor_seek(&cursor, key, 0);
+	while (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.objectid != fs->device_id || record.key.type != BT_DEV_EXTENT) {
+			break;
+		}
+		extent = (const void *)record.data;
+		chunk = record.size == sizeof(*extent)
+		    ? bt_space_chunk_at(fs, bt_u64(extent->chunk_offset))
+		    : NULL;
+		if (chunk == NULL || bt_u64(extent->chunk_tree) != BT_CHUNK_TREE ||
+		    bt_u64(extent->chunk_objectid) != BT_FIRST_CHUNK_OBJECTID ||
+		    bt_u64(extent->length) != chunk->length || record.key.offset < position ||
+		    chunk->length > total - record.key.offset) {
+			error = BTRFS_CORRUPT;
+			break;
+		}
+		for (stripe = 0; stripe < chunk->mirrors; stripe++) {
+			if (chunk->physical[stripe] == record.key.offset &&
+			    !(seen[chunk - fs->chunks] & (1U << stripe))) {
+				seen[chunk - fs->chunks] |= (uint8_t)(1U << stripe);
+				break;
+			}
+		}
+		if (stripe == chunk->mirrors) {
+			error = BTRFS_CORRUPT;
+			break;
+		}
+		error = bt_space_gap(space, &space->device, position, record.key.offset);
+		position = record.key.offset + chunk->length;
+		sum += chunk->length;
+		if (error == BTRFS_OK) {
+			error = bt_cursor_next(&cursor);
+		}
+	}
+	bt_cursor_fini(&cursor);
+	if (error == BTRFS_NOT_FOUND || error == BTRFS_OK) {
+		error = bt_space_gap(space, &space->device, position, total);
+	}
+	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
+		if (seen[i] != (1U << fs->chunks[i].mirrors) - 1) {
+			error = BTRFS_CORRUPT;
+		}
+	}
+	if (error == BTRFS_OK && sum != used) {
+		error = BTRFS_CORRUPT;
+	}
+	fs->env.release(fs->env.context, seen, fs->chunk_count);
+	space->growth = error == BTRFS_OK;
+	return error;
+}
+
+size_t
+bt_space_original_chunks(const struct bt_space *space)
+{
+	return space->original_chunks;
 }
 
 void
@@ -466,8 +719,15 @@ bt_space_destroy(struct bt_space *space)
 		    space->data.capacity * sizeof(*space->data.items));
 	}
 	if (space->used != NULL) {
-		env->release(
-		    env->context, space->used, space->fs->chunk_count * sizeof(*space->used));
+		env->release(env->context, space->used, BT_MAX_CHUNKS * sizeof(*space->used));
+	}
+	if (space->system.items != NULL) {
+		env->release(env->context, space->system.items,
+		    space->system.capacity * sizeof(*space->system.items));
+	}
+	if (space->device.items != NULL) {
+		env->release(env->context, space->device.items,
+		    space->device.capacity * sizeof(*space->device.items));
 	}
 	if (space->changes != NULL) {
 		env->release(

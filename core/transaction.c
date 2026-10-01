@@ -109,9 +109,18 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	transaction->base = base;
 	transaction->io = *environment;
 	transaction->roots = base->root_tree;
+	transaction->chunks = base->chunk_tree;
+	transaction->fs = *base;
+	transaction->fs.chunks =
+	    base->env.allocate(base->env.context, BT_MAX_CHUNKS * sizeof(*base->chunks));
+	if (transaction->fs.chunks != NULL) {
+		bt_copy(transaction->fs.chunks, base->chunks,
+		    base->chunk_count * sizeof(*base->chunks));
+	}
 	transaction->scratch = base->env.allocate(base->env.context, base->info.node_size);
 	transaction->original = base->env.allocate(base->env.context, base->info.node_size);
-	error = transaction->scratch == NULL || transaction->original == NULL
+	error = transaction->scratch == NULL || transaction->original == NULL ||
+		transaction->fs.chunks == NULL
 	    ? BTRFS_NO_MEMORY
 	    : bt_read_physical(base, BT_SUPER_OFFSET, &transaction->original_super,
 		  sizeof(transaction->original_super));
@@ -146,15 +155,20 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 		error = bt_find_root(base, BTRFS_TOP_LEVEL_TREE, &transaction->top);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_find_root(base, BT_DEV_TREE, &transaction->devices);
+		error = bt_tx_root(base, BT_DEV_TREE, &transaction->devices);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_space_create(
-		    base, transaction->extents.root, BT_TRANSACTION_NODES, &transaction->space);
+		error = bt_space_create(&transaction->fs, transaction->extents.root,
+		    BT_TRANSACTION_NODES, &transaction->space);
+	}
+	if (error == BTRFS_OK) {
+		transaction->chunks_published = bt_space_original_chunks(transaction->space);
+		error = bt_space_devices(
+		    transaction->space, transaction->chunks, transaction->devices.root);
 	}
 	if (error == BTRFS_OK) {
 		bt_space_allocator(transaction->space, &allocator);
-		error = bt_mutation_create(base, &allocator, &transaction->mutation);
+		error = bt_mutation_create(&transaction->fs, &allocator, &transaction->mutation);
 	}
 	if (error != BTRFS_OK) {
 		btrfs_transaction_destroy(transaction);
@@ -572,7 +586,6 @@ static void
 bt_tx_backup(struct btrfs_transaction *transaction)
 {
 	struct bt_disk_root_backup *backup;
-	const struct btrfs_fs *base = transaction->base;
 	struct bt_root top = transaction->top;
 	unsigned oldest = 0;
 	unsigned i;
@@ -599,18 +612,109 @@ bt_tx_backup(struct btrfs_transaction *transaction)
 	bt_put64(&backup->files, top.address);
 	bt_put64(&backup->files_generation, top.generation);
 	backup->files_level = top.level;
-	bt_put64(&backup->chunk, base->chunk_tree.address);
-	bt_put64(&backup->chunk_generation, base->chunk_tree.generation);
-	backup->chunk_level = base->chunk_tree.level;
-	bt_put64(&backup->device, transaction->devices.address);
-	bt_put64(&backup->device_generation, transaction->devices.generation);
-	backup->device_level = transaction->devices.level;
+	bt_put64(&backup->chunk, transaction->chunks.address);
+	bt_put64(&backup->chunk_generation, transaction->chunks.generation);
+	backup->chunk_level = transaction->chunks.level;
+	bt_put64(&backup->device, transaction->devices.root.address);
+	bt_put64(&backup->device_generation, transaction->devices.root.generation);
+	backup->device_level = transaction->devices.root.level;
 	bt_put64(&backup->checksum, transaction->checksums.root.address);
 	bt_put64(&backup->checksum_generation, transaction->checksums.root.generation);
 	backup->checksum_level = transaction->checksums.root.level;
 	backup->total_bytes = transaction->super.total_bytes;
 	backup->used_bytes = transaction->super.used_bytes;
 	bt_put64(&backup->devices, 1);
+}
+
+/* Records chunks created by growth: chunk item and device item in the chunk
+ * tree, device extents, the block group (its total follows each round) and,
+ * with a free-space tree, its info and one free extent before any logged
+ * allocation inside it is applied. */
+static enum btrfs_result
+bt_tx_publish_chunks(struct btrfs_transaction *transaction)
+{
+	struct {
+		struct bt_disk_chunk chunk;
+		struct bt_disk_stripe stripes[2];
+	} item;
+	struct bt_disk_dev_extent extent;
+	struct bt_disk_device device;
+	struct bt_disk_block_group group;
+	struct bt_disk_free_space_info info;
+	const struct bt_chunk *chunk;
+	const struct btrfs_fs *base = transaction->base;
+	struct bt_key key;
+	size_t size;
+	unsigned stripe;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (; error == BTRFS_OK && transaction->chunks_published < transaction->fs.chunk_count;
+	    transaction->chunks_published++) {
+		chunk = &transaction->fs.chunks[transaction->chunks_published];
+		bt_zero(&item, sizeof(item));
+		bt_put64(&item.chunk.length, chunk->length);
+		bt_put64(&item.chunk.owner, BT_EXTENT_TREE);
+		bt_put64(&item.chunk.stripe_length, BT_STRIPE_LENGTH);
+		bt_put64(&item.chunk.type, chunk->type);
+		bt_put32(&item.chunk.io_align, BT_STRIPE_LENGTH);
+		bt_put32(&item.chunk.io_width, BT_STRIPE_LENGTH);
+		bt_put32(&item.chunk.sector_size, base->info.sector_size);
+		bt_put16(&item.chunk.stripes, chunk->mirrors);
+		bt_put16(&item.chunk.sub_stripes, 1);
+		for (stripe = 0; stripe < chunk->mirrors; stripe++) {
+			bt_put64(&item.stripes[stripe].device, base->device_id);
+			bt_put64(&item.stripes[stripe].offset, chunk->physical[stripe]);
+			bt_copy(item.stripes[stripe].uuid, base->device_uuid, BTRFS_UUID_SIZE);
+		}
+		key = (struct bt_key){ BT_FIRST_CHUNK_OBJECTID, chunk->logical, BT_CHUNK_ITEM };
+		error = bt_tx_edit(transaction, &transaction->chunks, key, &item,
+		    sizeof(item.chunk) + chunk->mirrors * sizeof(item.stripes[0]), BT_INSERT);
+		for (stripe = 0; error == BTRFS_OK && stripe < chunk->mirrors; stripe++) {
+			bt_zero(&extent, sizeof(extent));
+			bt_put64(&extent.chunk_tree, BT_CHUNK_TREE);
+			bt_put64(&extent.chunk_objectid, BT_FIRST_CHUNK_OBJECTID);
+			bt_put64(&extent.chunk_offset, chunk->logical);
+			bt_put64(&extent.length, chunk->length);
+			key = (struct bt_key){ base->device_id, chunk->physical[stripe],
+				BT_DEV_EXTENT };
+			error = bt_tx_edit(transaction, &transaction->devices.root, key, &extent,
+			    sizeof(extent), BT_INSERT);
+		}
+		key = (struct bt_key){ BT_DEV_ITEMS_OBJECTID, base->device_id, BT_DEV_ITEM };
+		if (error == BTRFS_OK) {
+			error = bt_mutation_find(transaction->mutation, transaction->chunks, key,
+			    &device, sizeof(device), &size);
+			error = error == BTRFS_OK && size != sizeof(device) ? BTRFS_CORRUPT : error;
+		}
+		if (error == BTRFS_OK) {
+			bt_put64(&device.used_bytes,
+			    bt_u64(device.used_bytes) + chunk->length * chunk->mirrors);
+			transaction->super.device.used_bytes = device.used_bytes;
+			error = bt_tx_edit(transaction, &transaction->chunks, key, &device,
+			    sizeof(device), BT_REPLACE);
+		}
+		if (error == BTRFS_OK) {
+			bt_zero(&group, sizeof(group));
+			bt_put64(&group.chunk_objectid, BT_FIRST_CHUNK_OBJECTID);
+			bt_put64(&group.flags, chunk->type);
+			key = (struct bt_key){ chunk->logical, chunk->length, BT_BLOCK_GROUP_ITEM };
+			error = bt_tx_edit(transaction, &transaction->extents.root, key, &group,
+			    sizeof(group), BT_INSERT);
+		}
+		if (error == BTRFS_OK && transaction->has_free_space) {
+			bt_put32(&info.extent_count, 1);
+			bt_put32(&info.flags, 0);
+			key = (struct bt_key){ chunk->logical, chunk->length, BT_FREE_SPACE_INFO };
+			error = bt_tx_edit(transaction, &transaction->free_space.root, key, &info,
+			    sizeof(info), BT_INSERT);
+			key.type = BT_FREE_SPACE_EXTENT;
+			if (error == BTRFS_OK) {
+				error = bt_tx_edit(transaction, &transaction->free_space.root, key,
+				    NULL, 0, BT_INSERT);
+			}
+		}
+	}
+	return error;
 }
 
 /* Applies the allocations and releases logged since the previous round. */
@@ -627,8 +731,14 @@ bt_tx_free_space(struct btrfs_transaction *transaction)
 	    transaction->free_space_applied < bt_space_change_count(transaction->space);
 	    transaction->free_space_applied++) {
 		change = bt_space_change(transaction->space, transaction->free_space_applied);
+		if (change->chunk >= transaction->chunks_published) {
+			error = bt_tx_publish_chunks(transaction);
+			if (error != BTRFS_OK) {
+				break;
+			}
+		}
 		error = bt_fst_change(transaction->mutation, &transaction->free_space.root,
-		    &transaction->base->chunks[change->chunk], change->start, change->length,
+		    &transaction->fs.chunks[change->chunk], change->start, change->length,
 		    change->allocate);
 	}
 	if (error == BTRFS_OK &&
@@ -682,8 +792,12 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 		}
 		before = bt_mutation_count(transaction->mutation);
 		used = 0;
-		for (i = 0; i < transaction->base->chunk_count; i++) {
-			chunk = &transaction->base->chunks[i];
+		for (i = 0; i < transaction->fs.chunk_count; i++) {
+			error = bt_tx_publish_chunks(transaction);
+			if (error != BTRFS_OK) {
+				return error;
+			}
+			chunk = &transaction->fs.chunks[i];
 			bt_put64(&item.used_bytes, bt_space_used(transaction->space, i));
 			bt_put64(&item.chunk_objectid, BT_FIRST_CHUNK_OBJECTID);
 			bt_put64(&item.flags, chunk->type);
@@ -700,6 +814,11 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 		error = bt_tx_free_space(transaction);
 		if (error == BTRFS_OK) {
 			error = bt_tx_update_root(transaction, &transaction->extents);
+		}
+		if (error == BTRFS_OK &&
+		    transaction->devices.root.address !=
+			bt_u64(transaction->devices.item.legacy.bytenr)) {
+			error = bt_tx_update_root(transaction, &transaction->devices);
 		}
 		if (error != BTRFS_OK) {
 			return error;
@@ -721,6 +840,10 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 			    &transaction->super.generation, transaction->base->info.generation + 1);
 			bt_put64(&transaction->super.root, transaction->roots.address);
 			transaction->super.root_level = transaction->roots.level;
+			bt_put64(&transaction->super.chunk_root, transaction->chunks.address);
+			bt_put64(
+			    &transaction->super.chunk_generation, transaction->chunks.generation);
+			transaction->super.chunk_level = transaction->chunks.level;
 			/* A v1 free-space cache is advisory and has not been maintained. */
 			bt_put64(&transaction->super.cache_generation, UINT64_MAX);
 			bt_tx_backup(transaction);
@@ -768,8 +891,10 @@ bt_tx_persist(struct btrfs_transaction *transaction)
 			}
 			mirrors = 1;
 			for (mirror = 0; mirror < mirrors; mirror++) {
-				error = bt_map(transaction->base, block.address, block.size,
-				    BT_BLOCK_METADATA, mirror, &physical, &mirrors);
+				error = bt_map(&transaction->fs, block.address, block.size,
+				    block.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM
+								 : BT_BLOCK_METADATA,
+				    mirror, &physical, &mirrors);
 				if (error == BTRFS_OK) {
 					error = transaction->io.write(transaction->io.context,
 					    physical, block.bytes, block.size);
@@ -860,6 +985,10 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 	if (transaction->original != NULL) {
 		env->release(
 		    env->context, transaction->original, transaction->base->info.node_size);
+	}
+	if (transaction->fs.chunks != NULL) {
+		env->release(env->context, transaction->fs.chunks,
+		    BT_MAX_CHUNKS * sizeof(*transaction->fs.chunks));
 	}
 	env->release(env->context, transaction, sizeof(*transaction));
 }

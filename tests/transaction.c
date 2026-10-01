@@ -24,10 +24,10 @@
 #define MAX_WRITE (1024U * 1024U)
 #define WRITE_SECTORS (MAX_WRITE / DEVICE_SECTOR)
 #define INLINE_LIMIT 2048U
-#define MAX_FILES 32U
+#define MAX_FILES 4096U
 #define MAX_STAGES 4U
-#define MAX_OPERATIONS 32U
-#define MAX_FILE_BYTES (UINT64_C(16) * 1024 * 1024)
+#define MAX_OPERATIONS 4096U
+#define MAX_FILE_BYTES (UINT64_C(64) * 1024 * 1024)
 #define MAX_RECOVERY_WRITES BTRFS_SUPER_COPIES
 #define METADATA_SAMPLES 32U
 #define EXPORT_SAMPLES 8U
@@ -48,6 +48,8 @@
 #define EXHAUSTION_WRITE_BYTES (16U * 1024U * 1024U)
 #define FRAGMENT_WRITE_BYTES (2U * 1024U * 1024U)
 #define FAULT_POINTS 512U
+#define GROW_FILES 2000U
+#define GROW_DATA_BYTES (40U * 1024U * 1024U)
 #define SYNTHETIC_COMMIT SIZE_MAX
 
 enum fault { FAULT_NONE, FAULT_ALLOCATE, FAULT_READ, FAULT_WRITE, FAULT_FLUSH, FAULT_MODES };
@@ -97,11 +99,18 @@ struct operation {
  * by applying that commit's operations to a byte model of each file. */
 struct plan {
 	const char *name;
-	struct tracked files[MAX_FILES];
+	struct tracked *files;
 	size_t file_count;
 	size_t commits;
-	struct operation operations[MAX_STAGES][MAX_OPERATIONS];
+	struct operation *operations[MAX_STAGES];
 	size_t operation_count[MAX_STAGES];
+	/* Large commits bound the checked prefixes and fault points per class. */
+	size_t prefix_points;
+	size_t fault_points;
+	/* Chunks the first commit must add from unallocated device space. */
+	size_t new_chunks;
+	/* Every file is modeled; states check every verify_stride-th one. */
+	size_t verify_stride;
 };
 
 struct totals {
@@ -138,6 +147,7 @@ struct context {
 	size_t states;
 	size_t recoveries;
 	size_t audits;
+	struct btrfs_fs *plan_fs;
 	uint32_t seed;
 };
 
@@ -384,7 +394,7 @@ check_stage(struct context *context, struct btrfs_fs *fs, const struct plan *pla
 
 	btrfs_get_info(fs, &info);
 	REQUIRE(info.generation == context->base_generation + stage);
-	for (i = 0; i < plan->file_count; i++) {
+	for (i = 0; i < plan->file_count; i += plan->verify_stride == 0 ? 1 : plan->verify_stride) {
 		file = &plan->files[i];
 		contents = read_file(fs, file->path, &size);
 		if (size != file->size[stage] ||
@@ -396,6 +406,21 @@ check_stage(struct context *context, struct btrfs_fs *fs, const struct plan *pla
 		free(contents);
 	}
 	check_invariants(fs);
+}
+
+static void
+plan_init(struct plan *plan)
+{
+	size_t stage;
+
+	memset(plan, 0, sizeof(*plan));
+	plan->files = calloc(MAX_FILES, sizeof(*plan->files));
+	REQUIRE(plan->files != NULL);
+	for (stage = 1; stage < MAX_STAGES; stage++) {
+		plan->operations[stage] = calloc(MAX_OPERATIONS, sizeof(*plan->operations[stage]));
+		REQUIRE(plan->operations[stage] != NULL);
+	}
+	plan->fault_points = FAULT_POINTS;
 }
 
 static size_t
@@ -414,9 +439,14 @@ plan_file(struct context *context, struct plan *plan, const char *path)
 	file = &plan->files[plan->file_count];
 	memset(file, 0, sizeof(*file));
 	strcpy(file->path, path);
-	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	/* Plans are built against the committed state, which no write changes until
+	 * run_plan releases this mount. */
+	if (context->plan_fs == NULL) {
+		REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &context->plan_fs) ==
+		    BTRFS_OK);
+	}
+	fs = context->plan_fs;
 	file->data[0] = read_file(fs, path, &file->size[0]);
-	btrfs_unmount(fs);
 	return plan->file_count++;
 }
 
@@ -531,7 +561,9 @@ plan_destroy(struct plan *plan)
 		for (i = 0; i < plan->operation_count[stage]; i++) {
 			free(plan->operations[stage][i].data);
 		}
+		free(plan->operations[stage]);
 	}
+	free(plan->files);
 }
 
 /* Classify a durable state the way an owner must: mount the primary, then ask
@@ -846,13 +878,18 @@ crash_states(struct context *context, const struct plan *plan, struct exporter *
 	size_t sector;
 	size_t i;
 	size_t bucket;
+	size_t stride;
 	size_t exported = 0;
 	unsigned epoch;
 	unsigned pattern;
 	unsigned choice;
 
-	/* Every prefix is checked; about EXPORT_PREFIXES evenly spaced ones are exported. */
-	for (prefix = 0; prefix <= count; prefix++) {
+	/* Every prefix is checked unless the plan bounds them; about EXPORT_PREFIXES
+	 * evenly spaced ones are exported. */
+	stride =
+	    plan->prefix_points == 0 ? 1 : (count + plan->prefix_points - 1) / plan->prefix_points;
+	for (prefix = 0; prefix <= count;
+	    prefix = prefix < count && prefix + stride > count ? count : prefix + stride) {
 		for (i = first; i < last; i++) {
 			show(&device->writes[i], i - first < prefix);
 		}
@@ -905,7 +942,7 @@ static enum btrfs_result
 attempt(struct context *context, const struct plan *plan, size_t commit, enum fault fault,
     size_t point, struct totals *totals)
 {
-	struct btrfs_object_id ids[MAX_OPERATIONS];
+	struct btrfs_object_id *ids;
 	struct btrfs_fs *fs;
 	struct btrfs_transaction *transaction = NULL;
 	struct btrfs_inode inode;
@@ -917,6 +954,8 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	size_t i;
 	enum btrfs_result result;
 
+	ids = calloc(plan->operation_count[commit] + 1, sizeof(*ids));
+	REQUIRE(ids != NULL);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	for (i = 0; i < plan->operation_count[commit]; i++) {
 		REQUIRE(btrfs_image_lookup(fs, plan->files[plan->operations[commit][i].file].path,
@@ -969,6 +1008,7 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	}
 	btrfs_transaction_destroy(transaction);
 	btrfs_unmount(fs);
+	free(ids);
 	REQUIRE(context->image.live_allocations == 0);
 	return result;
 }
@@ -995,7 +1035,7 @@ fault_sweeps(struct context *context, const struct plan *plan, size_t commit, si
 	for (fault = FAULT_ALLOCATE; fault < FAULT_MODES; fault++) {
 		/* Every point up to FAULT_POINTS per class; larger commits use a
 		 * deterministic stride that keeps the first and last points. */
-		stride = (limits[fault] + FAULT_POINTS - 1) / FAULT_POINTS;
+		stride = (limits[fault] + plan->fault_points - 1) / plan->fault_points;
 		for (point = 1; point <= limits[fault];
 		    point = point < limits[fault] && point + stride > limits[fault]
 			? limits[fault]
@@ -1024,6 +1064,37 @@ fault_sweeps(struct context *context, const struct plan *plan, size_t commit, si
 		}
 		REQUIRE(failures[fault] != 0);
 	}
+}
+
+static size_t
+chunk_count(struct context *context)
+{
+	struct btrfs_fs *fs;
+	size_t count;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	count = fs->chunk_count;
+	btrfs_unmount(fs);
+	return count;
+}
+
+static void
+check_growth(struct context *context, const struct plan *plan)
+{
+	struct device *device = context->device;
+	size_t count = device->count;
+	size_t grown = chunk_count(context);
+	size_t before;
+
+	/* Compare with the committed state preceding this plan's first commit. */
+	while (device->count != 0 && device->writes[device->count - 1].commit != SYNTHETIC_COMMIT &&
+	    device->writes[device->count - 1].commit >= 1) {
+		device->count--;
+	}
+	before = chunk_count(context);
+	device->count = count;
+	REQUIRE(grown >= before + plan->new_chunks);
+	printf("%s: %zu chunks before, %zu after\n", plan->name, before, grown);
 }
 
 /* Every committed root set must satisfy the independent reference audit. */
@@ -1058,12 +1129,20 @@ run_plan(struct context *context, struct plan *plan)
 	size_t first;
 	size_t states = context->states;
 	size_t recoveries = context->recoveries;
+	enum btrfs_result result;
 
+	btrfs_unmount(context->plan_fs);
+	context->plan_fs = NULL;
 	plan_finish(plan);
 	export_begin(context, plan, &exporter);
 	for (commit = 1; commit <= plan->commits; commit++) {
 		first = device->count;
-		REQUIRE(attempt(context, plan, commit, FAULT_NONE, 0, &totals) == BTRFS_OK);
+		result = attempt(context, plan, commit, FAULT_NONE, 0, &totals);
+		if (result != BTRFS_OK) {
+			fprintf(stderr, "%s commit %zu: %s\n", plan->name, commit,
+			    btrfs_result_string(result));
+			exit(1);
+		}
 		REQUIRE(totals.flushes == BARRIERS && totals.writes == device->count - first);
 		REQUIRE(device->writes[device->count - 1].offset == BT_SUPER_OFFSET);
 		printf("%s commit %zu: %zu writes, %zu barriers, %llu allocations, %llu reads\n",
@@ -1071,6 +1150,9 @@ run_plan(struct context *context, struct plan *plan)
 		    (unsigned long long)totals.allocations, (unsigned long long)totals.reads);
 		export_writes(context, &exporter);
 		audit_state(context, plan->name);
+		if (commit == 1 && plan->new_chunks != 0) {
+			check_growth(context, plan);
+		}
 		crash_states(context, plan, &exporter, commit, first);
 		if (commit == plan->commits) {
 			truncate_writes(device, first);
@@ -1098,17 +1180,17 @@ plan_scenarios(struct context *context)
 	size_t i;
 	size_t entry;
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "replace";
 	plan_update(context, &plan, 1, "/greeting", replacement, sizeof(replacement) - 1);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "empty";
 	plan_update(context, &plan, 1, "/greeting", NULL, 0);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "maximum";
 	for (i = 0; i < INLINE_LIMIT; i++) {
 		data[i] = (uint8_t)(i * 7 + 3);
@@ -1117,7 +1199,7 @@ plan_scenarios(struct context *context)
 	run_plan(context, &plan);
 
 	/* Many inodes in several leaves, with growing items, in one transaction. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "batch";
 	plan_update(context, &plan, 1, "/greeting", replacement, sizeof(replacement) - 1);
 	for (entry = 0; entry < MANY_ENTRIES; entry += BATCH_STRIDE) {
@@ -1131,7 +1213,7 @@ plan_scenarios(struct context *context)
 	run_plan(context, &plan);
 
 	/* The second commit starts from a Machlin-written root set. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "repeated";
 	plan_update(context, &plan, 1, "/greeting", "first Machlin commit\n", 21);
 	plan_update(context, &plan, 1, "/many/entry-0001", "one\n", 4);
@@ -1198,14 +1280,14 @@ shared_scenarios(struct context *context)
 	struct plan plan;
 	size_t i;
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "shared-source";
 	for (i = 0; i < sizeof(spread) / sizeof(spread[0]); i++) {
 		shared_update(context, &plan, 1, "shared", spread[i]);
 	}
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "shared-snapshot";
 	for (i = 0; i < sizeof(spread) / sizeof(spread[0]); i++) {
 		shared_update(context, &plan, 1, "shared-snap", spread[i]);
@@ -1214,7 +1296,7 @@ shared_scenarios(struct context *context)
 
 	/* The source converts shared blocks first; the snapshot then CoWs blocks
 	 * with parent-named references, and the source continues afterwards. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "shared-alternate";
 	shared_update(context, &plan, 1, "shared", 100);
 	shared_update(context, &plan, 1, "shared", SHARED_LAST);
@@ -1226,7 +1308,7 @@ shared_scenarios(struct context *context)
 
 	/* The tail file's leaf holds the reflinked extent and the two references
 	 * to one extent at different extent offsets. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "shared-extents";
 	plan_file(context, &plan, "/shared-ro/tail");
 	plan_update(context, &plan, 1, "/shared/tail", "source tail\n", 12);
@@ -1236,7 +1318,7 @@ shared_scenarios(struct context *context)
 	/* Leaves shared by exactly two trees hold data references. The source moves
 	 * them to parent-named references; the snapshot then holds the last
 	 * reference, converts them back and frees the old leaves. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "pair-convert";
 	pair_update(context, &plan, 1, "pair", 5);
 	pair_update(context, &plan, 1, "pair", 60);
@@ -1249,7 +1331,7 @@ shared_scenarios(struct context *context)
 	run_plan(context, &plan);
 
 	/* One transaction spanning three trees. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "shared-trees";
 	plan_update(context, &plan, 1, "/greeting", "three trees\n", 12);
 	shared_update(context, &plan, 1, "shared", 700);
@@ -1285,20 +1367,20 @@ keyed_scenarios(struct context *context)
 {
 	struct plan plan;
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "keyed-source";
 	keyed_update(context, &plan, 1, "keyed", "i00");
 	keyed_update(context, &plan, 1, "keyed", "i20");
 	keyed_update(context, &plan, 1, "keyed", "last");
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "keyed-snapshot";
 	keyed_update(context, &plan, 1, "keyed-07", "i00");
 	keyed_update(context, &plan, 1, "keyed-07", "last");
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "keyed-alternate";
 	keyed_update(context, &plan, 1, "keyed", "last");
 	keyed_update(context, &plan, 2, "keyed-07", "last");
@@ -1339,7 +1421,7 @@ data_scenarios(struct context *context)
 	static uint8_t data[DATA_SCENARIO_BYTES];
 	struct plan plan;
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-overwrite";
 	track_data(context, &plan, "big");
 	plan_file(context, &plan, "/data/big-clone");
@@ -1347,7 +1429,7 @@ data_scenarios(struct context *context)
 	plan_write(context, &plan, 1, "/data/big", 300000, data, 8192);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-append";
 	track_data(context, &plan, "small");
 	fill_pattern(data, 5000, 2);
@@ -1356,7 +1438,7 @@ data_scenarios(struct context *context)
 	plan_write(context, &plan, 1, "/data/small", 4090, data, 10);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-hole";
 	track_data(context, &plan, "sparse");
 	fill_pattern(data, 4096, 4);
@@ -1365,7 +1447,7 @@ data_scenarios(struct context *context)
 	plan_write(context, &plan, 1, "/data/sparse", 6 * 1024 * 1024 + 7, data, 100);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-prealloc";
 	track_data(context, &plan, "prealloc");
 	fill_pattern(data, 4096, 6);
@@ -1374,7 +1456,7 @@ data_scenarios(struct context *context)
 	plan_write(context, &plan, 1, "/data/prealloc", 1000, data, 100);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-truncate";
 	track_data(context, &plan, "big");
 	track_data(context, &plan, "small");
@@ -1387,7 +1469,7 @@ data_scenarios(struct context *context)
 	plan_truncate(context, &plan, 2, "/data/zlib", 5000);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-compressed";
 	track_data(context, &plan, "zlib");
 	fill_pattern(data, 4096, 8);
@@ -1396,14 +1478,14 @@ data_scenarios(struct context *context)
 	plan_write(context, &plan, 1, "/data/zlib", 100003, data, 7);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-nodatasum";
 	track_data(context, &plan, "nodatasum");
 	fill_pattern(data, 5000, 10);
 	plan_write(context, &plan, 1, "/data/nodatasum", 3000, data, 5000);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-inline";
 	track_data(context, &plan, "inline");
 	fill_pattern(data, 5000, 11);
@@ -1413,7 +1495,7 @@ data_scenarios(struct context *context)
 
 	/* The source and its writable snapshot overwrite shared extents in turn;
 	 * the third commit drops the first commit's extent entirely. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-snapshot";
 	track_data(context, &plan, "big");
 	fill_pattern(data, 4096, 12);
@@ -1425,7 +1507,7 @@ data_scenarios(struct context *context)
 	run_plan(context, &plan);
 
 	/* Overlapping writes in one transaction read each other's staged data. */
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "data-overlap";
 	track_data(context, &plan, "small");
 	fill_pattern(data, 4096, 15);
@@ -1447,18 +1529,53 @@ fragment_scenarios(struct context *context)
 
 	data = malloc(FRAGMENT_WRITE_BYTES);
 	REQUIRE(data != NULL);
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "fst-free";
 	plan_truncate(context, &plan, 1, "/fragment/f001", 0);
 	plan_truncate(context, &plan, 1, "/fragment/f003", 0);
 	plan_truncate(context, &plan, 2, "/fragment/f255", 1000);
 	run_plan(context, &plan);
 
-	memset(&plan, 0, sizeof(plan));
+	plan_init(&plan);
 	plan.name = "fst-fill";
 	track_data(context, &plan, "small");
 	fill_pattern(data, FRAGMENT_WRITE_BYTES, 17);
 	plan_write(context, &plan, 1, "/data/small", 0, data, FRAGMENT_WRITE_BYTES);
+	run_plan(context, &plan);
+	free(data);
+}
+
+/* Classes that run out allocate chunks from unallocated device space: metadata
+ * while growing two thousand leaf-sized inline files, data for one large write. */
+static void
+grow_scenarios(struct context *context)
+{
+	struct plan plan;
+	char path[32];
+	uint8_t *data;
+	size_t i;
+
+	data = malloc(GROW_DATA_BYTES);
+	REQUIRE(data != NULL);
+	plan_init(&plan);
+	plan.name = "grow-metadata";
+	plan.prefix_points = 64;
+	plan.fault_points = 16;
+	plan.new_chunks = 1;
+	plan.verify_stride = 50;
+	fill_pattern(data, INLINE_LIMIT, 18);
+	for (i = 0; i < GROW_FILES; i++) {
+		REQUIRE(snprintf(path, sizeof(path), "/meta/f%zu", i) < (int)sizeof(path));
+		plan_update(context, &plan, 1, path, data, INLINE_LIMIT);
+	}
+	run_plan(context, &plan);
+
+	plan_init(&plan);
+	plan.name = "grow-data";
+	plan.fault_points = 32;
+	plan.new_chunks = 1;
+	fill_pattern(data, GROW_DATA_BYTES, 19);
+	plan_write(context, &plan, 1, "/big", 0, data, GROW_DATA_BYTES);
 	run_plan(context, &plan);
 	free(data);
 }
@@ -2117,6 +2234,7 @@ main(int argc, char **argv)
 	int keyed = 0;
 	int data = 0;
 	int fragment = 0;
+	int grow = 0;
 	int i;
 
 	context = calloc(1, sizeof(*context));
@@ -2134,6 +2252,8 @@ main(int argc, char **argv)
 			data = 1;
 		} else if (strcmp(argv[i], "--fragment") == 0) {
 			fragment = 1;
+		} else if (strcmp(argv[i], "--grow") == 0) {
+			grow = 1;
 		} else {
 			REQUIRE(image == NULL);
 			image = argv[i];
@@ -2179,6 +2299,9 @@ main(int argc, char **argv)
 	}
 	if (fragment) {
 		fragment_scenarios(context);
+	}
+	if (grow) {
+		grow_scenarios(context);
 	}
 	REQUIRE(context->image.live_allocations == 0);
 	btrfs_image_close(&context->image);

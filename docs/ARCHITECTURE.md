@@ -211,6 +211,29 @@ reference not owned by the CoWing tree, fails the transaction before writing.
 Root `bytes_used` changes by one node per new block and per CoW'd original, as
 Linux records it for snapshots.
 
+## Block-group growth
+
+A transaction works on a private copy of the chunk map with room for every
+chunk the format allows; the mutation, allocator and publisher all map through
+it. Admission verifies the device item and device extents against the chunk
+map: every stripe has exactly one extent, extents do not overlap, stay inside
+the device and above Linux's reserved first MiB, and sum to the device's used
+bytes. The gaps between them are the device's unallocated space.
+
+When a data or metadata reservation finds no free range, the allocator creates
+a chunk of that class in memory only: the next logical address after the last
+chunk, the profile of an existing chunk of the class (DUP gives two stripes),
+a tenth of the device rounded down to 1 MiB and capped at 1 GiB for data or
+256 MiB for metadata, halved until the stripes fit in unallocated space. It
+never edits trees from inside the editor's callback. The commit fixed point
+then inserts the chunk item and updates the device item in the chunk tree,
+inserts device extents, the block group (whose total follows each round) and,
+with a free-space tree, its info item and one free extent before any logged
+allocation inside it is applied. Chunk-tree blocks come from system chunks,
+which are never grown, so the superblock's system array never changes; the
+superblock records the new chunk root and device usage. A destroyed
+transaction discards the private chunks with everything else.
+
 ## Free-space tree
 
 Filesystems created with Linux defaults carry a free-space tree. Admission

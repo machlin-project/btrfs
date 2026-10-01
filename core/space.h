@@ -16,8 +16,16 @@ struct bt_space_change {
 /* Transaction-local reservations from an independently validated extent tree.
  * Released reservations are not reused within the transaction. The committed
  * extent map stays pinned until the owner discards this entire allocator. */
-enum btrfs_result bt_space_create(const struct btrfs_fs *fs, struct bt_root extent_root,
-    size_t node_limit, struct bt_space **result);
+/* fs->chunks must have room for BT_MAX_CHUNKS: growth appends chunks to it. */
+enum btrfs_result bt_space_create(
+    struct btrfs_fs *fs, struct bt_root extent_root, size_t node_limit, struct bt_space **result);
+/* Verifies the device item and device extents against the chunk map and enables
+ * chunk growth from the device's unallocated space. */
+enum btrfs_result bt_space_devices(
+    struct bt_space *space, struct bt_root chunk_tree, struct bt_root device_tree);
+enum btrfs_result bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum);
+/* Chunks at or after this index were created by growth in this transaction. */
+size_t bt_space_original_chunks(const struct bt_space *space);
 void bt_space_allocator(struct bt_space *space, struct bt_mutation_allocator *allocator);
 /* Returns up to length bytes (at least one sector) of contiguous free data space;
  * callers repeat for the remainder. Ranges are never handed out twice. */

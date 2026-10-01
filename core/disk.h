@@ -41,6 +41,9 @@ struct bt_le64 {
 #define BT_DATA_RELOC_TREE (UINT64_MAX - UINT64_C(8))
 #define BT_DEV_TREE UINT64_C(4)
 #define BT_FIRST_CHUNK_OBJECTID UINT64_C(256)
+#define BT_DEV_ITEMS_OBJECTID UINT64_C(1)
+/* Linux leaves the first MiB of every device unallocated. */
+#define BT_DEVICE_RESERVED (UINT64_C(1) << 20)
 #define BT_ROOT_DIR_OBJECTID UINT64_C(6)
 #define BT_CSUM_OBJECTID (UINT64_MAX - UINT64_C(9))
 #define BT_LAST_FREE_OBJECTID (UINT64_MAX - UINT64_C(255))
@@ -103,6 +106,8 @@ enum bt_item_type {
 	BT_FREE_SPACE_INFO = 198,
 	BT_FREE_SPACE_EXTENT = 199,
 	BT_FREE_SPACE_BITMAP = 200,
+	BT_DEV_EXTENT = 204,
+	BT_DEV_ITEM = 216,
 	BT_CHUNK_ITEM = 228
 };
 
@@ -150,6 +155,11 @@ struct bt_disk_device {
 struct bt_disk_stripe {
 	struct bt_le64 device, offset;
 	uint8_t uuid[BTRFS_UUID_SIZE];
+};
+
+struct bt_disk_dev_extent {
+	struct bt_le64 chunk_tree, chunk_objectid, chunk_offset, length;
+	uint8_t chunk_tree_uuid[BTRFS_UUID_SIZE];
 };
 
 struct bt_disk_chunk {
@@ -284,6 +294,9 @@ _Static_assert(offsetof(struct bt_disk_super, system_array) == 811, "system arra
 _Static_assert(sizeof(struct bt_disk_key) == 17, "key layout");
 _Static_assert(sizeof(struct bt_disk_header) == 101, "tree header layout");
 _Static_assert(sizeof(struct bt_disk_chunk) == 48, "chunk layout");
+_Static_assert(sizeof(struct bt_disk_stripe) == 32, "stripe layout");
+_Static_assert(sizeof(struct bt_disk_device) == 98, "device item layout");
+_Static_assert(sizeof(struct bt_disk_dev_extent) == 48, "device extent layout");
 _Static_assert(sizeof(struct bt_disk_inode) == 160, "inode layout");
 _Static_assert(sizeof(struct bt_disk_root) == 239, "legacy root layout");
 _Static_assert(sizeof(struct bt_disk_root_full) == 439, "root layout");

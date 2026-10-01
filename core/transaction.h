@@ -51,11 +51,15 @@ struct bt_file_ref {
 
 struct btrfs_transaction {
 	const struct btrfs_fs *base;
+	/* The base with a private chunk map that growth may extend; every mapping
+	 * and the mutation use it. */
+	struct btrfs_fs fs;
 	struct btrfs_write_environment io;
 	struct bt_mutation *mutation;
 	struct bt_space *space;
 	struct bt_root roots;
-	struct bt_root devices;
+	struct bt_root chunks;
+	struct bt_owned_root devices;
 	struct bt_root top;
 	struct bt_owned_root trees[BT_TRANSACTION_TREES];
 	size_t tree_count;
@@ -63,6 +67,7 @@ struct btrfs_transaction {
 	struct bt_owned_root checksums;
 	struct bt_owned_root free_space;
 	size_t free_space_applied;
+	size_t chunks_published;
 	int has_free_space;
 	struct bt_disk_super original_super;
 	struct bt_disk_super super;

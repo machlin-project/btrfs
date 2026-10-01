@@ -20,14 +20,15 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require sixteen passing test processes and all six reader profiles (312
-contracts). Eight writable images are required by the transaction suites:
+Require seventeen passing test processes and all six reader profiles (312
+contracts). Nine writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
 fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
 references), `transactions-keyed` (keyed backreferences), `transactions-data`
-(file data inputs with snapshots) and `transactions-fst` (mkfs defaults with a
-free-space tree in extent and bitmap form). Missing fixtures
+(file data inputs with snapshots), `transactions-fst` (mkfs defaults with a
+free-space tree in extent and bitmap form) and `transactions-grow` (nearly full
+metadata with unallocated device space). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -85,13 +86,14 @@ only after successful durable publication; `seal` alone is not a commit.
    fixtures, explicit hole items for filesystems without NO_HOLES, and lifting
    the 64 MiB staging bound with streaming writeback once native writers exist.
 4. **Finish allocation features.** The free-space tree is verified and kept in
-   step with every allocation (`core/fst.c`), and the editor merges underfull
-   siblings. Remaining: block-group growth (chunk, device-extent, device-item,
-   block-group and free-space info creation, with system-array updates for
-   system chunks) with its own fixture; extent/bitmap conversion at Linux's
-   thresholds; the v1 space cache (`cache_generation` is currently invalidated)
-   needs its own fixture; quotas, mixed groups, metadata UUID and the
-   block-group tree stay rejected until each is implemented and tested.
+   step with every allocation (`core/fst.c`), the editor merges underfull
+   siblings, and data and metadata chunks grow from unallocated device space
+   (`core/space.c`, `bt_tx_publish_chunks`). Remaining: system-chunk growth with
+   superblock system-array updates, removal of empty block groups, extent/bitmap
+   conversion at Linux's thresholds, the v1 space cache (`cache_generation` is
+   currently invalidated) with its own fixture, and quotas, mixed groups,
+   metadata UUID and the block-group tree, which stay rejected until each is
+   implemented and tested.
 5. **Add namespace mutations.** Create/mkdir, link/unlink, symlink, atomic rename
    and xattrs must update all coupled inode refs, DIR_ITEM collision records,
    DIR_INDEX cookies, link counts, parent metadata and orphan state in one

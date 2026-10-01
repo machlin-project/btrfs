@@ -13,7 +13,8 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions": (4096, "single", ""), "transactions-dup": (16384, "dup", ""),
             "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", ""),
             "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", ""),
-            "transactions-data": (4096, "single", ""), "transactions-fst": (16384, "dup", "")}
+            "transactions-data": (4096, "single", ""), "transactions-fst": (16384, "dup", ""),
+            "transactions-grow": (16384, "dup", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -44,6 +45,9 @@ DATA_NODATASUM_BYTES = 65536
 # space to bitmaps.
 FRAGMENT_FILES = 256
 FRAGMENT_BYTES = 4096
+# Leaf-sized xattrs for 16 KiB nodes in the growth profile.
+GROW_XATTR_BYTES = 3800
+GROW_ROOM_FILES = 600
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
@@ -196,6 +200,31 @@ btrfs inspect-internal dump-tree /dev/vda > /tmp/tree.txt
 echo BTRFS_REFERENCE_DATA_COMPRESSED:$(grep -c 'compression 1 (zlib)' /tmp/tree.txt || true)
 echo BTRFS_REFERENCE_DATA_PREALLOC:$(grep -c 'prealloc' /tmp/tree.txt || true)
 lsattr /mnt/data/nodatasum'''
+    if profile == "transactions-grow":
+        # Fill data, then metadata until Linux reports ENOSPC; delete the data and
+        # the newest fillers (whole leaves of room for balance's own transaction),
+        # and let balance drop the empty data block groups. Metadata stays nearly full
+        # while the device regains unallocated space.
+        fill = f'''dd if=/dev/zero of=/mnt/data-fill bs=1M 2>/dev/null || true
+btrfs filesystem sync /mnt
+mkdir /mnt/meta
+pad=$(head -c {GROW_XATTR_BYTES} /dev/zero | tr '\\0' q)
+i=0
+while printf m > /mnt/meta/f$i 2>/dev/null &&
+      setfattr -n user.pad -v "$pad" /mnt/meta/f$i 2>/dev/null; do
+    i=$((i + 1))
+done
+echo BTRFS_REFERENCE_METADATA_FILES:$i
+rm -f /mnt/meta/f$i /mnt/data-fill
+j=$((i - {GROW_ROOM_FILES}))
+while [ "$j" -lt "$i" ]; do
+    rm /mnt/meta/f$j
+    j=$((j + 1))
+done
+btrfs filesystem sync /mnt
+btrfs balance start -dusage=0 /mnt
+btrfs filesystem sync /mnt
+btrfs filesystem usage -b /mnt'''
     if profile == "transactions-fst":
         fill += f'''
 mkdir /mnt/fragment

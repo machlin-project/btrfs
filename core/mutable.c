@@ -201,6 +201,8 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 	}
 	error = mutation->allocator.reserve(
 	    mutation->allocator.context, root.owner, root.level, &address);
+	/* The allocator may have appended a chunk to the base's chunk map. */
+	mutation->view.chunk_count = mutation->base->chunk_count;
 	if (error != BTRFS_OK) {
 		goto failed;
 	}
