@@ -49,6 +49,7 @@ uint16_t bt_u16(struct bt_le16 value);
 uint32_t bt_u32(struct bt_le32 value);
 uint64_t bt_u64(struct bt_le64 value);
 void bt_copy(void *destination, const void *source, size_t length);
+void bt_move(void *destination, const void *source, size_t length);
 void bt_zero(void *buffer, size_t length);
 int bt_equal(const void *a, const void *b, size_t length);
 uint32_t bt_crc32c(uint32_t seed, const void *buffer, size_t length);

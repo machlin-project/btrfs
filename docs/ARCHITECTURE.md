@@ -165,13 +165,49 @@ standalone editor supports up to 65,536. Exhausted reservations return NO_SPACE
 from the failing edit, before any media write.
 
 `core/transaction.c` owns the private root set and a separate write environment.
-Its current operation is replacing an existing uncompressed inline regular file
-in the top-level tree, up to 2 KiB. Empty replacement removes the inline extent.
-One transaction may replace many inodes. It updates inode and root change
-metadata, tree references, block-group totals, root items and backup roots.
-Accounting changes may CoW the extent/root trees; a bounded fixed point resolves
-those allocations before the first media write. Shared/full-backreference paths
-are rejected until delayed references exist.
+Its current operation is replacing an existing uncompressed inline regular file,
+up to 2 KiB, in any writable file tree: the top level, subvolumes and writable
+snapshots. Read-only snapshots return READ_ONLY; dead or partially dropped trees
+are unsupported. Empty replacement removes the inline extent. One transaction may
+replace many inodes in up to 16 trees. It updates inode and root change metadata,
+tree references, block-group totals, root items and backup roots. Accounting
+changes may CoW the extent/root trees; a bounded fixed point resolves those
+allocations before the first media write.
+
+## Shared references
+
+Snapshots and reflinks share tree blocks and data extents. `core/backref.c`
+edits extent items in the private extent tree with Linux's exact representation:
+tree references name a root, shared block references name a parent block, data
+references name (root, inode, file offset minus extent offset) with a count, and
+shared data references name a parent leaf with a count. Inline references are
+ordered by type and by descending root/parent or data-reference hash. A new
+reference is keyed instead of inline when the item would reach Linux's maximum
+inline extent item size or any keyed reference of that extent already exists;
+keyed data references probe upward from their hash. A reference count reaching
+zero deletes the extent item.
+
+At accounting time every CoW of a committed block applies Linux's
+`update_ref_for_cow` decision in creation order, which is parent before child:
+
+- a block can be shared if it is in a file tree, is not that tree's root and is
+  no newer than the tree's last snapshot (or carries the relocation flag);
+- when the owning tree CoWs a shared block without FULL_BACKREF, the old block's
+  children gain references naming it as parent and it gains FULL_BACKREF;
+- when another tree CoWs a shared block, or the block already has FULL_BACKREF,
+  its children gain references from the CoWing tree;
+- an unshared FULL_BACKREF block converts its children back to tree references;
+- the old block then loses the CoWing tree's reference and is freed only when
+  that was its last one.
+
+Children are read from the immutable committed block, which is the copy's
+content at CoW time. Every change is applied before any media write, so the
+ordering Linux obtains from its delayed-reference heads (additions before drops)
+is preserved without a persistent queue. Any inconsistency, such as a missing
+reference, a shared block in an unshareable position, or a sole implicit
+reference not owned by the CoWing tree, fails the transaction before writing.
+Root `bytes_used` changes by one node per new block and per CoW'd original, as
+Linux records it for snapshots.
 
 ## Superblock copies, publication and recovery
 

@@ -38,6 +38,23 @@ bt_copy(void *destination, const void *source, size_t length)
 	}
 }
 
+/* Overlapping ranges are allowed. */
+void
+bt_move(void *destination, const void *source, size_t length)
+{
+	uint8_t *out = destination;
+	const uint8_t *in = source;
+	size_t i;
+
+	if (out <= in) {
+		bt_copy(destination, source, length);
+		return;
+	}
+	for (i = length; i != 0; i--) {
+		out[i - 1] = in[i - 1];
+	}
+}
+
 void
 bt_zero(void *buffer, size_t length)
 {

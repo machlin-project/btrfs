@@ -20,10 +20,12 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require eleven passing test processes and all six reader profiles (312 contracts).
-Four writable images are required by the transaction suites: `transactions`
-(4 KiB single), `transactions-dup` (16 KiB DUP), `transactions-large` (64 KiB DUP)
-and `transactions-full` (128 MiB with full, fragmented metadata). Missing fixtures
+Require fourteen passing test processes and all six reader profiles (312
+contracts). Six writable images are required by the transaction suites:
+`transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
+`transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
+fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
+references) and `transactions-keyed` (keyed backreferences). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -42,6 +44,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Reservation allocator | Extent-map and block-group reconciliation, physical alias/super-stripe exclusion, pinned committed allocations, bounded free gaps | `core/space.c` |
 | Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission, reference/accounting fixed point, root/backup updates, three barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
 | Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, log/foreign-copy refusal, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
+| Shared references / audit | Linux CoW reference rules, inline/keyed placement and ordering, FULL_BACKREF conversion; independent whole-filesystem reference audit | `core/backref.c`, `tests/references.c` |
 | Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
 | Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
 
@@ -63,12 +66,13 @@ only after successful durable publication; `seal` alone is not a commit.
    decision, persist the acknowledged generation, and never recover implicitly at
    mount. Extend every new writer feature with scenarios in `tests/transaction.c`
    and export them to the Linux oracle.
-2. **Implement shared/delayed references.** `bt_tx_drop_original` intentionally
-   accepts only one inline tree reference with matching owner/generation. Replace
-   that admission with correct shared/full backrefs and child/data reference
-   changes. Test shared leaves and internal nodes, retained snapshots, reflinks
-   and extent-offset references. Linux fsck must report no lost references or
-   accounting errors after every fault cut. Never just delete the rejection.
+2. **Extend shared references.** CoW of shared blocks follows Linux's
+   `update_ref_for_cow` with inline and keyed references (`core/backref.c`), and
+   the independent audit in `tests/references.c` checks every committed state.
+   Remaining: relocation trees and snapshot deletion (dead roots, drop progress)
+   stay unsupported; data reference edits from file writes must join the same
+   ordered pass with additions before drops. Keep running the audit after every
+   new writer feature and keep the Linux oracle on the shared and keyed profiles.
 3. **Add data extents and checksums.** Extend allocator reservations beyond
    metadata; support new regular extents, unaligned read-modify-CoW, holes,
    preallocation conversion, truncation and compressed input as separate cases.
@@ -122,10 +126,11 @@ For each operation sequence and each device fault:
   recovery modes separately from successful recovery.
 
 The portable model covers every prefix, seeded reorder/tear states of the
-metadata epoch and six tear patterns per superblock epoch for five inline
-scenarios on four profiles, each resolved through explicit recovery. The Linux
-oracle checks a bounded export of those states. Shared references, data extents
-and namespace operations have no crash coverage yet.
+metadata epoch and six tear patterns per superblock epoch for the inline,
+shared and keyed scenarios on six profiles, each resolved through explicit
+recovery. The Linux
+oracle checks a bounded export of those states, including shared and keyed
+references. Data extents and namespace operations have no crash coverage yet.
 
 ## Performance work
 

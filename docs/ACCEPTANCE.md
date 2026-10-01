@@ -8,14 +8,15 @@ conformance and a performance win over Linux remain open.
 
 | Layer | Result | Reproduction / generated evidence |
 | --- | --- | --- |
-| Linux fixtures | Ten independently created images; Linux contents and read-only fsck pass | `tests/prepare_linux.py`; `logs/linux-reference-*.log` |
+| Linux fixtures | Twelve independently created images; Linux contents and read-only fsck pass | `tests/prepare_linux.py`; `logs/linux-reference-*.log` |
 | Portable reader | 312 contracts across six read profiles; image hashes unchanged | `tests/check_images.py`; `logs/acceptance-tests.log` |
-| Portable acceptance | Eleven Meson test processes pass under ASan/UBSan | `make test -Dfixtures=...` via DEVELOPMENT.md |
+| Portable acceptance | Fourteen Meson test processes pass under ASan/UBSan | `make test -Dfixtures=...` via DEVELOPMENT.md |
 | Private CoW editor | Independent ordered model; 4/16/64 KiB nodes; root growth/collapse; three-way variable-item split; snapshot isolation; reservation/allocation/read failures | `tests/mutable.c` |
-| Inline transactions | Five scenarios (replace, zero-length, 2048-byte, 20-inode batch, two repeated commits) on 4 KiB single, 16 KiB DUP, 64 KiB DUP and full/fragmented 4 KiB profiles; every allocation/read/write/barrier fault point of each last commit; three barriers per commit | `tests/transaction.c`; `logs/transaction-export-*.log` |
-| Persistence and recovery model | 4,443 crash states: every prefix, 32 seeded reorder/tear states per metadata epoch and six tear patterns per superblock epoch; 255 need and pass explicit recovery; all resolve to the acknowledged or new stage and admit the next transaction | `tests/transaction.c` |
+| Inline transactions | Five scenarios (replace, zero-length, 2048-byte, 20-inode batch, two repeated commits) on six writable profiles, plus six shared-block and three keyed-reference scenarios; every allocation/read/write/barrier fault point of each last commit; three barriers per commit | `tests/transaction.c`; `logs/shared-export-*.log` |
+| Shared references | Owner and snapshot CoW of shared leaves and level-1 nodes, FULL_BACKREF creation, conversion and release, reflinked and offset data references, writes across three trees, inline and keyed references; the independent audit agrees with all twelve Linux images and every committed state, and rejects damaged references | `tests/references.c`, `tests/audit.c`, `tests/transaction.c` |
+| Persistence and recovery model | 13,591 crash states: every prefix, 32 seeded reorder/tear states per metadata epoch and six tear patterns per superblock epoch; 545 need and pass explicit recovery; all resolve to the acknowledged or new stage and admit the next transaction | `tests/transaction.c` |
 | Copies, allocation maps, exhaustion | Stale primary/secondary rejection; disagreeing copies block admission; recovery refuses rollback, foreign copies and pending logs; ten checksum-correct damaged allocation maps (nine with 4 KiB nodes) rejected before writes; full metadata returns NO_SPACE with no write | `tests/transaction.c` |
-| Independent writer oracle | 848 exported states over four profiles; Linux fsck, primary generation and exact contents agree for each; 212 recovery states agree with `btrfs rescue super-recover` and with this recovery's writes; Linux then commits read-write | `tests/prepare_transactions_linux.py`; `logs/linux-transactions-*.log` |
+| Independent writer oracle | 1,867 exported states over six profiles, including every shared and keyed scenario; Linux fsck (extent references included), primary generation and exact contents agree for each; 462 recovery states agree with `btrfs rescue super-recover` and with this recovery's writes; Linux then commits read-write | `tests/prepare_transactions_linux.py`; `logs/linux-transactions-*.log` |
 | Native identities / policy | 65,536 distinct identities, capacity failure, user-xattr filtering and malformed lists pass | `tests/identity.c`, `tests/native_policy.c` |
 | Corruption / concurrency | Adversarial/fault/budget tests and eight concurrent readers pass; prior reader TSAN and bounded fuzz runs passed | `tests/adversarial.c`, `tests/concurrent.c`, `logs/fuzz-final.log` |
 | Freestanding core | Stack frames bounded to 2 KiB, including writer | Meson freestanding target |
@@ -61,11 +62,14 @@ Neither native adapter supplies write callbacks yet.
 Admission requires skinny metadata, at least two superblock copies that agree
 with the mounted primary, and rejects read-only compatible features (including
 the free-space tree), mixed groups, metadata UUID and quotas. Only existing
-uncompressed inline regular files in tree 5 can be replaced, up to 2 KiB, many
-per transaction; zero length removes their extent. Other trees, external-extent conversion, set-id,
-immutable and append-only inodes are unsupported. Adapters still owe credential,
-ACL and capability policy. Shared/full-backreference paths are rejected before
-media writes; unrelated snapshots remain intact in the independent oracle.
+uncompressed inline regular files can be replaced, up to 2 KiB, many per
+transaction, in the top level, subvolumes and writable snapshots; zero length
+removes their extent. Read-only snapshots return READ_ONLY. External-extent
+conversion, set-id, immutable and append-only inodes, dead subvolumes and old
+backreference formats are unsupported. Adapters still owe credential, ACL and
+capability policy. CoW of shared blocks follows Linux's snapshot reference rules;
+inline and keyed references, FULL_BACKREF conversion and release are covered,
+and every committed state passes the independent reference audit.
 
 The allocator validates in one ordered pass that every extent lies inside a chunk
 and that block-group totals match, excludes all superblock stripes and rejects
@@ -89,7 +93,7 @@ remaining durability gates pass.
 
 ## Explicitly unfinished
 
-General data allocation/writeback, shared and delayed references, underfull sibling
+General data allocation/writeback, relocation trees and snapshot deletion, underfull sibling
 merge/rebalance, free-space tree maintenance, quotas, native read/write views and
 UBC/FSKit coherence; create/mkdir/link/unlink/rename/xattr mutations and orphan
 recovery; adapter use of superblock recovery and tree-log replay; LZO/alternate checksums/RAID;

@@ -21,6 +21,7 @@ struct bt_mutable_node {
 	uint64_t original;
 	uint64_t original_owner;
 	uint64_t original_generation;
+	uint64_t original_flags;
 	uint8_t original_level;
 	int checksum_valid;
 	int discarded;
@@ -227,6 +228,7 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 	node->original = original;
 	node->original_owner = original == 0 ? 0 : bt_u64(header->owner);
 	node->original_generation = original == 0 ? 0 : bt_u64(header->generation);
+	node->original_flags = original == 0 ? 0 : bt_u64(header->flags);
 	node->original_level = header->level;
 	bt_put64(&header->bytenr, address);
 	bt_put64(&header->owner, root.owner);
@@ -783,6 +785,7 @@ bt_mutation_block(struct bt_mutation *mutation, size_t index, struct bt_mutated_
 	block->owner = bt_u64(header->owner);
 	block->original_owner = node->original_owner;
 	block->original_generation = node->original_generation;
+	block->original_flags = node->original_flags;
 	block->original_level = node->original_level;
 	block->level = header->level;
 	block->discarded = node->discarded;

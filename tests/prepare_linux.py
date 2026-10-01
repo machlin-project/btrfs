@@ -11,9 +11,24 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "large-nodes": (65536, "dup", ""), "zlib": (16384, "dup", "zlib"),
             "zstd": (16384, "dup", "zstd"), "default-subvolume": (16384, "dup", ""),
             "transactions": (4096, "single", ""), "transactions-dup": (16384, "dup", ""),
-            "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", "")}
+            "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", ""),
+            "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", "")}
 # Writable profiles avoid allocation features the writer does not maintain yet.
-WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full"}
+WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
+            "transactions-shared", "transactions-keyed"}
+# Enough inline files for a level-2 subvolume tree with 4 KiB nodes, so that a
+# snapshot shares internal nodes as well as leaves.
+SHARED_INLINE_FILES = 1600
+SHARED_DATA_FILES = 64
+SHARED_DATA_BYTES = 8192
+SHARED_SPAN_BYTES = 262144
+SHARED_SPAN_MIDDLE = 131072
+PAIR_FILES = 120
+# More referencing snapshots and reflinks than one 4 KiB extent item can list
+# inline, so Linux also stores keyed backreference items.
+KEYED_FILES = 40
+KEYED_SNAPSHOTS = 30
+KEYED_REFLINKS = 30
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
@@ -39,6 +54,7 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
         options += ",nospace_cache"
     set_default = "btrfs subvolume set-default /mnt/subvol" if profile == "default-subvolume" else ":"
     device_bytes = DEVICE_BYTES.get(profile, 256 * 1024 * 1024)
+    len_random = len(contents["random"])
     fill = ":"
     if profile == "transactions-full":
         # Exhaust unallocated space with data, then metadata with inline files,
@@ -65,6 +81,81 @@ while [ "$j" -lt "$i" ]; do
 done
 btrfs filesystem sync /mnt
 btrfs filesystem df /mnt'''
+    if profile == "transactions-shared":
+        # Snapshots share leaves and internal nodes; a reflink shares a data
+        # extent between inodes; a partial overwrite leaves two references to
+        # one extent at different extent offsets. The inline tail file is the
+        # newest inode, so its leaf also holds those file extent items. The pair
+        # subvolume has exactly one writable snapshot and interleaves inline and
+        # data files, so leaves shared by two trees also hold data references.
+        # Nothing reads the pair after its snapshot, so access times stay put.
+        fill = f'''btrfs subvolume create /mnt/shared
+mkdir /mnt/shared/inline /mnt/shared/data
+i=0
+while [ "$i" -lt {SHARED_INLINE_FILES} ]; do
+    printf 'inline %s\\n' "$i" > /mnt/shared/inline/f$(printf '%04d' "$i")
+    i=$((i + 1))
+done
+i=0
+while [ "$i" -lt {SHARED_DATA_FILES} ]; do
+    dd if=/input/random of=/mnt/shared/data/d$(printf '%02d' "$i") bs={SHARED_DATA_BYTES} count=1 \\
+        skip=$((i % ({len_random} / {SHARED_DATA_BYTES}))) 2>/dev/null
+    i=$((i + 1))
+done
+dd if=/input/random of=/mnt/shared/span bs={SHARED_SPAN_BYTES} count=1 2>/dev/null
+btrfs filesystem sync /mnt
+printf MIDDLE | dd of=/mnt/shared/span bs=1 seek={SHARED_SPAN_MIDDLE} conv=notrunc 2>/dev/null
+btrfs filesystem sync /mnt
+cp --reflink=always /mnt/shared/data/d00 /mnt/shared/reflink
+printf 'tail\\n' > /mnt/shared/tail
+btrfs filesystem sync /mnt
+btrfs subvolume create /mnt/pair
+i=0
+while [ "$i" -lt {PAIR_FILES} ]; do
+    dd if=/input/random of=/mnt/pair/d$(printf '%03d' "$i") bs={SHARED_DATA_BYTES} count=1 \\
+        skip=$((i % ({len_random} / {SHARED_DATA_BYTES}))) 2>/dev/null
+    printf 'pair %s\\n' "$i" > /mnt/pair/i$(printf '%03d' "$i")
+    i=$((i + 1))
+done
+btrfs filesystem sync /mnt
+btrfs subvolume snapshot /mnt/pair /mnt/pair-snap
+btrfs subvolume snapshot /mnt/shared /mnt/shared-snap
+btrfs subvolume snapshot -r /mnt/shared /mnt/shared-ro
+cmp /mnt/shared/reflink /mnt/shared/data/d00
+test "$(dd if=/mnt/shared-ro/span bs=1 skip={SHARED_SPAN_MIDDLE} count=6 2>/dev/null)" = MIDDLE
+test "$(cat /mnt/shared-snap/inline/f1599)" = 'inline 1599'
+btrfs filesystem sync /mnt
+btrfs inspect-internal dump-tree -t extent /dev/vda > /tmp/extent.txt
+echo BTRFS_REFERENCE_SHARED_BLOCK_REFS:$(grep -c 'shared block backref' /tmp/extent.txt || true)
+echo BTRFS_REFERENCE_SHARED_DATA_REFS:$(grep -c 'shared data backref' /tmp/extent.txt || true)
+echo BTRFS_REFERENCE_FULL_BACKREF:$(grep -c 'FULL_BACKREF' /tmp/extent.txt || true)'''
+    if profile == "transactions-keyed":
+        fill = f'''btrfs subvolume create /mnt/keyed
+i=0
+while [ "$i" -lt {KEYED_FILES} ]; do
+    dd if=/input/random of=/mnt/keyed/d$(printf '%02d' "$i") bs={SHARED_DATA_BYTES} count=1 \\
+        skip=$((i % ({len_random} / {SHARED_DATA_BYTES}))) 2>/dev/null
+    printf 'keyed %s\\n' "$i" > /mnt/keyed/i$(printf '%02d' "$i")
+    i=$((i + 1))
+done
+dd if=/input/random of=/mnt/keyed/origin bs={SHARED_DATA_BYTES} count=1 2>/dev/null
+btrfs filesystem sync /mnt
+i=0
+while [ "$i" -lt {KEYED_REFLINKS} ]; do
+    cp --reflink=always /mnt/keyed/origin /mnt/keyed/r$(printf '%02d' "$i")
+    i=$((i + 1))
+done
+printf 'last\\n' > /mnt/keyed/last
+btrfs filesystem sync /mnt
+i=0
+while [ "$i" -lt {KEYED_SNAPSHOTS} ]; do
+    btrfs subvolume snapshot /mnt/keyed /mnt/keyed-$(printf '%02d' "$i") > /dev/null
+    i=$((i + 1))
+done
+btrfs filesystem sync /mnt
+cmp /mnt/keyed-29/r29 /mnt/keyed/origin
+btrfs inspect-internal dump-tree -t extent /dev/vda > /tmp/extent.txt
+echo BTRFS_REFERENCE_KEYED_REFS:$(grep -cE 'key \\([0-9]+ (TREE_BLOCK_REF|EXTENT_DATA_REF|SHARED_BLOCK_REF|SHARED_DATA_REF) ' /tmp/extent.txt || true)'''
     init = f'''#!/bin/busybox sh
 set -eu
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin

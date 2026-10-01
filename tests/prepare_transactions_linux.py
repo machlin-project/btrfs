@@ -163,8 +163,8 @@ restore() {{
 }}
 
 apply() {{
-    while IFS="$(printf '\\t')" read -r seek count name skip; do
-        dd if="$1/$name" of=/dev/vda bs=512 seek=$seek skip=$skip count=$count conv=notrunc 2>/dev/null
+    while IFS="$(printf '\\t')" read -r seek count payload skip; do
+        dd if="$1/$payload" of=/dev/vda bs=512 seek=$seek skip=$skip count=$count conv=notrunc 2>/dev/null
     done < "$1/$2"
     refresh
 }}
@@ -181,9 +181,9 @@ verify() {{
     btrfs check --readonly /dev/vda < /dev/null
     test "$(primary_generation)" = "$(generation "$1" "$2")"
     mount -t btrfs -o ro,nologreplay /dev/vda /mnt
-    while IFS="$(printf '\\t')" read -r stage generation path name; do
+    while IFS="$(printf '\\t')" read -r stage generation path expected; do
         if [ "$stage" = "$2" ]; then
-            cmp "/mnt$path" "$1/$name"
+            cmp "/mnt$path" "$1/$expected"
         fi
     done < "$1/stages.tsv"
     test "$(stat -c '%a:%u:%g:%h' /mnt/greeting)" = '640:1001:1002:2'

@@ -27,6 +27,7 @@ struct bt_mutated_block {
 	uint64_t owner;
 	uint64_t original_owner;
 	uint64_t original_generation;
+	uint64_t original_flags;
 	uint8_t original_level;
 	uint8_t level;
 	int discarded;

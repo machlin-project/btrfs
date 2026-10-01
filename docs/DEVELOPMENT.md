@@ -44,14 +44,23 @@ the image helper is not an implementation of host or Linux namei.
 ## Linux-authored fixtures
 
 The six reader profiles are `plain`, `small-nodes`, `large-nodes`, `zlib`, `zstd`
-and `default-subvolume`. The transaction suites require four writable profiles
+and `default-subvolume`. The transaction suites require six writable profiles
 without a free-space tree and mounted with `nospace_cache`: `transactions` (4 KiB
 nodes, single metadata), `transactions-dup` (16 KiB nodes, DUP metadata),
-`transactions-large` (64 KiB nodes, DUP metadata) and `transactions-full` (4 KiB
-nodes, single metadata, 128 MiB). The full profile first fills all unallocated
+`transactions-large` (64 KiB nodes, DUP metadata), `transactions-full` (4 KiB
+nodes, single metadata, 128 MiB), and `transactions-shared` and
+`transactions-keyed` (4 KiB nodes, single metadata). The full profile first fills all unallocated
 space with data, then metadata with inline files carrying leaf-sized xattrs until
 Linux reports ENOSPC, then removes every seventh filler so the remaining free
-metadata is scattered. Other profiles use 256 MiB. Each uses a separate disposable
+metadata is scattered. The shared profile adds a level-2 subvolume with a
+writable and a read-only snapshot, data files, a reflink, a partially overwritten
+file (two references to one extent at different extent offsets), and a second
+subvolume with exactly one writable snapshot whose leaves interleave inline and
+data files. Linux reads some files after the snapshots, so the image already
+holds parent-named references and FULL_BACKREF blocks. The keyed profile has a
+subvolume with 30 writable snapshots and 30 reflinks of one extent, more
+references than an extent item lists inline, so Linux also writes keyed
+backreference items. Other profiles use 256 MiB. Each uses a separate disposable
 raw image and the payload in `tests/prepare_linux.py`. The payload formats **guest
 `/dev/vda`**, fills files, takes a snapshot, verifies Linux-visible contents,
 unmounts, and requires `btrfs check --readonly` to succeed. Never attach a valuable
@@ -105,7 +114,7 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all ten
+Linux checks and a completed VM exit before consuming the image. Repeat all twelve
 profiles, then run the portable image and transaction suites. It hashes each complete image before
 and after reading, verifies 312 contracts, and fails if any byte changed.
 
@@ -179,6 +188,15 @@ scenarios on a recorded device. It never writes the source fixture.
 | `maximum` | 2048-byte inline payload |
 | `batch` | `/greeting` and 19 `/many` entries, growing items in several leaves |
 | `repeated` | Two commits; the second starts from the first Machlin root set |
+| `shared-*`, `pair-convert` (`--shared`) | Writes in a snapshot source, its writable snapshot, alternately, and across three trees; leaves with reflinked and offset data references; FULL_BACKREF conversion and release |
+| `keyed-*` (`--keyed`) | The same decisions on blocks and extents whose references are partly keyed items |
+
+`btrfs-reference-audit` is an independent reference oracle in the portable
+suite. It walks every tree from the superblock and root items, derives the
+backreference every parent pointer and file extent item requires (shared forms
+under FULL_BACKREF parents), and compares the multiset and totals exactly with
+the extent tree, including leaks. It runs on every Linux fixture, after every
+scenario commit, and against deliberately damaged references.
 
 Each scenario's last commit runs every allocation, read, write and barrier fault
 point. Every recorded commit is then cut at each issue-order prefix and in each
@@ -192,7 +210,9 @@ allocation maps. `--full` adds the metadata-exhaustion case: the full profile's
 remaining metadata cannot hold a batch of all inline files, so the edit returns
 NO_SPACE without any write.
 
-Export a profile's crash cases into a new generated directory:
+Export a profile's crash cases into a new generated directory. Pass the same
+profile flag Meson uses: `--full` for `transactions-full`, `--shared` for
+`transactions-shared` and `--keyed` for `transactions-keyed`:
 
 ```sh
 mkdir artifacts/transaction-plan-transactions

@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../adapters/posix/image.h"
 #include "encode.h"
+#include "references.h"
 #include "space.h"
 #include <btrfs/write.h>
 #include <stdio.h>
@@ -37,6 +38,9 @@
 #define TRANSACTION_NODE_LIMIT 4096U
 #define RESERVATION_PROBE_LIMIT 1048576U
 #define NO_STAGE SIZE_MAX
+#define ABSENT_TREE UINT64_C(4000)
+#define SHARED_LAST 1599U
+#define PAIR_LAST 119U
 #define SYNTHETIC_COMMIT SIZE_MAX
 
 enum fault { FAULT_NONE, FAULT_ALLOCATE, FAULT_READ, FAULT_WRITE, FAULT_FLUSH, FAULT_MODES };
@@ -115,6 +119,7 @@ struct context {
 	const char *export_root;
 	size_t states;
 	size_t recoveries;
+	size_t audits;
 	uint32_t seed;
 };
 
@@ -888,6 +893,27 @@ fault_sweeps(struct context *context, const struct plan *plan, size_t commit, si
 	}
 }
 
+/* Every committed root set must satisfy the independent reference audit. */
+static void
+audit_state(struct context *context, const char *name)
+{
+	struct reference_audit audit;
+	struct btrfs_fs *fs;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	if (reference_audit(fs, &audit) != 0) {
+		fprintf(stderr, "%s: reference audit: %s\n", name, audit.failure);
+		exit(1);
+	}
+	btrfs_unmount(fs);
+	REQUIRE(context->image.live_allocations == 0);
+	printf("%s references: %zu blocks, tree %zu, shared block %zu, data %zu, shared data %zu, "
+	       "keyed %zu, full-backref blocks %zu\n",
+	    name, audit.blocks, audit.tree_refs, audit.shared_block_refs, audit.data_refs,
+	    audit.shared_data_refs, audit.keyed_refs, audit.full_backref_blocks);
+	context->audits++;
+}
+
 static void
 run_plan(struct context *context, struct plan *plan)
 {
@@ -911,6 +937,7 @@ run_plan(struct context *context, struct plan *plan)
 		    plan->name, commit, totals.writes, totals.flushes,
 		    (unsigned long long)totals.allocations, (unsigned long long)totals.reads);
 		export_writes(context, &exporter);
+		audit_state(context, plan->name);
 		crash_states(context, plan, &exporter, commit, first);
 		if (commit == plan->commits) {
 			truncate_writes(device, first);
@@ -984,21 +1011,192 @@ plan_scenarios(struct context *context)
 }
 
 static void
+shared_path(char *path, size_t size, const char *tree, size_t index)
+{
+	REQUIRE(snprintf(path, size, "/%s/inline/f%04zu", tree, index) < (int)size);
+}
+
+static void
+shared_update(
+    struct context *context, struct plan *plan, size_t commit, const char *tree, size_t index)
+{
+	static const char *const trees[] = { "shared", "shared-snap", "shared-ro" };
+	char path[32];
+	char data[64];
+	size_t i;
+	int length;
+
+	/* Track every snapshot's copy so isolation is checked at each stage. */
+	for (i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+		shared_path(path, sizeof(path), trees[i], index);
+		(void)plan_file(context, plan, path);
+	}
+	shared_path(path, sizeof(path), tree, index);
+	length = snprintf(data, sizeof(data), "%s %zu in commit %zu\n", tree, index, commit);
+	REQUIRE(length > 0 && (size_t)length < sizeof(data));
+	plan_update(context, plan, commit, path, data, (size_t)length);
+}
+
+static void
+pair_update(
+    struct context *context, struct plan *plan, size_t commit, const char *tree, size_t index)
+{
+	char path[32];
+	char data[64];
+	int length;
+
+	REQUIRE(snprintf(path, sizeof(path), "/pair/i%03zu", index) < (int)sizeof(path));
+	(void)plan_file(context, plan, path);
+	REQUIRE(snprintf(path, sizeof(path), "/pair-snap/i%03zu", index) < (int)sizeof(path));
+	(void)plan_file(context, plan, path);
+	REQUIRE(snprintf(path, sizeof(path), "/%s/i%03zu", tree, index) < (int)sizeof(path));
+	length = snprintf(data, sizeof(data), "%s %zu in commit %zu\n", tree, index, commit);
+	REQUIRE(length > 0 && (size_t)length < sizeof(data));
+	plan_update(context, plan, commit, path, data, (size_t)length);
+}
+
+/* Subvolume trees shared with a writable and a read-only snapshot. The last
+ * inline file shares a leaf with regular data extents, and earlier writes by
+ * Linux left parent-named references and FULL_BACKREF blocks. */
+static void
+shared_scenarios(struct context *context)
+{
+	static const size_t spread[] = { 0, 400, 800, 1200, SHARED_LAST };
+	struct plan plan;
+	size_t i;
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "shared-source";
+	for (i = 0; i < sizeof(spread) / sizeof(spread[0]); i++) {
+		shared_update(context, &plan, 1, "shared", spread[i]);
+	}
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "shared-snapshot";
+	for (i = 0; i < sizeof(spread) / sizeof(spread[0]); i++) {
+		shared_update(context, &plan, 1, "shared-snap", spread[i]);
+	}
+	run_plan(context, &plan);
+
+	/* The source converts shared blocks first; the snapshot then CoWs blocks
+	 * with parent-named references, and the source continues afterwards. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "shared-alternate";
+	shared_update(context, &plan, 1, "shared", 100);
+	shared_update(context, &plan, 1, "shared", SHARED_LAST);
+	shared_update(context, &plan, 2, "shared-snap", 100);
+	shared_update(context, &plan, 2, "shared-snap", SHARED_LAST);
+	shared_update(context, &plan, 3, "shared", 101);
+	shared_update(context, &plan, 3, "shared-snap", 101);
+	run_plan(context, &plan);
+
+	/* The tail file's leaf holds the reflinked extent and the two references
+	 * to one extent at different extent offsets. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "shared-extents";
+	plan_file(context, &plan, "/shared-ro/tail");
+	plan_update(context, &plan, 1, "/shared/tail", "source tail\n", 12);
+	plan_update(context, &plan, 2, "/shared-snap/tail", "snapshot tail\n", 14);
+	run_plan(context, &plan);
+
+	/* Leaves shared by exactly two trees hold data references. The source moves
+	 * them to parent-named references; the snapshot then holds the last
+	 * reference, converts them back and frees the old leaves. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "pair-convert";
+	pair_update(context, &plan, 1, "pair", 5);
+	pair_update(context, &plan, 1, "pair", 60);
+	pair_update(context, &plan, 1, "pair", PAIR_LAST);
+	pair_update(context, &plan, 2, "pair-snap", 5);
+	pair_update(context, &plan, 2, "pair-snap", 60);
+	pair_update(context, &plan, 2, "pair-snap", PAIR_LAST);
+	pair_update(context, &plan, 3, "pair", 6);
+	pair_update(context, &plan, 3, "pair-snap", 61);
+	run_plan(context, &plan);
+
+	/* One transaction spanning three trees. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "shared-trees";
+	plan_update(context, &plan, 1, "/greeting", "three trees\n", 12);
+	shared_update(context, &plan, 1, "shared", 700);
+	shared_update(context, &plan, 1, "shared-snap", 701);
+	run_plan(context, &plan);
+}
+
+static void
+keyed_update(
+    struct context *context, struct plan *plan, size_t commit, const char *tree, const char *name)
+{
+	static const char *const trees[] = { "keyed", "keyed-07", "keyed-29" };
+	char path[32];
+	char data[64];
+	size_t i;
+	int length;
+
+	for (i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+		REQUIRE(snprintf(path, sizeof(path), "/%s/%s", trees[i], name) < (int)sizeof(path));
+		(void)plan_file(context, plan, path);
+	}
+	REQUIRE(snprintf(path, sizeof(path), "/%s/%s", tree, name) < (int)sizeof(path));
+	length = snprintf(data, sizeof(data), "%s %s in commit %zu\n", tree, name, commit);
+	REQUIRE(length > 0 && (size_t)length < sizeof(data));
+	plan_update(context, plan, commit, path, data, (size_t)length);
+}
+
+/* Blocks referenced by 31 trees and an extent referenced by 31 reflinks carry
+ * more references than one extent item lists inline; the rest are keyed items.
+ * The last inline file shares a leaf with all reflinked file extents. */
+static void
+keyed_scenarios(struct context *context)
+{
+	struct plan plan;
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "keyed-source";
+	keyed_update(context, &plan, 1, "keyed", "i00");
+	keyed_update(context, &plan, 1, "keyed", "i20");
+	keyed_update(context, &plan, 1, "keyed", "last");
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "keyed-snapshot";
+	keyed_update(context, &plan, 1, "keyed-07", "i00");
+	keyed_update(context, &plan, 1, "keyed-07", "last");
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "keyed-alternate";
+	keyed_update(context, &plan, 1, "keyed", "last");
+	keyed_update(context, &plan, 2, "keyed-07", "last");
+	keyed_update(context, &plan, 3, "keyed-29", "last");
+	keyed_update(context, &plan, 3, "keyed", "i39");
+	run_plan(context, &plan);
+}
+
+static void
 admission_tests(struct context *context)
 {
 	static const char replacement[] = "written by Machlin CoW transaction\n";
 	struct btrfs_fs *fs;
 	struct btrfs_transaction *transaction;
 	struct btrfs_inode inode;
+	struct btrfs_inode snapshot;
 	struct btrfs_time time = { 1700000000, 0 };
 	struct device *device = context->device;
 
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(fs, "/snapshot/value", &snapshot) == BTRFS_OK);
 	REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
 	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_write_inline(transaction, snapshot.id, replacement,
+		    sizeof(replacement) - 1, time) == BTRFS_READ_ONLY);
 	REQUIRE(btrfs_transaction_write_inline(transaction,
-		    (struct btrfs_object_id){ BTRFS_ROOT_INODE, inode.id.inode }, replacement,
-		    sizeof(replacement) - 1, time) == BTRFS_UNSUPPORTED);
+		    (struct btrfs_object_id){ BT_EXTENT_TREE, inode.id.inode }, replacement,
+		    sizeof(replacement) - 1, time) == BTRFS_INVALID_ARGUMENT);
+	REQUIRE(btrfs_transaction_write_inline(transaction,
+		    (struct btrfs_object_id){ ABSENT_TREE, inode.id.inode }, replacement,
+		    sizeof(replacement) - 1, time) == BTRFS_NOT_FOUND);
 	REQUIRE(btrfs_transaction_write_inline(transaction, inode.id, replacement, INLINE_LIMIT + 1,
 		    time) == BTRFS_UNSUPPORTED);
 	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
@@ -1395,27 +1593,33 @@ allocation_map_tests(struct context *context)
 	}
 
 	/* The last extent record moves beyond every chunk while its block group total
-	 * is reduced to match, so only the containment rule can reject it. */
+	 * is reduced to match, so only the containment rule can reject it. Moving a
+	 * record keeps key order only when it is the last record of the tree. */
 	bt_cursor_init(&cursor, fs, extents);
 	REQUIRE(bt_cursor_seek(&cursor, last, 1) == BTRFS_OK);
 	REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
 	last = record.key;
 	bt_cursor_fini(&cursor);
-	REQUIRE(last.type == BT_EXTENT_ITEM || last.type == BT_METADATA_ITEM);
-	length = last.type == BT_METADATA_ITEM ? fs->info.node_size : last.offset;
-	for (i = 0; i < fs->chunk_count; i++) {
-		if (last.objectid - fs->chunks[i].logical < fs->chunks[i].length) {
-			group_logical = fs->chunks[i].logical;
+	if (last.type == BT_EXTENT_ITEM || last.type == BT_METADATA_ITEM) {
+		length = last.type == BT_METADATA_ITEM ? fs->info.node_size : last.offset;
+		for (i = 0; i < fs->chunk_count; i++) {
+			if (last.objectid - fs->chunks[i].logical < fs->chunks[i].length) {
+				group_logical = fs->chunks[i].logical;
+			}
 		}
+		REQUIRE(find_leaf(fs, extents, match_last, &last, leaf, &logical, &slot));
+		bt_put64(&leaf_item(leaf, slot)->key.objectid, chunk_end + fs->info.node_size);
+		replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+		REQUIRE(
+		    find_leaf(fs, extents, match_group_at, &group_logical, leaf, &logical, &slot));
+		group = leaf_data(leaf, slot);
+		bt_put64(&group->used_bytes, bt_u64(group->used_bytes) - length);
+		replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+		expect_corrupt_map(context, "extent outside chunks");
+	} else {
+		printf("allocation map extent outside chunks: not constructed on this image "
+		       "(last record is a keyed backreference)\n");
 	}
-	REQUIRE(find_leaf(fs, extents, match_last, &last, leaf, &logical, &slot));
-	bt_put64(&leaf_item(leaf, slot)->key.objectid, chunk_end + fs->info.node_size);
-	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
-	REQUIRE(find_leaf(fs, extents, match_group_at, &group_logical, leaf, &logical, &slot));
-	group = leaf_data(leaf, slot);
-	bt_put64(&group->used_bytes, bt_u64(group->used_bytes) - length);
-	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
-	expect_corrupt_map(context, "extent outside chunks");
 
 	/* Logical separation does not authorize writes into another chunk's stripe. */
 	type = BT_BLOCK_DATA;
@@ -1428,6 +1632,80 @@ allocation_map_tests(struct context *context)
 	replace_leaf(context, fs, leaf, logical, BT_BLOCK_SYSTEM);
 	btrfs_unmount(fs);
 	expect_corrupt_map(context, "physical chunk alias");
+	free(leaf);
+}
+
+static int
+match_inline_ref(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument)
+{
+	const uint8_t *type = argument;
+
+	(void)fs;
+	(void)cursor;
+	return (record->key.type == BT_METADATA_ITEM || record->key.type == BT_EXTENT_ITEM) &&
+	    record->size > sizeof(struct bt_disk_extent_item) &&
+	    record->data[sizeof(struct bt_disk_extent_item)] == *type;
+}
+
+static void
+expect_audit_failure(struct context *context, const char *name)
+{
+	struct reference_audit audit;
+	struct btrfs_fs *fs;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(reference_audit(fs, &audit) != 0);
+	btrfs_unmount(fs);
+	truncate_writes(context->device, 0);
+	printf("reference audit detects %s: PASS (%s)\n", name, audit.failure);
+}
+
+/* The audit is an oracle only if it rejects damaged references. */
+static void
+audit_self_test(struct context *context)
+{
+	struct bt_disk_extent_item *extent;
+	struct bt_disk_data_ref *data;
+	struct btrfs_fs *fs;
+	struct bt_root extents;
+	struct bt_le64 value;
+	uint8_t *leaf;
+	uint8_t *reference;
+	uint8_t type;
+	uint64_t logical;
+	uint32_t slot;
+
+	leaf = malloc(BT_MAX_NODE_SIZE);
+	REQUIRE(leaf != NULL);
+	audit_state(context, "fixture");
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
+	type = BT_TREE_BLOCK_REF;
+	REQUIRE(find_leaf(fs, extents, match_inline_ref, &type, leaf, &logical, &slot));
+	reference = (uint8_t *)leaf_data(leaf, slot) + sizeof(*extent) + 1;
+	memcpy(&value, reference, sizeof(value));
+	bt_put64(&value, bt_u64(value) + 1);
+	memcpy(reference, &value, sizeof(value));
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_audit_failure(context, "a wrong tree reference");
+
+	REQUIRE(find_leaf(fs, extents, match_inline_ref, &type, leaf, &logical, &slot));
+	extent = leaf_data(leaf, slot);
+	bt_put64(&extent->refs, bt_u64(extent->refs) + 1);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_audit_failure(context, "an inconsistent reference total");
+
+	type = BT_EXTENT_DATA_REF;
+	REQUIRE(find_leaf(fs, extents, match_inline_ref, &type, leaf, &logical, &slot));
+	extent = leaf_data(leaf, slot);
+	data = (void *)((uint8_t *)extent + sizeof(*extent) + 1);
+	bt_put64(&extent->refs, bt_u64(extent->refs) + 1);
+	bt_put32(&data->count, bt_u32(data->count) + 1);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_audit_failure(context, "an overcounted data reference");
+	btrfs_unmount(fs);
+	REQUIRE(context->image.live_allocations == 0);
 	free(leaf);
 }
 
@@ -1531,6 +1809,8 @@ main(int argc, char **argv)
 	struct btrfs_info info;
 	const char *image = NULL;
 	int full = 0;
+	int shared = 0;
+	int keyed = 0;
 	int i;
 
 	context = calloc(1, sizeof(*context));
@@ -1540,6 +1820,10 @@ main(int argc, char **argv)
 			context->export_root = argv[++i];
 		} else if (strcmp(argv[i], "--full") == 0) {
 			full = 1;
+		} else if (strcmp(argv[i], "--shared") == 0) {
+			shared = 1;
+		} else if (strcmp(argv[i], "--keyed") == 0) {
+			keyed = 1;
 		} else {
 			REQUIRE(image == NULL);
 			image = argv[i];
@@ -1569,10 +1853,17 @@ main(int argc, char **argv)
 	admission_tests(context);
 	copy_tests(context);
 	allocation_map_tests(context);
+	audit_self_test(context);
 	if (full) {
 		exhaustion_test(context);
 	}
 	plan_scenarios(context);
+	if (shared) {
+		shared_scenarios(context);
+	}
+	if (keyed) {
+		keyed_scenarios(context);
+	}
 	REQUIRE(context->image.live_allocations == 0);
 	btrfs_image_close(&context->image);
 	free(context->device->writes);

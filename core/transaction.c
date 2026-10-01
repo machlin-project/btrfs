@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
+#include "backref.h"
 #include "encode.h"
 #include "space.h"
 #include <btrfs/write.h>
 
 #define BT_TRANSACTION_NODES 4096U
+#define BT_TRANSACTION_TREES 16U
 #define BT_INLINE_WRITE_LIMIT 2048U
 #define BT_ACCOUNT_ORIGINAL 1U
 #define BT_ACCOUNT_NEW 2U
@@ -24,12 +26,15 @@ struct btrfs_transaction {
 	struct bt_space *space;
 	struct bt_root roots;
 	struct bt_root devices;
-	struct bt_owned_root files;
+	struct bt_root top;
+	struct bt_owned_root trees[BT_TRANSACTION_TREES];
+	size_t tree_count;
 	struct bt_owned_root extents;
 	struct bt_disk_super original_super;
 	struct bt_disk_super super;
 	uint8_t accounted[BT_TRANSACTION_NODES];
 	uint8_t *scratch;
+	uint8_t *original;
 	unsigned copies;
 	enum btrfs_result failure;
 	int changed;
@@ -60,9 +65,13 @@ bt_tx_root(const struct btrfs_fs *fs, uint64_t owner, struct bt_owned_root *root
 			root->root = (struct bt_root){ bt_u64(root->item.legacy.bytenr),
 				bt_u64(root->item.legacy.generation), owner,
 				root->item.legacy.level };
-			if (bt_u64(root->item.legacy.flags) != 0 ||
+			if (bt_u64(root->item.legacy.flags) == BT_ROOT_SUBVOL_READ_ONLY) {
+				error = BTRFS_READ_ONLY;
+			} else if (bt_u64(root->item.legacy.flags) != 0 ||
 			    root->item.legacy.drop_level != 0 ||
-			    bt_u64(root->item.legacy.drop_progress.objectid) != 0) {
+			    bt_u64(root->item.legacy.drop_progress.objectid) != 0 ||
+			    (bt_file_tree(owner) && bt_u32(root->item.legacy.refs) == 0)) {
+				/* Dead or partially dropped trees need the cleaner's semantics. */
 				error = BTRFS_UNSUPPORTED;
 			}
 		}
@@ -138,7 +147,8 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	transaction->io = *environment;
 	transaction->roots = base->root_tree;
 	transaction->scratch = base->env.allocate(base->env.context, base->info.node_size);
-	error = transaction->scratch == NULL
+	transaction->original = base->env.allocate(base->env.context, base->info.node_size);
+	error = transaction->scratch == NULL || transaction->original == NULL
 	    ? BTRFS_NO_MEMORY
 	    : bt_read_physical(base, BT_SUPER_OFFSET, &transaction->original_super,
 		  sizeof(transaction->original_super));
@@ -158,7 +168,7 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 		error = bt_tx_root(base, BT_EXTENT_TREE, &transaction->extents);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_tx_root(base, BTRFS_TOP_LEVEL_TREE, &transaction->files);
+		error = bt_find_root(base, BTRFS_TOP_LEVEL_TREE, &transaction->top);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_find_root(base, BT_DEV_TREE, &transaction->devices);
@@ -177,6 +187,36 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	}
 	*result = transaction;
 	return BTRFS_OK;
+}
+
+/* Opens a writable file tree once per transaction; its committed root item
+ * remains the reference for sharing decisions until publication. */
+static enum btrfs_result
+bt_tx_tree(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root **result)
+{
+	struct bt_owned_root *owned;
+	size_t i;
+	enum btrfs_result error;
+
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == tree) {
+			*result = &transaction->trees[i];
+			return BTRFS_OK;
+		}
+	}
+	if (!bt_file_tree(tree)) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (transaction->tree_count == BT_TRANSACTION_TREES) {
+		return BTRFS_UNSUPPORTED;
+	}
+	owned = &transaction->trees[transaction->tree_count];
+	error = bt_tx_root(transaction->base, tree, owned);
+	if (error == BTRFS_OK) {
+		transaction->tree_count++;
+		*result = owned;
+	}
+	return error;
 }
 
 static enum btrfs_result
@@ -203,6 +243,7 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 	struct bt_key inode_key = { .objectid = id.inode, .type = BT_INODE_ITEM };
 	struct bt_key extent_key = { .objectid = id.inode, .type = BT_EXTENT_DATA };
 	const struct btrfs_fs *view;
+	struct bt_owned_root *tree;
 	size_t length;
 	enum btrfs_result error;
 
@@ -213,11 +254,15 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 	if (transaction->failure != BTRFS_OK || transaction->finished) {
 		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
 	}
-	if (id.tree != BTRFS_TOP_LEVEL_TREE || size > BT_INLINE_WRITE_LIMIT) {
+	if (size > BT_INLINE_WRITE_LIMIT) {
 		return BTRFS_UNSUPPORTED;
 	}
-	error = bt_mutation_find(transaction->mutation, transaction->files.root, inode_key, &inode,
-	    sizeof(inode), &length);
+	error = bt_tx_tree(transaction, id.tree, &tree);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	error = bt_mutation_find(
+	    transaction->mutation, tree->root, inode_key, &inode, sizeof(inode), &length);
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -230,7 +275,7 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 	/* Require exactly one existing, ordinary inline extent. This prevents a
 	 * partial conversion from leaking external extents or changing snapshots. */
 	view = bt_mutation_view(transaction->mutation);
-	bt_cursor_init(&cursor, view, transaction->files.root);
+	bt_cursor_init(&cursor, view, tree->root);
 	error = bt_cursor_seek(&cursor, extent_key, 0);
 	if (error == BTRFS_OK) {
 		(void)bt_cursor_record(&cursor, &record);
@@ -264,10 +309,9 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 	bt_put64(&extent->ram_bytes, size);
 	extent->type = BT_EXTENT_INLINE;
 	bt_copy(extent + 1, bytes, size);
-	error = size == 0
-	    ? bt_tx_edit(transaction, &transaction->files.root, extent_key, NULL, 0, BT_DELETE)
-	    : bt_tx_edit(transaction, &transaction->files.root, extent_key, extent,
-		  sizeof(*extent) + size, BT_REPLACE);
+	error = size == 0 ? bt_tx_edit(transaction, &tree->root, extent_key, NULL, 0, BT_DELETE)
+			  : bt_tx_edit(transaction, &tree->root, extent_key, extent,
+				sizeof(*extent) + size, BT_REPLACE);
 	if (error == BTRFS_OK) {
 		bt_put64(&inode.transid, transaction->base->info.generation + 1);
 		bt_put64(&inode.size, size);
@@ -278,47 +322,173 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 		inode.ctime = inode.mtime;
 		/* Set-id inodes were rejected before editing; credential policy belongs
 		 * to the owning adapter, which must authorize the operation separately. */
-		error = bt_tx_edit(transaction, &transaction->files.root, inode_key, &inode,
-		    sizeof(inode), BT_REPLACE);
+		error = bt_tx_edit(
+		    transaction, &tree->root, inode_key, &inode, sizeof(inode), BT_REPLACE);
 	}
 	if (error == BTRFS_OK) {
 		transaction->changed = 1;
-		bt_put64(&transaction->files.item.ctransid, transaction->base->info.generation + 1);
-		transaction->files.item.ctime = inode.ctime;
+		bt_put64(&tree->item.ctransid, transaction->base->info.generation + 1);
+		tree->item.ctime = inode.ctime;
 	}
 	return error;
 }
 
+/* Adds or removes the references a tree block's content holds: child blocks for
+ * nodes, regular and preallocated data extents for leaves. full selects the
+ * shared form naming this block as parent; otherwise references name root. */
 static enum btrfs_result
-bt_tx_drop_original(struct btrfs_transaction *transaction, const struct bt_mutated_block *block)
+bt_tx_children(struct btrfs_transaction *transaction, const uint8_t *node, uint64_t address,
+    int full, uint64_t root, int add)
 {
-	struct {
-		struct bt_disk_extent_item extent;
-		struct bt_disk_inline_ref reference;
-	} item;
-	struct bt_key key = { .objectid = block->original_address,
+	const struct bt_disk_header *header = (const void *)node;
+	const struct bt_disk_item *items = (const void *)(header + 1);
+	const struct bt_disk_pointer *pointers = (const void *)(header + 1);
+	const struct bt_disk_extent *file;
+	struct bt_backref reference;
+	struct bt_key extent;
+	struct bt_key key;
+	uint32_t i;
+	int freed = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (i = 0; error == BTRFS_OK && i < bt_u32(header->count); i++) {
+		bt_zero(&reference, sizeof(reference));
+		if (header->level != 0) {
+			extent = (struct bt_key){ .objectid = bt_u64(pointers[i].bytenr),
+				.type = BT_METADATA_ITEM,
+				.offset = (uint64_t)header->level - 1 };
+		} else {
+			key = bt_key_decode(&items[i].key);
+			file =
+			    (const void *)((const uint8_t *)(header + 1) + bt_u32(items[i].offset));
+			if (key.type != BT_EXTENT_DATA) {
+				continue;
+			}
+			if (bt_u32(items[i].size) < sizeof(file->header)) {
+				return BTRFS_CORRUPT;
+			}
+			if (file->header.type == BT_EXTENT_INLINE) {
+				continue;
+			}
+			if (bt_u32(items[i].size) < sizeof(*file)) {
+				return BTRFS_CORRUPT;
+			}
+			if (bt_u64(file->disk_bytenr) == 0) {
+				continue;
+			}
+			extent = (struct bt_key){ .objectid = bt_u64(file->disk_bytenr),
+				.type = BT_EXTENT_ITEM,
+				.offset = bt_u64(file->disk_bytes) };
+			reference.data = 1;
+			reference.inode = key.objectid;
+			reference.offset = key.offset - bt_u64(file->offset);
+		}
+		if (full) {
+			reference.parent = address;
+			reference.inode = 0;
+			reference.offset = 0;
+		} else {
+			reference.root = root;
+		}
+		error = add ? bt_backref_add(transaction->mutation, &transaction->extents.root,
+				  extent, &reference, 1)
+			    : bt_backref_drop(transaction->mutation, &transaction->extents.root,
+				  extent, &reference, 1, &freed);
+		/* Converting one reference form into another never frees an extent. */
+		if (error == BTRFS_OK && !add && freed) {
+			error = BTRFS_CORRUPT;
+		}
+	}
+	return error;
+}
+
+/* Linux's reference update for a CoW of a committed block (update_ref_for_cow).
+ * A block in a shareable tree may be shared when it is not the tree's root and
+ * not newer than the tree's last snapshot. If the owner of a shared block CoWs
+ * it, the old block's children switch to references naming it as parent; any
+ * other tree adds references from its root for the copy. An unshared block with
+ * parent-named children converts them back. The old block then loses this tree's
+ * reference and is freed only with its last one. */
+static enum btrfs_result
+bt_tx_release(struct btrfs_transaction *transaction, const struct bt_mutated_block *block)
+{
+	struct bt_owned_root *tree = NULL;
+	struct bt_backref reference;
+	struct bt_root original = { block->original_address, block->original_generation,
+		block->owner, block->original_level };
+	struct bt_key extent = { .objectid = block->original_address,
 		.type = BT_METADATA_ITEM,
 		.offset = block->original_level };
-	size_t size;
+	uint64_t refs;
+	uint64_t flags;
+	size_t i;
+	int shareable = 0;
+	int freed;
 	enum btrfs_result error;
 
-	error = bt_mutation_find(
-	    transaction->mutation, transaction->extents.root, key, &item, sizeof(item), &size);
+	if (block->original_flags >> BT_HEADER_BACKREF_SHIFT !=
+	    BT_HEADER_MIXED_BACKREF >> BT_HEADER_BACKREF_SHIFT) {
+		return BTRFS_UNSUPPORTED;
+	}
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == block->owner) {
+			tree = &transaction->trees[i];
+		}
+	}
+	if (tree != NULL) {
+		shareable = block->original_address != bt_u64(tree->item.legacy.bytenr) &&
+		    (block->original_generation <= bt_u64(tree->item.legacy.last_snapshot) ||
+			(block->original_flags & BT_HEADER_RELOC) != 0);
+	} else if (bt_file_tree(block->owner)) {
+		return BTRFS_CORRUPT;
+	}
+	error = bt_backref_info(
+	    transaction->mutation, transaction->extents.root, extent, &refs, &flags);
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	/* Explicitly reject shared/full-backreference paths. Removing a single
-	 * owner from those requires delayed child/data reference accounting. */
-	if (size != sizeof(item) || bt_u64(item.extent.refs) != 1 ||
-	    bt_u64(item.extent.flags) != BT_EXTENT_FLAG_TREE ||
-	    bt_u64(item.extent.generation) != block->original_generation ||
-	    item.reference.type != BT_TREE_BLOCK_REF ||
-	    bt_u64(item.reference.offset) != block->owner ||
-	    block->original_owner != block->owner) {
-		return BTRFS_UNSUPPORTED;
+	if (refs > 1 && !shareable) {
+		return BTRFS_CORRUPT;
 	}
-	error = bt_tx_edit(transaction, &transaction->extents.root, key, NULL, 0, BT_DELETE);
-	return error == BTRFS_OK
+	if (refs > 1 || (flags & BT_EXTENT_FLAG_FULL_BACKREF) != 0) {
+		error = bt_tree_read(transaction->base, original, transaction->original);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+	}
+	if (refs > 1 && block->original_owner == block->owner &&
+	    !(flags & BT_EXTENT_FLAG_FULL_BACKREF)) {
+		error = bt_tx_children(
+		    transaction, transaction->original, block->original_address, 1, 0, 1);
+		if (error == BTRFS_OK) {
+			error = bt_backref_set_flags(transaction->mutation,
+			    &transaction->extents.root, extent, BT_EXTENT_FLAG_FULL_BACKREF);
+		}
+	} else if (refs > 1) {
+		error = bt_tx_children(transaction, transaction->original, block->original_address,
+		    0, block->owner, 1);
+	} else if (flags & BT_EXTENT_FLAG_FULL_BACKREF) {
+		error = bt_tx_children(transaction, transaction->original, block->original_address,
+		    0, block->owner, 1);
+		if (error == BTRFS_OK) {
+			error = bt_tx_children(
+			    transaction, transaction->original, block->original_address, 1, 0, 0);
+		}
+	} else if (block->original_owner != block->owner) {
+		/* A sole implicit reference always comes from the owning tree. */
+		return BTRFS_CORRUPT;
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	bt_zero(&reference, sizeof(reference));
+	reference.root = block->owner;
+	error = bt_backref_drop(
+	    transaction->mutation, &transaction->extents.root, extent, &reference, 1, &freed);
+	if (error == BTRFS_OK && freed != (refs == 1)) {
+		error = BTRFS_CORRUPT;
+	}
+	return error == BTRFS_OK && freed
 	    ? bt_space_change_used(transaction->space, block->original_address, 0)
 	    : error;
 }
@@ -342,7 +512,7 @@ bt_tx_account(struct btrfs_transaction *transaction)
 		}
 		if (block.original_address != 0 &&
 		    !(transaction->accounted[i] & BT_ACCOUNT_ORIGINAL)) {
-			error = bt_tx_drop_original(transaction, &block);
+			error = bt_tx_release(transaction, &block);
 			if (error != BTRFS_OK) {
 				return error;
 			}
@@ -425,9 +595,15 @@ bt_tx_backup(struct btrfs_transaction *transaction)
 {
 	struct bt_disk_root_backup *backup;
 	const struct btrfs_fs *base = transaction->base;
+	struct bt_root top = transaction->top;
 	unsigned oldest = 0;
 	unsigned i;
 
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == BTRFS_TOP_LEVEL_TREE) {
+			top = transaction->trees[i].root;
+		}
+	}
 	for (i = 1; i < BT_BACKUP_ROOTS; i++) {
 		if (bt_u64(transaction->super.backup_roots[i].tree_generation) <
 		    bt_u64(transaction->super.backup_roots[oldest].tree_generation)) {
@@ -442,9 +618,9 @@ bt_tx_backup(struct btrfs_transaction *transaction)
 	bt_put64(&backup->extent, transaction->extents.root.address);
 	bt_put64(&backup->extent_generation, transaction->extents.root.generation);
 	backup->extent_level = transaction->extents.root.level;
-	bt_put64(&backup->files, transaction->files.root.address);
-	bt_put64(&backup->files_generation, transaction->files.root.generation);
-	backup->files_level = transaction->files.root.level;
+	bt_put64(&backup->files, top.address);
+	bt_put64(&backup->files_generation, top.generation);
+	backup->files_level = top.level;
 	bt_put64(&backup->chunk, base->chunk_tree.address);
 	bt_put64(&backup->chunk_generation, base->chunk_tree.generation);
 	backup->chunk_level = base->chunk_tree.level;
@@ -473,9 +649,11 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 	int pending;
 	enum btrfs_result error;
 
-	error = bt_tx_update_root(transaction, &transaction->files);
-	if (error != BTRFS_OK) {
-		return error;
+	for (i = 0; i < transaction->tree_count; i++) {
+		error = bt_tx_update_root(transaction, &transaction->trees[i]);
+		if (error != BTRFS_OK) {
+			return error;
+		}
 	}
 	/* Extent references, block groups and root items may themselves CoW more
 	 * blocks. Resolve this bounded fixed point before issuing any I/O. */
@@ -650,6 +828,10 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 	bt_space_destroy(transaction->space);
 	if (transaction->scratch != NULL) {
 		env->release(env->context, transaction->scratch, transaction->base->info.node_size);
+	}
+	if (transaction->original != NULL) {
+		env->release(
+		    env->context, transaction->original, transaction->base->info.node_size);
 	}
 	env->release(env->context, transaction, sizeof(*transaction));
 }

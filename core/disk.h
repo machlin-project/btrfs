@@ -37,6 +37,7 @@ struct bt_le64 {
 #define BT_CHUNK_TREE UINT64_C(3)
 #define BT_CSUM_TREE UINT64_C(7)
 #define BT_QUOTA_TREE UINT64_C(8)
+#define BT_DATA_RELOC_TREE (UINT64_MAX - UINT64_C(8))
 #define BT_DEV_TREE UINT64_C(4)
 #define BT_FIRST_CHUNK_OBJECTID UINT64_C(256)
 #define BT_ROOT_DIR_OBJECTID UINT64_C(6)
@@ -67,7 +68,10 @@ struct bt_le64 {
 #define BT_SUPER_METADUMP (UINT64_C(1) << 33)
 #define BT_SUPER_METADUMP_V2 (UINT64_C(1) << 34)
 #define BT_HEADER_WRITTEN UINT64_C(1)
-#define BT_HEADER_MIXED_BACKREF (UINT64_C(1) << 56)
+#define BT_HEADER_RELOC (UINT64_C(1) << 1)
+#define BT_HEADER_BACKREF_SHIFT 56U
+#define BT_HEADER_MIXED_BACKREF (UINT64_C(1) << BT_HEADER_BACKREF_SHIFT)
+#define BT_ROOT_SUBVOL_READ_ONLY UINT64_C(1)
 #define BT_BACKUP_ROOTS 4U
 #define BT_EXTENT_FLAG_DATA UINT64_C(1)
 #define BT_EXTENT_FLAG_TREE UINT64_C(2)
@@ -87,6 +91,9 @@ enum bt_item_type {
 	BT_EXTENT_ITEM = 168,
 	BT_METADATA_ITEM = 169,
 	BT_TREE_BLOCK_REF = 176,
+	BT_EXTENT_DATA_REF = 178,
+	BT_SHARED_BLOCK_REF = 182,
+	BT_SHARED_DATA_REF = 184,
 	BT_BLOCK_GROUP_ITEM = 192,
 	BT_CHUNK_ITEM = 228
 };
@@ -210,6 +217,22 @@ struct bt_disk_inline_ref {
 	struct bt_le64 offset;
 };
 
+/* Follows the inline reference type byte, or forms a keyed item. */
+struct bt_disk_data_ref {
+	struct bt_le64 root, objectid, offset;
+	struct bt_le32 count;
+};
+
+struct bt_disk_shared_data_ref {
+	struct bt_le32 count;
+};
+
+/* Present after a non-skinny tree extent item, before its inline references. */
+struct bt_disk_tree_block_info {
+	struct bt_disk_key key;
+	uint8_t level;
+};
+
 struct bt_disk_block_group {
 	struct bt_le64 used_bytes, chunk_objectid, flags;
 };
@@ -255,5 +278,8 @@ _Static_assert(sizeof(struct bt_disk_root_full) == 439, "root layout");
 _Static_assert(sizeof(struct bt_disk_extent_item) == 24, "extent item layout");
 _Static_assert(sizeof(struct bt_disk_inline_ref) == 9, "inline reference layout");
 _Static_assert(sizeof(struct bt_disk_extent_header) == 21, "inline extent layout");
+_Static_assert(sizeof(struct bt_disk_extent) == 53, "file extent layout");
+_Static_assert(sizeof(struct bt_disk_data_ref) == 28, "data reference layout");
+_Static_assert(sizeof(struct bt_disk_tree_block_info) == 18, "tree block info layout");
 
 #endif
