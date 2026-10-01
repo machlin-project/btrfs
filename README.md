@@ -18,12 +18,14 @@ failures, mirror fallback, subvolume identity and structural I/O budgets.
 The XNU guest suite passes on four image profiles, including mmap, native user
 xattrs, Unix permissions, directory cookies, snapshots and concurrent reads.
 
-The writer can replace an existing uncompressed inline file in the top-level
-tree. It updates CoW paths, extent references, block-group accounting, root
-items and superblock mirrors with two persistence barriers. Linux fsck and
-mounted checks accept every whole-write crash prefix. Native mounts remain
-read-only: general file writes, shared reference updates, recovery and native
-write coherence are remaining work. See [acceptance](docs/ACCEPTANCE.md) and
+The writer can replace existing uncompressed inline files in the top-level
+tree, many per transaction. It updates CoW paths, extent references, block-group
+accounting, root items and superblock copies with three persistence barriers.
+Explicit superblock recovery resolves torn or disagreeing copies without rolling
+back an acknowledged generation. Linux agrees with the recorded outcome of
+reordered and torn crash states on four writable profiles. Native mounts remain
+read-only: general file writes, shared reference updates and native write
+coherence are remaining work. See [acceptance](docs/ACCEPTANCE.md) and
 [the concrete handoff](docs/HANDOFF.md).
 
 The performance goal is to outperform Linux Btrfs on matched filesystem

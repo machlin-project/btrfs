@@ -9,7 +9,7 @@ warnings = ['-Wdeclaration-after-statement', '-Werror=conditional-uninitialized'
 add_project_arguments(cc.get_supported_arguments(warnings), language: 'c')
 sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
-  'core/mutable.c', 'core/space.c', 'core/transaction.c')
+  'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -65,6 +65,12 @@ if fixtures != ''
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   test('inline-transactions', transaction_test,
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 180, suite: 'images')
+  test('inline-transactions-dup', transaction_test,
+    args: [join_paths(fixtures, 'transactions-dup.raw')], timeout: 180, suite: 'images')
+  test('inline-transactions-large', transaction_test,
+    args: [join_paths(fixtures, 'transactions-large.raw')], timeout: 180, suite: 'images')
+  test('metadata-exhaustion', transaction_test,
+    args: ['--full', join_paths(fixtures, 'transactions-full.raw')], timeout: 180, suite: 'images')
 endif
 run_target('format', command: [py, files('scripts/format.py')])
 run_target('check-style', command: [py, files('scripts/format.py'), '--check'])

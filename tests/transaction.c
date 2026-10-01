@@ -1,15 +1,14 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #define _POSIX_C_SOURCE 200809L
 #include "../adapters/posix/image.h"
-#include "internal.h"
+#include "encode.h"
+#include "space.h"
 #include <btrfs/write.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
-#define WRITE_LIMIT 1024U
-#define SECOND_SUPER_OFFSET (UINT64_C(64) * 1024 * 1024)
-#define DEVICE_SECTOR_SIZE 512U
 #define REQUIRE(condition)                                                                         \
 	do {                                                                                       \
 		if (!(condition)) {                                                                \
@@ -18,52 +17,168 @@
 		}                                                                                  \
 	} while (0)
 
+/* Device persistence is modeled per 512-byte sector: between two successful
+ * barriers, issued writes may persist in any order and any subset of sectors. */
+#define DEVICE_SECTOR 512U
+#define WRITE_SECTORS (BT_MAX_NODE_SIZE / DEVICE_SECTOR)
+#define INLINE_LIMIT 2048U
+#define MAX_FILES 32U
+#define MAX_STAGES 4U
+#define MAX_RECOVERY_WRITES BTRFS_SUPER_COPIES
+#define METADATA_SAMPLES 32U
+#define EXPORT_SAMPLES 8U
+#define EXPORT_PREFIXES 16U
+#define BARRIERS 3U
+#define SUPER_EPOCHS 2U
+#define TEAR_PATTERNS 6U
+#define MANY_ENTRIES 700U
+#define BATCH_STRIDE 37U
+/* Mirrors core/transaction.c: the dirty-node limit of one transaction. */
+#define TRANSACTION_NODE_LIMIT 4096U
+#define RESERVATION_PROBE_LIMIT 1048576U
+#define NO_STAGE SIZE_MAX
+#define SYNTHETIC_COMMIT SIZE_MAX
+
+enum fault { FAULT_NONE, FAULT_ALLOCATE, FAULT_READ, FAULT_WRITE, FAULT_FLUSH, FAULT_MODES };
+
 struct saved_write {
 	uint64_t offset;
 	size_t length;
 	uint8_t *bytes;
+	uint8_t visible[WRITE_SECTORS];
+	size_t commit;
+	unsigned epoch;
 };
 
 struct device {
-	struct btrfs_environment original;
-	struct saved_write writes[WRITE_LIMIT];
+	struct btrfs_image *image;
+	struct saved_write *writes;
 	size_t count;
-	size_t flushes;
+	size_t capacity;
 	size_t durable;
+	size_t commit;
+	unsigned epoch;
+	size_t issued;
+	size_t flushes;
 	size_t fail_write;
 	size_t fail_flush;
-	size_t persisted[WRITE_LIMIT];
-	int selective;
-	int visible;
+	int immediate;
 };
+
+struct tracked {
+	char path[32];
+	uint8_t *data[MAX_STAGES];
+	size_t size[MAX_STAGES];
+};
+
+/* Source-controlled operation sequence: stage 0 is the Linux fixture and stage
+ * k is the expected logical state after the k-th acknowledged commit. */
+struct plan {
+	const char *name;
+	struct tracked files[MAX_FILES];
+	size_t file_count;
+	size_t commits;
+	size_t updated[MAX_STAGES][MAX_FILES];
+	size_t update_count[MAX_STAGES];
+};
+
+struct totals {
+	size_t writes;
+	size_t flushes;
+	uint64_t allocations;
+	uint64_t reads;
+};
+
+struct outcome {
+	size_t mounted;
+	size_t resolved;
+	int recovered;
+	size_t recovery_count;
+	struct saved_write recovery[MAX_RECOVERY_WRITES];
+};
+
+struct exporter {
+	char directory[2048];
+	FILE *cases;
+	size_t next;
+	size_t exported;
+};
+
+struct context {
+	struct btrfs_image image;
+	struct device *device;
+	struct btrfs_environment env;
+	struct btrfs_write_environment writer;
+	uint64_t base_generation;
+	uint32_t node_size;
+	uint32_t sector_size;
+	const char *export_root;
+	size_t states;
+	size_t recoveries;
+	uint32_t seed;
+};
+
+static uint32_t
+next_random(struct context *context)
+{
+	context->seed ^= context->seed << 13;
+	context->seed ^= context->seed >> 17;
+	context->seed ^= context->seed << 5;
+	return context->seed;
+}
+
+static size_t
+sectors(const struct saved_write *write)
+{
+	return write->length / DEVICE_SECTOR;
+}
+
+static void
+show(struct saved_write *write, int visible)
+{
+	memset(write->visible, visible, sectors(write));
+}
+
+static void
+overlay(void *bytes, uint64_t offset, size_t size, const struct saved_write *write, size_t sector,
+    size_t count)
+{
+	uint64_t source = write->offset + sector * DEVICE_SECTOR;
+	uint64_t start = offset > source ? offset : source;
+	uint64_t end = offset + size < source + count * DEVICE_SECTOR
+	    ? offset + size
+	    : source + count * DEVICE_SECTOR;
+
+	if (start < end) {
+		memcpy((uint8_t *)bytes + (start - offset), write->bytes + (start - write->offset),
+		    (size_t)(end - start));
+	}
+}
 
 static enum btrfs_result
 read_device(void *context, uint64_t offset, void *bytes, size_t size)
 {
 	struct device *device = context;
 	const struct saved_write *write;
-	uint64_t start;
-	uint64_t end;
 	size_t i;
-	size_t length;
+	size_t sector;
+	size_t run;
 	enum btrfs_result error;
 
-	error = device->original.read(device->original.context, offset, bytes, size);
-	if (error == BTRFS_OK && device->visible) {
-		for (i = 0; i < device->count; i++) {
-			write = &device->writes[i];
-			length = device->selective ? device->persisted[i]
-			    : i < device->durable  ? write->length
-						   : 0;
-			if (length == 0) {
-				continue;
+	error = device->image->environment.read(
+	    device->image->environment.context, offset, bytes, size);
+	for (i = 0; error == BTRFS_OK && i < device->count; i++) {
+		write = &device->writes[i];
+		if (write->offset >= offset + size || offset >= write->offset + write->length) {
+			continue;
+		}
+		for (sector = 0; sector < sectors(write); sector += run) {
+			for (run = 1; sector + run < sectors(write) &&
+			    write->visible[sector + run] == write->visible[sector];
+			    run++) {
 			}
-			start = offset > write->offset ? offset : write->offset;
-			end = offset + size < write->offset + length ? offset + size
-								     : write->offset + length;
-			if (start < end) {
-				memcpy((uint8_t *)bytes + (start - offset),
-				    write->bytes + (start - write->offset), (size_t)(end - start));
+			if (write->visible[sector]) {
+				overlay(bytes, offset, size, write, sector, run);
 			}
 		}
 	}
@@ -75,7 +190,7 @@ allocate(void *context, size_t size)
 {
 	struct device *device = context;
 
-	return device->original.allocate(device->original.context, size);
+	return device->image->environment.allocate(device->image->environment.context, size);
 }
 
 static void
@@ -83,7 +198,35 @@ release(void *context, void *bytes, size_t size)
 {
 	struct device *device = context;
 
-	device->original.release(device->original.context, bytes, size);
+	device->image->environment.release(device->image->environment.context, bytes, size);
+}
+
+static struct saved_write *
+record(struct device *device, uint64_t offset, const void *bytes, size_t size)
+{
+	struct saved_write *write;
+	struct saved_write *grown;
+
+	REQUIRE(offset % DEVICE_SECTOR == 0 && size % DEVICE_SECTOR == 0 && size != 0 &&
+	    size <= BT_MAX_NODE_SIZE);
+	REQUIRE(offset <= device->image->environment.size_bytes &&
+	    size <= device->image->environment.size_bytes - offset);
+	if (device->count == device->capacity) {
+		device->capacity = device->capacity == 0 ? 256 : device->capacity * 2;
+		grown = realloc(device->writes, device->capacity * sizeof(*grown));
+		REQUIRE(grown != NULL);
+		device->writes = grown;
+	}
+	write = &device->writes[device->count++];
+	memset(write, 0, sizeof(*write));
+	write->offset = offset;
+	write->length = size;
+	write->bytes = malloc(size);
+	REQUIRE(write->bytes != NULL);
+	memcpy(write->bytes, bytes, size);
+	write->commit = device->commit;
+	write->epoch = device->epoch;
+	return write;
 }
 
 static enum btrfs_result
@@ -92,18 +235,14 @@ write_device(void *context, uint64_t offset, const void *bytes, size_t size)
 	struct device *device = context;
 	struct saved_write *write;
 
-	if (device->count + 1 == device->fail_write) {
+	device->issued++;
+	if (device->issued == device->fail_write) {
 		return BTRFS_IO;
 	}
-	REQUIRE(device->count < WRITE_LIMIT);
-	REQUIRE(
-	    offset <= device->original.size_bytes && size <= device->original.size_bytes - offset);
-	write = &device->writes[device->count++];
-	write->offset = offset;
-	write->length = size;
-	write->bytes = malloc(size);
-	REQUIRE(write->bytes != NULL);
-	memcpy(write->bytes, bytes, size);
+	write = record(device, offset, bytes, size);
+	if (device->immediate) {
+		show(write, 1);
+	}
 	return BTRFS_OK;
 }
 
@@ -116,258 +255,1331 @@ flush_device(void *context)
 	if (device->flushes == device->fail_flush) {
 		return BTRFS_IO;
 	}
-	device->durable = device->count;
+	for (; device->durable < device->count; device->durable++) {
+		show(&device->writes[device->durable], 1);
+	}
+	device->epoch++;
 	return BTRFS_OK;
 }
 
 static void
-clear(struct device *device)
+truncate_writes(struct device *device, size_t count)
 {
-	size_t i;
-
-	for (i = 0; i < device->count; i++) {
-		free(device->writes[i].bytes);
+	while (device->count > count) {
+		free(device->writes[--device->count].bytes);
 	}
-	device->count = 0;
-	device->flushes = 0;
-	device->durable = 0;
-	device->visible = 0;
-	device->selective = 0;
+	if (device->durable > count) {
+		device->durable = count;
+	}
 }
 
 static void
-check_contents(struct btrfs_environment *env, const void *expected, size_t size)
+synthetic(struct context *context, uint64_t offset, const void *bytes, size_t size)
+{
+	size_t commit = context->device->commit;
+
+	context->device->commit = SYNTHETIC_COMMIT;
+	show(record(context->device, offset, bytes, size), 1);
+	context->device->commit = commit;
+	context->device->durable = context->device->count;
+}
+
+static void
+read_exact(struct context *context, uint64_t offset, void *bytes, size_t size)
+{
+	REQUIRE(context->env.read(context->env.context, offset, bytes, size) == BTRFS_OK);
+}
+
+static void
+check_text(struct btrfs_fs *fs, const char *path, const char *expected)
+{
+	struct btrfs_inode inode;
+	uint8_t buffer[64];
+	size_t completed;
+
+	REQUIRE(btrfs_image_lookup(fs, path, &inode) == BTRFS_OK);
+	REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
+	REQUIRE(completed == strlen(expected) && memcmp(buffer, expected, completed) == 0);
+}
+
+/* Objects outside the transaction's write set keep their Linux contents. */
+static void
+check_invariants(struct btrfs_fs *fs)
+{
+	struct btrfs_inode inode;
+	struct btrfs_inode link;
+	uint8_t value[32];
+	size_t length;
+
+	REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(fs, "/hardlink", &link) == BTRFS_OK);
+	REQUIRE(inode.id.tree == link.id.tree && inode.id.inode == link.id.inode);
+	REQUIRE(inode.links == 2 && inode.uid == 1001 && inode.gid == 1002 &&
+	    (inode.mode & 07777U) == 0640);
+	REQUIRE(btrfs_get_xattr(fs, &inode, "user.text", strlen("user.text"), value, sizeof(value),
+		    &length) == BTRFS_OK);
+	REQUIRE(length == strlen("Linux xattr") && memcmp(value, "Linux xattr", length) == 0);
+	check_text(fs, "/snapshot/value", "snapshot original\n");
+	check_text(fs, "/subvol/value", "subvolume changed\n");
+}
+
+static void
+check_stage(struct context *context, struct btrfs_fs *fs, const struct plan *plan, size_t stage)
+{
+	struct btrfs_info info;
+	struct btrfs_inode inode;
+	uint8_t buffer[INLINE_LIMIT + 1];
+	const struct tracked *file;
+	size_t completed;
+	size_t i;
+
+	btrfs_get_info(fs, &info);
+	REQUIRE(info.generation == context->base_generation + stage);
+	for (i = 0; i < plan->file_count; i++) {
+		file = &plan->files[i];
+		REQUIRE(btrfs_image_lookup(fs, file->path, &inode) == BTRFS_OK);
+		REQUIRE(inode.size == file->size[stage]);
+		REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
+		REQUIRE(completed == file->size[stage]);
+		REQUIRE(completed == 0 || memcmp(buffer, file->data[stage], completed) == 0);
+	}
+	check_invariants(fs);
+}
+
+static size_t
+plan_file(struct context *context, struct plan *plan, const char *path)
 {
 	struct btrfs_fs *fs;
 	struct btrfs_inode inode;
-	struct btrfs_inode link;
-	uint8_t buffer[2048];
+	struct tracked *file;
+	uint8_t buffer[INLINE_LIMIT + 1];
 	size_t completed;
-
-	REQUIRE(btrfs_mount(env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
-	REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
-	REQUIRE(btrfs_image_lookup(fs, "/hardlink", &link) == BTRFS_OK);
-	REQUIRE(inode.id.inode == link.id.inode && inode.links == 2 && inode.size == size);
-	REQUIRE(inode.uid == 1001 && inode.gid == 1002 && (inode.mode & 07777U) == 0640);
-	REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
-	REQUIRE(completed == size && memcmp(buffer, expected, size) == 0);
-	REQUIRE(btrfs_image_lookup(fs, "/snapshot/value", &inode) == BTRFS_OK);
-	REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
-	REQUIRE(completed == sizeof("snapshot original\n") - 1 &&
-	    memcmp(buffer, "snapshot original\n", completed) == 0);
-	btrfs_unmount(fs);
-}
-
-/* Export changed byte ranges for the independent Linux oracle, which applies
- * each crash prefix to its private copy of the original Linux fixture. */
-static void
-export_writes(const struct device *device, const char *directory)
-{
-	char path[4096];
-	FILE *manifest;
-	FILE *payload;
 	size_t i;
 
-	REQUIRE(snprintf(path, sizeof(path), "%s/writes.tsv", directory) < (int)sizeof(path));
-	manifest = fopen(path, "wx");
-	REQUIRE(manifest != NULL);
-	for (i = 0; i < device->count; i++) {
-		REQUIRE(snprintf(path, sizeof(path), "%s/write-%04zu.bin", directory, i) <
-		    (int)sizeof(path));
-		payload = fopen(path, "wx");
-		REQUIRE(payload != NULL);
-		REQUIRE(fwrite(device->writes[i].bytes, 1, device->writes[i].length, payload) ==
-		    device->writes[i].length);
-		REQUIRE(fclose(payload) == 0);
-		REQUIRE(fprintf(manifest, "%llu\t%zu\twrite-%04zu.bin\n",
-			    (unsigned long long)device->writes[i].offset, device->writes[i].length,
-			    i) > 0);
+	for (i = 0; i < plan->file_count; i++) {
+		if (strcmp(plan->files[i].path, path) == 0) {
+			return i;
+		}
+	}
+	REQUIRE(plan->file_count < MAX_FILES && strlen(path) < sizeof(file->path));
+	file = &plan->files[plan->file_count];
+	memset(file, 0, sizeof(*file));
+	strcpy(file->path, path);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(fs, path, &inode) == BTRFS_OK);
+	REQUIRE(btrfs_read(fs, &inode, 0, buffer, sizeof(buffer), &completed) == BTRFS_OK);
+	REQUIRE(completed <= INLINE_LIMIT && completed == inode.size);
+	btrfs_unmount(fs);
+	file->size[0] = completed;
+	file->data[0] = malloc(completed + 1);
+	REQUIRE(file->data[0] != NULL);
+	memcpy(file->data[0], buffer, completed);
+	return plan->file_count++;
+}
+
+static void
+plan_update(struct context *context, struct plan *plan, size_t commit, const char *path,
+    const void *data, size_t size)
+{
+	struct tracked *file;
+	size_t index;
+
+	REQUIRE(commit > 0 && commit < MAX_STAGES && size <= INLINE_LIMIT);
+	index = plan_file(context, plan, path);
+	file = &plan->files[index];
+	REQUIRE(file->data[commit] == NULL);
+	file->size[commit] = size;
+	file->data[commit] = malloc(size + 1);
+	REQUIRE(file->data[commit] != NULL);
+	memcpy(file->data[commit], data, size);
+	plan->updated[commit][plan->update_count[commit]++] = index;
+	if (commit > plan->commits) {
+		plan->commits = commit;
+	}
+}
+
+static void
+plan_finish(struct plan *plan)
+{
+	struct tracked *file;
+	size_t stage;
+	size_t i;
+
+	for (i = 0; i < plan->file_count; i++) {
+		file = &plan->files[i];
+		for (stage = 1; stage <= plan->commits; stage++) {
+			if (file->data[stage] == NULL) {
+				file->size[stage] = file->size[stage - 1];
+				file->data[stage] = malloc(file->size[stage] + 1);
+				REQUIRE(file->data[stage] != NULL);
+				memcpy(file->data[stage], file->data[stage - 1], file->size[stage]);
+			}
+		}
+	}
+}
+
+static void
+plan_destroy(struct plan *plan)
+{
+	size_t stage;
+	size_t i;
+
+	for (i = 0; i < plan->file_count; i++) {
+		for (stage = 0; stage < MAX_STAGES; stage++) {
+			free(plan->files[i].data[stage]);
+		}
+	}
+}
+
+/* Classify a durable state the way an owner must: mount the primary, then ask
+ * explicit recovery. Every state must resolve to the acknowledged or the newest
+ * stage, never a mixture, never below acknowledgement, and remain admissible. */
+static void
+resolve(struct context *context, const struct plan *plan, size_t acknowledged, size_t latest,
+    struct outcome *outcome)
+{
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct btrfs_recovery_report report;
+	struct btrfs_recovery_report applied;
+	struct btrfs_info info;
+	struct device *device = context->device;
+	uint64_t floor = context->base_generation + acknowledged;
+	size_t writes = device->count;
+	size_t stage;
+	size_t i;
+	enum btrfs_result result;
+
+	memset(outcome, 0, sizeof(*outcome));
+	outcome->mounted = NO_STAGE;
+	result = btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs);
+	REQUIRE(result == BTRFS_OK || result == BTRFS_CORRUPT);
+	if (result == BTRFS_OK) {
+		btrfs_get_info(fs, &info);
+		stage = (size_t)(info.generation - context->base_generation);
+		REQUIRE(stage == acknowledged || stage == latest);
+		check_stage(context, fs, plan, stage);
+		btrfs_unmount(fs);
+		outcome->mounted = stage;
+	}
+	result = btrfs_recover_supers(&context->env, NULL, floor, &report);
+	REQUIRE(result == BTRFS_OK || result == BTRFS_RECOVERY_REQUIRED);
+	REQUIRE(report.present == 2 && report.selected < BTRFS_SUPER_COPIES);
+	stage = (size_t)(report.generation - context->base_generation);
+	REQUIRE(stage == acknowledged || stage == latest);
+	REQUIRE(outcome->mounted != NO_STAGE || result == BTRFS_RECOVERY_REQUIRED);
+	outcome->resolved = stage;
+	if (result == BTRFS_OK) {
+		REQUIRE(stage == outcome->mounted && report.rewritten == 0);
+	} else {
+		device->immediate = 1;
+		REQUIRE(btrfs_recover_supers(&context->env, &context->writer, floor, &applied) ==
+		    BTRFS_OK);
+		device->immediate = 0;
+		REQUIRE(applied.generation == report.generation && applied.rewritten != 0 &&
+		    applied.selected == report.selected);
+		REQUIRE(device->count - writes == applied.rewritten);
+		REQUIRE(device->count - writes <= MAX_RECOVERY_WRITES);
+		for (i = writes; i < device->count; i++) {
+			outcome->recovery[outcome->recovery_count++] = device->writes[i];
+			outcome->recovery[outcome->recovery_count - 1].bytes =
+			    malloc(device->writes[i].length);
+			REQUIRE(outcome->recovery[outcome->recovery_count - 1].bytes != NULL);
+			memcpy(outcome->recovery[outcome->recovery_count - 1].bytes,
+			    device->writes[i].bytes, device->writes[i].length);
+		}
+		REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+		check_stage(context, fs, plan, stage);
+		btrfs_unmount(fs);
+		REQUIRE(btrfs_recover_supers(&context->env, NULL, floor, &applied) == BTRFS_OK &&
+		    applied.rewritten == 0 && applied.generation == report.generation);
+		outcome->recovered = 1;
+		context->recoveries++;
+	}
+	/* A resolved state is consistent and admits the next transaction. */
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
+	REQUIRE(device->count == writes + outcome->recovery_count);
+	truncate_writes(device, writes);
+	REQUIRE(context->image.live_allocations == 0);
+	context->states++;
+}
+
+static void
+outcome_release(struct outcome *outcome)
+{
+	size_t i;
+
+	for (i = 0; i < outcome->recovery_count; i++) {
+		free(outcome->recovery[i].bytes);
+	}
+	outcome->recovery_count = 0;
+}
+
+static void
+export_path(const struct exporter *exporter, const char *name, char *path, size_t size)
+{
+	REQUIRE(snprintf(path, size, "%s/%s", exporter->directory, name) < (int)size);
+}
+
+static FILE *
+export_open(const struct exporter *exporter, const char *name)
+{
+	char path[4096];
+	FILE *file;
+
+	export_path(exporter, name, path, sizeof(path));
+	file = fopen(path, "wx");
+	REQUIRE(file != NULL);
+	return file;
+}
+
+static void
+export_bytes(const struct exporter *exporter, const char *name, const void *bytes, size_t size)
+{
+	FILE *file = export_open(exporter, name);
+
+	REQUIRE(size == 0 || fwrite(bytes, 1, size, file) == size);
+	REQUIRE(fclose(file) == 0);
+}
+
+static void
+export_begin(struct context *context, const struct plan *plan, struct exporter *exporter)
+{
+	char name[64];
+	FILE *stages;
+	size_t stage;
+	size_t i;
+
+	memset(exporter, 0, sizeof(*exporter));
+	if (context->export_root == NULL) {
+		return;
+	}
+	REQUIRE(snprintf(exporter->directory, sizeof(exporter->directory), "%s/%s",
+		    context->export_root, plan->name) < (int)sizeof(exporter->directory));
+	REQUIRE(mkdir(exporter->directory, 0755) == 0);
+	stages = export_open(exporter, "stages.tsv");
+	for (stage = 0; stage <= plan->commits; stage++) {
+		for (i = 0; i < plan->file_count; i++) {
+			REQUIRE(snprintf(name, sizeof(name), "stage-%zu-%02zu.bin", stage, i) <
+			    (int)sizeof(name));
+			export_bytes(
+			    exporter, name, plan->files[i].data[stage], plan->files[i].size[stage]);
+			REQUIRE(fprintf(stages, "%zu\t%llu\t%s\t%s\n", stage,
+				    (unsigned long long)(context->base_generation + stage),
+				    plan->files[i].path, name) > 0);
+		}
+	}
+	REQUIRE(fclose(stages) == 0);
+	exporter->cases = export_open(exporter, "cases.tsv");
+}
+
+static void
+export_writes(struct context *context, struct exporter *exporter)
+{
+	const struct saved_write *write;
+	char name[64];
+	FILE *manifest;
+
+	if (exporter->cases == NULL) {
+		return;
+	}
+	manifest = exporter->exported == 0 ? export_open(exporter, "writes.tsv") : NULL;
+	if (manifest == NULL) {
+		char path[4096];
+
+		export_path(exporter, "writes.tsv", path, sizeof(path));
+		manifest = fopen(path, "a");
+		REQUIRE(manifest != NULL);
+	}
+	for (; exporter->exported < context->device->count; exporter->exported++) {
+		write = &context->device->writes[exporter->exported];
+		REQUIRE(write->commit != SYNTHETIC_COMMIT);
+		REQUIRE(snprintf(name, sizeof(name), "write-%04zu.bin", exporter->exported) <
+		    (int)sizeof(name));
+		export_bytes(exporter, name, write->bytes, write->length);
+		REQUIRE(fprintf(manifest, "%zu\t%llu\t%zu\t%s\t%zu\t%u\n", exporter->exported,
+			    (unsigned long long)write->offset, write->length, name, write->commit,
+			    write->epoch) > 0);
 	}
 	REQUIRE(fclose(manifest) == 0);
 }
 
+/* A case lists every visible sector run of the issued writes, in issue order,
+ * followed by the explicit recovery writes this implementation selected. */
 static void
-reordered_persistence(struct device *device, struct btrfs_environment *env, const char *original,
-    size_t original_size, const char *replacement, size_t replacement_size)
+export_case(struct context *context, struct exporter *exporter, const char *kind, size_t commit,
+    const struct outcome *outcome)
 {
-	struct btrfs_fs *fs = NULL;
+	const struct saved_write *write;
+	char name[64];
+	char mounted[32];
+	FILE *fragments;
+	size_t sector;
+	size_t run;
 	size_t i;
-	size_t metadata = device->count - 2;
-	uint32_t seed = UINT32_C(0x142857);
-	unsigned round;
-	unsigned mirrors;
 
-	REQUIRE(device->writes[metadata].offset == SECOND_SUPER_OFFSET);
-	REQUIRE(device->writes[metadata + 1].offset == BT_SUPER_OFFSET);
-	device->selective = 1;
-	for (round = 0; round < 64; round++) {
-		memset(device->persisted, 0, sizeof(device->persisted));
-		for (i = 0; i < metadata; i++) {
-			seed ^= seed << 13;
-			seed ^= seed >> 17;
-			seed ^= seed << 5;
-			/* Volatile metadata may be missing, complete or sector-torn. No
-			 * superblock may be issued before its persistence barrier succeeds. */
-			device->persisted[i] =
-			    (seed % (device->writes[i].length / DEVICE_SECTOR_SIZE + 1)) *
-			    DEVICE_SECTOR_SIZE;
+	if (exporter->cases == NULL) {
+		return;
+	}
+	REQUIRE(snprintf(name, sizeof(name), "case-%04zu.tsv", exporter->next) < (int)sizeof(name));
+	fragments = export_open(exporter, name);
+	for (i = 0; i < context->device->count; i++) {
+		write = &context->device->writes[i];
+		for (sector = 0; sector < sectors(write); sector += run) {
+			for (run = 1; sector + run < sectors(write) &&
+			    write->visible[sector + run] == write->visible[sector];
+			    run++) {
+			}
+			if (write->visible[sector]) {
+				REQUIRE(fprintf(fragments, "%llu\t%zu\twrite-%04zu.bin\t%zu\n",
+					    (unsigned long long)(write->offset / DEVICE_SECTOR +
+						sector),
+					    run, i, sector) > 0);
+			}
 		}
-		check_contents(env, original, original_size);
 	}
-	for (i = 0; i < metadata; i++) {
-		device->persisted[i] = device->writes[i].length;
+	REQUIRE(fclose(fragments) == 0);
+	REQUIRE(
+	    snprintf(name, sizeof(name), "recover-%04zu.tsv", exporter->next) < (int)sizeof(name));
+	fragments = export_open(exporter, name);
+	for (i = 0; i < outcome->recovery_count; i++) {
+		REQUIRE(snprintf(name, sizeof(name), "recover-%04zu-%zu.bin", exporter->next, i) <
+		    (int)sizeof(name));
+		export_bytes(
+		    exporter, name, outcome->recovery[i].bytes, outcome->recovery[i].length);
+		REQUIRE(fprintf(fragments, "%llu\t%zu\t%s\t0\n",
+			    (unsigned long long)(outcome->recovery[i].offset / DEVICE_SECTOR),
+			    outcome->recovery[i].length / DEVICE_SECTOR, name) > 0);
 	}
-	for (mirrors = 0; mirrors < 4; mirrors++) {
-		device->persisted[metadata] = mirrors & 1 ? BT_SUPER_SIZE : 0;
-		device->persisted[metadata + 1] = mirrors & 2 ? BT_SUPER_SIZE : 0;
-		check_contents(env, mirrors & 2 ? replacement : original,
-		    mirrors & 2 ? replacement_size : original_size);
+	REQUIRE(fclose(fragments) == 0);
+	if (outcome->mounted == NO_STAGE) {
+		strcpy(mounted, "-");
+	} else {
+		REQUIRE(snprintf(mounted, sizeof(mounted), "%zu", outcome->mounted) <
+		    (int)sizeof(mounted));
 	}
-	/* A torn primary must fail explicitly. Automatic mirror recovery remains
-	 * a separate feature; this is rejection coverage, not successful recovery. */
-	device->persisted[metadata + 1] = DEVICE_SECTOR_SIZE;
-	REQUIRE(btrfs_mount(env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_CORRUPT && fs == NULL);
-	device->selective = 0;
+	REQUIRE(fprintf(exporter->cases, "%04zu\t%zu\t%s\t%s\t%zu\t%d\n", exporter->next, commit,
+		    kind, mounted, outcome->resolved, outcome->recovered) > 0);
+	exporter->next++;
+}
+
+static void
+export_end(struct exporter *exporter)
+{
+	if (exporter->cases != NULL) {
+		REQUIRE(fclose(exporter->cases) == 0);
+		exporter->cases = NULL;
+	}
+}
+
+static void
+evaluate(struct context *context, const struct plan *plan, struct exporter *exporter, size_t commit,
+    const char *kind, int exported)
+{
+	struct outcome outcome;
+
+	resolve(context, plan, commit - 1, commit, &outcome);
+	if (exported) {
+		export_case(context, exporter, kind, commit, &outcome);
+	}
+	outcome_release(&outcome);
+}
+
+static int
+tear(unsigned pattern, size_t sector, size_t count)
+{
+	switch (pattern) {
+	case 0:
+		return 0;
+	case 1:
+		return 1;
+	case 2:
+		return sector == 0;
+	case 3:
+		return sector + 1 < count;
+	case 4:
+		return sector % 2 == 0;
+	default:
+		return sector + 1 == count;
+	}
+}
+
+/* Crash states of one recorded commit. Earlier commits stay durable. Prefixes
+ * follow issue order; epoch states persist arbitrary subsets of the writes issued
+ * after the last successful barrier, including torn superblock copies. */
+static void
+crash_states(struct context *context, const struct plan *plan, struct exporter *exporter,
+    size_t commit, size_t first)
+{
+	struct device *device = context->device;
+	struct saved_write *write;
+	size_t last = device->count;
+	size_t count = last - first;
+	size_t prefix;
+	size_t sample;
+	size_t sector;
+	size_t i;
+	size_t bucket;
+	size_t exported = 0;
+	unsigned epoch;
+	unsigned pattern;
+	unsigned choice;
+
+	/* Every prefix is checked; about EXPORT_PREFIXES evenly spaced ones are exported. */
+	for (prefix = 0; prefix <= count; prefix++) {
+		for (i = first; i < last; i++) {
+			show(&device->writes[i], i - first < prefix);
+		}
+		bucket = prefix * (EXPORT_PREFIXES - 1) / count;
+		evaluate(context, plan, exporter, commit, "prefix",
+		    prefix == 0 || prefix == count || bucket != exported);
+		exported = bucket;
+	}
+	for (epoch = 0; epoch < BARRIERS; epoch++) {
+		for (sample = 0; sample < (epoch == 0 ? METADATA_SAMPLES + 2 : TEAR_PATTERNS);
+		    sample++) {
+			for (i = first; i < last; i++) {
+				write = &device->writes[i];
+				show(write, write->epoch < epoch);
+				if (write->epoch != epoch) {
+					continue;
+				}
+				if (epoch != 0) {
+					/* One copy per superblock epoch on these devices. */
+					for (sector = 0; sector < sectors(write); sector++) {
+						write->visible[sector] = (uint8_t)tear(
+						    (unsigned)sample, sector, sectors(write));
+					}
+					continue;
+				}
+				choice = sample < 2 ? (unsigned)sample : next_random(context) % 4;
+				for (sector = 0; sector < sectors(write); sector++) {
+					write->visible[sector] = (uint8_t)(choice == 1 ||
+					    (choice == 2 && next_random(context) % 2 != 0));
+				}
+				if (choice == 3) {
+					pattern =
+					    next_random(context) % (unsigned)(sectors(write) + 1);
+					memset(write->visible, 1, pattern);
+				}
+			}
+			evaluate(context, plan, exporter, commit,
+			    epoch == 0	     ? "metadata"
+				: epoch == 1 ? "secondary"
+					     : "primary",
+			    epoch != 0 || sample < EXPORT_SAMPLES + 2);
+		}
+	}
+	for (i = first; i < last; i++) {
+		show(&device->writes[i], 1);
+	}
+}
+
+static enum btrfs_result
+attempt(struct context *context, const struct plan *plan, size_t commit, enum fault fault,
+    size_t point, struct totals *totals)
+{
+	struct btrfs_object_id ids[MAX_FILES];
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction = NULL;
+	struct btrfs_inode inode;
+	struct btrfs_time time = { 1700000000 + (int64_t)commit, 123456789 };
+	const struct tracked *file;
+	struct device *device = context->device;
+	uint64_t allocations;
+	uint64_t reads;
+	size_t i;
+	enum btrfs_result result;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	for (i = 0; i < plan->update_count[commit]; i++) {
+		REQUIRE(btrfs_image_lookup(
+			    fs, plan->files[plan->updated[commit][i]].path, &inode) == BTRFS_OK);
+		ids[i] = inode.id;
+	}
+	device->commit = commit;
+	device->epoch = 0;
+	device->issued = 0;
+	device->flushes = 0;
+	device->fail_write = fault == FAULT_WRITE ? point : 0;
+	device->fail_flush = fault == FAULT_FLUSH ? point : 0;
+	allocations = context->image.allocations;
+	reads = context->image.reads;
+	context->image.fail_allocate = fault == FAULT_ALLOCATE ? allocations + point : 0;
+	context->image.fail_read = fault == FAULT_READ ? reads + point : 0;
+	result = btrfs_transaction_begin(fs, &context->writer, &transaction);
+	for (i = 0; result == BTRFS_OK && i < plan->update_count[commit]; i++) {
+		file = &plan->files[plan->updated[commit][i]];
+		result = btrfs_transaction_write_inline(
+		    transaction, ids[i], file->data[commit], file->size[commit], time);
+	}
+	if (result == BTRFS_OK) {
+		result = btrfs_transaction_commit(transaction);
+	}
+	totals->writes = device->issued;
+	totals->flushes = device->flushes;
+	totals->allocations = context->image.allocations - allocations;
+	totals->reads = context->image.reads - reads;
+	context->image.fail_allocate = 0;
+	context->image.fail_read = 0;
+	device->fail_write = 0;
+	device->fail_flush = 0;
+	if (transaction != NULL &&
+	    (fault == FAULT_NONE || fault == FAULT_WRITE || fault == FAULT_FLUSH ||
+		result == BTRFS_OK)) {
+		/* Success and uncertain persistence are both terminal. */
+		i = device->count;
+		REQUIRE(btrfs_transaction_commit(transaction) ==
+		    (result == BTRFS_OK ? BTRFS_READ_ONLY : result));
+		REQUIRE(device->count == i);
+	}
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
+	REQUIRE(context->image.live_allocations == 0);
+	return result;
+}
+
+static void
+fault_sweeps(struct context *context, const struct plan *plan, size_t commit, size_t first,
+    const struct totals *totals)
+{
+	struct outcome outcome;
+	struct totals ignored;
+	struct device *device = context->device;
+	size_t limits[FAULT_MODES];
+	size_t failures[FAULT_MODES] = { 0 };
+	size_t point;
+	enum fault fault;
+	enum btrfs_result result;
+
+	limits[FAULT_NONE] = 0;
+	limits[FAULT_ALLOCATE] = (size_t)totals->allocations;
+	limits[FAULT_READ] = (size_t)totals->reads;
+	limits[FAULT_WRITE] = totals->writes;
+	limits[FAULT_FLUSH] = totals->flushes;
+	for (fault = FAULT_ALLOCATE; fault < FAULT_MODES; fault++) {
+		for (point = 1; point <= limits[fault]; point++) {
+			result = attempt(context, plan, commit, fault, point, &ignored);
+			if (fault == FAULT_ALLOCATE) {
+				REQUIRE(result == BTRFS_NO_MEMORY);
+			} else if (fault == FAULT_READ) {
+				/* A DUP copy may satisfy a failed metadata read. */
+				REQUIRE(result == BTRFS_IO || result == BTRFS_OK);
+			} else {
+				REQUIRE(result == BTRFS_IO);
+			}
+			if (result != BTRFS_OK) {
+				failures[fault]++;
+			}
+			if (fault == FAULT_ALLOCATE ||
+			    (fault == FAULT_READ && result != BTRFS_OK)) {
+				REQUIRE(device->count == first);
+			}
+			resolve(context, plan, commit - 1, commit, &outcome);
+			REQUIRE(result == BTRFS_OK || device->count != first ||
+			    outcome.resolved == commit - 1);
+			outcome_release(&outcome);
+			truncate_writes(device, first);
+		}
+		REQUIRE(failures[fault] != 0);
+	}
+}
+
+static void
+run_plan(struct context *context, struct plan *plan)
+{
+	struct exporter exporter;
+	struct totals totals;
+	struct btrfs_fs *fs;
+	struct device *device = context->device;
+	size_t commit;
+	size_t first;
+	size_t states = context->states;
+	size_t recoveries = context->recoveries;
+
+	plan_finish(plan);
+	export_begin(context, plan, &exporter);
+	for (commit = 1; commit <= plan->commits; commit++) {
+		first = device->count;
+		REQUIRE(attempt(context, plan, commit, FAULT_NONE, 0, &totals) == BTRFS_OK);
+		REQUIRE(totals.flushes == BARRIERS && totals.writes == device->count - first);
+		REQUIRE(device->writes[device->count - 1].offset == BT_SUPER_OFFSET);
+		printf("%s commit %zu: %zu writes, %zu barriers, %llu allocations, %llu reads\n",
+		    plan->name, commit, totals.writes, totals.flushes,
+		    (unsigned long long)totals.allocations, (unsigned long long)totals.reads);
+		export_writes(context, &exporter);
+		crash_states(context, plan, &exporter, commit, first);
+		if (commit == plan->commits) {
+			truncate_writes(device, first);
+			fault_sweeps(context, plan, commit, first, &totals);
+			REQUIRE(attempt(context, plan, commit, FAULT_NONE, 0, &totals) == BTRFS_OK);
+		}
+	}
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	check_stage(context, fs, plan, plan->commits);
+	btrfs_unmount(fs);
+	export_end(&exporter);
+	printf("%s: %zu crash states, %zu explicit recoveries PASS\n", plan->name,
+	    context->states - states, context->recoveries - recoveries);
+	truncate_writes(device, 0);
+	plan_destroy(plan);
+}
+
+static void
+plan_scenarios(struct context *context)
+{
+	static const char replacement[] = "written by Machlin CoW transaction\n";
+	struct plan plan;
+	uint8_t data[INLINE_LIMIT];
+	char path[32];
+	size_t i;
+	size_t entry;
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "replace";
+	plan_update(context, &plan, 1, "/greeting", replacement, sizeof(replacement) - 1);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "empty";
+	plan_update(context, &plan, 1, "/greeting", NULL, 0);
+	run_plan(context, &plan);
+
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "maximum";
+	for (i = 0; i < INLINE_LIMIT; i++) {
+		data[i] = (uint8_t)(i * 7 + 3);
+	}
+	plan_update(context, &plan, 1, "/greeting", data, INLINE_LIMIT);
+	run_plan(context, &plan);
+
+	/* Many inodes in several leaves, with growing items, in one transaction. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "batch";
+	plan_update(context, &plan, 1, "/greeting", replacement, sizeof(replacement) - 1);
+	for (entry = 0; entry < MANY_ENTRIES; entry += BATCH_STRIDE) {
+		REQUIRE(
+		    snprintf(path, sizeof(path), "/many/entry-%04zu", entry) < (int)sizeof(path));
+		for (i = 0; i < 16 + entry % 200; i++) {
+			data[i] = (uint8_t)('a' + (entry + i) % 26);
+		}
+		plan_update(context, &plan, 1, path, data, i);
+	}
+	run_plan(context, &plan);
+
+	/* The second commit starts from a Machlin-written root set. */
+	memset(&plan, 0, sizeof(plan));
+	plan.name = "repeated";
+	plan_update(context, &plan, 1, "/greeting", "first Machlin commit\n", 21);
+	plan_update(context, &plan, 1, "/many/entry-0001", "one\n", 4);
+	for (i = 0; i < 300; i++) {
+		data[i] = (uint8_t)('A' + i % 23);
+	}
+	plan_update(context, &plan, 2, "/greeting", data, 300);
+	plan_update(context, &plan, 2, "/many/entry-0002", NULL, 0);
+	run_plan(context, &plan);
+}
+
+static void
+admission_tests(struct context *context)
+{
+	static const char replacement[] = "written by Machlin CoW transaction\n";
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct btrfs_inode inode;
+	struct btrfs_time time = { 1700000000, 0 };
+	struct device *device = context->device;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_write_inline(transaction,
+		    (struct btrfs_object_id){ BTRFS_ROOT_INODE, inode.id.inode }, replacement,
+		    sizeof(replacement) - 1, time) == BTRFS_UNSUPPORTED);
+	REQUIRE(btrfs_transaction_write_inline(transaction, inode.id, replacement, INLINE_LIMIT + 1,
+		    time) == BTRFS_UNSUPPORTED);
+	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
+	REQUIRE(device->count == 0 && device->flushes == 0);
+	btrfs_transaction_destroy(transaction);
+	/* Destroying an uncommitted transaction discards private work without I/O. */
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_write_inline(
+		    transaction, inode.id, replacement, sizeof(replacement) - 1, time) == BTRFS_OK);
+	btrfs_transaction_destroy(transaction);
+	REQUIRE(device->count == 0);
+	btrfs_unmount(fs);
+	REQUIRE(context->image.live_allocations == 0);
+	printf("admission, no-op and abort: PASS\n");
+}
+
+static void
+super_copy(struct context *context, unsigned mirror, struct bt_disk_super *super)
+{
+	read_exact(context, bt_super_offset(mirror), super, sizeof(*super));
+}
+
+static enum btrfs_result
+begin_and_commit(struct context *context, struct btrfs_fs *fs, int damage_after_begin,
+    const struct bt_disk_super *damage, unsigned mirror)
+{
+	struct btrfs_transaction *transaction;
+	struct btrfs_inode inode;
+	struct btrfs_time time = { 1700000000, 0 };
+	enum btrfs_result result;
+
+	REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
+	result = btrfs_transaction_begin(fs, &context->writer, &transaction);
+	if (result != BTRFS_OK) {
+		return result;
+	}
+	REQUIRE(
+	    btrfs_transaction_write_inline(transaction, inode.id, "stale\n", 6, time) == BTRFS_OK);
+	if (damage_after_begin) {
+		synthetic(context, bt_super_offset(mirror), damage, sizeof(*damage));
+	}
+	result = btrfs_transaction_commit(transaction);
+	btrfs_transaction_destroy(transaction);
+	return result;
+}
+
+/* Admission requires agreeing copies; commit rejects copies changed underneath
+ * it; recovery never rolls back, merges filesystems or discards a tree log. */
+static void
+copy_tests(struct context *context)
+{
+	struct bt_disk_super *primary;
+	struct bt_disk_super *secondary;
+	struct bt_disk_super *damage;
+	struct btrfs_recovery_report report;
+	struct btrfs_fs *fs;
+	struct device *device = context->device;
+	uint64_t generation = context->base_generation;
+	size_t writes;
+
+	primary = malloc(sizeof(*primary));
+	secondary = malloc(sizeof(*secondary));
+	damage = malloc(sizeof(*damage));
+	REQUIRE(primary != NULL && secondary != NULL && damage != NULL);
+	super_copy(context, 0, primary);
+	super_copy(context, 1, secondary);
+	REQUIRE(bt_super_same(primary, secondary));
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	*damage = *primary;
+	bt_put64(&damage->generation, generation + 1);
+	bt_super_seal(damage, BT_SUPER_OFFSET);
+	synthetic(context, BT_SUPER_OFFSET, damage, sizeof(*damage));
+	REQUIRE(begin_and_commit(context, fs, 0, NULL, 0) == BTRFS_STALE && device->count == 1);
+	truncate_writes(device, 0);
+	*damage = *primary;
+	damage->label[0] ^= 1;
+	bt_super_seal(damage, BT_SUPER_OFFSET);
+	REQUIRE(begin_and_commit(context, fs, 1, damage, 0) == BTRFS_STALE && device->count == 1);
+	truncate_writes(device, 0);
+	*damage = *secondary;
+	damage->label[0] ^= 1;
+	bt_super_seal(damage, bt_super_offset(1));
+	REQUIRE(begin_and_commit(context, fs, 1, damage, 1) == BTRFS_STALE && device->count == 1);
+	truncate_writes(device, 0);
+
+	/* A torn secondary blocks admission until explicit recovery rewrites it. */
+	*damage = *secondary;
+	((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
+	synthetic(context, bt_super_offset(1), damage, sizeof(*damage));
+	REQUIRE(begin_and_commit(context, fs, 0, NULL, 0) == BTRFS_RECOVERY_REQUIRED);
+	REQUIRE(btrfs_recover_supers(&context->env, NULL, generation, &report) ==
+		BTRFS_RECOVERY_REQUIRED &&
+	    report.selected == 0 && report.copies[1].status == BTRFS_CORRUPT);
+	REQUIRE(btrfs_recover_supers(&context->env, NULL, generation + 1, &report) == BTRFS_STALE);
+	writes = device->count;
+	REQUIRE(btrfs_recover_supers(&context->env, &context->writer, generation, &report) ==
+		BTRFS_OK &&
+	    report.rewritten == 1 && device->count == writes + 1);
+	show(&device->writes[writes], 1);
+	REQUIRE(btrfs_recover_supers(&context->env, NULL, generation, &report) == BTRFS_OK &&
+	    report.rewritten == 0);
+	btrfs_unmount(fs);
+	truncate_writes(device, 0);
+
+	/* No valid copy: nothing is selected or written. */
+	*damage = *primary;
+	((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
+	synthetic(context, BT_SUPER_OFFSET, damage, sizeof(*damage));
+	*damage = *secondary;
+	((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
+	synthetic(context, bt_super_offset(1), damage, sizeof(*damage));
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_CORRUPT);
+	REQUIRE(
+	    btrfs_recover_supers(&context->env, &context->writer, 0, &report) == BTRFS_CORRUPT &&
+	    device->count == 2);
+	truncate_writes(device, 0);
+
+	/* A torn primary with an intact secondary recovers the same generation. */
+	*damage = *primary;
+	((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
+	synthetic(context, BT_SUPER_OFFSET, damage, sizeof(*damage));
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_CORRUPT);
+	REQUIRE(btrfs_recover_supers(&context->env, &context->writer, generation, &report) ==
+		BTRFS_OK &&
+	    report.selected == 1 && report.generation == generation && report.rewritten == 1);
+	show(&device->writes[device->count - 1], 1);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	check_invariants(fs);
+	btrfs_unmount(fs);
+	truncate_writes(device, 0);
+
+	/* A newer copy from another filesystem is ambiguous, never selected. */
+	*damage = *secondary;
+	damage->fsid[0] ^= 1;
+	bt_put64(&damage->generation, generation + 1);
+	bt_super_seal(damage, bt_super_offset(1));
+	synthetic(context, bt_super_offset(1), damage, sizeof(*damage));
+	REQUIRE(
+	    btrfs_recover_supers(&context->env, &context->writer, 0, &report) == BTRFS_CORRUPT &&
+	    device->count == 1);
+	truncate_writes(device, 0);
+
+	/* Choosing a copy without the pending log would drop fsynced data. */
+	*damage = *primary;
+	bt_put64(&damage->log_root, bt_u64(primary->root));
+	bt_super_seal(damage, BT_SUPER_OFFSET);
+	synthetic(context, BT_SUPER_OFFSET, damage, sizeof(*damage));
+	REQUIRE(btrfs_recover_supers(&context->env, &context->writer, 0, &report) ==
+		BTRFS_UNSUPPORTED &&
+	    device->count == 1);
+	truncate_writes(device, 0);
+	REQUIRE(context->image.live_allocations == 0);
+	free(damage);
+	free(secondary);
+	free(primary);
+	printf("superblock copies: stale rejection, admission and explicit recovery PASS\n");
+}
+
+typedef int (*item_match)(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument);
+
+/* Copy the leaf holding the first matching item of a tree. */
+static int
+find_leaf(const struct btrfs_fs *fs, struct bt_root root, item_match match, void *argument,
+    uint8_t *leaf, uint64_t *logical, uint32_t *slot)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key first = { 0 };
+	enum btrfs_result error;
+	int found = 0;
+
+	bt_cursor_init(&cursor, fs, root);
+	error = bt_cursor_seek(&cursor, first, 0);
+	while (error == BTRFS_OK && !found) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		found = match(fs, &cursor, &record, argument);
+		if (found) {
+			memcpy(leaf, cursor.blocks[0], fs->info.node_size);
+			*logical = cursor.loaded[0].address;
+			*slot = cursor.slots[0];
+		} else {
+			error = bt_cursor_next(&cursor);
+		}
+	}
+	REQUIRE(found || error == BTRFS_NOT_FOUND);
+	bt_cursor_fini(&cursor);
+	return found;
+}
+
+static void
+replace_leaf(struct context *context, const struct btrfs_fs *fs, uint8_t *leaf, uint64_t logical,
+    uint64_t kind)
+{
+	struct bt_le32 checksum;
+	uint64_t physical;
+	unsigned mirrors = 1;
+	unsigned mirror;
+
+	bt_put32(&checksum,
+	    ~bt_crc32c(UINT32_MAX, leaf + BT_CSUM_SIZE, fs->info.node_size - BT_CSUM_SIZE));
+	memset(leaf, 0, BT_CSUM_SIZE);
+	memcpy(leaf, &checksum, sizeof(checksum));
+	for (mirror = 0; mirror < mirrors; mirror++) {
+		REQUIRE(bt_map(fs, logical, fs->info.node_size, kind, mirror, &physical,
+			    &mirrors) == BTRFS_OK);
+		synthetic(context, physical, leaf, fs->info.node_size);
+	}
+}
+
+static struct bt_disk_item *
+leaf_item(uint8_t *leaf, uint32_t slot)
+{
+	return (struct bt_disk_item *)(leaf + sizeof(struct bt_disk_header)) + slot;
+}
+
+static void *
+leaf_data(uint8_t *leaf, uint32_t slot)
+{
+	return leaf + sizeof(struct bt_disk_header) + bt_u32(leaf_item(leaf, slot)->offset);
+}
+
+/* Key edits avoid slot zero, whose key a parent pointer also records. */
+static int
+match_metadata(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument)
+{
+	(void)fs;
+	(void)argument;
+	return record->key.type == BT_METADATA_ITEM && cursor->slots[0] > 0;
+}
+
+static int
+match_successor(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument)
+{
+	const struct bt_disk_item *items =
+	    (const void *)(cursor->blocks[0] + sizeof(struct bt_disk_header));
+
+	(void)fs;
+	(void)argument;
+	return record->key.type == BT_METADATA_ITEM && cursor->slots[0] > 0 &&
+	    items[cursor->slots[0] - 1].key.type == BT_METADATA_ITEM;
+}
+
+static int
+match_group(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument)
+{
+	const struct bt_disk_block_group *group = (const void *)record->data;
+
+	(void)fs;
+	(void)argument;
+	return record->key.type == BT_BLOCK_GROUP_ITEM && cursor->slots[0] > 0 &&
+	    (bt_u64(group->flags) & BT_BLOCK_METADATA) != 0;
+}
+
+static int
+match_last(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument)
+{
+	struct bt_key *last = argument;
+
+	(void)fs;
+	(void)cursor;
+	return bt_key_compare(record->key, *last) == 0;
+}
+
+static int
+match_group_at(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument)
+{
+	const uint64_t *logical = argument;
+
+	(void)fs;
+	(void)cursor;
+	return record->key.type == BT_BLOCK_GROUP_ITEM && record->key.objectid == *logical;
+}
+
+static int
+match_chunk(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
+    const struct bt_record *record, void *argument)
+{
+	const struct bt_disk_chunk *chunk = (const void *)record->data;
+	const uint64_t *type = argument;
+
+	(void)fs;
+	(void)cursor;
+	return record->key.type == BT_CHUNK_ITEM && bt_u64(chunk->type) == *type;
+}
+
+static void
+expect_corrupt_map(struct context *context, const char *name)
+{
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction = NULL;
+	size_t writes = context->device->count;
+	uint64_t live = context->image.live_allocations;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_CORRUPT);
+	REQUIRE(transaction == NULL && context->device->count == writes);
+	btrfs_unmount(fs);
+	REQUIRE(context->image.live_allocations == live);
+	truncate_writes(context->device, 0);
+	printf("allocation map %s: PASS (corrupt)\n", name);
+}
+
+/* Checksum-correct allocation maps damaged by this test, not by the writer. */
+static void
+allocation_map_tests(struct context *context)
+{
+	struct btrfs_fs *fs;
+	struct bt_root extents;
+	struct bt_disk_extent_item *extent;
+	struct bt_disk_block_group *group;
+	struct bt_disk_item *item;
+	struct bt_disk_chunk *chunk;
+	struct bt_disk_stripe *stripes;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key last = { UINT64_MAX, UINT64_MAX, UINT8_MAX };
+	uint8_t *leaf;
+	uint64_t logical;
+	uint64_t metadata_physical = 0;
+	uint64_t type;
+	uint64_t chunk_end = 0;
+	uint64_t group_logical = UINT64_MAX;
+	uint64_t length;
+	uint32_t slot;
+	size_t i;
+
+	leaf = malloc(BT_MAX_NODE_SIZE);
+	REQUIRE(leaf != NULL);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
+	for (i = 0; i < fs->chunk_count; i++) {
+		if (fs->chunks[i].logical + fs->chunks[i].length > chunk_end) {
+			chunk_end = fs->chunks[i].logical + fs->chunks[i].length;
+		}
+		if (fs->chunks[i].type & BT_BLOCK_METADATA) {
+			metadata_physical = fs->chunks[i].physical[0];
+		}
+	}
+
+	REQUIRE(find_leaf(fs, extents, match_group, NULL, leaf, &logical, &slot));
+	group = leaf_data(leaf, slot);
+	bt_put64(&group->used_bytes, bt_u64(group->used_bytes) + fs->info.node_size);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "block-group total");
+
+	REQUIRE(find_leaf(fs, extents, match_group, NULL, leaf, &logical, &slot));
+	leaf_item(leaf, slot)->key.type = BT_BLOCK_GROUP_ITEM + 1;
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "missing block group");
+
+	REQUIRE(find_leaf(fs, extents, match_metadata, NULL, leaf, &logical, &slot));
+	extent = leaf_data(leaf, slot);
+	bt_put64(&extent->refs, 0);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "zero references");
+
+	REQUIRE(find_leaf(fs, extents, match_metadata, NULL, leaf, &logical, &slot));
+	extent = leaf_data(leaf, slot);
+	bt_put64(&extent->generation, fs->info.generation + 1);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "future generation");
+
+	REQUIRE(find_leaf(fs, extents, match_metadata, NULL, leaf, &logical, &slot));
+	extent = leaf_data(leaf, slot);
+	bt_put64(&extent->flags, BT_EXTENT_FLAG_DATA);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "data extent in metadata");
+
+	REQUIRE(find_leaf(fs, extents, match_metadata, NULL, leaf, &logical, &slot));
+	bt_put64(&leaf_item(leaf, slot)->key.offset, BT_MAX_LEVEL);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "tree level bound");
+
+	REQUIRE(find_leaf(fs, extents, match_successor, NULL, leaf, &logical, &slot));
+	item = leaf_item(leaf, slot);
+	bt_put64(&item->key.objectid, bt_u64(item->key.objectid) + DEVICE_SECTOR);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "unaligned extent");
+
+	if (fs->info.node_size > fs->info.sector_size) {
+		REQUIRE(find_leaf(fs, extents, match_successor, NULL, leaf, &logical, &slot));
+		item = leaf_item(leaf, slot);
+		bt_put64(&item->key.objectid,
+		    bt_u64(leaf_item(leaf, slot - 1)->key.objectid) + fs->info.sector_size);
+		replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+		expect_corrupt_map(context, "overlapping extents");
+	}
+
+	/* The last extent record moves beyond every chunk while its block group total
+	 * is reduced to match, so only the containment rule can reject it. */
+	bt_cursor_init(&cursor, fs, extents);
+	REQUIRE(bt_cursor_seek(&cursor, last, 1) == BTRFS_OK);
+	REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+	last = record.key;
+	bt_cursor_fini(&cursor);
+	REQUIRE(last.type == BT_EXTENT_ITEM || last.type == BT_METADATA_ITEM);
+	length = last.type == BT_METADATA_ITEM ? fs->info.node_size : last.offset;
+	for (i = 0; i < fs->chunk_count; i++) {
+		if (last.objectid - fs->chunks[i].logical < fs->chunks[i].length) {
+			group_logical = fs->chunks[i].logical;
+		}
+	}
+	REQUIRE(find_leaf(fs, extents, match_last, &last, leaf, &logical, &slot));
+	bt_put64(&leaf_item(leaf, slot)->key.objectid, chunk_end + fs->info.node_size);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	REQUIRE(find_leaf(fs, extents, match_group_at, &group_logical, leaf, &logical, &slot));
+	group = leaf_data(leaf, slot);
+	bt_put64(&group->used_bytes, bt_u64(group->used_bytes) - length);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
+	expect_corrupt_map(context, "extent outside chunks");
+
+	/* Logical separation does not authorize writes into another chunk's stripe. */
+	type = BT_BLOCK_DATA;
+	REQUIRE(find_leaf(fs, fs->chunk_tree, match_chunk, &type, leaf, &logical, &slot));
+	chunk = leaf_data(leaf, slot);
+	stripes = (void *)(chunk + 1);
+	REQUIRE(
+	    metadata_physical != 0 && metadata_physical + bt_u64(chunk->length) <= fs->device_size);
+	bt_put64(&stripes[0].offset, metadata_physical);
+	replace_leaf(context, fs, leaf, logical, BT_BLOCK_SYSTEM);
+	btrfs_unmount(fs);
+	expect_corrupt_map(context, "physical chunk alias");
+	free(leaf);
+}
+
+static int
+inline_regular(const struct btrfs_inode *inode)
+{
+	return (inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_REGULAR && inode->size <= INLINE_LIMIT;
+}
+
+static size_t
+collect_inline(struct btrfs_fs *fs, const char *path, struct btrfs_object_id *ids, size_t count,
+    size_t capacity)
+{
+	struct btrfs_directory *stream;
+	struct btrfs_dir_entry entry;
+	struct btrfs_inode directory;
+	struct btrfs_inode inode;
+	uint64_t cookie;
+	enum btrfs_result error;
+
+	REQUIRE(btrfs_image_lookup(fs, path, &directory) == BTRFS_OK);
+	REQUIRE(btrfs_directory_open(fs, &directory, 0, &stream) == BTRFS_OK);
+	while ((error = btrfs_directory_next(stream, &entry, &cookie)) == BTRFS_OK) {
+		REQUIRE(btrfs_get_inode(fs, entry.id, &inode) == BTRFS_OK);
+		if (inline_regular(&inode)) {
+			REQUIRE(count < capacity);
+			ids[count++] = entry.id;
+		}
+	}
+	REQUIRE(error == BTRFS_NOT_FOUND);
+	btrfs_directory_close(stream);
+	return count;
+}
+
+/* The Linux fixture's metadata is full and fragmented. A transaction needing
+ * more nodes than remain must fail with NO_SPACE before any media write. */
+static void
+exhaustion_test(struct context *context)
+{
+	struct bt_mutation_allocator allocator;
+	struct btrfs_object_id *ids;
+	struct btrfs_fs *fs;
+	struct btrfs_transaction *transaction;
+	struct btrfs_time time = { 1700000000, 0 };
+	struct bt_space *space;
+	struct bt_root extents;
+	uint8_t data[INLINE_LIMIT];
+	uint64_t logical;
+	size_t available = 0;
+	size_t count = 0;
+	size_t i;
+	enum btrfs_result result;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
+	REQUIRE(bt_space_create(fs, extents, TRANSACTION_NODE_LIMIT, &space) == BTRFS_OK);
+	bt_space_allocator(space, &allocator);
+	while (available < RESERVATION_PROBE_LIMIT &&
+	    allocator.reserve(allocator.context, BTRFS_TOP_LEVEL_TREE, 0, &logical) == BTRFS_OK) {
+		available++;
+	}
+	bt_space_destroy(space);
+	REQUIRE(available != 0 && available < TRANSACTION_NODE_LIMIT / 2);
+	ids = malloc(RESERVATION_PROBE_LIMIT * sizeof(*ids));
+	REQUIRE(ids != NULL);
+	count = collect_inline(fs, "/meta", ids, count, RESERVATION_PROBE_LIMIT);
+	count = collect_inline(fs, "/many", ids, count, RESERVATION_PROBE_LIMIT);
+	for (i = 0; i < INLINE_LIMIT; i++) {
+		data[i] = (uint8_t)i;
+	}
+	context->device->issued = 0;
+	context->device->flushes = 0;
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	result = BTRFS_OK;
+	for (i = 0; result == BTRFS_OK && i < count; i++) {
+		result =
+		    btrfs_transaction_write_inline(transaction, ids[i], data, INLINE_LIMIT, time);
+	}
+	if (result == BTRFS_OK) {
+		result = btrfs_transaction_commit(transaction);
+	}
+	REQUIRE(result == BTRFS_NO_SPACE);
+	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_NO_SPACE);
+	REQUIRE(context->device->count == 0 && context->device->issued == 0 &&
+	    context->device->flushes == 0);
+	btrfs_transaction_destroy(transaction);
+	check_invariants(fs);
+	btrfs_unmount(fs);
+	free(ids);
+	REQUIRE(context->image.live_allocations == 0);
+	printf("metadata exhaustion: %zu reservable nodes, %zu files stopped after %zu edits; "
+	       "no write PASS\n",
+	    available, count, i);
 }
 
 int
 main(int argc, char **argv)
 {
-	static const char original[] = "hello from Linux Btrfs\n";
-	static const char replacement[] = "written by Machlin CoW transaction\n";
-	struct btrfs_image image;
-	struct device *device;
-	struct btrfs_environment env;
-	struct btrfs_write_environment writer;
+	struct context *context;
 	struct btrfs_fs *fs;
-	struct btrfs_transaction *transaction;
-	struct btrfs_inode inode;
-	struct btrfs_time time = { 1700000000, 123456789 };
-	enum btrfs_result result;
-	size_t write_count;
-	size_t flush_count;
-	size_t totals[5] = { 1, 0, 0, 0, 0 };
-	uint64_t allocation_start;
-	uint64_t read_start;
-	size_t point;
-	size_t prefix;
-	size_t saved;
-	unsigned mode;
+	struct btrfs_info info;
+	const char *image = NULL;
+	int full = 0;
+	int i;
 
-	REQUIRE(argc == 2 || argc == 3);
-	REQUIRE(btrfs_image_open(argv[1], &image) == 0);
-	device = calloc(1, sizeof(*device));
-	REQUIRE(device != NULL);
-	device->original = image.environment;
-	env = image.environment;
-	env.context = device;
-	env.read = read_device;
-	env.allocate = allocate;
-	env.release = release;
-	env.decompress = NULL;
-	writer = (struct btrfs_write_environment){ device, write_device, flush_device };
-	write_count = flush_count = 0;
-	for (mode = 0; mode < 5; mode++) {
-		for (point = 1; point <= totals[mode]; point++) {
-			device->fail_write = mode == 1 ? point : 0;
-			device->fail_flush = mode == 2 ? point : 0;
-			REQUIRE(btrfs_mount(&env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
-			REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
-			allocation_start = image.allocations;
-			read_start = image.reads;
-			image.fail_allocate = mode == 3 ? allocation_start + point : 0;
-			image.fail_read = mode == 4 ? read_start + point : 0;
-			result = btrfs_transaction_begin(fs, &writer, &transaction);
-			if (result == BTRFS_OK) {
-				result = btrfs_transaction_write_inline(transaction, inode.id,
-				    replacement, sizeof(replacement) - 1, time);
-			}
-			if (result == BTRFS_OK) {
-				result = btrfs_transaction_commit(transaction);
-			}
-			if (mode == 0 && result != BTRFS_OK) {
-				fprintf(stderr, "commit: %s\n", btrfs_result_string(result));
-			}
-			REQUIRE(result ==
-			    (mode == 0		? BTRFS_OK
-				    : mode == 3 ? BTRFS_NO_MEMORY
-						: BTRFS_IO));
-			if (mode == 0) {
-				totals[1] = device->count;
-				totals[2] = device->flushes;
-				totals[3] = (size_t)(image.allocations - allocation_start);
-				totals[4] = (size_t)(image.reads - read_start);
-			}
-			saved = device->count;
-			if (mode <= 2) {
-				REQUIRE(btrfs_transaction_commit(transaction) ==
-				    (mode == 0 ? BTRFS_READ_ONLY : BTRFS_IO));
-			} else {
-				REQUIRE(device->count == 0 && device->flushes == 0);
-			}
-			REQUIRE(device->count == saved);
-			btrfs_transaction_destroy(transaction);
-			btrfs_unmount(fs);
-			image.fail_allocate = 0;
-			image.fail_read = 0;
-			REQUIRE(image.live_allocations == 0);
-			check_contents(&env, original, sizeof(original) - 1);
-			device->visible = 1;
-			if (mode == 0) {
-				write_count = device->count;
-				flush_count = device->flushes;
-				REQUIRE(write_count >= 4 && flush_count == 2);
-				check_contents(&env, replacement, sizeof(replacement) - 1);
-				if (argc == 3) {
-					export_writes(device, argv[2]);
-				}
-				for (prefix = 0; prefix <= write_count; prefix++) {
-					device->durable = prefix;
-					check_contents(&env,
-					    prefix == write_count ? replacement : original,
-					    prefix == write_count ? sizeof(replacement) - 1
-								  : sizeof(original) - 1);
-				}
-				reordered_persistence(device, &env, original, sizeof(original) - 1,
-				    replacement, sizeof(replacement) - 1);
-			} else {
-				check_contents(&env, original, sizeof(original) - 1);
-			}
-			clear(device);
-			REQUIRE(image.live_allocations == 0);
+	context = calloc(1, sizeof(*context));
+	REQUIRE(context != NULL);
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--export") == 0 && i + 1 < argc) {
+			context->export_root = argv[++i];
+		} else if (strcmp(argv[i], "--full") == 0) {
+			full = 1;
+		} else {
+			REQUIRE(image == NULL);
+			image = argv[i];
 		}
 	}
-	/* Unsupported operation admission and abort do not issue media writes. */
-	device->fail_write = device->fail_flush = 0;
-	REQUIRE(btrfs_mount(&env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
-	REQUIRE(btrfs_image_lookup(fs, "/greeting", &inode) == BTRFS_OK);
-	REQUIRE(btrfs_transaction_begin(fs, &writer, &transaction) == BTRFS_OK);
-	REQUIRE(btrfs_transaction_write_inline(transaction,
-		    (struct btrfs_object_id){ 256, inode.id.inode }, replacement,
-		    sizeof(replacement) - 1, time) == BTRFS_UNSUPPORTED);
-	REQUIRE(btrfs_transaction_write_inline(transaction, inode.id, replacement, 2049, time) ==
-	    BTRFS_UNSUPPORTED);
-	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
-	REQUIRE(device->count == 0 && device->flushes == 0);
-	btrfs_transaction_destroy(transaction);
-	REQUIRE(btrfs_transaction_begin(fs, &writer, &transaction) == BTRFS_OK);
-	REQUIRE(btrfs_transaction_write_inline(
-		    transaction, inode.id, replacement, sizeof(replacement) - 1, time) == BTRFS_OK);
-	btrfs_transaction_destroy(transaction);
-	REQUIRE(device->count == 0 && device->flushes == 0);
-	REQUIRE(btrfs_transaction_begin(fs, &writer, &transaction) == BTRFS_OK);
-	REQUIRE(btrfs_transaction_write_inline(transaction, inode.id, NULL, 0, time) == BTRFS_OK);
-	REQUIRE(btrfs_transaction_commit(transaction) == BTRFS_OK);
-	btrfs_transaction_destroy(transaction);
+	REQUIRE(image != NULL);
+	REQUIRE(btrfs_image_open(image, &context->image) == 0);
+	context->device = calloc(1, sizeof(*context->device));
+	REQUIRE(context->device != NULL);
+	context->device->image = &context->image;
+	context->env = context->image.environment;
+	context->env.context = context->device;
+	context->env.read = read_device;
+	context->env.allocate = allocate;
+	context->env.release = release;
+	context->env.decompress = NULL;
+	context->writer =
+	    (struct btrfs_write_environment){ context->device, write_device, flush_device };
+	context->seed = UINT32_C(0x142857);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	btrfs_get_info(fs, &info);
+	context->base_generation = info.generation;
+	context->node_size = info.node_size;
+	context->sector_size = info.sector_size;
+	check_invariants(fs);
 	btrfs_unmount(fs);
-	device->visible = 1;
-	check_contents(&env, "", 0);
-	clear(device);
-	REQUIRE(image.live_allocations == 0);
-	btrfs_image_close(&image);
-	free(device);
-	printf("inline transactions: %zu writes, %zu barriers, %zu allocations, %zu reads; fault "
-	       "sweeps and crash prefixes PASS\n",
-	    write_count, flush_count, totals[3], totals[4]);
+	admission_tests(context);
+	copy_tests(context);
+	allocation_map_tests(context);
+	if (full) {
+		exhaustion_test(context);
+	}
+	plan_scenarios(context);
+	REQUIRE(context->image.live_allocations == 0);
+	btrfs_image_close(&context->image);
+	free(context->device->writes);
+	free(context->device);
+	printf("transactions (%u-byte nodes): %zu crash states, %zu explicit recoveries; fault "
+	       "sweeps, stale copies and allocation maps PASS\n",
+	    context->node_size, context->states, context->recoveries);
+	free(context);
 	return 0;
 }

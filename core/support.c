@@ -423,13 +423,62 @@ bt_read_physical(const struct btrfs_fs *fs, uint64_t offset, void *buffer, size_
 	return fs->env.read(fs->env.context, offset, buffer, length);
 }
 
+uint64_t
+bt_super_offset(unsigned mirror)
+{
+	return mirror == 0 ? BT_SUPER_OFFSET
+			   : BT_SUPER_MIRROR_BASE << (BT_SUPER_MIRROR_SHIFT * mirror);
+}
+
+/* Linux writes a copy only when it ends strictly before the device end. */
+int
+bt_super_present(uint64_t device_size, unsigned mirror)
+{
+	uint64_t offset = bt_super_offset(mirror);
+
+	return mirror < BT_SUPER_MIRRORS && offset < device_size &&
+	    BT_SUPER_SIZE < device_size - offset;
+}
+
+enum btrfs_result
+bt_super_check(const struct bt_disk_super *super, uint64_t offset)
+{
+	struct bt_le32 checksum;
+
+	if (!bt_equal(super->magic, BT_MAGIC, sizeof(super->magic))) {
+		return BTRFS_NOT_BTRFS;
+	}
+	if (bt_u16(super->checksum_type) != 0) {
+		return BTRFS_UNSUPPORTED;
+	}
+	bt_copy(&checksum, super->csum, sizeof(checksum));
+	if (bt_u32(checksum) !=
+		~bt_crc32c(UINT32_MAX, (const uint8_t *)super + BT_CSUM_SIZE,
+		    BT_SUPER_SIZE - BT_CSUM_SIZE) ||
+	    bt_u64(super->bytenr) != offset) {
+		return BTRFS_CORRUPT;
+	}
+	return BTRFS_OK;
+}
+
+int
+bt_super_same(const struct bt_disk_super *a, const struct bt_disk_super *b)
+{
+	size_t shared = offsetof(struct bt_disk_super, bytenr);
+	size_t rest = offsetof(struct bt_disk_super, flags);
+
+	return bt_equal((const uint8_t *)a + BT_CSUM_SIZE, (const uint8_t *)b + BT_CSUM_SIZE,
+		   shared - BT_CSUM_SIZE) &&
+	    bt_equal((const uint8_t *)a + rest, (const uint8_t *)b + rest, sizeof(*a) - rest);
+}
+
 const char *
 btrfs_result_string(enum btrfs_result result)
 {
 	static const char *const names[] = { "success", "invalid argument", "not Btrfs",
 		"unsupported format or operation", "corrupt filesystem", "I/O error",
 		"out of memory", "not found", "not a directory", "is a directory", "range exceeded",
-		"read-only filesystem", "log recovery required", "stale identity", "already exists",
+		"read-only filesystem", "recovery required", "stale identity", "already exists",
 		"no space available" };
 
 	if ((unsigned)result >= sizeof(names) / sizeof(names[0])) {

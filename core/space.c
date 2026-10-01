@@ -2,7 +2,6 @@
 #include "space.h"
 
 #define BT_SPACE_MAX_GAPS 131072U
-#define BT_SUPER_MIRRORS 3U
 
 struct bt_gap {
 	uint64_t start, end;
@@ -17,12 +16,6 @@ struct bt_space {
 	size_t next;
 	size_t node_limit;
 };
-
-static uint64_t
-bt_super_mirror(unsigned mirror)
-{
-	return mirror == 0 ? BT_SUPER_OFFSET : UINT64_C(16384) << (12 * mirror);
-}
 
 static enum btrfs_result
 bt_space_gap(struct bt_space *space, uint64_t start, uint64_t end)
@@ -74,7 +67,7 @@ bt_space_exclude_supers(struct bt_space *space)
 		chunk = &space->fs->chunks[chunk_index];
 		for (copy = 0; copy < chunk->mirrors; copy++) {
 			for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
-				physical = bt_super_mirror(mirror) & ~(BT_STRIPE_LENGTH - 1);
+				physical = bt_super_offset(mirror) & ~(BT_STRIPE_LENGTH - 1);
 				if (physical + BT_STRIPE_LENGTH <= chunk->physical[copy] ||
 				    physical >= chunk->physical[copy] + chunk->length) {
 					continue;
@@ -107,75 +100,100 @@ bt_space_exclude_supers(struct bt_space *space)
 	return BTRFS_OK;
 }
 
+/* Finish one chunk: its block group must exist and match the extents found. */
+static enum btrfs_result
+bt_space_close(struct bt_space *space, size_t index, uint64_t position, uint64_t used, int group)
+{
+	const struct bt_chunk *chunk = &space->fs->chunks[index];
+
+	if (!group || used != space->used[index]) {
+		return BTRFS_CORRUPT;
+	}
+	return chunk->type & BT_BLOCK_METADATA
+	    ? bt_space_gap(space, position, chunk->logical + chunk->length)
+	    : BTRFS_OK;
+}
+
+static enum btrfs_result
+bt_space_extent(struct bt_space *space, const struct bt_chunk *chunk,
+    const struct bt_record *record, uint64_t position)
+{
+	const struct btrfs_fs *fs = space->fs;
+	const struct bt_disk_extent_item *extent = (const void *)record->data;
+	uint64_t length =
+	    record->key.type == BT_METADATA_ITEM ? fs->info.node_size : record->key.offset;
+	uint64_t flags = record->size >= sizeof(*extent) ? bt_u64(extent->flags) : 0;
+
+	if (record->size < sizeof(*extent) || bt_u64(extent->refs) == 0 ||
+	    bt_u64(extent->generation) > fs->info.generation ||
+	    (flags != BT_EXTENT_FLAG_DATA && flags != BT_EXTENT_FLAG_TREE &&
+		flags != (BT_EXTENT_FLAG_TREE | BT_EXTENT_FLAG_FULL_BACKREF)) ||
+	    (record->key.type == BT_METADATA_ITEM &&
+		(!(flags & BT_EXTENT_FLAG_TREE) || record->key.offset >= BT_MAX_LEVEL)) ||
+	    length == 0 || length % fs->info.sector_size != 0 || record->key.objectid < position ||
+	    record->key.objectid % fs->info.sector_size != 0 ||
+	    length > chunk->logical + chunk->length - record->key.objectid ||
+	    (flags == BT_EXTENT_FLAG_DATA
+		    ? !(chunk->type & BT_BLOCK_DATA)
+		    : !(chunk->type & (BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)))) {
+		return BTRFS_CORRUPT;
+	}
+	return BTRFS_OK;
+}
+
+/* One ordered pass over the extent tree, merged with the sorted chunk map. Every
+ * extent and block-group record must lie inside a chunk; each chunk's extents
+ * must be disjoint and sum to its block-group total. Metadata gaps become
+ * reservation candidates. Other record types are backreferences of an extent. */
 static enum btrfs_result
 bt_space_load(struct bt_space *space, struct bt_root root)
 {
 	const struct btrfs_fs *fs = space->fs;
 	const struct bt_chunk *chunk;
-	const struct bt_disk_extent_item *extent;
 	const struct bt_disk_block_group *group;
 	struct bt_cursor cursor;
 	struct bt_record record;
-	uint64_t position;
-	uint64_t length;
-	uint64_t flags;
-	uint64_t used;
-	size_t i;
+	struct bt_key first = { 0 };
+	uint64_t position = fs->chunks[0].logical;
+	uint64_t used = 0;
+	size_t index = 0;
 	size_t scanned = 0;
-	int group_found;
+	int group_found = 0;
 	enum btrfs_result error;
 
 	bt_cursor_init(&cursor, fs, root);
-	error = BTRFS_OK;
-	for (i = 0; i < fs->chunk_count && error == BTRFS_OK; i++) {
-		chunk = &fs->chunks[i];
-		position = chunk->logical;
-		used = 0;
-		group_found = 0;
-		error = bt_cursor_seek(&cursor, (struct bt_key){ .objectid = position }, 0);
-		while (error == BTRFS_OK) {
-			(void)bt_cursor_record(&cursor, &record);
-			if (record.key.objectid >= chunk->logical + chunk->length) {
-				break;
-			}
-			if (++scanned > BT_MAX_TREE_ITEMS) {
-				error = BTRFS_UNSUPPORTED;
-				break;
-			}
-			if (record.key.type == BT_EXTENT_ITEM ||
-			    record.key.type == BT_METADATA_ITEM) {
-				extent = (const void *)record.data;
-				length = record.key.type == BT_METADATA_ITEM ? fs->info.node_size
-									     : record.key.offset;
-				flags = record.size >= sizeof(*extent) ? bt_u64(extent->flags) : 0;
-				if (record.size < sizeof(*extent) || bt_u64(extent->refs) == 0 ||
-				    bt_u64(extent->generation) > fs->info.generation ||
-				    (flags != BT_EXTENT_FLAG_DATA && flags != BT_EXTENT_FLAG_TREE &&
-					flags !=
-					    (BT_EXTENT_FLAG_TREE | BT_EXTENT_FLAG_FULL_BACKREF)) ||
-				    (record.key.type == BT_METADATA_ITEM &&
-					(!(flags & BT_EXTENT_FLAG_TREE) ||
-					    record.key.offset >= BT_MAX_LEVEL)) ||
-				    length == 0 || length % fs->info.sector_size != 0 ||
-				    record.key.objectid < position ||
-				    record.key.objectid % fs->info.sector_size != 0 ||
-				    length > chunk->logical + chunk->length - record.key.objectid ||
-				    (flags == BT_EXTENT_FLAG_DATA
-					    ? !(chunk->type & BT_BLOCK_DATA)
-					    : !(chunk->type &
-						  (BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)))) {
-					error = BTRFS_CORRUPT;
+	error = bt_cursor_seek(&cursor, first, 0);
+	while (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (++scanned > BT_MAX_TREE_ITEMS) {
+			error = BTRFS_UNSUPPORTED;
+			break;
+		}
+		if (record.key.type == BT_EXTENT_ITEM || record.key.type == BT_METADATA_ITEM ||
+		    record.key.type == BT_BLOCK_GROUP_ITEM) {
+			while (index < fs->chunk_count &&
+			    record.key.objectid - fs->chunks[index].logical >=
+				fs->chunks[index].length &&
+			    record.key.objectid >= fs->chunks[index].logical) {
+				error = bt_space_close(space, index, position, used, group_found);
+				if (error != BTRFS_OK) {
 					break;
 				}
-				if (chunk->type & BT_BLOCK_METADATA) {
-					error = bt_space_gap(space, position, record.key.objectid);
-					if (error != BTRFS_OK) {
-						break;
-					}
-				}
-				position = record.key.objectid + length;
-				used += length;
-			} else if (record.key.type == BT_BLOCK_GROUP_ITEM) {
+				index++;
+				position = index < fs->chunk_count ? fs->chunks[index].logical : 0;
+				used = 0;
+				group_found = 0;
+			}
+			if (error != BTRFS_OK) {
+				break;
+			}
+			if (index == fs->chunk_count ||
+			    record.key.objectid < fs->chunks[index].logical) {
+				error = BTRFS_CORRUPT;
+				break;
+			}
+			chunk = &fs->chunks[index];
+			if (record.key.type == BT_BLOCK_GROUP_ITEM) {
 				group = (const void *)record.data;
 				if (group_found || record.key.objectid != chunk->logical ||
 				    record.key.offset != chunk->length ||
@@ -185,22 +203,34 @@ bt_space_load(struct bt_space *space, struct bt_root root)
 					error = BTRFS_CORRUPT;
 					break;
 				}
-				space->used[i] = bt_u64(group->used_bytes);
+				space->used[index] = bt_u64(group->used_bytes);
 				group_found = 1;
+			} else {
+				error = bt_space_extent(space, chunk, &record, position);
+				if (error == BTRFS_OK && (chunk->type & BT_BLOCK_METADATA)) {
+					error = bt_space_gap(space, position, record.key.objectid);
+				}
+				if (error != BTRFS_OK) {
+					break;
+				}
+				position = record.key.objectid +
+				    (record.key.type == BT_METADATA_ITEM ? fs->info.node_size
+									 : record.key.offset);
+				used += position - record.key.objectid;
 			}
-			error = bt_cursor_next(&cursor);
 		}
-		if (error == BTRFS_NOT_FOUND) {
-			error = BTRFS_OK;
-		}
-		if (error == BTRFS_OK && (!group_found || used != space->used[i])) {
-			error = BTRFS_CORRUPT;
-		}
-		if (error == BTRFS_OK && (chunk->type & BT_BLOCK_METADATA)) {
-			error = bt_space_gap(space, position, chunk->logical + chunk->length);
-		}
+		error = bt_cursor_next(&cursor);
 	}
 	bt_cursor_fini(&cursor);
+	if (error == BTRFS_NOT_FOUND) {
+		error = BTRFS_OK;
+	}
+	for (; error == BTRFS_OK && index < fs->chunk_count; index++) {
+		error = bt_space_close(space, index, position, used, group_found);
+		position = index + 1 < fs->chunk_count ? fs->chunks[index + 1].logical : 0;
+		used = 0;
+		group_found = 0;
+	}
 	return error;
 }
 

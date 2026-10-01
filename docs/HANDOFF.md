@@ -20,10 +20,12 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require eight passing test processes and all six reader profiles (312 contracts).
-The seventh image, `transactions.raw`, has 4 KiB nodes, single metadata and no
-free-space tree/cache, and is required by `inline-transactions`. Missing fixtures
-are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md.
+Require eleven passing test processes and all six reader profiles (312 contracts).
+Four writable images are required by the transaction suites: `transactions`
+(4 KiB single), `transactions-dup` (16 KiB DUP), `transactions-large` (64 KiB DUP)
+and `transactions-full` (128 MiB with full, fragmented metadata). Missing fixtures
+are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
+also describes the exported crash cases and the two-disk Linux oracle.
 
 `tests/mounted.c` and `tests/run_macos.py` establish actual XNU mount behavior on
 four profiles. Use the prepared dedicated Btrfs guest and check its loaded kernel
@@ -38,8 +40,9 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Immutable reader | Validated geometry, chunks, trees, inodes, namespaces, extents/checksums, subvolumes and xattrs | `core/{mount,chunk,tree,inode,directory,parent,read,xattr}.c` |
 | Private tree editor | Path CoW; insert/replace/upsert/delete; variable-item splits including three leaves; root growth and collapse; poisoned failures | `core/mutable.c`, `tests/mutable.c` |
 | Reservation allocator | Extent-map and block-group reconciliation, physical alias/super-stripe exclusion, pinned committed allocations, bounded free gaps | `core/space.c` |
-| Transaction owner | Inline replacement, exclusive resource contract, reference/accounting fixed point, root/backup updates, two barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
-| Persistence model / Linux oracle | Read/allocation/write/barrier sweeps, whole-write cuts, partial metadata and mirror subsets; Linux fsck/read/write validation | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
+| Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission, reference/accounting fixed point, root/backup updates, three barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
+| Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, log/foreign-copy refusal, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
+| Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/prepare_transactions_linux.py` |
 | Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
 
 The mutation view supports metadata traversal; it does not magically update all
@@ -50,15 +53,16 @@ only after successful durable publication; `seal` alone is not a commit.
 
 ## Next changes, in dependency order
 
-1. **Broaden transaction and recovery acceptance.** Extend the Linux oracle to
-   zero-length replacement, maximum inline size, multi-inode batches, repeated
-   commits, DUP metadata and large nodes. Add full/fragmented metadata ENOSPC,
-   stale-superblock rejection and independently constructed corrupt allocation
-   maps. Current whole-write crash plans are exported, not source-controlled.
-   Add device models that tear superblocks and reorder writes between successful
-   barriers, then test an explicit recovery policy against Linux. The current
-   reader rejects a damaged primary; do not silently select an older mirror or
-   call that rejection successful recovery. Preserve an acknowledged generation.
+1. **Finish transaction and recovery acceptance.** The scenario suite, epoch
+   device model, explicit superblock recovery, metadata exhaustion and damaged
+   allocation maps are accepted (see ACCEPTANCE.md). Remaining: devices large
+   enough for a third copy (tear combinations across two secondaries), NO_SPACE
+   raised inside the commit's accounting fixed point rather than an edit, a
+   Linux-written crash state (Linux as writer, this implementation recovering),
+   and adapter use of recovery: report RECOVERY_REQUIRED with the dry-run
+   decision, persist the acknowledged generation, and never recover implicitly at
+   mount. Extend every new writer feature with scenarios in `tests/transaction.c`
+   and export them to the Linux oracle.
 2. **Implement shared/delayed references.** `bt_tx_drop_original` intentionally
    accepts only one inline tree reference with matching owner/generation. Replace
    that admission with correct shared/full backrefs and child/data reference
@@ -117,11 +121,11 @@ For each operation sequence and each device fault:
 - Reduce every failure to a deterministic test. Record skipped unsupported
   recovery modes separately from successful recovery.
 
-The portable model currently covers 64 seeded metadata persistence subsets and
-all four super-mirror subsets, in addition to complete-write cuts. A torn primary
-is an explicit error test. The independent Linux oracle currently covers the
-whole-write cuts for one inline replacement, followed by a Linux read-write
-commit. These are concrete starting tests, not complete crash consistency.
+The portable model covers every prefix, seeded reorder/tear states of the
+metadata epoch and six tear patterns per superblock epoch for five inline
+scenarios on four profiles, each resolved through explicit recovery. The Linux
+oracle checks a bounded export of those states. Shared references, data extents
+and namespace operations have no crash coverage yet.
 
 ## Performance work
 

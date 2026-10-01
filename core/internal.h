@@ -59,6 +59,12 @@ int bt_name_valid(const void *name, size_t length);
 int bt_xattr_name_valid(const void *name, size_t length);
 enum btrfs_result bt_read_physical(
     const struct btrfs_fs *fs, uint64_t offset, void *buffer, size_t length);
+uint64_t bt_super_offset(unsigned mirror);
+int bt_super_present(uint64_t device_size, unsigned mirror);
+enum btrfs_result bt_super_check(const struct bt_disk_super *super, uint64_t offset);
+int bt_super_same(const struct bt_disk_super *a, const struct bt_disk_super *b);
+enum btrfs_result bt_mount_super(const struct btrfs_environment *environment,
+    const struct bt_disk_super *super, uint64_t offset, uint64_t tree, struct btrfs_fs **result);
 enum btrfs_result bt_chunk_add(
     struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap);
 enum btrfs_result bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,

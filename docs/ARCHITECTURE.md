@@ -153,35 +153,69 @@ whole-node repacking. The original root and bytes remain immutable. A failed
 edit poisons the context; sealing computes checksums, and accepting transfers
 reservations only after the owning transaction's durable publication.
 
-`core/space.c` validates occupied extents and block-group totals, rejects physical
-chunk aliases, removes superblock stripes from candidate gaps, and produces
-bounded metadata reservations. It pins the committed allocation map for the whole
-transaction and never reuses a released reservation within that transaction.
-Gap storage grows from 256 records to a maximum of 131,072. The current transaction
-limit is 4,096 dirty nodes; the standalone editor supports up to 65,536.
+`core/space.c` reads the extent tree in one ordered pass merged with the sorted
+chunk map. Every extent and block-group record must lie inside a chunk; extents
+must be aligned, disjoint and bounded by their chunk, and each chunk's extents must
+sum to its block-group total. It rejects physical chunk aliases, removes
+superblock stripes from candidate gaps, and produces bounded metadata reservations.
+It pins the committed allocation map for the whole transaction and never reuses a
+released reservation within that transaction. Gap storage grows from 256 records
+to a maximum of 131,072. The current transaction limit is 4,096 dirty nodes; the
+standalone editor supports up to 65,536. Exhausted reservations return NO_SPACE
+from the failing edit, before any media write.
 
 `core/transaction.c` owns the private root set and a separate write environment.
 Its current operation is replacing an existing uncompressed inline regular file
 in the top-level tree, up to 2 KiB. Empty replacement removes the inline extent.
-It updates inode and root change metadata, tree references, block-group totals,
-root items and backup roots. Accounting changes may CoW the extent/root trees;
-a bounded fixed point resolves those allocations before the first media write.
-Shared/full-backreference paths are rejected until delayed references exist.
+One transaction may replace many inodes. It updates inode and root change
+metadata, tree references, block-group totals, root items and backup roots.
+Accounting changes may CoW the extent/root trees; a bounded fixed point resolves
+those allocations before the first media write. Shared/full-backreference paths
+are rejected until delayed references exist.
 
-The publisher writes new metadata bottom-up, persists it with a real adapter
-barrier, writes secondary and then primary superblocks, and requires a second
-barrier before success. Exact write/flush callbacks are explicit capabilities.
+## Superblock copies, publication and recovery
+
+Linux maintains a superblock copy at 64 KiB, 64 MiB and 256 GiB when the copy
+ends strictly before the device end. Copies differ only in their offset and
+checksum. Admission requires at least two copies, each intact and identical to
+the mounted primary; otherwise `begin` returns RECOVERY_REQUIRED. A disagreement
+means an earlier publication was not resolved, and a new commit could reuse blocks
+that a newer copy still references. Commit re-reads every copy and returns STALE
+if any changed after `begin`.
+
+The publisher writes new metadata bottom-up, then:
+
+1. barrier: the new tree is durable but unreferenced;
+2. secondary copies, barrier: the untouched primary still names the
+   acknowledged generation;
+3. primary copy, barrier: success is returned only after this barrier.
+
+Between barriers the device may persist issued writes in any order and tear any
+of them at sector granularity. At every crash point at least one intact copy
+names the acknowledged generation or the new one, and every intact copy names a
+complete durable tree. Exact write/flush callbacks are explicit capabilities.
 Failure or uncertain persistence makes the transaction terminal. Pre-write
 failures and destruction discard private state without changing media.
 
+Mount reads only the primary, so a torn primary fails as CORRUPT and an older
+mirror is never silently chosen. `btrfs_recover_supers` is the explicit,
+exclusive recovery operation, matching `btrfs rescue super-recover`: it selects
+the newest checksum-valid copy, requires same-generation copies to agree, and
+refuses a selection below the caller's acknowledged generation (STALE), a pending
+tree log (UNSUPPORTED) or a copy with another filesystem identity (CORRUPT).
+Before writing, it opens the selection's chunk, root, checksum, top-level, device
+and extent trees and allocation map; file trees are not scrubbed. It rewrites
+only disagreeing copies, never the selected source, followed by one barrier.
+Without a writer it reports the decision and returns RECOVERY_REQUIRED.
+
 The owner must hold exclusive resource access, drain readers before commit and
-retire the original mount after successful or uncertain publication. Live native
-read/write views, reader pins across commits, UBC dirty-page coherence and native
-flush callbacks are not connected yet. Both native adapters remain read-only.
-The primary-only reader rejects a torn primary; recovery selection is a separate
-open feature. Backup roots are rotating recovery hints, not permanently pinned
-snapshots. See ACCEPTANCE.md for the exact crash oracle scope and HANDOFF.md for
-the requirements before general writable mounts.
+retire the original mount after successful or uncertain publication. It must
+record the generation of each acknowledged commit and pass it to recovery. Live
+native read/write views, reader pins across commits, UBC dirty-page coherence and
+native flush callbacks are not connected yet. Both native adapters remain
+read-only and do not call recovery. Backup roots are rotating recovery hints, not
+permanently pinned snapshots. See ACCEPTANCE.md for the exact crash oracle scope
+and HANDOFF.md for the requirements before general writable mounts.
 
 ## Primary format references
 

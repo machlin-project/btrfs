@@ -30,6 +30,7 @@ struct btrfs_transaction {
 	struct bt_disk_super super;
 	uint8_t accounted[BT_TRANSACTION_NODES];
 	uint8_t *scratch;
+	unsigned copies;
 	enum btrfs_result failure;
 	int changed;
 	int finished;
@@ -68,6 +69,36 @@ bt_tx_root(const struct btrfs_fs *fs, uint64_t owner, struct bt_owned_root *root
 	}
 	bt_cursor_fini(&cursor);
 	return error;
+}
+
+/* Every superblock copy Linux maintains must be intact and agree with the
+ * mounted primary. A disagreement is an unresolved earlier publication; a new
+ * commit could otherwise overwrite blocks still referenced by a newer copy. */
+static enum btrfs_result
+bt_tx_copies(struct btrfs_transaction *transaction)
+{
+	struct bt_disk_super *copy = (void *)transaction->scratch;
+	uint64_t offset;
+	unsigned mirror;
+	enum btrfs_result error;
+
+	transaction->copies = 0;
+	for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
+		if (!bt_super_present(transaction->base->device_size, mirror)) {
+			continue;
+		}
+		offset = bt_super_offset(mirror);
+		error = bt_read_physical(transaction->base, offset, copy, BT_SUPER_SIZE);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		if (bt_super_check(copy, offset) != BTRFS_OK ||
+		    !bt_super_same(copy, &transaction->original_super)) {
+			return BTRFS_RECOVERY_REQUIRED;
+		}
+		transaction->copies++;
+	}
+	return BTRFS_OK;
 }
 
 enum btrfs_result
@@ -114,6 +145,13 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	if (error == BTRFS_OK &&
 	    bt_u64(transaction->original_super.generation) != base->info.generation) {
 		error = BTRFS_STALE;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_tx_copies(transaction);
+	}
+	/* A single copy cannot survive its own torn publication write. */
+	if (error == BTRFS_OK && transaction->copies < 2) {
+		error = BTRFS_UNSUPPORTED;
 	}
 	if (error == BTRFS_OK) {
 		transaction->super = transaction->original_super;
@@ -494,13 +532,20 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 }
 
 static enum btrfs_result
+bt_tx_publish(struct btrfs_transaction *transaction, unsigned mirror)
+{
+	uint64_t offset = bt_super_offset(mirror);
+
+	bt_super_seal(&transaction->super, offset);
+	return transaction->io.write(
+	    transaction->io.context, offset, &transaction->super, sizeof(transaction->super));
+}
+
+static enum btrfs_result
 bt_tx_persist(struct btrfs_transaction *transaction)
 {
 	struct bt_mutated_block block;
-	struct bt_disk_super *super = &transaction->super;
-	struct bt_le32 checksum;
 	uint64_t physical;
-	uint64_t offset;
 	size_t i;
 	unsigned mirrors;
 	unsigned mirror;
@@ -534,28 +579,23 @@ bt_tx_persist(struct btrfs_transaction *transaction)
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	/* Secondary mirrors first; the primary root is the last publication write.
-	 * A failed or torn publication is uncertain and requires a fresh recovery
-	 * decision; the immutable reader never silently rolls back to a mirror. */
-	for (mirror = 3; mirror != 0; mirror--) {
-		offset = mirror == 1 ? BT_SUPER_OFFSET : UINT64_C(16384) << (12 * (mirror - 1));
-		if (offset > transaction->base->device_size ||
-		    BT_SUPER_SIZE > transaction->base->device_size - offset) {
-			continue;
-		}
-		bt_put64(&super->bytenr, offset);
-		bt_zero(super->csum, sizeof(super->csum));
-		bt_put32(&checksum,
-		    ~bt_crc32c(UINT32_MAX, (const uint8_t *)super + BT_CSUM_SIZE,
-			sizeof(*super) - BT_CSUM_SIZE));
-		bt_copy(super->csum, &checksum, sizeof(checksum));
-		error =
-		    transaction->io.write(transaction->io.context, offset, super, sizeof(*super));
-		if (error != BTRFS_OK) {
-			return error;
+	/* Secondary copies, barrier, primary, barrier. Until the second barrier the
+	 * untouched primary holds the acknowledged generation; afterwards the durable
+	 * secondaries hold the new one. A torn copy is resolved only by explicit
+	 * recovery; the immutable reader never silently selects a mirror. */
+	for (mirror = BT_SUPER_MIRRORS - 1; mirror != 0; mirror--) {
+		if (bt_super_present(transaction->base->device_size, mirror)) {
+			error = bt_tx_publish(transaction, mirror);
+			if (error != BTRFS_OK) {
+				return error;
+			}
 		}
 	}
-	return transaction->io.flush(transaction->io.context);
+	error = transaction->io.flush(transaction->io.context);
+	if (error == BTRFS_OK) {
+		error = bt_tx_publish(transaction, 0);
+	}
+	return error == BTRFS_OK ? transaction->io.flush(transaction->io.context) : error;
 }
 
 enum btrfs_result
@@ -580,6 +620,10 @@ btrfs_transaction_commit(struct btrfs_transaction *transaction)
 		if (error == BTRFS_OK &&
 		    !bt_equal(transaction->scratch, &transaction->original_super, BT_SUPER_SIZE)) {
 			error = BTRFS_STALE;
+		}
+		if (error == BTRFS_OK) {
+			error = bt_tx_copies(transaction);
+			error = error == BTRFS_RECOVERY_REQUIRED ? BTRFS_STALE : error;
 		}
 	}
 	if (error == BTRFS_OK) {

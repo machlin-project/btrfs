@@ -8,24 +8,15 @@ bt_power_of_two(uint32_t value)
 }
 
 static enum btrfs_result
-bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super)
+bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t offset)
 {
-	struct bt_le32 checksum;
 	uint64_t flags;
 	uint64_t incompat;
+	enum btrfs_result error;
 
-	if (!bt_equal(super->magic, BT_MAGIC, sizeof(super->magic))) {
-		return BTRFS_NOT_BTRFS;
-	}
-	if (bt_u16(super->checksum_type) != 0) {
-		return BTRFS_UNSUPPORTED;
-	}
-	bt_copy(&checksum, super->csum, sizeof(checksum));
-	if (bt_u32(checksum) !=
-		~bt_crc32c(UINT32_MAX, (const uint8_t *)super + BT_CSUM_SIZE,
-		    BT_SUPER_SIZE - BT_CSUM_SIZE) ||
-	    bt_u64(super->bytenr) != BT_SUPER_OFFSET) {
-		return BTRFS_CORRUPT;
+	error = bt_super_check(super, offset);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	flags = bt_u64(super->flags);
 	incompat = bt_u64(super->incompat);
@@ -148,39 +139,21 @@ bt_load_chunks(struct btrfs_fs *fs)
 }
 
 enum btrfs_result
-btrfs_mount(const struct btrfs_environment *environment, uint64_t tree, struct btrfs_fs **result)
+bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk_super *super,
+    uint64_t offset, uint64_t tree, struct btrfs_fs **result)
 {
 	struct btrfs_fs *fs;
-	struct bt_disk_super *super;
 	struct btrfs_object_id id;
 	enum btrfs_result error;
 
-	if (result == NULL) {
-		return BTRFS_INVALID_ARGUMENT;
-	}
 	*result = NULL;
-	if (environment == NULL || environment->read == NULL || environment->allocate == NULL ||
-	    environment->release == NULL || (tree != 0 && !bt_file_tree(tree))) {
-		return BTRFS_INVALID_ARGUMENT;
-	}
-	if (environment->size_bytes < BT_SUPER_OFFSET + BT_SUPER_SIZE) {
-		return BTRFS_NOT_BTRFS;
-	}
 	fs = environment->allocate(environment->context, sizeof(*fs));
 	if (fs == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
 	bt_zero(fs, sizeof(*fs));
 	fs->env = *environment;
-	super = environment->allocate(environment->context, sizeof(*super));
-	if (super == NULL) {
-		btrfs_unmount(fs);
-		return BTRFS_NO_MEMORY;
-	}
-	error = bt_read_physical(fs, BT_SUPER_OFFSET, super, sizeof(*super));
-	if (error == BTRFS_OK) {
-		error = bt_super_decode(fs, super);
-	}
+	error = bt_super_decode(fs, super, offset);
 	if (error == BTRFS_OK) {
 		fs->chunks = environment->allocate(
 		    environment->context, BT_MAX_CHUNKS * sizeof(*fs->chunks));
@@ -191,7 +164,6 @@ btrfs_mount(const struct btrfs_environment *environment, uint64_t tree, struct b
 	if (error == BTRFS_OK) {
 		error = bt_bootstrap_chunks(fs, super);
 	}
-	environment->release(environment->context, super, sizeof(*super));
 	if (error == BTRFS_OK) {
 		error = bt_load_chunks(fs);
 	}
@@ -220,6 +192,37 @@ btrfs_mount(const struct btrfs_environment *environment, uint64_t tree, struct b
 	}
 	*result = fs;
 	return BTRFS_OK;
+}
+
+/* Mount admits only the primary copy. Selecting a mirror is an explicit recovery
+ * decision because an older copy may silently roll back acknowledged data. */
+enum btrfs_result
+btrfs_mount(const struct btrfs_environment *environment, uint64_t tree, struct btrfs_fs **result)
+{
+	struct bt_disk_super *super;
+	enum btrfs_result error;
+
+	if (result == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*result = NULL;
+	if (environment == NULL || environment->read == NULL || environment->allocate == NULL ||
+	    environment->release == NULL || (tree != 0 && !bt_file_tree(tree))) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (environment->size_bytes < BT_SUPER_OFFSET + BT_SUPER_SIZE) {
+		return BTRFS_NOT_BTRFS;
+	}
+	super = environment->allocate(environment->context, sizeof(*super));
+	if (super == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	error = environment->read(environment->context, BT_SUPER_OFFSET, super, sizeof(*super));
+	if (error == BTRFS_OK) {
+		error = bt_mount_super(environment, super, BT_SUPER_OFFSET, tree, result);
+	}
+	environment->release(environment->context, super, sizeof(*super));
+	return error;
 }
 
 void

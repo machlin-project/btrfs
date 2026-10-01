@@ -44,11 +44,18 @@ the image helper is not an implementation of host or Linux namei.
 ## Linux-authored fixtures
 
 The six reader profiles are `plain`, `small-nodes`, `large-nodes`, `zlib`, `zstd`
-and `default-subvolume`. The transaction suite also requires `transactions`, which
-uses 4 KiB nodes, single metadata, no free-space tree and `nospace_cache`. Each uses a separate disposable 256 MiB raw image and the
-payload in `tests/prepare_linux.py`. The payload formats **guest `/dev/vda`**, fills
-files, takes a snapshot, verifies Linux-visible contents, unmounts, and requires
-`btrfs check --readonly` to succeed. Never attach a valuable image to this payload.
+and `default-subvolume`. The transaction suites require four writable profiles
+without a free-space tree and mounted with `nospace_cache`: `transactions` (4 KiB
+nodes, single metadata), `transactions-dup` (16 KiB nodes, DUP metadata),
+`transactions-large` (64 KiB nodes, DUP metadata) and `transactions-full` (4 KiB
+nodes, single metadata, 128 MiB). The full profile first fills all unallocated
+space with data, then metadata with inline files carrying leaf-sized xattrs until
+Linux reports ENOSPC, then removes every seventh filler so the remaining free
+metadata is scattered. Other profiles use 256 MiB. Each uses a separate disposable
+raw image and the payload in `tests/prepare_linux.py`. The payload formats **guest
+`/dev/vda`**, fills files, takes a snapshot, verifies Linux-visible contents,
+unmounts, and requires `btrfs check --readonly` to succeed. Never attach a valuable
+image to this payload.
 
 The existing lab Linux reference runner supplies the VM transport. The accepted
 fixture environment used Alpine 3.22.5 AArch64, Linux 6.12.94 and btrfs-progs 6.14.
@@ -80,8 +87,9 @@ must match. A fresh checkout requires staging these external tools; the fixture
 preparer does not silently download or substitute them.
 
 For each profile, run the following **from the absolute lab directory**, replacing
-`plain` consistently. The image creation uses exclusive mode to avoid truncating
-an existing fixture. Archives and manifests go to generated directories.
+`plain` consistently and using 128 MiB for `transactions-full`. The image creation
+uses exclusive mode to avoid truncating an existing fixture. Archives and
+manifests go to generated directories.
 
 ```sh
 python3 ../btrfs/tests/prepare_linux.py \
@@ -97,7 +105,7 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all seven
+Linux checks and a completed VM exit before consuming the image. Repeat all ten
 profiles, then run the portable image and transaction suites. It hashes each complete image before
 and after reading, verifies 312 contracts, and fails if any byte changed.
 
@@ -161,42 +169,75 @@ or LXNU tests. See HANDOFF.md for those mandatory gates.
 ## Transaction persistence and independent Linux oracle
 
 The public writer interface is `include/btrfs/write.h`; both native adapters
-currently stay read-only. The image transaction test uses a recorded write device
-with explicit volatile/durable state. It never writes the source fixture. Export
-its accepted transaction into a new generated directory:
+currently stay read-only. `btrfs-transaction-test` runs source-controlled
+scenarios on a recorded device. It never writes the source fixture.
+
+| Scenario | Operations |
+| --- | --- |
+| `replace` | Replace `/greeting` |
+| `empty` | Zero-length replacement removes the inline extent |
+| `maximum` | 2048-byte inline payload |
+| `batch` | `/greeting` and 19 `/many` entries, growing items in several leaves |
+| `repeated` | Two commits; the second starts from the first Machlin root set |
+
+Each scenario's last commit runs every allocation, read, write and barrier fault
+point. Every recorded commit is then cut at each issue-order prefix and in each
+barrier epoch: 32 seeded metadata states persist arbitrary subsets of whole,
+missing, sector-subset or torn writes; each superblock epoch tries six tear
+patterns. Every state is classified by mounting the primary and by explicit
+recovery. It must resolve to the acknowledged or new stage with exact contents,
+invariant snapshots/xattrs/links, and admit the next transaction. The suite also
+checks admission, stale copies, recovery refusals and checksum-correct damaged
+allocation maps. `--full` adds the metadata-exhaustion case: the full profile's
+remaining metadata cannot hold a batch of all inline files, so the edit returns
+NO_SPACE without any write.
+
+Export a profile's crash cases into a new generated directory:
 
 ```sh
-mkdir artifacts/transaction-plan
-.build/btrfs-transaction-test artifacts/fixtures/transactions.raw artifacts/transaction-plan
+mkdir artifacts/transaction-plan-transactions
+.build/btrfs-transaction-test --export artifacts/transaction-plan-transactions \
+  artifacts/fixtures/transactions.raw
 ```
 
-The export is a TSV of physical offsets/lengths and separate binary write payloads.
-These are test artifacts, not a source revision ledger. The test requires all
-allocation/read/write/flush fault points to satisfy its contract, then verifies
-whole-write prefixes, seeded partial metadata, independent mirror persistence,
-abort/no-op, and zero-length replacement. A torn primary is rejected, not repaired.
+Each scenario directory holds write payloads (`writes.tsv`), per-stage expected
+contents (`stages.tsv`), and one sector-run list per case plus the superblock
+writes this implementation's recovery chose. These are generated test inputs, not
+a source ledger. About sixteen prefixes, ten metadata states and all superblock
+tear patterns are exported per commit; the portable test checks all of them.
 
-Reserve the Linux runner and stop the macOS test guest first. From the absolute
-lab directory, create a disposable copy without overwriting an existing artifact:
+Reserve the Linux runner and stop the macOS test guest first. The oracle needs the
+two-disk runner built from lab `scripts/linux-vm.swift` (the lab caches it as
+`.cache/linux-reference/linux-vm-external`). From the absolute lab directory,
+create a disposable working copy and a pristine copy without overwriting existing
+files, then run (use 134217728 bytes for `transactions-full`):
 
 ```sh
-python3 -c 'from pathlib import Path; import shutil; s=Path("../btrfs/artifacts/fixtures/transactions.raw"); d=Path("../btrfs/artifacts/transaction-linux.raw"); shutil.copyfileobj(s.open("rb"), d.open("xb"))'
+python3 -c 'from pathlib import Path; import shutil; s=Path("../btrfs/artifacts/fixtures/transactions.raw"); [shutil.copyfileobj(s.open("rb"), Path(d).open("xb")) for d in ("../btrfs/artifacts/oracle-transactions-work.raw", "../btrfs/artifacts/oracle-transactions-pristine.raw")]'
 python3 ../btrfs/tests/prepare_transactions_linux.py \
-  --root artifacts/btrfs-reference/root --plan ../btrfs/artifacts/transaction-plan \
-  --archive artifacts/btrfs-reference/transaction-check.cpio
-.cache/linux-reference/linux-vm .cache/linux-reference/Image \
-  artifacts/btrfs-reference/transaction-check.cpio 2 512 \
+  --root artifacts/btrfs-reference/root --plan ../btrfs/artifacts/transaction-plan-transactions \
+  --archive artifacts/btrfs-reference/transaction-check-transactions.cpio --device-bytes 268435456
+.cache/linux-reference/linux-vm-external .cache/linux-reference/Image \
+  artifacts/btrfs-reference/transaction-check-transactions.cpio 2 512 \
   'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
-  ../btrfs/artifacts/transaction-linux.raw > ../btrfs/logs/linux-transactions.log 2>&1
+  ../btrfs/artifacts/oracle-transactions-work.raw ../btrfs/artifacts/oracle-transactions-pristine.raw \
+  > ../btrfs/logs/linux-transactions-transactions.log 2>&1
 ```
 
-Require the exact pass marker with the exported number of writes plus one, each
-Linux read-only fsck, each mounted old/new data check and the final Linux
-read-write commit/fsck. Check the original fixture hash before and after.
-The oracle writes only the disposable VM disk; it restores affected ranges
-between crash cases. It does not use `btrfs check --repair`. It proves on-disk
-compatibility for that transaction; actual native flush durability is a separate
-gate once native write callbacks exist.
+The guest restores the working disk from the pristine `/dev/vdb` before every
+case and compares both disks after each scenario. For each case it applies the
+exported sector runs, then requires Linux to agree with the recorded outcome:
+`btrfs check --readonly`, the primary generation and exact tracked contents plus
+invariants for a valid primary, or a failed mount for a torn primary. For each
+recovery case it runs `btrfs rescue super-recover -y`, requires status 2 and the
+same resolved generation and contents, then repeats from the crash state with
+this implementation's recovery writes and requires Linux to find every copy
+valid. Finally Linux mounts the last scenario's newest root read-write, writes,
+syncs and passes `btrfs check`. Require `BTRFS_TRANSACTION_PASS:N` with the case
+count printed by the preparer and in its JSON, and an unchanged pristine copy and
+fixture. The oracle never runs `btrfs check --repair`. It proves on-disk
+compatibility and Linux agreement for these states; actual native flush
+durability is a separate gate once native write callbacks exist.
 
 ## Identified macOS mounted acceptance
 

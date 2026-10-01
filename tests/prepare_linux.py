@@ -10,7 +10,14 @@ import subprocess
 PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "large-nodes": (65536, "dup", ""), "zlib": (16384, "dup", "zlib"),
             "zstd": (16384, "dup", "zstd"), "default-subvolume": (16384, "dup", ""),
-            "transactions": (4096, "single", "")}
+            "transactions": (4096, "single", ""), "transactions-dup": (16384, "dup", ""),
+            "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", "")}
+# Writable profiles avoid allocation features the writer does not maintain yet.
+WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full"}
+DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024}
+# A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
+FILL_XATTR_BYTES = 3800
+FILL_REMOVE_STRIDE = 7
 
 
 def prepare(root: Path, profile: str, archive: Path) -> None:
@@ -27,10 +34,37 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
     (inputs / "SHA256SUMS").write_text("".join(
         f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in contents.items()))
     options = f"compress-force={compression}" if compression else "compress=no"
-    features = "-R ^free-space-tree" if profile == "transactions" else ""
-    if profile == "transactions":
+    features = "-R ^free-space-tree" if profile in WRITABLE else ""
+    if profile in WRITABLE:
         options += ",nospace_cache"
     set_default = "btrfs subvolume set-default /mnt/subvol" if profile == "default-subvolume" else ":"
+    device_bytes = DEVICE_BYTES.get(profile, 256 * 1024 * 1024)
+    fill = ":"
+    if profile == "transactions-full":
+        # Exhaust unallocated space with data, then metadata with inline files,
+        # then free every seventh filler so the remaining free space is scattered.
+        fill = f'''test "$(blockdev --getsize64 /dev/vda)" = {device_bytes}
+dd if=/dev/zero of=/mnt/data-fill bs=1M 2>/dev/null || true
+btrfs filesystem sync /mnt
+mkdir /mnt/meta
+pad=$(head -c {FILL_XATTR_BYTES} /dev/zero | tr '\\0' p)
+i=0
+while printf m > /mnt/meta/f$i 2>/dev/null &&
+      setfattr -n user.pad -v "$pad" /mnt/meta/f$i 2>/dev/null; do
+    i=$((i + 1))
+done
+echo BTRFS_REFERENCE_METADATA_FILES:$i
+test "$i" -gt {FILL_REMOVE_STRIDE * 16}
+rm -f /mnt/meta/f$i
+j=0
+while [ "$j" -lt "$i" ]; do
+    if [ $((j % {FILL_REMOVE_STRIDE})) -eq 0 ]; then
+        rm /mnt/meta/f$j
+    fi
+    j=$((j + 1))
+done
+btrfs filesystem sync /mnt
+btrfs filesystem df /mnt'''
     init = f'''#!/bin/busybox sh
 set -eu
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
@@ -71,6 +105,7 @@ printf 'snapshot original\\n' > /mnt/subvol/value
 btrfs subvolume snapshot -r /mnt/subvol /mnt/snapshot
 printf 'subvolume changed\\n' > /mnt/subvol/value
 {set_default}
+{fill}
 cd /mnt
 sha256sum -c /input/SHA256SUMS
 test "$(stat -c '%a:%u:%g:%h' greeting)" = '640:1001:1002:2'
@@ -96,7 +131,7 @@ poweroff -f
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root,
                        input=paths, stdout=output, check=True)
     manifest = {"profile": profile, "node_size": node_size, "metadata": metadata,
-                "compression": compression, "files": {
+                "compression": compression, "device_bytes": device_bytes, "files": {
                     name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                     for name, data in contents.items()}}
     archive.with_suffix(".json").write_text(json.dumps(manifest, indent=2) + "\n")
