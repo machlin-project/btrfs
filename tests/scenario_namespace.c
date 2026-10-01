@@ -42,7 +42,7 @@ item_limit(const struct context *context)
 	return context->node_size - sizeof(struct bt_disk_header) - sizeof(struct bt_disk_item);
 }
 
-static void
+void
 namespace_plan(struct context *context, struct plan *plan, const char *name)
 {
 	plan_init(plan);

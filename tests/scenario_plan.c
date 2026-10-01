@@ -592,6 +592,21 @@ plan_set_attributes(struct plan *plan, size_t commit, const char *path, unsigned
 	operation->modify_time.seconds = modify_seconds;
 }
 
+/* The last operation of commit must be refused with result. */
+void
+plan_expect_refusal(struct plan *plan, size_t commit, enum btrfs_result result)
+{
+	REQUIRE(plan->operation_count[commit] != 0);
+	plan->operations[commit][plan->operation_count[commit] - 1].expected = result;
+}
+
+/* Truncation of a file the plan models through expectations. */
+void
+plan_truncate_new(struct plan *plan, size_t commit, const char *path, uint64_t size)
+{
+	plan_namespace(plan, commit, OPERATION_TRUNCATE, path, NULL)->offset = size;
+}
+
 void
 plan_privileges(struct plan *plan, size_t commit, const char *path, int keep)
 {

@@ -33,6 +33,7 @@ inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: in
 transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
+  'tests/scenario_random.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
   dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
@@ -104,8 +105,17 @@ if fixtures != ''
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,
     suite: 'images')
+  test('random-writer', transaction_test,
+    args: ['--random', '1', '16', join_paths(fixtures, 'transactions-namespace.raw')],
+    timeout: 900, suite: 'images')
+  test('random-writer-dup', transaction_test,
+    args: ['--random-quick', '1', '500', join_paths(fixtures, 'transactions-dup.raw')],
+    timeout: 900, suite: 'images')
   test('native-volume-views', volume_test,
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
+  test('native-volume-stress', volume_test,
+    args: ['--stress', '1000', join_paths(fixtures, 'transactions.raw')], timeout: 300,
+    suite: 'images')
   test('metadata-exhaustion', transaction_test,
     args: ['--full', join_paths(fixtures, 'transactions-full.raw')], timeout: 180, suite: 'images')
 endif

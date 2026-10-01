@@ -56,7 +56,7 @@
 #define GROW_DATA_BYTES (40U * 1024U * 1024U)
 #define SYNTHETIC_COMMIT SIZE_MAX
 #define NO_FILE SIZE_MAX
-#define MAX_EXPECTATIONS 512U
+#define MAX_EXPECTATIONS 16384U
 /* The largest xattr value one 64 KiB leaf item can hold. */
 #define XATTR_VALUE_LIMIT 65536U
 /* Linux keeps device numbers in inode items as its internal dev_t. */
@@ -147,6 +147,9 @@ struct operation {
 	struct btrfs_object_id id;
 	struct btrfs_time access_time;
 	struct btrfs_time modify_time;
+	/* A refusal the operation must return without poisoning the transaction;
+	 * BTRFS_OK for an operation that must succeed. */
+	enum btrfs_result expected;
 };
 
 enum expectation_kind {
@@ -224,6 +227,8 @@ struct plan {
 	/* Namespace plans check their expectations and the namespace audit in
 	 * every state. */
 	int namespace;
+	/* Committed stages only: no crash states or fault sweeps. */
+	int quick;
 };
 
 struct totals {
@@ -313,6 +318,10 @@ void plan_clean(struct plan *plan, size_t commit, uint64_t tree, size_t expected
 void plan_set_attributes(struct plan *plan, size_t commit, const char *path, unsigned mask,
     uint32_t mode, uint32_t uid, uint32_t gid, int64_t access_seconds, int64_t modify_seconds);
 void plan_privileges(struct plan *plan, size_t commit, const char *path, int keep);
+void plan_expect_refusal(struct plan *plan, size_t commit, enum btrfs_result result);
+void plan_truncate_new(struct plan *plan, size_t commit, const char *path, uint64_t size);
+void namespace_plan(struct context *context, struct plan *plan, const char *name);
+void random_scenarios(struct context *context, uint32_t first, uint32_t count, int quick);
 struct expectation *expect(
     struct plan *plan, size_t first, size_t last, enum expectation_kind kind, const char *path);
 void expect_absent(struct plan *plan, size_t first, size_t last, const char *path);

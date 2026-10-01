@@ -516,8 +516,9 @@ path_prepare(struct path_table *table, struct btrfs_fs *fs, const char *path, in
 	if (path_slot(table, copy)->path != NULL) {
 		return;
 	}
+	/* A path below a committed file does not exist either. */
 	result = btrfs_image_lookup(fs, copy, &inode);
-	REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND);
+	REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND || result == BTRFS_NOT_DIRECTORY);
 	path_set(table, copy, result == BTRFS_OK ? inode.id : none, result == BTRFS_OK);
 }
 
@@ -535,7 +536,10 @@ path_object(struct path_table *table, const char *path, int parent, const char *
 		*leaf = slash + 1;
 	}
 	entry = path_slot(table, copy);
-	REQUIRE(entry->path != NULL && entry->present);
+	if (entry->path == NULL || !entry->present) {
+		fprintf(stderr, "unresolved path %s\n", copy);
+		exit(1);
+	}
 	return entry->id;
 }
 
@@ -567,6 +571,7 @@ prepare_paths(struct path_table *table, struct btrfs_fs *fs, const struct operat
 	case OPERATION_RENAME:
 		path_prepare(table, fs, operation->path, 0);
 		path_prepare(table, fs, operation->path, 1);
+		path_prepare(table, fs, operation->target, 0);
 		path_prepare(table, fs, operation->target, 1);
 		break;
 	case OPERATION_EVICT:
@@ -590,6 +595,7 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 	const char *leaf = NULL;
 	const char *new_leaf = NULL;
 	struct btrfs_attributes changes;
+	struct path_entry *replaced;
 	size_t cleaned;
 	enum btrfs_result result;
 
@@ -643,7 +649,11 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 		target = path_object(table, operation->target, 1, &new_leaf);
 		result = btrfs_transaction_rename(transaction, parent, leaf, strlen(leaf), target,
 		    new_leaf, strlen(new_leaf), time, operation->flags);
-		if (result == BTRFS_OK) {
+		replaced = path_slot(table, operation->target);
+		/* Between two names of one inode, rename changes nothing. */
+		if (result == BTRFS_OK &&
+		    !(replaced->path != NULL && replaced->present && replaced->id.tree == id.tree &&
+			replaced->id.inode == id.inode)) {
 			path_set(table, operation->path, none, 0);
 			path_set(table, operation->target, id, 1);
 		}
@@ -721,6 +731,21 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	result = btrfs_transaction_begin(fs, &context->writer, &transaction);
 	for (i = 0; result == BTRFS_OK && i < plan->operation_count[commit]; i++) {
 		result = execute(transaction, &table, &plan->operations[commit][i], time);
+		if (plan->operations[commit][i].expected != BTRFS_OK &&
+		    result == plan->operations[commit][i].expected) {
+			REQUIRE(transaction->failure == BTRFS_OK);
+			result = BTRFS_OK;
+		} else if (plan->operations[commit][i].expected != BTRFS_OK && result == BTRFS_OK) {
+			fprintf(stderr, "%s commit %zu operation %zu (%s) succeeded, expected %s\n",
+			    plan->name, commit, i, plan->operations[commit][i].path,
+			    btrfs_result_string(plan->operations[commit][i].expected));
+			result = BTRFS_CORRUPT;
+		} else if (result != BTRFS_OK && fault == FAULT_NONE) {
+			fprintf(stderr, "%s commit %zu operation %zu (%s): %s, expected %s\n",
+			    plan->name, commit, i, plan->operations[commit][i].path,
+			    btrfs_result_string(result),
+			    btrfs_result_string(plan->operations[commit][i].expected));
+		}
 	}
 	if (result == BTRFS_OK) {
 		result = btrfs_transaction_commit(transaction);
@@ -894,6 +919,13 @@ run_plan(struct context *context, struct plan *plan)
 		audit_state(context, plan->name);
 		if (commit == 1 && plan->new_chunks != 0) {
 			check_growth(context, plan);
+		}
+		if (plan->quick) {
+			/* Without crash states, check each committed stage directly. */
+			REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+			check_stage(context, fs, plan, commit);
+			btrfs_unmount(fs);
+			continue;
 		}
 		crash_states(context, plan, &exporter, commit, first);
 		if (commit == plan->commits) {

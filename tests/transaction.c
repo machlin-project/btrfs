@@ -18,6 +18,9 @@ main(int argc, char **argv)
 	int fragment = 0;
 	int grow = 0;
 	int names = 0;
+	uint32_t random_first = 0;
+	uint32_t random_count = 0;
+	int random_quick = 0;
 	int i;
 
 	context = calloc(1, sizeof(*context));
@@ -39,6 +42,12 @@ main(int argc, char **argv)
 			grow = 1;
 		} else if (strcmp(argv[i], "--namespace") == 0) {
 			names = 1;
+		} else if ((strcmp(argv[i], "--random") == 0 ||
+			       strcmp(argv[i], "--random-quick") == 0) &&
+		    i + 2 < argc) {
+			random_quick = strcmp(argv[i], "--random-quick") == 0;
+			random_first = (uint32_t)strtoul(argv[++i], NULL, 10);
+			random_count = (uint32_t)strtoul(argv[++i], NULL, 10);
 		} else {
 			REQUIRE(image == NULL);
 			image = argv[i];
@@ -90,6 +99,9 @@ main(int argc, char **argv)
 	}
 	if (names) {
 		namespace_scenarios(context);
+	}
+	if (random_count != 0) {
+		random_scenarios(context, random_first, random_count, random_quick);
 	}
 	REQUIRE(context->image.live_allocations == 0);
 	btrfs_image_close(&context->image);

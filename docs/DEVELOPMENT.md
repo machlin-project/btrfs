@@ -155,9 +155,21 @@ env -i PATH="$PATH" BTRFS_FUZZ_IMAGE="$PWD/artifacts/fixtures/plain.raw" \
   -artifact_prefix=artifacts/fuzz-findings/ artifacts/fuzz-corpus
 CC=/opt/homebrew/opt/llvm/bin/clang meson setup .build-tsan \
   -Db_sanitize=thread -Dfixtures=artifacts/fixtures
-meson compile -C .build-tsan btrfs-concurrent
-env -i PATH="$PATH" meson test -C .build-tsan --no-rebuild concurrent-readers --print-errorlogs
+meson compile -C .build-tsan btrfs-concurrent btrfs-volume-test
+env -i PATH="$PATH" meson test -C .build-tsan --no-rebuild concurrent-readers \
+  native-volume-views native-volume-stress --print-errorlogs
 ```
+
+`native-volume-stress` runs four readers against the shared native volume layer
+(`adapters/common/volume.c`) while one writer runs 1,000 transactions of
+creates, rewrites, unlinks and replacing renames. Before each commit the writer
+records the expected names, sizes and contents for the generation it may
+publish; every reader checks its pinned view against the record for that view's
+generation (lookups, full reads and the directory listing), and one reader
+checks its view again after a pause, so later transactions must not reuse its
+blocks. The writer also aborts transactions, fails allocations inside them, and
+finally fails a commit write: the volume must refuse the next writer, keep
+serving the published view, and a reopened volume must find that generation.
 
 A bounded smoke campaign is not exhaustive fuzzing. Preserve and minimize every
 crashing input; turn the cause into a deterministic regression before fixing it.
@@ -216,6 +228,7 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 | `fst-*` (`--fragment`) | Frees between bitmap holes and a write that spills from extent-mode free space into bitmap holes |
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes |
 | `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item |
+| `random-N` (`--random FIRST COUNT`, `--random-quick FIRST COUNT`) | Seeded differential sequences: 24 operations in three commits drawn from create of every type, link, unlink, rename (also over files and between names of one inode), xattr set/remove, write, truncation, attribute changes, orphan cleanup and expected refusals under `/fuzz`, over a name pool with real CRC32C collisions; a separate model predicts each stage's namespace facts |
 
 `btrfs-reference-audit` is an independent reference oracle in the portable
 suite. It walks every tree from the superblock and root items, derives the
@@ -249,6 +262,20 @@ xattr limits, properties) and numbering or packed-item limit (last directory
 index, last inode number, the per-transaction directory bound, a full colliding
 DIR_ITEM) is decided before the first change and leaves the transaction able to
 commit.
+
+`tests/scenario_random.c` adds differential coverage. Seed N draws operations
+with fixed weights against a model of `/fuzz` (inodes, names, link counts,
+owners, modes, times, data, symlink targets and xattrs), including refusals the
+model predicts (existing and missing names and xattrs under create/replace
+flags, non-empty directories, a directory renamed below itself, a linked
+directory); an operation that must be refused and succeeds fails the test. After every commit the model's state
+becomes the stage's expectations: the reader, the reference audit and the
+namespace audit check them, and `--random` samples twelve prefixes and 24 fault
+points per commit plus the reorder and tear epochs, while `--random-quick`
+checks each committed stage only. `BTRFS_RANDOM_TRACE=1` prints each drawn
+operation. Meson runs seeds 1-16 on `transactions-namespace` and quick seeds
+1-500 on `transactions-dup`; export seeds with `--random 1 16 --export DIR`
+on `transactions-namespace` for the Linux oracle.
 
 Export a profile's crash cases into a new generated directory. Pass the same
 profile flag Meson uses: `--full` for `transactions-full`, `--shared` for
