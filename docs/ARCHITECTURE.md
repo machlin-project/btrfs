@@ -173,7 +173,11 @@ It pins the committed allocation map for the whole transaction and never reuses 
 released reservation within that transaction. Gap storage grows from 256 records
 to a maximum of 131,072. The current transaction limit is 4,096 dirty nodes; the
 standalone editor supports up to 65,536. Exhausted reservations return NO_SPACE
-from the failing edit, before any media write.
+from the failing edit, before any media write. The commit's accounting fixed
+point (extent items, block groups, free space and root items of the blocks the
+edits copied) may still run out after every edit fitted; it too returns
+NO_SPACE before any media write, the transaction is failed and the volume stays
+usable.
 
 `core/transaction.c` owns the private root set and a separate write environment.
 File data and namespace operations are described in their own sections below.
@@ -531,6 +535,12 @@ Before writing, it opens the selection's chunk, root, checksum, top-level, devic
 and extent trees and allocation map; file trees are not scrubbed. It rewrites
 only disagreeing copies, never the selected source, followed by one barrier.
 Without a writer it reports the decision and returns RECOVERY_REQUIRED.
+`btrfs-inspect IMAGE recover` offers it for image files: without `--apply` it
+prints the decision (each copy's status and generation, the selection) as JSON,
+writes nothing and exits 3 when recovery is required; `--apply` rewrites the
+disagreeing copies with positioned writes and a barrier that reaches stable
+storage (F_FULLFSYNC); `--acknowledged` passes the last generation the caller
+saw committed.
 
 The owner must hold exclusive resource access, drain readers before commit and
 retire the original mount after successful or uncertain publication. It must

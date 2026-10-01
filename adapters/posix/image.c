@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+/* F_FULLFSYNC */
+#define _DARWIN_C_SOURCE
+#endif
 #include "image.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -165,14 +169,53 @@ btrfs_image_compress(void *context, enum btrfs_compression codec, const void *in
 	return BTRFS_UNSUPPORTED;
 }
 
-int
-btrfs_image_open(const char *path, struct btrfs_image *image)
+static enum btrfs_result
+image_write(void *context, uint64_t offset, const void *buffer, size_t length)
+{
+	struct btrfs_image *image = context;
+	size_t done = 0;
+	ssize_t amount;
+
+	if (offset > INT64_MAX || length > (uint64_t)INT64_MAX - offset) {
+		return BTRFS_IO;
+	}
+	while (done < length) {
+		amount = pwrite(image->descriptor, (const uint8_t *)buffer + done, length - done,
+		    (off_t)(offset + done));
+		if (amount < 0 && errno == EINTR) {
+			continue;
+		}
+		if (amount <= 0) {
+			return BTRFS_IO;
+		}
+		done += (size_t)amount;
+	}
+	return BTRFS_OK;
+}
+
+/* A barrier reaches stable storage: F_FULLFSYNC where the platform has it,
+ * since fsync alone may leave data in the drive's cache. */
+static enum btrfs_result
+image_flush(void *context)
+{
+	struct btrfs_image *image = context;
+
+#ifdef F_FULLFSYNC
+	if (fcntl(image->descriptor, F_FULLFSYNC) == 0) {
+		return BTRFS_OK;
+	}
+#endif
+	return fsync(image->descriptor) == 0 ? BTRFS_OK : BTRFS_IO;
+}
+
+static int
+image_open(const char *path, int flags, struct btrfs_image *image)
 {
 	struct stat status;
 	int error;
 
 	memset(image, 0, sizeof(*image));
-	image->descriptor = open(path, O_RDONLY | O_CLOEXEC);
+	image->descriptor = open(path, flags | O_CLOEXEC);
 	if (image->descriptor < 0) {
 		return errno;
 	}
@@ -192,6 +235,29 @@ btrfs_image_open(const char *path, struct btrfs_image *image)
 	image->environment.release = image_release;
 	image->environment.decompress = image_decompress;
 	return 0;
+}
+
+int
+btrfs_image_open(const char *path, struct btrfs_image *image)
+{
+	return image_open(path, O_RDONLY, image);
+}
+
+int
+btrfs_image_open_writable(const char *path, struct btrfs_image *image)
+{
+	return image_open(path, O_RDWR, image);
+}
+
+void
+btrfs_image_writer(struct btrfs_image *image, struct btrfs_write_environment *writer)
+{
+	memset(writer, 0, sizeof(*writer));
+	writer->context = image;
+	writer->write = image_write;
+	writer->flush = image_flush;
+	writer->compress = btrfs_image_compress;
+	writer->compression = BTRFS_COMPRESSION_NONE;
 }
 
 void

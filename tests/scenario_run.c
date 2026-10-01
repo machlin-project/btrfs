@@ -4,6 +4,19 @@
 #define _POSIX_C_SOURCE 200809L
 #include "scenario.h"
 
+/* Superblock copies the device holds: two, or three past 256 GiB. */
+static unsigned
+super_copies(const struct context *context)
+{
+	unsigned copies = 0;
+	unsigned mirror;
+
+	for (mirror = 0; mirror < BTRFS_SUPER_COPIES; mirror++) {
+		copies += bt_super_present(context->image.environment.size_bytes, mirror) != 0;
+	}
+	return copies;
+}
+
 /* Classify a durable state the way an owner must: mount the primary, then ask
  * explicit recovery. Every state must resolve to the acknowledged or the newest
  * stage, never a mixture, never below acknowledgement, and remain admissible. */
@@ -38,7 +51,7 @@ resolve(struct context *context, const struct plan *plan, size_t acknowledged, s
 	}
 	result = btrfs_recover_supers(&context->env, NULL, floor, &report);
 	REQUIRE(result == BTRFS_OK || result == BTRFS_RECOVERY_REQUIRED);
-	REQUIRE(report.present == 2 && report.selected < BTRFS_SUPER_COPIES);
+	REQUIRE(report.present == super_copies(context) && report.selected < BTRFS_SUPER_COPIES);
 	stage = (size_t)(report.generation - context->base_generation);
 	REQUIRE(stage == acknowledged || stage == latest);
 	REQUIRE(outcome->mounted != NO_STAGE || result == BTRFS_RECOVERY_REQUIRED);
@@ -441,6 +454,10 @@ crash_states(struct context *context, const struct plan *plan, struct exporter *
 	size_t bucket;
 	size_t stride;
 	size_t exported = 0;
+	size_t copies;
+	size_t copy;
+	size_t samples;
+	size_t combination;
 	unsigned epoch;
 	unsigned pattern;
 	unsigned choice;
@@ -460,8 +477,22 @@ crash_states(struct context *context, const struct plan *plan, struct exporter *
 		exported = bucket;
 	}
 	for (epoch = 0; epoch < BARRIERS; epoch++) {
-		for (sample = 0; sample < (epoch == 0 ? METADATA_SAMPLES + 2 : TEAR_PATTERNS);
-		    sample++) {
+		/* A superblock epoch writes one copy per device location past the
+		 * primary's; every combination of tear patterns across them is a
+		 * state (two secondaries on devices over 256 GiB). */
+		copies = 0;
+		for (i = first; i < last; i++) {
+			copies += device->writes[i].epoch == epoch;
+		}
+		samples = METADATA_SAMPLES + 2;
+		if (epoch != 0) {
+			REQUIRE(copies >= 1 && copies <= SUPER_COPIES_TORN);
+			for (samples = 1, copy = 0; copy < copies; copy++) {
+				samples *= TEAR_PATTERNS;
+			}
+		}
+		for (sample = 0; sample < samples; sample++) {
+			combination = sample;
 			for (i = first; i < last; i++) {
 				write = &device->writes[i];
 				show(write, write->epoch < epoch);
@@ -469,11 +500,12 @@ crash_states(struct context *context, const struct plan *plan, struct exporter *
 					continue;
 				}
 				if (epoch != 0) {
-					/* One copy per superblock epoch on these devices. */
 					for (sector = 0; sector < sectors(write); sector++) {
 						write->visible[sector] = (uint8_t)tear(
-						    (unsigned)sample, sector, sectors(write));
+						    (unsigned)(combination % TEAR_PATTERNS), sector,
+						    sectors(write));
 					}
+					combination /= TEAR_PATTERNS;
 					continue;
 				}
 				choice = sample < 2 ? (unsigned)sample : next_random(context) % 4;

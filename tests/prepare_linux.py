@@ -17,12 +17,13 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-grow": (16384, "dup", ""),
             "transactions-namespace": (4096, "single", ""),
             "transactions-holes": (4096, "dup", ""),
-            "transactions-convert": (4096, "single", "")}
+            "transactions-convert": (4096, "single", ""),
+            "transactions-copies": (4096, "single", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
             "transactions-shared", "transactions-keyed", "transactions-data",
-            "transactions-holes"}
+            "transactions-holes", "transactions-copies"}
 # The holes profile repeats the data payload without NO_HOLES, so Linux writes
 # explicit hole items, and with DUP data, so every data sector has two copies;
 # it adds a file grown by truncation alone and a NODATACOW directory.
@@ -78,9 +79,13 @@ NAMESPACE_DATA_BYTES = 65536
 # remaining links of the inode as extended references.
 EXTREF_NAME_BYTES = 200
 EXTREF_LINKS = 40
+# Past 256 GiB a device holds the third superblock copy; the image is sparse.
+COPIES_DEVICE_BYTES = 257 * 1024 * 1024 * 1024
+THIRD_SUPER_OFFSET = 256 * 1024 * 1024 * 1024
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
                 "transactions-holes": 512 * 1024 * 1024,
-                "transactions-convert": 1024 * 1024 * 1024}
+                "transactions-convert": 1024 * 1024 * 1024,
+                "transactions-copies": COPIES_DEVICE_BYTES}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
 FILL_REMOVE_STRIDE = 7
@@ -309,6 +314,11 @@ echo BTRFS_REFERENCE_FST_TO_BITMAPS:$to_bitmaps
 echo BTRFS_REFERENCE_FST_TO_EXTENTS:$to_extents
 test "$to_bitmaps" = $((high + 1))
 test "$to_extents" = $((low - 1))'''
+    if profile == "transactions-copies":
+        fill = f'''test "$(blockdev --getsize64 /dev/vda)" = {COPIES_DEVICE_BYTES}
+btrfs filesystem sync /mnt
+btrfs inspect-internal dump-super -s 2 /dev/vda | grep -q '^bytenr[[:space:]]*{THIRD_SUPER_OFFSET}$'
+echo BTRFS_REFERENCE_SUPER_COPIES:$(btrfs inspect-internal dump-super -a /dev/vda | grep -c '^superblock: bytenr=')'''
     if profile == "transactions-grow":
         # Fill data, then metadata until Linux reports ENOSPC; delete the data and
         # the newest fillers (whole leaves of room for balance's own transaction),

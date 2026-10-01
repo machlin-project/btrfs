@@ -86,7 +86,12 @@ copy_tests(struct context *context)
 	struct device *device = context->device;
 	uint64_t generation = context->base_generation;
 	size_t writes;
+	unsigned copies = 0;
+	unsigned mirror;
 
+	for (mirror = 0; mirror < BTRFS_SUPER_COPIES; mirror++) {
+		copies += bt_super_present(context->image.environment.size_bytes, mirror) != 0;
+	}
 	primary = malloc(sizeof(*primary));
 	secondary = malloc(sizeof(*secondary));
 	damage = malloc(sizeof(*damage));
@@ -129,20 +134,37 @@ copy_tests(struct context *context)
 	show(&device->writes[writes], 1);
 	REQUIRE(btrfs_recover_supers(&context->env, NULL, generation, &report) == BTRFS_OK &&
 	    report.rewritten == 0);
-	btrfs_unmount(fs);
 	truncate_writes(device, 0);
 
+	/* On devices past 256 GiB, a torn third copy alone blocks admission too,
+	 * and recovery rewrites only it. */
+	if (copies == BTRFS_SUPER_COPIES) {
+		super_copy(context, 2, damage);
+		REQUIRE(bt_super_same(primary, damage));
+		((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
+		synthetic(context, bt_super_offset(2), damage, sizeof(*damage));
+		REQUIRE(begin_and_commit(context, fs, 0, NULL, 0) == BTRFS_RECOVERY_REQUIRED);
+		writes = device->count;
+		REQUIRE(btrfs_recover_supers(
+			    &context->env, &context->writer, generation, &report) == BTRFS_OK &&
+		    report.selected == 0 && report.copies[2].status == BTRFS_CORRUPT &&
+		    report.copies[1].current && report.rewritten == 1 &&
+		    device->count == writes + 1 &&
+		    device->writes[writes].offset == bt_super_offset(2));
+		truncate_writes(device, 0);
+	}
+	btrfs_unmount(fs);
+
 	/* No valid copy: nothing is selected or written. */
-	*damage = *primary;
-	((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
-	synthetic(context, BT_SUPER_OFFSET, damage, sizeof(*damage));
-	*damage = *secondary;
-	((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
-	synthetic(context, bt_super_offset(1), damage, sizeof(*damage));
+	for (mirror = 0; mirror < copies; mirror++) {
+		super_copy(context, mirror, damage);
+		((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
+		synthetic(context, bt_super_offset(mirror), damage, sizeof(*damage));
+	}
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_CORRUPT);
 	REQUIRE(
 	    btrfs_recover_supers(&context->env, &context->writer, 0, &report) == BTRFS_CORRUPT &&
-	    device->count == 2);
+	    device->count == copies);
 	truncate_writes(device, 0);
 
 	/* A torn primary with an intact secondary recovers the same generation. */
@@ -183,7 +205,9 @@ copy_tests(struct context *context)
 	free(damage);
 	free(secondary);
 	free(primary);
-	printf("superblock copies: stale rejection, admission and explicit recovery PASS\n");
+	printf("superblock copies (%u on this device): stale rejection, admission and explicit "
+	       "recovery PASS\n",
+	    copies);
 }
 
 typedef int (*item_match)(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
@@ -571,6 +595,80 @@ collect_inline(struct btrfs_fs *fs, const char *path, struct btrfs_object_id *id
 	return count;
 }
 
+/* Replaces the first count inline files in one transaction: the commit's
+ * result, or the first failing edit's result with *edits_ok cleared. */
+static enum btrfs_result
+replace_inline(struct context *context, struct btrfs_fs *fs, const struct btrfs_object_id *ids,
+    size_t count, int *edits_ok)
+{
+	struct btrfs_transaction *transaction;
+	struct btrfs_time time = { 1700000000, 0 };
+	uint8_t data[INLINE_LIMIT];
+	size_t i;
+	enum btrfs_result result = BTRFS_OK;
+
+	memset(data, 0x33, sizeof(data));
+	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);
+	for (i = 0; result == BTRFS_OK && i < count; i++) {
+		result =
+		    btrfs_transaction_write_inline(transaction, ids[i], data, INLINE_LIMIT, time);
+	}
+	*edits_ok = result == BTRFS_OK;
+	if (result == BTRFS_OK) {
+		result = btrfs_transaction_commit(transaction);
+		/* A failed commit leaves the transaction failed. */
+		REQUIRE(result == BTRFS_OK || btrfs_transaction_commit(transaction) == result);
+	}
+	btrfs_transaction_destroy(transaction);
+	return result;
+}
+
+/* Every edit fits but the commit's accounting fixed point (extent items, block
+ * groups, free space and root items of the CoW blocks) does not: the commit
+ * fails with NO_SPACE before any media write, and the volume stays usable for
+ * a transaction one edit smaller. The boundary is found by bisection over the
+ * number of replaced files. */
+static void
+exhaustion_commit_test(
+    struct context *context, struct btrfs_fs *fs, const struct btrfs_object_id *ids, size_t count)
+{
+	struct reference_audit audit;
+	struct btrfs_fs *after;
+	size_t low = 0;
+	size_t high = count;
+	size_t middle;
+	int edits_ok = 0;
+	enum btrfs_result result;
+
+	/* Invariant: low replacements commit; high replacements do not. */
+	REQUIRE(replace_inline(context, fs, ids, high, &edits_ok) != BTRFS_OK);
+	truncate_writes(context->device, 0);
+	while (high - low > 1) {
+		middle = low + (high - low) / 2;
+		result = replace_inline(context, fs, ids, middle, &edits_ok);
+		truncate_writes(context->device, 0);
+		if (result == BTRFS_OK) {
+			low = middle;
+		} else {
+			high = middle;
+		}
+	}
+	context->device->issued = 0;
+	context->device->flushes = 0;
+	REQUIRE(replace_inline(context, fs, ids, high, &edits_ok) == BTRFS_NO_SPACE);
+	REQUIRE(edits_ok);
+	REQUIRE(context->device->count == 0 && context->device->issued == 0 &&
+	    context->device->flushes == 0);
+	REQUIRE(replace_inline(context, fs, ids, low, &edits_ok) == BTRFS_OK);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &after) == BTRFS_OK);
+	REQUIRE(reference_audit(after, &audit) == 0);
+	btrfs_unmount(after);
+	truncate_writes(context->device, 0);
+	printf("commit exhaustion: %zu edits fit but their commit returns NO_SPACE before any "
+	       "write; %zu commit PASS\n",
+	    high, low);
+}
+
 /* The Linux fixture's metadata is full and fragmented. A transaction needing
  * more nodes than remain must fail with NO_SPACE before any media write. */
 void
@@ -609,6 +707,7 @@ exhaustion_test(struct context *context)
 	for (i = 0; i < INLINE_LIMIT; i++) {
 		data[i] = (uint8_t)i;
 	}
+	exhaustion_commit_test(context, fs, ids, count);
 	context->device->issued = 0;
 	context->device->flushes = 0;
 	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);

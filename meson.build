@@ -70,6 +70,8 @@ if fixtures != ''
   endif
   test('linux-images', py, args: [files('tests/check_images.py'),
     '--tool', inspect, '--fixtures', fixtures], timeout: 300, suite: 'images')
+  test('explicit-recovery', py, args: [files('tests/check_recovery.py'), '--tool', inspect,
+    '--fixture', join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
   test('malformed-faults-and-io-budgets', adversarial,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   test('concurrent-readers', concurrent,
@@ -78,6 +80,8 @@ if fixtures != ''
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 180, suite: 'images')
   test('inline-transactions-dup', transaction_test,
     args: [join_paths(fixtures, 'transactions-dup.raw')], timeout: 180, suite: 'images')
+  test('three-superblock-copies', transaction_test,
+    args: [join_paths(fixtures, 'transactions-copies.raw')], timeout: 300, suite: 'images')
   test('inline-transactions-large', transaction_test,
     args: [join_paths(fixtures, 'transactions-large.raw')], timeout: 180, suite: 'images')
   test('shared-references', transaction_test,
@@ -114,7 +118,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-grow.raw'),
     join_paths(fixtures, 'transactions-namespace.raw'),
     join_paths(fixtures, 'transactions-holes.raw'),
-    join_paths(fixtures, 'transactions-convert.raw')],
+    join_paths(fixtures, 'transactions-convert.raw'),
+    join_paths(fixtures, 'transactions-copies.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

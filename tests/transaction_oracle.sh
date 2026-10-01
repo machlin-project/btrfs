@@ -18,11 +18,29 @@ uname -r
 btrfs --version
 test "$(blockdev --getsize64 /dev/vda)" = @DEVICE_BYTES@
 test "$(blockdev --getsize64 /dev/vdb)" = @DEVICE_BYTES@
-cmp /dev/vda /dev/vdb
+# Devices past a few GiB (the third superblock copy needs 256 GiB) are sparse
+# images: whole-disk comparisons and copies would read every byte, so only the
+# ranges the cases wrote are compared, and Linux's read-write continuation,
+# which may write anywhere, runs after the last scenario only.
+large=0
+if [ @DEVICE_BYTES@ -gt 4294967296 ]; then
+    large=1
+fi
+[ "$large" = 1 ] || cmp /dev/vda /dev/vdb
 
 refresh() {
     sync
     blockdev --flushbufs /dev/vda
+}
+
+# The ranges restore.tsv names agree on both disks.
+compare_restored() {
+    while IFS="$(printf '\t')" read -r seek count; do
+        dd if=/dev/vda of=/tmp/work bs=512 skip=$seek count=$count 2>/dev/null
+        dd if=/dev/vdb of=/tmp/pristine bs=512 skip=$seek count=$count 2>/dev/null
+        cmp /tmp/work /tmp/pristine
+    done < "$1/restore.tsv"
+    rm -f /tmp/work /tmp/pristine
 }
 
 restore() {
@@ -281,6 +299,10 @@ verify() {
 
 total=0
 commit=
+last=
+for scenario in /transaction/*; do
+    last=$scenario
+done
 for scenario in /transaction/*; do
     name=${scenario##*/}
     while IFS="$(printf '\t')" read -r case commit kind mounted resolved recovered; do
@@ -313,11 +335,19 @@ for scenario in /transaction/*; do
         total=$((total + 1))
     done < "$scenario/cases.tsv"
     restore "$scenario"
-    cmp /dev/vda /dev/vdb
+    if [ "$large" = 1 ]; then
+        compare_restored "$scenario"
+    else
+        cmp /dev/vda /dev/vdb
+    fi
     commit=
     # Linux continues read-write from the scenario's newest root, cleaning any
     # orphans it left. A free-space tree must stay enabled; the other profiles
-    # keep no space cache.
+    # keep no space cache. A large device does this for its last scenario only.
+    if [ "$large" = 1 ] && [ "$scenario" != "$last" ]; then
+        echo "BTRFS_TRANSACTION_SCENARIO:$name"
+        continue
+    fi
     awk -F '\t' '{ printf "%d\t%d\t%s\t0\n", $2 / 512, $3 / 512, $4 }' "$scenario/writes.tsv" > "$scenario/all.tsv"
     apply "$scenario" all.tsv
     verify "$scenario" "$(cat "$scenario/final.txt")"
@@ -335,9 +365,11 @@ for scenario in /transaction/*; do
     # Every copy of every checksummed data sector, DUP included.
     btrfs check --readonly --check-data-csum /dev/vda < /dev/null
     test "$(btrfs inspect-internal dump-tree -t 5 /dev/vda | grep -c ORPHAN_ITEM || true)" = 0
-    dd if=/dev/vdb of=/dev/vda bs=1048576 conv=notrunc 2>/dev/null
-    refresh
-    cmp /dev/vda /dev/vdb
+    if [ "$large" = 0 ]; then
+        dd if=/dev/vdb of=/dev/vda bs=1048576 conv=notrunc 2>/dev/null
+        refresh
+        cmp /dev/vda /dev/vdb
+    fi
     echo "BTRFS_TRANSACTION_SCENARIO:$name"
 done
 echo "BTRFS_TRANSACTION_NAMESPACE_CHECKS:$namespace_checks"

@@ -17,7 +17,8 @@ import subprocess
 
 SECTOR = 512
 MAX_WRITE = 1024 * 1024
-MAX_DEVICE = 1 << 30
+# Up to the sparse device that holds a third superblock copy (past 256 GiB).
+MAX_DEVICE = 512 << 30
 NAME = re.compile(r"^[a-z0-9-]+\.(bin|tsv)$")
 SCENARIO = re.compile(r"^[a-z0-9-]+$")
 STAGE_PATH = re.compile(r"^(/[A-Za-z0-9._-]+)+$")

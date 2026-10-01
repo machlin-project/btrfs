@@ -29,6 +29,14 @@ private CoW editor tests run;
 that is not complete acceptance. With fixtures, every image is required and an
 unavailable codec causes the image test to fail, not silently skip.
 
+Explicit superblock recovery of an image (dry run unless `--apply`; exit 3 means
+RECOVERY_REQUIRED; `tests/check_recovery.py` exercises it on a copy):
+
+```sh
+.build/btrfs-inspect IMAGE recover
+.build/btrfs-inspect IMAGE recover --apply --acknowledged GENERATION
+```
+
 Useful inspection commands:
 
 ```sh
@@ -49,7 +57,9 @@ without a free-space tree and mounted with `nospace_cache`, plus
 `transactions-fst` and `transactions-grow` with mkfs and mount defaults (16 KiB
 nodes, DUP metadata and a free-space tree), `transactions-namespace` (mkfs
 defaults with 4 KiB nodes and single metadata) and `transactions-convert` (mkfs
-defaults with 4 KiB nodes, 1 GiB): `transactions` (4 KiB
+defaults with 4 KiB nodes, 1 GiB), plus `transactions-copies` (4 KiB nodes,
+single metadata, no free-space tree, a 257 GiB sparse device holding all three
+superblock copies): `transactions` (4 KiB
 nodes, single metadata), `transactions-dup` (16 KiB nodes, DUP metadata),
 `transactions-large` (64 KiB nodes, DUP metadata), `transactions-full` (4 KiB
 nodes, single metadata, 128 MiB), `transactions-shared`, `transactions-keyed`
@@ -144,9 +154,10 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all eighteen
-profiles (512 MiB for `transactions-holes`, 1 GiB for `transactions-convert`),
-then run the portable image and
+Linux checks and a completed VM exit before consuming the image. Repeat all nineteen
+profiles (512 MiB for `transactions-holes`, 1 GiB for `transactions-convert`,
+257 GiB for `transactions-copies`, created with `truncate` so it stays sparse and
+never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
 verifies 367 contracts (the six reader profiles and `transactions-holes`, whose
 split hole items it reads), and fails if any byte changed.
@@ -273,7 +284,8 @@ the first and last point for larger commits. Every recorded commit is then cut
 at each issue-order prefix (the growth scenarios check 64 evenly spaced prefixes
 and every 50th of their 2,000 files) and in each barrier epoch: 32 seeded
 metadata states persist arbitrary subsets of whole, missing, sector-subset or
-torn writes; each superblock epoch tries six tear patterns. Every state is classified by mounting the primary and by explicit
+torn writes; each superblock epoch tries six tear patterns per copy, and every
+combination across the two secondaries of a device past 256 GiB (36). Every state is classified by mounting the primary and by explicit
 recovery. It must resolve to the acknowledged or new stage with exact contents,
 invariant snapshots/xattrs/links, every free-space-tree block group on the right
 side of Linux's conversion thresholds (derived independently in the test), and
@@ -355,7 +367,12 @@ Reserve the Linux runner and stop the macOS test guest first. The oracle needs t
 two-disk runner built from lab `scripts/linux-vm.swift` (the lab caches it as
 `.cache/linux-reference/linux-vm-external`). From the absolute lab directory,
 create a disposable working copy and a pristine copy without overwriting existing
-files, then run (use 134217728 bytes for `transactions-full`):
+files, then run (use 134217728 bytes for `transactions-full`). For the 257 GiB
+`transactions-copies` image, make both copies as APFS clones (`/bin/cp -c`,
+after checking that neither exists) and pass 275951648768 bytes: the guest then
+compares only the ranges the cases wrote instead of whole disks and runs
+Linux's read-write continuation after the last scenario only, since restoring
+whole disks would read every byte.
 
 ```sh
 python3 -c 'from pathlib import Path; import shutil; s=Path("../btrfs/artifacts/fixtures/transactions.raw"); [shutil.copyfileobj(s.open("rb"), Path(d).open("xb")) for d in ("../btrfs/artifacts/oracle-transactions-work.raw", "../btrfs/artifacts/oracle-transactions-pristine.raw")]'

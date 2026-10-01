@@ -39,6 +39,8 @@
 #define BARRIERS 3U
 #define SUPER_EPOCHS 2U
 #define TEAR_PATTERNS 6U
+/* Superblock copies one barrier epoch may write: both secondaries. */
+#define SUPER_COPIES_TORN 2U
 #define MANY_ENTRIES 700U
 #define BATCH_STRIDE 37U
 /* Mirrors core/transaction.c: the dirty-node limit of one transaction. */

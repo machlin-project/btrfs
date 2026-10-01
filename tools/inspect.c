@@ -99,6 +99,62 @@ inspect(struct btrfs_fs *fs, int argc, char **argv)
 	return error;
 }
 
+/* Explicit superblock recovery, never implied by any other command. Without
+ * --apply only the decision is printed and nothing is written; exit status 3
+ * then means RECOVERY_REQUIRED. --acknowledged refuses to select a generation
+ * below the last one the caller saw committed. */
+static int
+recover(const char *path, int argc, char **argv)
+{
+	struct btrfs_recovery_report report;
+	struct btrfs_write_environment writer;
+	struct btrfs_image image;
+	uint64_t acknowledged = 0;
+	unsigned i;
+	int apply = 0;
+	int argument;
+	enum btrfs_result error;
+
+	for (argument = 0; argument < argc; argument++) {
+		if (strcmp(argv[argument], "--apply") == 0) {
+			apply = 1;
+		} else if (strcmp(argv[argument], "--acknowledged") == 0 && argument + 1 < argc) {
+			acknowledged = strtoull(argv[++argument], NULL, 0);
+		} else {
+			fprintf(stderr,
+			    "Usage: btrfs-inspect IMAGE recover [--apply] "
+			    "[--acknowledged GENERATION]\n");
+			return 2;
+		}
+	}
+	if ((apply ? btrfs_image_open_writable(path, &image) : btrfs_image_open(path, &image)) !=
+	    0) {
+		perror("open image");
+		return 1;
+	}
+	btrfs_image_writer(&image, &writer);
+	error =
+	    btrfs_recover_supers(&image.environment, apply ? &writer : NULL, acknowledged, &report);
+	printf("{\"result\":\"%s\",\"apply\":%s,\"generation\":%" PRIu64
+	       ",\"selected\":%u,\"rewritten\":%u,\"copies\":[",
+	    btrfs_result_string(error), apply ? "true" : "false", report.generation,
+	    report.selected, report.rewritten);
+	for (i = 0; i < BTRFS_SUPER_COPIES; i++) {
+		printf("%s{\"offset\":%" PRIu64 ",\"status\":\"%s\",\"generation\":%" PRIu64
+		       ",\"current\":%s}",
+		    i == 0 ? "" : ",", report.copies[i].offset,
+		    btrfs_result_string(report.copies[i].status), report.copies[i].generation,
+		    report.copies[i].current ? "true" : "false");
+	}
+	printf("]}\n");
+	btrfs_image_close(&image);
+	if (image.live_allocations != 0 || image.live_bytes != 0) {
+		fprintf(stderr, "allocation leak\n");
+		return 1;
+	}
+	return error == BTRFS_OK ? 0 : error == BTRFS_RECOVERY_REQUIRED ? 3 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -115,8 +171,12 @@ main(int argc, char **argv)
 	if (argc - argument < 2) {
 		fprintf(stderr,
 		    "Usage: btrfs-inspect [--tree ID] IMAGE info|stat|ls|cat|xattr|listxattr "
-		    "[PATH] [ARGS]\n");
+		    "[PATH] [ARGS]\n       btrfs-inspect IMAGE recover [--apply] [--acknowledged "
+		    "GENERATION]\n");
 		return 2;
+	}
+	if (strcmp(argv[argument + 1], "recover") == 0) {
+		return recover(argv[argument], argc - argument - 2, argv + argument + 2);
 	}
 	if (btrfs_image_open(argv[argument], &image) != 0) {
 		perror("open image");

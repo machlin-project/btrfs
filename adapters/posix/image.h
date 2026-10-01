@@ -2,6 +2,7 @@
 #ifndef MACHLIN_BTRFS_IMAGE_H
 #define MACHLIN_BTRFS_IMAGE_H
 #include <btrfs/btrfs.h>
+#include <btrfs/write.h>
 #include <stdatomic.h>
 
 struct btrfs_image {
@@ -12,6 +13,10 @@ struct btrfs_image {
 };
 
 int btrfs_image_open(const char *path, struct btrfs_image *image);
+/* Opens the image for reading and writing; btrfs_image_writer then supplies
+ * exact positioned writes and a barrier that reaches stable storage. */
+int btrfs_image_open_writable(const char *path, struct btrfs_image *image);
+void btrfs_image_writer(struct btrfs_image *image, struct btrfs_write_environment *writer);
 void btrfs_image_close(struct btrfs_image *image);
 /* zlib and Zstd compression for the write environment's compress callback. */
 enum btrfs_result btrfs_image_compress(void *context, enum btrfs_compression codec,
