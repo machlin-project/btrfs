@@ -147,7 +147,7 @@ verification of every written image; `tests/mounted_contracts.py --suite write`
 has not run for this driver. Missing contracts must fail, not be removed or
 blanket-skipped. `tests/power_cut_macos.py` kills the guest while the loaded
 module writes and requires every acknowledged fsync to survive; it passes for
-the XNU adapter. FSKit power cuts remain.
+the XNU adapter and, with `--adapter fskit` on stock macOS, for FSKit.
 
 For each operation sequence and each device fault:
 
@@ -163,8 +163,7 @@ For each operation sequence and each device fault:
 
 The portable model covers every prefix and seeded reorder/tear states between
 persistence barriers, followed by explicit recovery where needed. The native
-power-cut runner checks the XNU adapter's flush and recovery on a real guest;
-FSKit needs the same check.
+power-cut runner checks both adapters' flush and recovery on real guests.
 
 ## Performance work
 

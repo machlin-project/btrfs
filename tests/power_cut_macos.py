@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Cut the power of a disposable macOS guest while the native XNU mount writes.
+"""Cut the power of a disposable macOS guest while a native mount writes.
+
+--adapter xnu (default) mounts with the loaded module's mount helper; --adapter
+fskit lets Disk Arbitration mount the image through the installed FSKit module
+(enabled, with its device barrier approved), runs root commands with a sudo
+password read from a file (never logged) and needs automatic login in the guest.
 
 The host keeps the authoritative image. Each iteration copies it into the
 guest, mounts it read-write (grouped and synchronous commits alternate),
@@ -52,10 +57,13 @@ def main():
     parser.add_argument("--guest-directory", required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--workload", type=Path, required=True)
-    parser.add_argument("--mount-helper", type=Path, required=True)
+    parser.add_argument("--adapter", choices=("xnu", "fskit"), default="xnu")
+    parser.add_argument("--mount-helper", type=Path)
     parser.add_argument("--inspect", type=Path, required=True)
-    parser.add_argument("--kernel-uuid", required=True)
-    parser.add_argument("--module-uuid", required=True)
+    parser.add_argument("--kernel-uuid")
+    parser.add_argument("--module-uuid")
+    parser.add_argument("--sudo-password-file", type=Path)
+    parser.add_argument("--app", default="/Applications/Machlin btrfs.app")
     parser.add_argument("--iterations", type=int, default=6)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--min-seconds", type=float, default=2.0)
@@ -71,13 +79,21 @@ def main():
         parser.error("--output must be a new directory directly inside --products")
     if not 0 < args.iterations < 100 or not 0 < args.min_seconds <= args.max_seconds:
         parser.error("Invalid iteration or delay bounds")
+    xnu = args.adapter == "xnu"
+    if xnu and not (args.mount_helper and args.kernel_uuid and args.module_uuid):
+        parser.error("--adapter xnu needs --mount-helper, --kernel-uuid and --module-uuid")
+    if not xnu and args.sudo_password_file is None:
+        parser.error("--adapter fskit needs --sudo-password-file")
     output.mkdir()
     tart = str(lab / "scripts/tart.sh")
     share = f"/Volumes/My Shared Files/{args.share}/{output.name}"
     guest_dir = args.guest_directory.rstrip("/") + "/" + output.name
     mountpoint = guest_dir + "/mount"
-    record = {"vm": args.vm, "image": str(args.image), "image_sha256": digest(args.image),
-              "seed": args.seed, "iterations": [], "commands": []}
+    mounted = {"path": mountpoint, "device": None}
+    record = {"vm": args.vm, "adapter": args.adapter, "image": str(args.image),
+              "image_sha256": digest(args.image), "seed": args.seed, "iterations": [],
+              "commands": []}
+    password = args.sudo_password_file.read_bytes() if args.sudo_password_file else None
     log = (output / "runner.log").open("a")
 
     def save():
@@ -96,6 +112,22 @@ def main():
             raise RuntimeError(f"Guest command failed: {command!r}: {entry['stderr']}")
         return result.stdout if stdout is None else b""
 
+    def root_argv(*command):
+        if password is None:
+            return [tart, "exec", args.vm, "/usr/bin/sudo", "-n", *command]
+        return [tart, "exec", "-i", args.vm, "/usr/bin/sudo", "-S", "-p", "", "--", *command]
+
+    def root(*command, timeout=120):
+        result = subprocess.run(root_argv(*command), cwd=lab, timeout=timeout, input=password,
+                                capture_output=True)
+        entry = {"command": ["sudo", *command], "status": result.returncode,
+                 "stdout": result.stdout.decode(errors="backslashreplace")[-2000:],
+                 "stderr": result.stderr.decode(errors="backslashreplace")[-2000:]}
+        record["commands"].append(entry)
+        if result.returncode != 0:
+            raise RuntimeError(f"Guest root command failed: {command!r}: {entry['stderr']}")
+        return entry
+
     def bootctl(*command):
         return subprocess.run(["python3", str(lab / "scripts/bootctl.py"), "--vm", args.vm,
                                *command], cwd=lab, check=True, capture_output=True, text=True,
@@ -103,9 +135,10 @@ def main():
 
     def start_vm(index):
         vm_log = (output / f"vm-{index:02d}.log").open("xb")
+        shares = [f"--dir=lxnu-artifacts:{lab / 'artifacts'}:ro",
+                  f"--dir=lxnu-kdk:{lab / '.cache/kdk'}:ro"] if xnu else []
         return subprocess.Popen(
-            [tart, "run", args.vm, "--no-audio", "--no-clipboard", "--vnc-experimental",
-             f"--dir=lxnu-artifacts:{lab / 'artifacts'}:ro", f"--dir=lxnu-kdk:{lab / '.cache/kdk'}:ro",
+            [tart, "run", args.vm, "--no-audio", "--no-clipboard", "--vnc-experimental", *shares,
              f"--dir={args.share}:{products}"], cwd=lab, stdout=vm_log, stderr=subprocess.STDOUT)
 
     def wait_boot():
@@ -118,6 +151,15 @@ def main():
                 time.sleep(3)
         else:
             raise RuntimeError("The guest did not boot")
+        if not xnu:
+            record.setdefault("kernels", []).append(guest("/usr/bin/uname", "-v").decode().strip())
+            control = f"{args.app}/Contents/MacOS/{Path(args.app).stem}"
+            modules = json.loads(guest(control, "--control", "modules", timeout=60))
+            service = json.loads(guest(control, "--control", "device-service", timeout=60))
+            if not modules or not all(module["enabled"] for module in modules) or \
+                    service.get("status") != "enabled":
+                raise RuntimeError(f"FSKit module or device barrier unavailable: {modules} {service}")
+            return session.decode().strip()
         kernel = guest("/usr/sbin/sysctl", "-n", "kern.uuid").decode().strip()
         if kernel != args.kernel_uuid:
             raise RuntimeError(f"Unexpected kernel {kernel}")
@@ -134,27 +176,45 @@ def main():
         if guest("/usr/bin/shasum", "-a", "256", f"{guest_dir}/{local}",
                  timeout=600).decode().split()[0] != digest(output / name):
             raise RuntimeError("Guest image copy differs")
-        device = guest("/usr/bin/hdiutil", "attach", "-nomount", "-imagekey",
-                       "diskimage-class=CRawDiskImage", f"{guest_dir}/{local}").decode().split()[0]
+        attach = ["/usr/bin/hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage"]
+        attach += ["-nomount"] if xnu else ["-owners", "on"]
+        device = guest(*attach, f"{guest_dir}/{local}").decode().split()[0]
         if not device.startswith("/dev/disk"):
             raise RuntimeError(f"Unexpected device {device}")
-        guest("/usr/bin/sudo", "-n", f"{guest_dir}/{args.mount_helper.name}", *flags, device,
-              mountpoint)
-        return device
+        mounted["device"] = device
+        if xnu:
+            root(f"{guest_dir}/{args.mount_helper.name}", *flags, device, mountpoint)
+            return device
+        # Disk Arbitration mounts through the FSKit module; writable needs the barrier.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            for line in guest("/sbin/mount").decode().splitlines():
+                if line.startswith(device + " on ") and "machlinbtrfs" in line:
+                    if "read-only" in line:
+                        raise RuntimeError(f"FSKit mounted read-only: {line}")
+                    mounted["path"] = line[len(device) + 4:line.rindex(" (")]
+                    return device
+            time.sleep(1)
+        raise RuntimeError("Disk Arbitration did not mount the image through FSKit")
+
+    def unmount():
+        if xnu:
+            root("/sbin/umount", mounted["path"])
+        else:
+            guest("/usr/bin/hdiutil", "detach", mounted["device"])
 
     def verify(manifest):
-        result = guest("/usr/bin/sudo", "-n", f"{guest_dir}/{args.workload.name}", "verify",
-                       mountpoint, f"{share}/{manifest}", timeout=900)
-        del result
-        return record["commands"][-1]["stderr"].strip()
+        return root(f"{guest_dir}/{args.workload.name}", "verify", mounted["path"],
+                    f"{share}/{manifest}", timeout=900)["stderr"].strip()
 
     # Unattended boots take the btrfs slot; the confirmed fallback slot stays.
-    status = json.loads(bootctl("status"))
-    record["menu_timeout_before"] = status["state"]["timeout_seconds"]
-    record["default_slot_before"] = status["state"]["default_slot"]
-    btrfs_slot = next(i for i, slot in enumerate(status["state"]["slots"])
-                      if slot["label"] == "Btrfs")
-    bootctl("select", str(btrfs_slot), "--timeout", str(MENU_TIMEOUT))
+    if xnu:
+        status = json.loads(bootctl("status"))
+        record["menu_timeout_before"] = status["state"]["timeout_seconds"]
+        record["default_slot_before"] = status["state"]["default_slot"]
+        btrfs_slot = next(i for i, slot in enumerate(status["state"]["slots"])
+                          if slot["label"] == "Btrfs")
+        bootctl("select", str(btrfs_slot), "--timeout", str(MENU_TIMEOUT))
     subprocess.run([tart, "stop", args.vm], cwd=lab, timeout=300)
     vm = start_vm(0)
     acks = []
@@ -162,7 +222,7 @@ def main():
     try:
         record["sessions"] = [wait_boot()]
         guest("/bin/mkdir", "-p", mountpoint)
-        for binary in (args.workload, args.mount_helper):
+        for binary in (args.workload, args.mount_helper) if xnu else (args.workload,):
             shutil.copy2(binary, output / binary.name)
             guest("/bin/cp", f"{share}/{binary.name}", f"{guest_dir}/{binary.name}")
             guest("/bin/chmod", "755", f"{guest_dir}/{binary.name}")
@@ -172,7 +232,7 @@ def main():
         current = "image-00.raw"
         exclusive_copy(args.image, output / current)
         for index in range(1, args.iterations + 1):
-            mode = "grouped" if index % 2 else "synchronous"
+            mode = "grouped" if index % 2 or not xnu else "synchronous"
             flags = ["-w"] if mode == "grouped" else ["-w", "-s"]
             item = {"index": index, "mode": mode, "image": current, "acked_before": len(acks)}
             record["iterations"].append(item)
@@ -180,10 +240,13 @@ def main():
             if acks:
                 item["verified_before"] = verify(f"acks-{index - 1:02d}.tsv")
             stream = subprocess.Popen(
-                [tart, "exec", args.vm, "/usr/bin/sudo", "-n",
-                 f"{guest_dir}/{args.workload.name}", "write", mountpoint, str(index)],
-                cwd=lab, stdout=subprocess.PIPE,
+                root_argv(f"{guest_dir}/{args.workload.name}", "write", mounted["path"],
+                          str(index)),
+                cwd=lab, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=(output / f"workload-{index:02d}.log").open("xb"))
+            if password is not None:
+                stream.stdin.write(password)
+            stream.stdin.close()
             started = threading.Event()
 
             def read_acks():
@@ -233,7 +296,7 @@ def main():
             save()
         mount_image(current, "final.raw", ["-w"])
         record["final"] = verify(f"acks-{args.iterations:02d}.tsv")
-        guest("/usr/bin/sudo", "-n", "/sbin/umount", mountpoint)
+        unmount()
         print(f"final verify: {record['final']}", flush=True)
         if args.linux:
             record["linux"] = linux_checks(args, lab, output, record)
@@ -242,8 +305,9 @@ def main():
     finally:
         save()
         try:
-            bootctl("select", str(record["default_slot_before"]), "--timeout",
-                    str(record["menu_timeout_before"]))
+            if xnu:
+                bootctl("select", str(record["default_slot_before"]), "--timeout",
+                        str(record["menu_timeout_before"]))
         except (subprocess.SubprocessError, OSError) as error:
             print(f"Restore the boot menu manually: {error}", flush=True)
     print(f"{record['result']} power cut: {args.iterations} cuts, {len(acks)} acknowledged files",

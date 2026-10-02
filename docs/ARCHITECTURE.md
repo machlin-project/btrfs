@@ -782,9 +782,8 @@ copy names a complete tree, since the first barrier precedes every copy, and
 every acknowledged commit wrote all copies, so the selection is never older than
 one. Opening from the primary instead could reuse blocks a newer copy references.
 A read-only mount reads the primary and writes nothing. Neither adapter replays
-a tree log; the reader refuses filesystems that have one. The XNU adapter passes
-native power-cut acceptance; FSKit power cuts and dirty-page coherence remain
-open. Backup
+a tree log; the reader refuses filesystems that have one. Both adapters pass
+native power-cut acceptance; FSKit dirty-page coherence remains open. Backup
 roots are rotating recovery hints, not permanently pinned snapshots. See
 ACCEPTANCE.md for the exact crash oracle scope and HANDOFF.md for the remaining
 writable-mount requirements.

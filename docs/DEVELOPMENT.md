@@ -644,3 +644,11 @@ python3 ../btrfs/tests/power_cut_macos.py \
 every fact acknowledged before that cut and a Linux read-write continuation.
 Require `PASS power cut` and a passing Linux check for every cut. Each cut
 reboots the guest, so allow about two minutes per iteration.
+
+`--adapter fskit` cuts a stock guest with the signed app installed, its module
+enabled and its device barrier approved, logged in automatically: Disk
+Arbitration mounts each copy through the module (`hdiutil attach -owners on`),
+the runner refuses a read-only mount, and root commands read the guest's sudo
+password from `--sudo-password-file` through stdin, never from arguments or
+logs. It takes no mount helper or kernel identities, and every iteration uses
+grouped commits.

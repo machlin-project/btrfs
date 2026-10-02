@@ -2,8 +2,8 @@
 
 The portable reader, four-profile read-only XNU mount, the CoW writer and
 explicit read-write XNU mounts in both commit modes have executable acceptance;
-installed FSKit reads and writes pass on stock macOS 26.5.2, and the loaded XNU
-module keeps every acknowledged fsync through power cuts. FSKit power cuts,
+installed FSKit reads and writes pass on stock macOS 26.5.2, and both the loaded
+XNU module and installed FSKit keep every acknowledged fsync through power cuts.
 FSKit set-id metadata, Linux ABI conformance and a performance win over Linux
 remain open.
 
@@ -47,7 +47,8 @@ images, and installed FSKit on stock macOS 26.5.2 were rerun and pass.
 | Installed FSKit | A team-signed development build on stock macOS 26.5.2 (Apple RELEASE kernel, SIP and authenticated root on, Gatekeeper on), enabled under File System Extensions, with the device barrier registered through ServiceManagement and approved by the administrator: Disk Arbitration mounts through FSKit read-only and read-write; the read-only suite passes on the plain, 4 KiB-node, 64 KiB-node and zlib profiles with media unchanged; the write suite passes on the plain and 4 KiB-node profiles apart from its set-id group, with remount persistence, and Linux passes `btrfs check`, 12 manifest facts and a read-write mount on both written images. The set-id group fails, a recorded failure: no 26.x caller credentials, and a live `stat` keeps bits that are gone on disk and after a remount. The same suites also pass in the lab guest (macOS 26.4 on the LXNU development kernel) | Lab `artifacts/btrfs-kext/fskit-stock-20261002/` and `fskit-20261002/`; `tests/mounted.c`, `tests/mounted_write.c --skip-set-id` |
 | LXNU ABI semantics | Not run for Btrfs | No XNU-fork hooks or ABI matrix completion claimed |
 | Native power cuts (XNU) | Fourteen hard kills of the guest's virtual machine, in series of six and eight, while the loaded module wrote to a 1 GiB mkfs-default image file (4 KiB nodes, free-space tree) with grouped and synchronous commits alternating: after every cut the next read-write mount verifies every file whose fsync and directory fsync had returned (721 and 759 files), and Linux passes `btrfs check`, every fact acknowledged before the cut and a read-write continuation on each crash image, whose unacknowledged churn left orphans and partial renames. One cut in each series fell between the secondary and primary superblock writes; in the second series the module's own read-write mount recovered the newer root set | `tests/power_cut_macos.py`, `tests/power_cut.c`; lab `artifacts/btrfs-kext/powercut-*` reports |
-| FSKit power cuts / comparative performance | Not accepted | No cut of an installed FSKit volume; no matched Linux benchmark |
+| Native power cuts (FSKit) | Six hard kills of the stock macOS 26.5.2 guest (Apple RELEASE kernel) while Disk Arbitration's FSKit mount of the same 1 GiB image wrote through the device barrier: after every cut the next writable load verifies all acknowledged files (181), and Linux passes `btrfs check`, every acknowledged fact and a read-write continuation on each crash image. One cut fell between the superblock writes; the extension's writable load recovered it | `tests/power_cut_macos.py --adapter fskit`; lab `artifacts/btrfs-kext/powercut-fskit-*` reports |
+| Comparative performance | Not accepted | No matched Linux benchmark |
 
 Source revisions belong to Git. Kernel/module UUIDs, artifact hashes, precise
 commands and individual observations live in generated reports. The 367 reader
@@ -132,7 +133,6 @@ remaining durability gates pass.
 
 Native data writeback, relocation trees, system-chunk growth, chunk removal and
 balance, free-space representation conversion, the v1 space cache, quotas,
-power-cut acceptance of FSKit mounts, and FSKit dirty-page coherence; tree-log
-replay; LZO/alternate checksums/RAID;
+FSKit dirty-page coherence; tree-log replay; LZO/alternate checksums/RAID;
 full Linux authorization semantics; provisioning and mounted FSKit acceptance;
 matched Linux performance measurements.
