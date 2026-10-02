@@ -47,6 +47,15 @@ bt_key_decode(const struct bt_disk_key *key)
 	return result;
 }
 
+/* a <= b, written so the compiler can evaluate it without branches. */
+static inline int
+bt_key_at_most(struct bt_key a, struct bt_key b)
+{
+	return (a.objectid < b.objectid) |
+	    ((a.objectid == b.objectid) &
+		((a.type < b.type) | ((a.type == b.type) & (a.offset <= b.offset))));
+}
+
 static inline int
 bt_key_compare(struct bt_key a, struct bt_key b)
 {

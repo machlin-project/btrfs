@@ -384,9 +384,8 @@ bt_cursor_step(struct bt_cursor *cursor, int forward)
 enum btrfs_result
 bt_cursor_seek(struct bt_cursor *cursor, struct bt_key key, int predecessor)
 {
-	uint32_t low;
-	uint32_t high;
-	uint32_t middle;
+	uint32_t base;
+	uint32_t half;
 	uint32_t count;
 	unsigned level = cursor->root.level;
 	struct bt_key found;
@@ -402,18 +401,15 @@ bt_cursor_seek(struct bt_cursor *cursor, struct bt_key key, int predecessor)
 		if (count == 0) {
 			return BTRFS_NOT_FOUND;
 		}
-		low = 0;
-		high = count;
-		while (low < high) {
-			middle = low + (high - low) / 2;
-			found = bt_node_key(cursor->blocks[level], (uint8_t)level, middle);
-			if (bt_key_compare(found, key) <= 0) {
-				low = middle + 1;
-			} else {
-				high = middle;
-			}
+		/* The last key at or below key, or slot 0: a branch-free search. */
+		base = 0;
+		while (count > 1) {
+			half = count / 2;
+			found = bt_node_key(cursor->blocks[level], (uint8_t)level, base + half);
+			base = bt_key_at_most(found, key) ? base + half : base;
+			count -= half;
 		}
-		cursor->slots[level] = low == 0 ? 0 : low - 1;
+		cursor->slots[level] = base;
 		if (level == 0) {
 			break;
 		}
