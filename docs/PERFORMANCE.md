@@ -36,9 +36,13 @@ I/O instrumentation are explicit follow-up work.
 The private editor reuses its dirty paths; repeated fixed-size replacement in an
 already modified path allocates nothing. It updates payloads and child pointers
 without repacking the whole node. The reservation gap vector begins at 4 KiB and
-grows only when needed. Transaction begin still scans the full committed extent
-map; persistent allocation state and metadata caching need measurements before
-native writable throughput can be competitive. Each backreference edit copies its
+grows only when needed. A volume keeps its allocation state across transactions:
+only the admission transaction loads the extent tree and verifies the free-space
+and device trees, and later begins copy the kept state (on the small Linux
+fixtures a full load costs 18 to 39 reads and 72 to 588 KiB, which grows with
+the extent tree). Metadata caching needs measurements before native writable
+throughput can be competitive. Each commit still pays three barriers; grouping
+operations into one commit is designed in [group commit](GROUP_COMMIT.md). Each backreference edit copies its
 extent item into a fresh node-sized buffer and probes for keyed items with a new
 cursor, so a shared-subvolume commit costs several hundred allocations; the test
 output prints these counts per commit. New file data is written to the device

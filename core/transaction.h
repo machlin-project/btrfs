@@ -87,6 +87,8 @@ struct btrfs_transaction {
 	struct btrfs_write_environment io;
 	struct bt_mutation *mutation;
 	struct bt_space *space;
+	/* The owner's allocation map, updated after a successful commit. */
+	struct btrfs_allocation_map *map;
 	struct bt_root roots;
 	struct bt_root chunks;
 	struct bt_owned_root devices;

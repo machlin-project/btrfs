@@ -3,6 +3,7 @@
 #define MACHLIN_BTRFS_SPACE_H
 
 #include "mutable.h"
+#include <btrfs/write.h>
 
 struct bt_space;
 
@@ -54,5 +55,21 @@ uint64_t bt_space_used(const struct bt_space *space, size_t chunk);
 size_t bt_space_change_count(const struct bt_space *space);
 const struct bt_space_change *bt_space_change(const struct bt_space *space, size_t index);
 void bt_space_destroy(struct bt_space *space);
+
+/* The allocation map an owner keeps across transactions (btrfs_allocation_map
+ * in write.h). A begin whose base is the map's generation copies the map
+ * instead of loading and verifying the extent, free-space and device trees;
+ * otherwise it verifies as usual and saves the fresh state. A successful commit
+ * replays its chunk growth, allocation log and removed groups into the map. */
+int bt_space_map_fits(const struct btrfs_allocation_map *map, const struct btrfs_fs *fs);
+enum btrfs_result bt_space_from_map(struct btrfs_fs *fs, struct btrfs_allocation_map *map,
+    size_t node_limit, struct bt_space **result);
+enum btrfs_result bt_space_map_save(const struct bt_space *space, struct btrfs_allocation_map *map);
+enum btrfs_result bt_space_map_commit(
+    const struct bt_space *space, struct btrfs_allocation_map *map, uint64_t generation);
+void bt_space_map_invalidate(struct btrfs_allocation_map *map);
+/* Tests: whether the map equals a freshly verified space of its generation. */
+enum btrfs_result bt_space_map_check(
+    const struct btrfs_allocation_map *map, const struct bt_space *space);
 
 #endif

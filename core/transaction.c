@@ -73,9 +73,18 @@ enum btrfs_result
 btrfs_transaction_begin(const struct btrfs_fs *base,
     const struct btrfs_write_environment *environment, struct btrfs_transaction **result)
 {
+	return btrfs_transaction_begin_mapped(base, environment, NULL, result);
+}
+
+enum btrfs_result
+btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
+    const struct btrfs_write_environment *environment, struct btrfs_allocation_map *map,
+    struct btrfs_transaction **result)
+{
 	struct btrfs_transaction *transaction;
 	struct bt_mutation_allocator allocator;
 	struct bt_root quota;
+	int mapped;
 	enum btrfs_result error;
 	uint64_t unsupported = BT_FEATURE_MIXED_GROUPS | BT_FEATURE_METADATA_UUID;
 	uint64_t free_space = BT_COMPAT_RO_FREE_SPACE_TREE | BT_COMPAT_RO_FREE_SPACE_TREE_VALID;
@@ -108,6 +117,10 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	bt_zero(transaction, sizeof(*transaction));
 	transaction->base = base;
 	transaction->io = *environment;
+	transaction->map = map;
+	/* The map holds this generation's verified allocator state, which only this
+	 * owner's commits have changed since it was verified. */
+	mapped = bt_space_map_fits(map, base);
 	transaction->roots = base->root_tree;
 	transaction->chunks = base->chunk_tree;
 	transaction->fs = *base;
@@ -147,7 +160,7 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 		error = bt_tx_root(base, BT_FREE_SPACE_TREE, &transaction->free_space);
 	}
 	/* A free-space tree that disagrees with the extent tree is not propagated. */
-	if (error == BTRFS_OK && transaction->has_free_space) {
+	if (error == BTRFS_OK && transaction->has_free_space && !mapped) {
 		error =
 		    bt_fst_verify(base, transaction->free_space.root, transaction->extents.root);
 	}
@@ -162,14 +175,27 @@ btrfs_transaction_begin(const struct btrfs_fs *base,
 	if (error == BTRFS_OK) {
 		error = bt_tx_root(base, BT_DEV_TREE, &transaction->devices);
 	}
-	if (error == BTRFS_OK) {
+	if (error == BTRFS_OK && mapped) {
+		error = bt_space_from_map(
+		    &transaction->fs, map, BT_TRANSACTION_NODES, &transaction->space);
+		if (error == BTRFS_OK) {
+			transaction->chunks_published =
+			    bt_space_original_chunks(transaction->space);
+		}
+	} else if (error == BTRFS_OK) {
 		error = bt_space_create(&transaction->fs, transaction->extents.root,
 		    BT_TRANSACTION_NODES, &transaction->space);
-	}
-	if (error == BTRFS_OK) {
-		transaction->chunks_published = bt_space_original_chunks(transaction->space);
-		error = bt_space_devices(
-		    transaction->space, transaction->chunks, transaction->devices.root);
+		if (error == BTRFS_OK) {
+			transaction->chunks_published =
+			    bt_space_original_chunks(transaction->space);
+			error = bt_space_devices(
+			    transaction->space, transaction->chunks, transaction->devices.root);
+		}
+		/* Only a fully verified state is kept; a failed save only costs the
+		 * next transaction a load. */
+		if (error == BTRFS_OK && map != NULL) {
+			(void)bt_space_map_save(transaction->space, map);
+		}
 	}
 	if (error == BTRFS_OK) {
 		bt_space_allocator(transaction->space, &allocator);
@@ -1122,6 +1148,13 @@ btrfs_transaction_commit(struct btrfs_transaction *transaction)
 	}
 	if (error == BTRFS_OK) {
 		error = bt_mutation_accept(transaction->mutation);
+	}
+	/* The commit is durable; a map that cannot follow it is dropped and the
+	 * next transaction loads and verifies again. */
+	if (error == BTRFS_OK && transaction->map != NULL &&
+	    bt_space_map_commit(transaction->space, transaction->map,
+		transaction->base->info.generation + 1) != BTRFS_OK) {
+		bt_space_map_invalidate(transaction->map);
 	}
 	transaction->failure = error;
 	return error;

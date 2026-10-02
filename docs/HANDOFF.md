@@ -165,8 +165,9 @@ an explicit bound. Keep allocation and I/O counts visible in tests.
 
 Follow PERFORMANCE.md for matched Linux comparisons. Remaining likely costs are
 repeated subvolume-root resolution, per-call cursors, attribute-rich enumeration,
-metadata caching, full-extent-map scanning at transaction begin, and rebuilding
-allocation state for each transaction. Optimize after measurement. Add a bounded,
+metadata caching and three barriers per operation, which
+[group commit](GROUP_COMMIT.md) designs away; a mounted volume already keeps its
+allocation state across transactions. Optimize after measurement. Add a bounded,
 generation-aware cache with documented lifetime rules if it pays for itself.
 Do not claim a speed win from a userspace image reader versus a mounted guest.
 

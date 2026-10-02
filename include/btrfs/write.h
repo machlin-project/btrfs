@@ -88,6 +88,22 @@ void btrfs_counters_destroy(struct btrfs_counters *counters);
 /* Attaches counters before the transaction's first namespace change. */
 enum btrfs_result btrfs_transaction_use_counters(
     struct btrfs_transaction *transaction, struct btrfs_counters *counters);
+/* The allocator state of the last committed generation, which a mounted
+ * volume keeps across its transactions: a transaction begun on that
+ * generation copies it instead of loading and verifying the extent,
+ * free-space and device trees again, and a successful commit updates it; any
+ * other base is verified as usual and saved. counts reports the full loads
+ * (scans) and the reuses so far. One transaction at a time uses a map. */
+struct btrfs_allocation_map;
+
+enum btrfs_result btrfs_allocation_map_create(
+    const struct btrfs_environment *environment, struct btrfs_allocation_map **result);
+void btrfs_allocation_map_destroy(struct btrfs_allocation_map *map);
+void btrfs_allocation_map_counts(
+    const struct btrfs_allocation_map *map, uint64_t *scans, uint64_t *reuses);
+enum btrfs_result btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
+    const struct btrfs_write_environment *environment, struct btrfs_allocation_map *map,
+    struct btrfs_transaction **result);
 /* Replace an existing, uncompressed inline regular file (including hardlinks).
  * No file creation, external extent conversion or implicit truncation of other
  * extents. Payloads are bounded by Btrfs's 2 KiB default inline-write policy. */

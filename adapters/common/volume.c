@@ -17,6 +17,8 @@ struct btrfs_volume {
 	struct btrfs_volume_locks locks;
 	/* Inode numbers and directory indexes stay unique for the mount. */
 	struct btrfs_counters *counters;
+	/* The last committed allocator state, so a begin need not reload it. */
+	struct btrfs_allocation_map *map;
 	uint64_t tree;
 	struct btrfs_volume_view *current;
 	struct btrfs_transaction *open;
@@ -132,6 +134,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	volume->tree = tree;
 	volume->current = NULL;
 	volume->counters = NULL;
+	volume->map = NULL;
 	volume->open = NULL;
 	volume->issued = 0;
 	volume->failure = BTRFS_OK;
@@ -145,8 +148,12 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	}
 	error = volume_view(volume, &volume->current);
 	if (error == BTRFS_OK && volume->writable) {
-		error =
-		    btrfs_transaction_begin(volume->current->fs, &volume->counted, &transaction);
+		error = btrfs_allocation_map_create(environment, &volume->map);
+	}
+	/* The admission transaction also verifies and keeps the allocator state. */
+	if (error == BTRFS_OK && volume->writable) {
+		error = btrfs_transaction_begin_mapped(
+		    volume->current->fs, &volume->counted, volume->map, &transaction);
 		btrfs_transaction_destroy(transaction);
 	}
 	if (error == BTRFS_OK && volume->writable) {
@@ -156,6 +163,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 		if (volume->current != NULL) {
 			volume_release_view(volume, volume->current);
 		}
+		btrfs_allocation_map_destroy(volume->map);
 		environment->release(environment->context, volume, sizeof(*volume));
 		return error;
 	}
@@ -171,7 +179,18 @@ btrfs_volume_close(struct btrfs_volume *volume)
 	}
 	volume_release_list(volume, volume->current);
 	btrfs_counters_destroy(volume->counters);
+	btrfs_allocation_map_destroy(volume->map);
 	volume->environment.release(volume->environment.context, volume, sizeof(*volume));
+}
+
+void
+btrfs_volume_allocation_counts(const struct btrfs_volume *volume, uint64_t *scans, uint64_t *reuses)
+{
+	*scans = 0;
+	*reuses = 0;
+	if (volume->map != NULL) {
+		btrfs_allocation_map_counts(volume->map, scans, reuses);
+	}
 }
 
 int
@@ -249,7 +268,8 @@ btrfs_volume_begin(struct btrfs_volume *volume, struct btrfs_transaction **trans
 	volume->locks.unlock(volume->locks.context);
 	if (error == BTRFS_OK) {
 		volume->issued = 0;
-		error = btrfs_transaction_begin(volume->current->fs, &volume->counted, transaction);
+		error = btrfs_transaction_begin_mapped(
+		    volume->current->fs, &volume->counted, volume->map, transaction);
 	}
 	if (error == BTRFS_OK) {
 		error = btrfs_transaction_use_counters(*transaction, volume->counters);

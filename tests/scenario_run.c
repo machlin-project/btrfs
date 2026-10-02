@@ -932,7 +932,7 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 
 static enum btrfs_result
 attempt(struct context *context, const struct plan *plan, size_t commit, enum fault fault,
-    size_t point, struct totals *totals)
+    size_t point, struct btrfs_allocation_map *map, struct totals *totals)
 {
 	struct path_table table;
 	struct btrfs_fs *fs;
@@ -960,7 +960,7 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	reads = context->image.reads;
 	context->image.fail_allocate = fault == FAULT_ALLOCATE ? allocations + point : 0;
 	context->image.fail_read = fault == FAULT_READ ? reads + point : 0;
-	result = btrfs_transaction_begin(fs, &context->writer, &transaction);
+	result = btrfs_transaction_begin_mapped(fs, &context->writer, map, &transaction);
 	device->coherent = 1;
 	for (i = 0; result == BTRFS_OK && i < plan->operation_count[commit]; i++) {
 		result = execute(transaction, &table, &plan->operations[commit][i], time);
@@ -1084,7 +1084,7 @@ fault_sweeps(struct context *context, const struct plan *plan, size_t commit, si
 		    point = point < limits[fault] && point + stride > limits[fault]
 			? limits[fault]
 			: point + stride) {
-			result = attempt(context, plan, commit, fault, point, &ignored);
+			result = attempt(context, plan, commit, fault, point, NULL, &ignored);
 			if (fault == FAULT_ALLOCATE) {
 				REQUIRE(result == BTRFS_NO_MEMORY);
 			} else if (fault == FAULT_READ) {
@@ -1171,6 +1171,107 @@ audit_state(struct context *context, const char *name)
 	context->audits++;
 }
 
+/* The kept map lives across transactions, outside the per-transaction
+ * allocation accounting of the image. */
+static void *
+map_allocate(void *context, size_t size)
+{
+	(void)context;
+	return malloc(size);
+}
+
+static void
+map_release(void *context, void *allocation, size_t size)
+{
+	(void)context;
+	(void)size;
+	free(allocation);
+}
+
+/* Whether the map equals what a fresh, verified load of the current committed
+ * state produces. */
+static void
+check_map(struct context *context, const struct plan *plan, size_t commit,
+    const struct btrfs_allocation_map *map)
+{
+	struct btrfs_fs *fs;
+	struct bt_space *space;
+	struct bt_root extents;
+	struct bt_root devices;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, BT_DEV_TREE, &devices) == BTRFS_OK);
+	REQUIRE(bt_space_create(fs, extents, TRANSACTION_NODE_LIMIT, &space) == BTRFS_OK);
+	REQUIRE(bt_space_devices(space, fs->chunk_tree, devices) == BTRFS_OK);
+	if (bt_space_map_check(map, space) != BTRFS_OK) {
+		fprintf(stderr,
+		    "%s commit %zu: the kept allocation map differs from a fresh load\n",
+		    plan->name, commit);
+		exit(1);
+	}
+	bt_space_destroy(space);
+	btrfs_unmount(fs);
+}
+
+/* Replays the plan's commits from its base with one allocation map kept
+ * across them, as a mounted volume does: every commit must issue exactly the
+ * writes of the recorded run, which loaded and verified the allocator state
+ * at each begin, and leave the map equal to a fresh load. */
+static void
+map_replay(struct context *context, const struct plan *plan, const size_t *starts)
+{
+	struct btrfs_allocation_map *map;
+	struct btrfs_environment environment = context->env;
+	struct saved_write *recorded;
+	struct device *device = context->device;
+	struct totals totals;
+	size_t end = device->count;
+	size_t count = end - starts[1];
+	size_t commit;
+	size_t i;
+	uint64_t scans;
+	uint64_t reuses;
+
+	recorded = calloc(count == 0 ? 1 : count, sizeof(*recorded));
+	REQUIRE(recorded != NULL);
+	for (i = 0; i < count; i++) {
+		recorded[i] = device->writes[starts[1] + i];
+		recorded[i].bytes = malloc(recorded[i].length);
+		REQUIRE(recorded[i].bytes != NULL);
+		memcpy(recorded[i].bytes, device->writes[starts[1] + i].bytes, recorded[i].length);
+	}
+	truncate_writes(device, starts[1]);
+	environment.allocate = map_allocate;
+	environment.release = map_release;
+	REQUIRE(btrfs_allocation_map_create(&environment, &map) == BTRFS_OK);
+	for (commit = 1; commit <= plan->commits; commit++) {
+		REQUIRE(attempt(context, plan, commit, FAULT_NONE, 0, map, &totals) == BTRFS_OK);
+		REQUIRE(device->count == (commit < plan->commits ? starts[commit + 1] : end));
+		for (i = starts[commit]; i < device->count; i++) {
+			if (device->writes[i].offset != recorded[i - starts[1]].offset ||
+			    device->writes[i].length != recorded[i - starts[1]].length ||
+			    memcmp(device->writes[i].bytes, recorded[i - starts[1]].bytes,
+				device->writes[i].length) != 0) {
+				fprintf(stderr,
+				    "%s commit %zu: write %zu differs with the allocation map "
+				    "kept\n",
+				    plan->name, commit, i - starts[commit]);
+				exit(1);
+			}
+		}
+		check_map(context, plan, commit, map);
+	}
+	btrfs_allocation_map_counts(map, &scans, &reuses);
+	REQUIRE(scans == 1 && reuses == plan->commits - 1);
+	btrfs_allocation_map_destroy(map);
+	for (i = 0; i < count; i++) {
+		free(recorded[i].bytes);
+	}
+	free(recorded);
+	REQUIRE(context->image.live_allocations == 0);
+}
+
 void
 run_plan(struct context *context, struct plan *plan)
 {
@@ -1178,6 +1279,7 @@ run_plan(struct context *context, struct plan *plan)
 	struct totals totals;
 	struct btrfs_fs *fs;
 	struct device *device = context->device;
+	size_t starts[MAX_STAGES + 1];
 	size_t commit;
 	size_t first;
 	size_t states = context->states;
@@ -1190,7 +1292,8 @@ run_plan(struct context *context, struct plan *plan)
 	export_begin(context, plan, &exporter);
 	for (commit = 1; commit <= plan->commits; commit++) {
 		first = device->count;
-		result = attempt(context, plan, commit, FAULT_NONE, 0, &totals);
+		starts[commit] = first;
+		result = attempt(context, plan, commit, FAULT_NONE, 0, NULL, &totals);
 		if (result != BTRFS_OK) {
 			fprintf(stderr, "%s commit %zu: %s\n", plan->name, commit,
 			    btrfs_result_string(result));
@@ -1217,9 +1320,11 @@ run_plan(struct context *context, struct plan *plan)
 		if (commit == plan->commits) {
 			truncate_writes(device, first);
 			fault_sweeps(context, plan, commit, first, &totals);
-			REQUIRE(attempt(context, plan, commit, FAULT_NONE, 0, &totals) == BTRFS_OK);
+			REQUIRE(attempt(context, plan, commit, FAULT_NONE, 0, NULL, &totals) ==
+			    BTRFS_OK);
 		}
 	}
+	map_replay(context, plan, starts);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	check_stage(context, fs, plan, plan->commits);
 	btrfs_unmount(fs);

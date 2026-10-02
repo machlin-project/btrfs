@@ -170,7 +170,22 @@ must be aligned, disjoint and bounded by their chunk, and each chunk's extents m
 sum to its block-group total. It rejects physical chunk aliases, removes
 superblock stripes from candidate gaps, and produces bounded metadata reservations.
 It pins the committed allocation map for the whole transaction and never reuses a
-released reservation within that transaction. Gap storage grows from 256 records
+released reservation within that transaction. Free ranges are kept in canonical
+form: sorted, and merged only within one chunk.
+
+An owner may keep this state across its transactions (`btrfs_allocation_map`,
+`btrfs_transaction_begin_mapped`); the native volume does. A transaction whose
+base is the map's generation, filesystem and chunk map copies it instead of
+loading the extent tree and verifying the free-space and device trees again: the
+state was verified when the map was saved, and only this owner's commits changed
+it since. A successful commit replays into the map its grown chunks (free as a
+whole, minus superblock stripes), its allocation log in order, its block-group
+totals and its removed groups, and derives the device's free ranges from the
+chunk map; a map that cannot follow is dropped, and any other base is loaded,
+verified and saved. A failed or aborted transaction leaves the map at its
+generation. Grouping many operations into one commit, with the reservations and
+durability waits it needs, is designed in [group commit](GROUP_COMMIT.md).
+Gap storage grows from 256 records
 to a maximum of 131,072. The current transaction limit is 4,096 dirty nodes; the
 standalone editor supports up to 65,536. Exhausted reservations return NO_SPACE
 from the failing edit, before any media write. The commit's accounting fixed

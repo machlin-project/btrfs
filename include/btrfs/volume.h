@@ -35,6 +35,10 @@ enum btrfs_result btrfs_volume_open(const struct btrfs_environment *environment,
 /* Every view must be unpinned and no transaction may be open. */
 void btrfs_volume_close(struct btrfs_volume *volume);
 int btrfs_volume_writable(const struct btrfs_volume *volume);
+/* How often a writable volume's transactions loaded and verified the
+ * allocator state (scans) and reused the state its last commit left. */
+void btrfs_volume_allocation_counts(
+    const struct btrfs_volume *volume, uint64_t *scans, uint64_t *reuses);
 /* The current committed generation; it changes after each published commit. */
 uint64_t btrfs_volume_generation(struct btrfs_volume *volume);
 enum btrfs_result btrfs_volume_failure(struct btrfs_volume *volume);

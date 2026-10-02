@@ -711,6 +711,8 @@ stress_test(struct harness *harness, size_t iterations)
 	uint32_t random = 0x2545f491U;
 	uint32_t version = 0;
 	uint64_t generation;
+	uint64_t scans = 0;
+	uint64_t reuses = 0;
 	size_t commits = 0;
 	size_t aborts = 0;
 	size_t injected = 0;
@@ -792,6 +794,10 @@ stress_test(struct harness *harness, size_t iterations)
 	REQUIRE(btrfs_volume_failure(stress.volume) == BTRFS_IO);
 	REQUIRE(btrfs_volume_generation(stress.volume) == generation);
 	REQUIRE(btrfs_volume_begin(stress.volume, &transaction) == BTRFS_IO);
+	/* Every transaction after the admission reused the allocator state the
+	 * previous commit left, aborts and failed commits included. */
+	btrfs_volume_allocation_counts(stress.volume, &scans, &reuses);
+	REQUIRE(scans == 1 && reuses == commits + aborts + injected + 1);
 	nanosleep(&drain, NULL);
 	stress.stop = 1;
 	for (i = 0; i < STRESS_READERS; i++) {
@@ -809,9 +815,11 @@ stress_test(struct harness *harness, size_t iterations)
 	btrfs_volume_close(stress.volume);
 	REQUIRE(commits != 0 && aborts != 0 && injected != 0 && stress.long_pins != 0);
 	printf("native volume stress: %zu commits, %zu aborts, %zu allocation failures, "
-	       "%llu checked views (%llu long pins), failed final commit PASS\n",
+	       "%llu checked views (%llu long pins), allocator state loaded %llu times and "
+	       "reused %llu, failed final commit PASS\n",
 	    commits, aborts, injected, (unsigned long long)stress.views,
-	    (unsigned long long)stress.long_pins);
+	    (unsigned long long)stress.long_pins, (unsigned long long)scans,
+	    (unsigned long long)reuses);
 	free(stress.published);
 	free(data);
 	free(buffer);

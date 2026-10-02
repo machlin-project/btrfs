@@ -195,6 +195,8 @@ checks its view again after a pause, so later transactions must not reuse its
 blocks. The writer also aborts transactions, fails allocations inside them, and
 finally fails a commit write: the volume must refuse the next writer, keep
 serving the published view, and a reopened volume must find that generation.
+Its allocation map must have been loaded once, at admission, and reused by
+every later transaction, aborted and failed ones included.
 
 A bounded smoke campaign is not exhaustive fuzzing. Preserve and minimize every
 crashing input; turn the cause into a deterministic regression before fixing it.
@@ -289,7 +291,10 @@ combination across the two secondaries of a device past 256 GiB (36). Every stat
 recovery. It must resolve to the acknowledged or new stage with exact contents,
 invariant snapshots/xattrs/links, every free-space-tree block group on the right
 side of Linux's conversion thresholds (derived independently in the test), and
-admit the next transaction. The suite also
+admit the next transaction. Finally every plan is replayed from its base with one
+allocation map kept across its commits: each replayed commit must issue exactly
+the recorded writes, and afterwards the map must equal a fresh load and
+verification of the committed state. The suite also
 checks admission, stale copies, recovery refusals and checksum-correct damaged
 allocation maps. `--full` adds the metadata-exhaustion case: the full profile's
 remaining metadata cannot hold a batch of all inline files, so the edit returns
