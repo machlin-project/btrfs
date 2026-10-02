@@ -53,6 +53,8 @@ enum btrfs_result bt_mutation_find(struct bt_mutation *mutation, struct bt_root 
     struct bt_key key, void *value, size_t capacity, size_t *length);
 const struct btrfs_fs *bt_mutation_view(const struct bt_mutation *mutation);
 size_t bt_mutation_count(const struct bt_mutation *mutation);
+/* Describes changed node index; its bytes carry their checksum once the
+ * mutation is sealed. */
 enum btrfs_result bt_mutation_block(
     struct bt_mutation *mutation, size_t index, struct bt_mutated_block *block);
 enum btrfs_result bt_mutation_seal(struct bt_mutation *mutation);

@@ -1023,7 +1023,11 @@ bt_mutation_block(struct bt_mutation *mutation, size_t index, struct bt_mutated_
 	}
 	node = mutation->nodes[index];
 	header = bt_mut_header(node);
-	bt_mut_checksum(mutation, node);
+	/* Accounting reads blocks while it still edits them; checksums are
+	 * computed once, when sealing. */
+	if (mutation->sealed) {
+		bt_mut_checksum(mutation, node);
+	}
 	block->address = node->address;
 	block->original_address = node->original;
 	block->owner = bt_u64(header->owner);
