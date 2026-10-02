@@ -439,6 +439,7 @@ stream_tests(struct fixture *fixture)
 	struct btrfs_inode directory;
 	struct btrfs_directory *stream;
 	struct btrfs_dir_entry entry;
+	struct btrfs_inode child;
 	uint64_t cookie = 0;
 	uint64_t saved = 0;
 	uint64_t reads;
@@ -463,6 +464,22 @@ stream_tests(struct fixture *fixture)
 	printf("700-entry stream: %" PRIu64 " I/O calls, %" PRIu64 " allocations\n", reads,
 	    allocations);
 	assert(reads <= 32 && allocations <= 8);
+	/* Each entry's inode through the stream: neighboring inodes share a
+	 * leaf, which is read once, not once per entry. */
+	reads = fixture->image.reads;
+	entries = 0;
+	assert(btrfs_directory_open(fs, &directory, 0, &stream) == BTRFS_OK);
+	while ((result = btrfs_directory_next(stream, &entry, &cookie)) == BTRFS_OK) {
+		assert(btrfs_directory_inode(stream, &entry, &child) == BTRFS_OK);
+		assert(child.id.inode == entry.id.inode &&
+		    (child.mode & BTRFS_MODE_TYPE) == BTRFS_MODE_REGULAR);
+		entries++;
+	}
+	assert(result == BTRFS_NOT_FOUND && entries == 700);
+	btrfs_directory_close(stream);
+	reads = fixture->image.reads - reads;
+	printf("700-entry stream with each inode: %" PRIu64 " I/O calls\n", reads);
+	assert(reads <= 64);
 	assert(btrfs_directory_open(fs, &directory, saved, &stream) == BTRFS_OK);
 	assert(btrfs_directory_next(stream, &entry, &cookie) == BTRFS_NOT_FOUND);
 	btrfs_directory_close(stream);
