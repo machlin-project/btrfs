@@ -306,5 +306,18 @@ enum btrfs_result btrfs_transaction_clean_orphans(
     struct btrfs_transaction *transaction, uint64_t tree, size_t *cleaned);
 enum btrfs_result btrfs_transaction_commit(struct btrfs_transaction *transaction);
 void btrfs_transaction_destroy(struct btrfs_transaction *transaction);
+/* OK while the transaction can still commit; otherwise the error that made it
+ * unusable (an operation failed after its first change) or READ_ONLY after
+ * commit. A refused operation leaves it usable. */
+enum btrfs_result btrfs_transaction_failure(const struct btrfs_transaction *transaction);
+/* The transaction's current state for readers: lookups, attributes,
+ * directory streams, extended attributes and data reads see every operation
+ * applied so far. Its nodes come from the transaction or, when unchanged, the
+ * device and the node cache; it uses the base environment's allocator, so
+ * readers may share it with each other but not with an operation in progress,
+ * and must finish (closing their streams) before the next operation. The view
+ * stays valid until the next call, commit or destroy; NULL when the
+ * transaction is unusable or finished. */
+const struct btrfs_fs *btrfs_transaction_reader(struct btrfs_transaction *transaction);
 
 #endif

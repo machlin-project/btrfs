@@ -29,4 +29,17 @@ struct namespace_audit {
  * count its bytes, and without NO_HOLES they cover it below its size. */
 int namespace_audit(const struct btrfs_fs *fs, struct namespace_audit *audit);
 
+struct namespace_digest {
+	uint64_t hash;
+	size_t objects;
+	uint64_t bytes;
+	char failure[256];
+};
+
+/* A hash of everything the public read interface shows from the mounted
+ * tree's root: names in stream order, every inode attribute, file and symlink
+ * bytes, and extended attributes, descending into subvolumes. Two views with
+ * equal digests read the same. */
+int namespace_digest(const struct btrfs_fs *fs, struct namespace_digest *digest);
+
 #endif

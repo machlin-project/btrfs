@@ -371,6 +371,8 @@ struct context {
 	size_t states;
 	size_t recoveries;
 	size_t audits;
+	/* Commits whose transaction view read the same as their published view. */
+	size_t reader_digests;
 	struct btrfs_fs *plan_fs;
 	uint32_t seed;
 	/* While a commit's crash or fault states are resolved: that commit. */

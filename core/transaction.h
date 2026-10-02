@@ -130,6 +130,8 @@ struct btrfs_transaction {
 	struct btrfs_object_id privileged[BT_TRANSACTION_PRIVILEGED];
 	size_t privileged_count;
 	unsigned copies;
+	/* btrfs_transaction_reader's view, rebuilt by each call. */
+	struct btrfs_fs reader;
 	enum btrfs_result failure;
 	int changed;
 	int finished;

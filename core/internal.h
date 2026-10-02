@@ -97,6 +97,12 @@ struct btrfs_fs {
 	 * with no device read or checksum; NOT_FOUND falls back to a read. */
 	enum btrfs_result (*private_read)(void *context, struct bt_root root, void *buffer);
 	void *private_context;
+	/* A transaction's reader view resolves the trees the transaction owns to
+	 * their private roots: nonzero with *result OK or NOT_FOUND (a deleted
+	 * subvolume); zero to look the root item up. */
+	int (*private_root)(
+	    void *context, uint64_t tree, struct bt_root *root, enum btrfs_result *result);
+	void *private_root_context;
 };
 
 /* blocks[level] is the cursor's own buffer (owned[level]) or a node read in

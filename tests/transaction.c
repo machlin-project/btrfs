@@ -131,9 +131,10 @@ main(int argc, char **argv)
 	btrfs_image_close(&context->image);
 	free(context->device->writes);
 	free(context->device);
-	printf("transactions (%u-byte nodes): %zu crash states, %zu explicit recoveries; fault "
-	       "sweeps, stale copies and allocation maps PASS\n",
-	    context->node_size, context->states, context->recoveries);
+	printf("transactions (%u-byte nodes): %zu crash states, %zu explicit recoveries, %zu "
+	       "transaction views read as published; fault sweeps, stale copies and allocation "
+	       "maps PASS\n",
+	    context->node_size, context->states, context->recoveries, context->reader_digests);
 	free(context);
 	return 0;
 }

@@ -1,6 +1,8 @@
 # Group commit design
 
-Status: design, not implemented. The XNU adapter commits each namespace and
+Status: design; the core provides a transaction's reader view
+(`btrfs_transaction_reader`), and grouping is not implemented yet. The XNU
+adapter commits each namespace and
 attribute operation in its own transaction, and every commit pays three device
 barriers (metadata, secondary superblocks, primary). Durable throughput is
 therefore bounded by barrier latency, about one operation per three flushes.
@@ -84,7 +86,12 @@ read-only.
    accepted batches never fail at commit for space (extending the exhaustion
    bisection), and that refusals leave the running transaction usable.
 2. Read paths over the running transaction's view with a reader/writer lock,
-   and TSan stress of concurrent readers against a running writer.
+   and TSan stress of concurrent readers against a running writer. The core
+   part exists: `btrfs_transaction_reader` resolves the transaction's own trees
+   to their private roots, copies private nodes by logical address and reads
+   unchanged nodes from the device and cache with the base allocator. The
+   scenario harness requires every transaction's view, read through the public
+   interface before commit, to equal the published view.
 3. Durability waits: per-object last-changing generation, `fsync`/`sync`
    semantics, failure propagation to waiters.
 4. Commit triggers and limits, then adapter integration and the mounted write

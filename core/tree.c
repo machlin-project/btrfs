@@ -424,6 +424,10 @@ bt_find_root(const struct btrfs_fs *fs, uint64_t tree, struct bt_root *root)
 	struct bt_key key = { .objectid = tree, .type = BT_ROOT_ITEM, .offset = UINT64_MAX };
 	enum btrfs_result error;
 
+	if (fs->private_root != NULL &&
+	    fs->private_root(fs->private_root_context, tree, root, &error)) {
+		return error;
+	}
 	if (fs->selected_tree.owner == tree) {
 		*root = fs->selected_tree;
 		return BTRFS_OK;

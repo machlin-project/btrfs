@@ -925,3 +925,214 @@ namespace_audit(const struct btrfs_fs *fs, struct namespace_audit *audit)
 	}
 	return result;
 }
+
+/* FNV-1a, 64-bit. */
+#define DIGEST_OFFSET UINT64_C(0xcbf29ce484222325)
+#define DIGEST_PRIME UINT64_C(0x100000001b3)
+/* Directory nesting the digest follows. */
+#define DIGEST_DEPTH 64U
+#define DIGEST_CHUNK (64U * 1024U)
+#define DIGEST_XATTRS (64U * 1024U)
+/* Larger files contribute their file extent items and their first and last
+ * chunk; sparse test files reach many GiB. */
+#define DIGEST_FULL_BYTES (1024U * 1024U)
+
+struct digest_state {
+	const struct btrfs_fs *fs;
+	struct namespace_digest *digest;
+	uint8_t *buffer;
+	char *names;
+};
+
+static void
+digest_mix(struct namespace_digest *digest, const void *bytes, size_t length)
+{
+	const uint8_t *in = bytes;
+	uint64_t word;
+	size_t i = 0;
+
+	for (; length - i >= sizeof(word); i += sizeof(word)) {
+		memcpy(&word, in + i, sizeof(word));
+		digest->hash = (digest->hash ^ word) * DIGEST_PRIME;
+	}
+	for (; i < length; i++) {
+		digest->hash = (digest->hash ^ in[i]) * DIGEST_PRIME;
+	}
+}
+
+static void
+digest_u64(struct namespace_digest *digest, uint64_t value)
+{
+	digest_mix(digest, &value, sizeof(value));
+}
+
+static int
+digest_fail(struct digest_state *state, const char *what, enum btrfs_result result,
+    struct btrfs_object_id id)
+{
+	snprintf(state->digest->failure, sizeof(state->digest->failure), "%s of %llu:%llu: %s",
+	    what, (unsigned long long)id.tree, (unsigned long long)id.inode,
+	    btrfs_result_string(result));
+	return -1;
+}
+
+/* The file extent items of a large file, through its tree's root as the
+ * view resolves it. */
+static int
+digest_extents(struct digest_state *state, const struct btrfs_inode *inode)
+{
+	struct bt_root root;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { .objectid = inode->id.inode, .type = BT_EXTENT_DATA };
+	enum btrfs_result result;
+
+	result = bt_find_root(state->fs, inode->id.tree, &root);
+	if (result != BTRFS_OK) {
+		return digest_fail(state, "tree", result, inode->id);
+	}
+	bt_cursor_init(&cursor, state->fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.objectid != inode->id.inode || record.key.type != BT_EXTENT_DATA) {
+			break;
+		}
+		digest_u64(state->digest, record.key.offset);
+		digest_mix(state->digest, record.data, record.size);
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	if (result != BTRFS_OK && result != BTRFS_NOT_FOUND) {
+		return digest_fail(state, "extents", result, inode->id);
+	}
+	return 0;
+}
+
+static int
+digest_inode(struct digest_state *state, const struct btrfs_inode *inode)
+{
+	struct namespace_digest *digest = state->digest;
+	const struct btrfs_time *times[] = { &inode->access_time, &inode->modify_time,
+		&inode->change_time, &inode->birth_time };
+	size_t length;
+	size_t completed;
+	size_t value;
+	size_t offset;
+	uint64_t position;
+	unsigned i;
+	enum btrfs_result result;
+
+	digest->objects++;
+	digest_u64(digest, inode->id.tree);
+	digest_u64(digest, inode->id.inode);
+	digest_u64(digest, inode->generation);
+	digest_u64(digest, inode->size);
+	digest_u64(digest, inode->allocated_bytes);
+	digest_u64(digest, inode->flags);
+	digest_u64(digest, inode->device);
+	digest_u64(digest, inode->mode);
+	digest_u64(digest, inode->uid);
+	digest_u64(digest, inode->gid);
+	digest_u64(digest, inode->links);
+	for (i = 0; i < sizeof(times) / sizeof(times[0]); i++) {
+		digest_u64(digest, (uint64_t)times[i]->seconds);
+		digest_u64(digest, times[i]->nanoseconds);
+	}
+	result = btrfs_list_xattrs(state->fs, inode, state->names, DIGEST_XATTRS, &length);
+	if (result != BTRFS_OK) {
+		return digest_fail(state, "xattr list", result, inode->id);
+	}
+	for (offset = 0; offset < length; offset += strlen(state->names + offset) + 1) {
+		digest_mix(digest, state->names + offset, strlen(state->names + offset) + 1);
+		result = btrfs_get_xattr(state->fs, inode, state->names + offset,
+		    strlen(state->names + offset), state->buffer, DIGEST_CHUNK, &value);
+		if (result != BTRFS_OK) {
+			return digest_fail(state, "xattr", result, inode->id);
+		}
+		digest_mix(digest, state->buffer, value);
+	}
+	if ((inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR &&
+	    (inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_SYMLINK) {
+		return 0;
+	}
+	if (inode->size > DIGEST_FULL_BYTES && digest_extents(state, inode) != 0) {
+		return -1;
+	}
+	for (position = 0; position < inode->size; position += completed) {
+		if (inode->size > DIGEST_FULL_BYTES && position == DIGEST_CHUNK) {
+			position = inode->size - DIGEST_CHUNK;
+		}
+		result =
+		    btrfs_read(state->fs, inode, position, state->buffer, DIGEST_CHUNK, &completed);
+		if (result != BTRFS_OK || completed == 0) {
+			return digest_fail(state, "read", result, inode->id);
+		}
+		digest_mix(digest, state->buffer, completed);
+		digest->bytes += completed;
+	}
+	return 0;
+}
+
+static int
+digest_directory(struct digest_state *state, const struct btrfs_inode *directory, unsigned depth)
+{
+	struct btrfs_directory *stream;
+	struct btrfs_dir_entry entry;
+	struct btrfs_inode child;
+	uint64_t cookie;
+	enum btrfs_result result;
+
+	if (depth == DIGEST_DEPTH) {
+		return digest_fail(state, "depth", BTRFS_RANGE, directory->id);
+	}
+	result = btrfs_directory_open(state->fs, directory, 0, &stream);
+	if (result != BTRFS_OK) {
+		return digest_fail(state, "stream", result, directory->id);
+	}
+	while ((result = btrfs_directory_next(stream, &entry, &cookie)) == BTRFS_OK) {
+		digest_mix(state->digest, entry.name, entry.name_length);
+		digest_u64(state->digest, entry.type);
+		digest_u64(state->digest, cookie);
+		result = btrfs_get_inode(state->fs, entry.id, &child);
+		if (result != BTRFS_OK) {
+			btrfs_directory_close(stream);
+			return digest_fail(state, "inode", result, entry.id);
+		}
+		if (digest_inode(state, &child) != 0 ||
+		    ((child.mode & BTRFS_MODE_TYPE) == BTRFS_MODE_DIRECTORY &&
+			digest_directory(state, &child, depth + 1) != 0)) {
+			btrfs_directory_close(stream);
+			return -1;
+		}
+	}
+	btrfs_directory_close(stream);
+	return result == BTRFS_NOT_FOUND ? 0 : digest_fail(state, "next", result, directory->id);
+}
+
+int
+namespace_digest(const struct btrfs_fs *fs, struct namespace_digest *digest)
+{
+	struct digest_state state;
+	struct btrfs_inode root;
+	enum btrfs_result result;
+	int status = -1;
+
+	memset(digest, 0, sizeof(*digest));
+	digest->hash = DIGEST_OFFSET;
+	state.fs = fs;
+	state.digest = digest;
+	state.buffer = malloc(DIGEST_CHUNK);
+	state.names = malloc(DIGEST_XATTRS);
+	result = btrfs_root(fs, &root);
+	if (state.buffer == NULL || state.names == NULL) {
+		snprintf(digest->failure, sizeof(digest->failure), "out of memory");
+	} else if (result != BTRFS_OK) {
+		status = digest_fail(&state, "root", result, root.id);
+	} else if (digest_inode(&state, &root) == 0) {
+		status = digest_directory(&state, &root, 0);
+	}
+	free(state.buffer);
+	free(state.names);
+	return status;
+}

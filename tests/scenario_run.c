@@ -935,13 +935,20 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
     size_t point, struct btrfs_allocation_map *map, struct totals *totals)
 {
 	struct path_table table;
+	struct namespace_digest pending;
+	struct namespace_digest published;
+	const struct btrfs_fs *reader;
 	struct btrfs_fs *fs;
+	struct btrfs_fs *after;
 	struct btrfs_transaction *transaction = NULL;
 	struct btrfs_time time = { 1700000000 + (int64_t)commit, 123456789 };
 	struct device *device = context->device;
 	uint64_t allocations;
 	uint64_t reads;
+	uint64_t digest_allocations;
+	uint64_t digest_reads;
 	size_t i;
+	int compare = 0;
 	enum btrfs_result result;
 
 	/* An operation names at most three paths and creates or moves at most one. */
@@ -980,6 +987,22 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 			    btrfs_result_string(plan->operations[commit][i].expected));
 		}
 	}
+	/* The transaction's reader view must read what its commit publishes; its
+	 * cost stays out of the commit's fault-point counts. */
+	if (fault == FAULT_NONE && result == BTRFS_OK) {
+		digest_allocations = context->image.allocations;
+		digest_reads = context->image.reads;
+		reader = btrfs_transaction_reader(transaction);
+		REQUIRE(reader != NULL);
+		if (namespace_digest(reader, &pending) != 0) {
+			fprintf(stderr, "%s commit %zu: transaction view: %s\n", plan->name, commit,
+			    pending.failure);
+			REQUIRE(0);
+		}
+		allocations += context->image.allocations - digest_allocations;
+		reads += context->image.reads - digest_reads;
+		compare = 1;
+	}
 	device->before_commit = device->count;
 	if (result == BTRFS_OK) {
 		result = btrfs_transaction_commit(transaction);
@@ -1004,6 +1027,25 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	btrfs_transaction_destroy(transaction);
 	device->coherent = 0;
 	btrfs_unmount(fs);
+	if (compare && result == BTRFS_OK) {
+		REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &after) == BTRFS_OK);
+		if (namespace_digest(after, &published) != 0) {
+			fprintf(stderr, "%s commit %zu: published view: %s\n", plan->name, commit,
+			    published.failure);
+			REQUIRE(0);
+		}
+		btrfs_unmount(after);
+		if (published.hash != pending.hash || published.objects != pending.objects ||
+		    published.bytes != pending.bytes) {
+			fprintf(stderr,
+			    "%s commit %zu: transaction view read %zu objects, %llu bytes; "
+			    "published view %zu objects, %llu bytes\n",
+			    plan->name, commit, pending.objects, (unsigned long long)pending.bytes,
+			    published.objects, (unsigned long long)published.bytes);
+			REQUIRE(0);
+		}
+		context->reader_digests++;
+	}
 	path_table_release(&table);
 	REQUIRE(context->image.live_allocations == 0);
 	return result;

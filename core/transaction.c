@@ -1198,3 +1198,68 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 	}
 	env->release(env->context, transaction, sizeof(*transaction));
 }
+
+enum btrfs_result
+btrfs_transaction_failure(const struct btrfs_transaction *transaction)
+{
+	if (transaction == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (transaction->failure != BTRFS_OK) {
+		return transaction->failure;
+	}
+	return transaction->finished ? BTRFS_READ_ONLY : BTRFS_OK;
+}
+
+static int
+bt_tx_private_root(void *context, uint64_t tree, struct bt_root *root, enum btrfs_result *result)
+{
+	struct btrfs_transaction *transaction = context;
+	size_t i;
+
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == tree) {
+			*root = transaction->trees[i].root;
+			/* As bt_find_root reports a subvolume deleted in this view. */
+			*result = bt_u32(transaction->trees[i].item.legacy.refs) == 0
+			    ? BTRFS_NOT_FOUND
+			    : BTRFS_OK;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+const struct btrfs_fs *
+btrfs_transaction_reader(struct btrfs_transaction *transaction)
+{
+	struct btrfs_fs *reader;
+	struct bt_root root;
+	enum btrfs_result result;
+
+	if (btrfs_transaction_failure(transaction) != BTRFS_OK) {
+		return NULL;
+	}
+	reader = &transaction->reader;
+	/* The private view's nodes and chunk map, with the base environment:
+	 * readers do not use the transaction's buffers. */
+	*reader = *bt_mutation_view(transaction->mutation);
+	reader->env = transaction->base->env;
+	reader->private_root = bt_tx_private_root;
+	reader->private_root_context = transaction;
+	/* Chunks grown for data since the mutation last allocated a node. */
+	reader->chunks = transaction->fs.chunks;
+	reader->chunk_count = transaction->fs.chunk_count;
+	reader->root_tree = transaction->roots;
+	reader->checksum_tree = transaction->checksums.root;
+	if (bt_tx_private_root(transaction, reader->selected_tree.owner, &root, &result)) {
+		if (result != BTRFS_OK) {
+			return NULL;
+		}
+		reader->selected_tree = root;
+	}
+	if (btrfs_get_inode(reader, reader->root_inode.id, &reader->root_inode) != BTRFS_OK) {
+		return NULL;
+	}
+	return reader;
+}
