@@ -1237,12 +1237,16 @@ stress_test(struct harness *harness, size_t iterations)
  * writes its sequence number into GROUPED_STAMP; the writer records the model
  * of each sequence number before leaving. Readers read the newest state and
  * check it against the model of the sequence number they see, so a view that
- * mixes operations fails. Syncs come from the writer and from a reader. */
+ * mixes operations fails, and a read never shows less than the operations
+ * acknowledged before it started, during a commit included. Syncs come from
+ * the writer and from a reader. */
 struct grouped {
 	struct btrfs_volume *volume;
 	uint32_t (*models)[STRESS_FILES];
 	size_t capacity;
 	_Atomic int stop;
+	/* The last operation that left. */
+	_Atomic uint64_t acknowledged;
 	_Atomic uint64_t running_reads;
 	_Atomic uint64_t committed_reads;
 	_Atomic uint64_t reader_syncs;
@@ -1289,13 +1293,22 @@ grouped_reader(void *context)
 	uint32_t versions[STRESS_FILES];
 	uint8_t *buffer;
 	uint64_t sequence;
+	uint64_t acknowledged;
 
 	buffer = malloc(STRESS_MAX_SIZE);
 	REQUIRE(buffer != NULL);
 	while (!grouped->stop) {
+		acknowledged = grouped->acknowledged;
 		fs = btrfs_volume_read(grouped->volume, &view);
 		sequence = grouped_sequence(fs);
 		REQUIRE(sequence < grouped->capacity);
+		if (sequence < acknowledged) {
+			fprintf(stderr,
+			    "grouped reader %u: read operation %llu after %llu was acknowledged\n",
+			    reader->index, (unsigned long long)sequence,
+			    (unsigned long long)acknowledged);
+			exit(1);
+		}
 		memcpy(versions, grouped->models[sequence], sizeof(versions));
 		difference = stress_check(fs, versions, buffer);
 		if (view == NULL) {
@@ -1382,6 +1395,7 @@ grouped_stress_test(struct harness *harness, size_t iterations)
 		/* Readers see this model once the operation leaves. */
 		memcpy(grouped.models[iteration], model.versions, sizeof(model.versions));
 		btrfs_volume_leave(grouped.volume, transaction);
+		grouped.acknowledged = iteration;
 		if (stress_random(&random) % 8U == 0) {
 			REQUIRE(btrfs_volume_sync(grouped.volume,
 				    btrfs_volume_pending(grouped.volume)) == BTRFS_OK);

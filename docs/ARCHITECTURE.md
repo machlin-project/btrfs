@@ -668,7 +668,8 @@ transaction, so copies needing recovery fail the mount rather than a later write
 
 The XNU adapter groups operations ([group commit](GROUP_COMMIT.md)): every
 namespace and attribute operation joins the volume's running transaction and
-returns once applied; readers see it at once. A commit publishes the running
+returns once applied; readers see it at once, and a read during a commit waits
+for the commit's view rather than read the older one. A commit publishes the running
 transaction when `fsync` asks for an object whose last change it holds, on
 `sync`, every five seconds, when the transaction lacks room for the next
 operation, and at unmount. A mount with `-o sync` (`MNT_SYNCHRONOUS`) instead

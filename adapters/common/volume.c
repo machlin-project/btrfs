@@ -45,6 +45,9 @@ struct btrfs_volume {
 	 * operation, the operations it holds and the readers of that view. */
 	struct btrfs_transaction *running;
 	const struct btrfs_fs *running_view;
+	/* Set while the detached running transaction commits, until its view is
+	 * published (atomic; written with the lock held). */
+	int committing;
 	size_t operations;
 	uint32_t readers;
 	/* Threads waiting for the writer turn; running-view readers yield to them,
@@ -220,6 +223,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	volume->open = NULL;
 	__atomic_store_n(&volume->running, NULL, __ATOMIC_SEQ_CST);
 	volume->running_view = NULL;
+	volume->committing = 0;
 	volume->operations = 0;
 	volume->readers = 0;
 	volume->waiting = 0;
@@ -331,7 +335,11 @@ volume_pin_current(struct btrfs_volume *volume, int committed_only, const void *
 	struct btrfs_volume_view *view = NULL;
 
 	__atomic_fetch_add(&active->count, 1, __ATOMIC_SEQ_CST);
-	if (committed_only || __atomic_load_n(&volume->running, __ATOMIC_SEQ_CST) == NULL) {
+	/* A commit stores committing before it detaches the running transaction
+	 * and clears it after publishing current. */
+	if (committed_only ||
+	    (__atomic_load_n(&volume->running, __ATOMIC_SEQ_CST) == NULL &&
+		__atomic_load_n(&volume->committing, __ATOMIC_SEQ_CST) == 0)) {
 		view = __atomic_load_n(&volume->current, __ATOMIC_SEQ_CST);
 #ifdef BTRFS_VOLUME_TEST_HOOKS
 		if (btrfs_volume_test_pin_hook != NULL) {
@@ -456,16 +464,22 @@ volume_commit_running(struct btrfs_volume *volume)
 	if (transaction == NULL) {
 		return BTRFS_OK;
 	}
+	/* Until the commit publishes its view, readers wait for this turn: the
+	 * committed view lacks the transaction's acknowledged operations, and
+	 * nothing reads the transaction while it commits. */
 	volume->locks.lock(volume->locks.context);
+	__atomic_store_n(&volume->committing, 1, __ATOMIC_SEQ_CST);
 	__atomic_store_n(&volume->running, NULL, __ATOMIC_SEQ_CST);
 	volume->running_view = NULL;
 	volume->operations = 0;
 	volume->locks.unlock(volume->locks.context);
 	volume->issued = 0;
 	error = volume_commit_view(volume, transaction, &view);
+	/* Before publication: the transaction refers to the view it began on. */
 	btrfs_transaction_destroy(transaction);
 	volume->locks.lock(volume->locks.context);
 	retired = volume_publish(volume, view, error);
+	__atomic_store_n(&volume->committing, 0, __ATOMIC_SEQ_CST);
 	volume->locks.unlock(volume->locks.context);
 	volume_release_list(volume, retired);
 	return error;
@@ -686,7 +700,7 @@ btrfs_volume_read(struct btrfs_volume *volume, struct btrfs_volume_view **view)
 	}
 	volume->locks.lock(volume->locks.context);
 	volume->read_waiting++;
-	while (volume->running != NULL &&
+	while ((volume->running != NULL || volume->committing) &&
 	    (volume->writer || (volume->waiting != 0 && volume->admitting == 0))) {
 		volume->locks.wait(volume->locks.context, &volume->readers);
 	}

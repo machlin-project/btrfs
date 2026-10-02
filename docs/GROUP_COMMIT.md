@@ -108,17 +108,21 @@ transaction-per-operation calls:
 - `btrfs_volume_read` returns the running transaction's view between
   operations, shared by readers; otherwise it pins the committed view as
   before. Operations and commits wait for readers of the running view, and
-  readers wait for them. The turn is phase-fair: the readers waiting when a
-  turn ends enter before the next writer, so a continuous writer does not
-  starve readers. A read of the running view must finish within the call; no
-  directory stream outlives it.
+  readers wait for them, including while a commit writes the detached running
+  transaction: until its view is published the committed view lacks
+  acknowledged operations, so a read then would go back in time. The turn is
+  phase-fair: the readers waiting when a turn ends enter before the next
+  writer, so a continuous writer does not starve readers. A read of the
+  running view must finish within the call; no directory stream outlives it.
 
 `tests/volume.c` checks visibility before commit, one commit per sync, commits
 for a begin and for room, refusals that keep the transaction, and both failure
 cases; its grouped stress test writes a sequence number with every operation,
 and four readers (one also syncing) check that each view they read equals the
-model of the sequence number it shows, under ASan and TSan. Letting readers in
-during an operation makes them see torn state.
+model of the sequence number it shows and is not older than the last operation
+acknowledged before the read began, under ASan and TSan. Letting readers in
+during an operation makes them see torn state; letting them read the committed
+view during a commit makes them see an operation disappear (both fail).
 
 ## Order of work
 

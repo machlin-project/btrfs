@@ -225,8 +225,23 @@ while sampled), and the plain profiles at 6,178 to 8,661. A sample of the extens
 finds it busy for about a fifth of the time, most of that in B-tree descents
 for lookup and inode reads and in device reads for nodes outside the cache;
 the remainder is FSKit's per-name lookup and attribute requests. Build 6
-cannot finish the scale walk. These are single-guest measurements without a
-matched APFS, Apple FSKit or Linux comparison.
+cannot finish the scale walk.
+
+On the same guest the same tree (100 directories of 1,000 files of 4 KiB,
+created by one program, walked cold by `walkbench`, which does readdir and
+lstat of each name) gives:
+
+| Filesystem | Create 100,000 files | Walk, names per second (three cold mounts) |
+| --- | --- | --- |
+| APFS (in-kernel) | 22 s | 92,780; 72,760; 56,213 |
+| exFAT (Apple's FSKit module) | 168 s | 3,692; 3,748; 3,749 |
+| Btrfs (FSKit build 8, 1 GiB image) | 843 s with the final sync | 7,665; 7,644; 7,648 |
+
+Through FSKit, Btrfs walks twice as fast as Apple's exFAT module but creates
+five times slower; per-file creation cost through the extension (namespace
+operation, 4 KiB data write and its extent) is the next FSKit target. These
+are single-guest measurements; the loaded kernel module and Linux are not
+compared yet.
 
 ## Matched benchmark protocol
 
