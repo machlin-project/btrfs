@@ -57,22 +57,30 @@ work.
 `btrfs-bench` (see DEVELOPMENT.md) measures this implementation on an image file
 through the host page cache: CPU and backend-call costs per operation, not a
 mounted filesystem and not a comparison with Linux. On `transactions` (4 KiB
-nodes) in a release build, the shared node cache (64 MiB) and cursors that read
-cached nodes in place changed:
+nodes) in a release build, without and with a 64 MiB node cache:
 
-| Operation | Without cache | Cache, copied nodes | Cache, nodes in place |
-| --- | --- | --- | --- |
-| 4 KiB random read of a 4 MiB file | 4.8 us, 5 reads | 1.4 us, 1 read | 1.2 us, 1 read |
-| Path lookup in a 700-entry directory | 8.6 us, 8 reads | 1.3 us, 8 allocations | 0.9 us, 0 allocations |
-| 700-entry directory stream | 28 us, 16 reads | 15 us, 0.1 reads | 15 us, 0.1 reads |
-| 700-entry stream with each inode | 1,487 us, 1,416 reads | 203 us, 1,403 allocations | 137 us, 1 allocation |
-| 1 MiB sequential read | 162 us, 5.2 reads | 141 us, 1 read | 151 us, 1 read |
-| Mount, create one file, commit | 236 us, 61 reads | 150-220 us, 16 reads | 145-190 us, 16 reads |
+| Operation | Without cache | With cache |
+| --- | --- | --- |
+| 4 KiB random read of a 4 MiB file | 4.0 us, 5 reads | 1.0 us, 1 read |
+| Path lookup in a 700-entry directory | 6.5 us, 8 reads | 0.6 us, no reads or allocations |
+| 700-entry directory stream | 24 us, 16 reads | 12 us, 0.1 reads |
+| 700-entry stream with each inode | 1,100 us, 1,416 reads | 90 us, 1 allocation |
+| 1 MiB sequential read | 140-160 us, 5.2 reads | 140-165 us, 1 read |
+| Mount, create one file, commit | 90-110 us, 61 reads | 55 us, 5 reads |
+| Create and write an 8 MiB file, commit | 1.8 ms, 71 reads | 1.7 ms, 5 reads |
 
-Writes in this harness are dominated by host file I/O and vary by tens of
-percent between runs; compare them only within one run. A commit still writes
-and barriers per operation. Generated benchmark reports keep the exact figures
-and build identities.
+Against the first cached measurement (lookup 1.2 us, stat during enumeration
+203 us, a create commit 185 us), the gains came from cursors reading cached
+nodes in place, inlined key and integer decoding, a commit adding its published
+nodes to the cache, and a transaction reading its own nodes without checksumming
+them twice, and from reusing the primary superblock a transaction has just read
+instead of reading it again. The remaining reads are superblocks: the primary at
+mount, and at both begin and commit the primary and each secondary copy present
+on the device. The written images are byte-identical to those before these
+changes. Writes in
+this harness depend on host file I/O and vary between runs; compare them only
+within one run. A commit still writes and barriers per operation. Generated
+benchmark reports keep the exact figures and build identities.
 
 ## Matched benchmark protocol
 

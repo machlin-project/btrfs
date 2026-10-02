@@ -93,6 +93,10 @@ struct btrfs_fs {
 	/* Nodes of this generation and later are not committed in this view (a
 	 * transaction's private nodes) and never enter the shared node cache. */
 	uint64_t cache_limit;
+	/* A transaction's private view copies its own nodes by logical address,
+	 * with no device read or checksum; NOT_FOUND falls back to a read. */
+	enum btrfs_result (*private_read)(void *context, struct bt_root root, void *buffer);
+	void *private_context;
 };
 
 /* blocks[level] is the cursor's own buffer (owned[level]) or a node read in

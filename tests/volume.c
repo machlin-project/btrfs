@@ -11,7 +11,9 @@
  * as well as the default sanitizers. */
 #define _POSIX_C_SOURCE 200809L
 #include "../adapters/posix/image.h"
+#include "../core/disk.h"
 #include <btrfs/volume.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -381,6 +383,17 @@ harness_close(struct harness *harness)
 	free(harness->overlay.bytes);
 }
 
+/* Changes the overlay's primary superblock as another writer would. */
+static void
+flip_primary_label(struct harness *harness)
+{
+	uint64_t sector = BT_SUPER_OFFSET / SECTOR;
+	size_t slot = overlay_slot(&harness->overlay, sector);
+
+	REQUIRE(harness->overlay.sectors[slot] == sector);
+	harness->overlay.bytes[slot * SECTOR + offsetof(struct bt_disk_super, label)] ^= 1;
+}
+
 static void
 views_test(struct harness *harness)
 {
@@ -396,6 +409,8 @@ views_test(struct harness *harness)
 	pthread_t thread;
 	uint64_t generation;
 	uint64_t removed;
+	uint64_t reads;
+	uint64_t writes;
 
 	/* A read-only volume serves views and refuses writers. */
 	REQUIRE(btrfs_volume_open(environment, NULL, &harness->callbacks, BTRFS_TOP_LEVEL_TREE,
@@ -432,8 +447,12 @@ views_test(struct harness *harness)
 	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
 	REQUIRE(harness->overlay.flushes == 3);
 	REQUIRE(btrfs_volume_generation(volume) == generation + 1);
+	/* The published commit's nodes entered the node cache: reading what it
+	 * wrote takes no device read. */
+	reads = atomic_load(&harness->image.reads);
 	new_fs = btrfs_volume_pin(volume, &new_view);
 	REQUIRE(exists(new_fs, "/created") && !exists(new_fs, "/aborted"));
+	REQUIRE(atomic_load(&harness->image.reads) == reads);
 	REQUIRE(!exists(old_fs, "/created") && exists(old_fs, "/greeting"));
 	btrfs_volume_unpin(volume, new_view);
 
@@ -464,6 +483,26 @@ views_test(struct harness *harness)
 	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
 	REQUIRE(inode_number(volume, "/renumbered") == removed + 1);
 	generation = btrfs_volume_generation(volume);
+
+	/* A commit refused before it writes (the primary superblock changed
+	 * underneath it) leaves the volume usable, and its sealed nodes stay out
+	 * of the node cache: the next commit reuses the generation and the same
+	 * addresses with other contents. */
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_file(volume, transaction, "refused") == BTRFS_OK);
+	writes = harness->overlay.writes;
+	flip_primary_label(harness);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_STALE);
+	flip_primary_label(harness);
+	REQUIRE(harness->overlay.writes == writes && btrfs_volume_failure(volume) == BTRFS_OK &&
+	    btrfs_volume_generation(volume) == generation);
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_file(volume, transaction, "accepted") == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	generation = btrfs_volume_generation(volume);
+	new_fs = btrfs_volume_pin(volume, &new_view);
+	REQUIRE(exists(new_fs, "/accepted") && !exists(new_fs, "/refused"));
+	btrfs_volume_unpin(volume, new_view);
 
 	/* A failed commit that issued writes leaves the volume failed. */
 	old_fs = btrfs_volume_pin(volume, &old_view);

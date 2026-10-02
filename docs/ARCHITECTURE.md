@@ -124,11 +124,18 @@ lookup. Tree cursors read a stored node in place while they hold a pin on it,
 so a hit copies nothing; a pinned node is never replaced, and a set whose ways
 are all pinned stores nothing new until a pin is released. Open directory
 streams hold their pins, so every stream must be closed and every mount
-unmounted before the cache is destroyed. Nodes enter only from committed views: a transaction's private view
-excludes its own generation, and explicit recovery validates candidates without
-the cache, since a refused candidate's generation may be written again. The
-cache is valid only while the device changes through its owner's commits; it
-must be dropped when anything else changes the device.
+unmounted before the cache is destroyed.
+
+Nodes enter the cache from committed views, and a commit adds the nodes it
+wrote once its primary superblock is durable. A transaction's private view
+excludes its own generation; a refused or failed commit adds nothing, since the
+next commit may reuse that generation and those addresses; explicit recovery
+validates candidates without the cache, since a refused candidate's generation
+may be written again. Within a transaction, the private view copies its own
+nodes by logical address and checks their structure and identity; their
+checksums are computed once, when they are written. The cache is valid only
+while the device changes through its owner's commits; it must be dropped when
+anything else changes the device.
 
 Inline data is protected by its leaf checksum. Sparse holes, hole items and
 unwritten preallocation return zeroes; a hole item may carry the nonzero offset

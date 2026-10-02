@@ -152,6 +152,23 @@ bt_mut_read(void *context, uint64_t offset, void *buffer, size_t length)
 	return env->read(env->context, offset, buffer, length);
 }
 
+static enum btrfs_result
+bt_mut_private_read(void *context, struct bt_root root, void *buffer)
+{
+	struct bt_mutation *mutation = context;
+	struct bt_mutable_node *node = bt_mut_find_node(mutation, root.address);
+
+	if (node == NULL) {
+		return BTRFS_NOT_FOUND;
+	}
+	/* A freed private node is no longer reachable from this view. */
+	if (node->discarded) {
+		return BTRFS_CORRUPT;
+	}
+	bt_copy(buffer, node->bytes, mutation->view.info.node_size);
+	return BTRFS_OK;
+}
+
 static void *
 bt_mut_allocate(void *context, size_t size)
 {
@@ -845,6 +862,8 @@ bt_mutation_create(const struct btrfs_fs *base, const struct bt_mutation_allocat
 	mutation->view.env.read = bt_mut_read;
 	mutation->view.env.allocate = bt_mut_allocate;
 	mutation->view.env.release = bt_mut_release;
+	mutation->view.private_read = bt_mut_private_read;
+	mutation->view.private_context = mutation;
 	/* This view supports private metadata traversal; file codec context stays with its adapter.
 	 */
 	mutation->view.env.decompress = NULL;
@@ -1023,6 +1042,12 @@ bt_mutation_accept(struct bt_mutation *mutation)
 		if (mutation->nodes[i]->discarded) {
 			mutation->allocator.release(
 			    mutation->allocator.context, mutation->nodes[i]->address);
+		} else if (mutation->base->env.cache != NULL) {
+			/* Published and durable: the next view reads these bytes without
+			 * fetching and verifying them again. */
+			bt_cache_put(mutation->base->env.cache, bt_mut_root(mutation->nodes[i]),
+			    mutation->view.info.node_size, mutation->nodes[i]->bytes,
+			    bt_mut_root(mutation->nodes[i]).owner);
 		}
 	}
 	mutation->accepted = 1;

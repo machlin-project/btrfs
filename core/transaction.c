@@ -45,7 +45,7 @@ bt_tx_root(const struct btrfs_fs *fs, uint64_t owner, struct bt_owned_root *root
 static enum btrfs_result
 bt_tx_copies(struct btrfs_transaction *transaction)
 {
-	struct bt_disk_super *copy = (void *)transaction->scratch;
+	const struct bt_disk_super *copy;
 	uint64_t offset;
 	unsigned mirror;
 	enum btrfs_result error;
@@ -56,9 +56,16 @@ bt_tx_copies(struct btrfs_transaction *transaction)
 			continue;
 		}
 		offset = bt_super_offset(mirror);
-		error = bt_read_physical(transaction->base, offset, copy, BT_SUPER_SIZE);
-		if (error != BTRFS_OK) {
-			return error;
+		/* Callers have just read the primary into original_super or compared
+		 * it byte for byte with it. */
+		copy = &transaction->original_super;
+		if (mirror != 0) {
+			copy = (const void *)transaction->scratch;
+			error = bt_read_physical(
+			    transaction->base, offset, transaction->scratch, BT_SUPER_SIZE);
+			if (error != BTRFS_OK) {
+				return error;
+			}
 		}
 		if (bt_super_check(copy, offset) != BTRFS_OK ||
 		    !bt_super_same(copy, &transaction->original_super)) {
