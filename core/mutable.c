@@ -840,6 +840,7 @@ bt_mutation_create(const struct btrfs_fs *base, const struct bt_mutation_allocat
 	mutation->allocator = *allocator;
 	mutation->view = *base;
 	mutation->view.info.generation++;
+	mutation->view.cache_limit = mutation->view.info.generation;
 	mutation->view.env.context = mutation;
 	mutation->view.env.read = bt_mut_read;
 	mutation->view.env.allocate = bt_mut_allocate;

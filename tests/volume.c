@@ -311,7 +311,22 @@ struct harness {
 	struct btrfs_volume_locks callbacks;
 	struct overlay overlay;
 	struct locks locks;
+	/* One node cache for every view of the volume, as an adapter keeps. */
+	struct btrfs_cache *cache;
+	pthread_mutex_t cache_mutex;
 };
+
+static void
+cache_lock(void *context)
+{
+	REQUIRE(pthread_mutex_lock(context) == 0);
+}
+
+static void
+cache_unlock(void *context)
+{
+	REQUIRE(pthread_mutex_unlock(context) == 0);
+}
 
 static void
 harness_open(struct harness *harness, const char *path)
@@ -340,11 +355,24 @@ harness_open(struct harness *harness, const char *path)
 	pthread_cond_init(&harness->locks.condition, NULL);
 	harness->callbacks =
 	    (struct btrfs_volume_locks){ &harness->locks, lock, unlock, wait_on, wake };
+	pthread_mutex_init(&harness->cache_mutex, NULL);
+	/* Small enough that views evict each other's nodes. */
+	REQUIRE(btrfs_cache_create(&harness->environment,
+		    &(struct btrfs_cache_locks){ &harness->cache_mutex, cache_lock, cache_unlock },
+		    512 * 1024, &harness->cache) == BTRFS_OK);
+	harness->environment.cache = harness->cache;
 }
 
 static void
 harness_close(struct harness *harness)
 {
+	uint64_t hits;
+	uint64_t misses;
+
+	btrfs_cache_counts(harness->cache, &hits, &misses);
+	REQUIRE(hits != 0);
+	btrfs_cache_destroy(harness->cache);
+	pthread_mutex_destroy(&harness->cache_mutex);
 	REQUIRE(harness->image.live_allocations == 0);
 	btrfs_image_close(&harness->image);
 	pthread_rwlock_destroy(&harness->overlay.lock);

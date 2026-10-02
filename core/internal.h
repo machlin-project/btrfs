@@ -30,6 +30,9 @@ struct btrfs_fs {
 	uint64_t device_id, device_size;
 	struct bt_chunk *chunks;
 	size_t chunk_count;
+	/* Nodes of this generation and later are not committed in this view (a
+	 * transaction's private nodes) and never enter the shared node cache. */
+	uint64_t cache_limit;
 };
 
 struct bt_cursor {
@@ -46,6 +49,13 @@ struct bt_record {
 	const uint8_t *data;
 	size_t size;
 };
+
+/* The shared node cache (core/cache.c): get copies a stored node and its
+ * header owner into buffer; put stores a verified node. */
+int bt_cache_get(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, void *buffer,
+    uint64_t *owner);
+void bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
+    const void *node, uint64_t owner);
 
 uint16_t bt_u16(struct bt_le16 value);
 uint32_t bt_u32(struct bt_le32 value);

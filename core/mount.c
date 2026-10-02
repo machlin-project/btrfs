@@ -153,6 +153,7 @@ bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk
 	}
 	bt_zero(fs, sizeof(*fs));
 	fs->env = *environment;
+	fs->cache_limit = UINT64_MAX;
 	error = bt_super_decode(fs, super, offset);
 	if (error == BTRFS_OK) {
 		fs->chunks = environment->allocate(

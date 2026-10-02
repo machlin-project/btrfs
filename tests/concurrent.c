@@ -50,30 +50,62 @@ read_worker(void *argument)
 	return NULL;
 }
 
+static void
+cache_lock(void *context)
+{
+	assert(pthread_mutex_lock(context) == 0);
+}
+
+static void
+cache_unlock(void *context)
+{
+	assert(pthread_mutex_unlock(context) == 0);
+}
+
 int
 main(int argc, char **argv)
 {
 	struct btrfs_image image;
+	struct btrfs_cache_locks locks;
+	struct btrfs_cache *cache = NULL;
 	struct btrfs_fs *fs;
 	struct worker workers[8];
+	pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 	pthread_t threads[8];
+	uint64_t hits = 0;
+	uint64_t misses = 0;
 	size_t i;
+	int pass;
 
 	assert(argc == 2);
 	assert(btrfs_image_open(argv[1], &image) == 0);
-	assert(btrfs_mount(&image.environment, 5, &fs) == BTRFS_OK);
-	for (i = 0; i < 8; i++) {
-		workers[i].fs = fs;
-		workers[i].index = (unsigned)i;
-		assert(pthread_create(&threads[i], NULL, read_worker, &workers[i]) == 0);
+	locks = (struct btrfs_cache_locks){ &mutex, cache_lock, cache_unlock };
+	/* Without a node cache, then with one cache shared by all readers. */
+	for (pass = 0; pass < 2; pass++) {
+		if (pass == 1) {
+			/* Small enough that readers evict each other's nodes. */
+			assert(btrfs_cache_create(&image.environment, &locks, 256 * 1024, &cache) ==
+			    BTRFS_OK);
+		}
+		image.environment.cache = cache;
+		assert(btrfs_mount(&image.environment, 5, &fs) == BTRFS_OK);
+		for (i = 0; i < 8; i++) {
+			workers[i].fs = fs;
+			workers[i].index = (unsigned)i;
+			assert(pthread_create(&threads[i], NULL, read_worker, &workers[i]) == 0);
+		}
+		for (i = 0; i < 8; i++) {
+			assert(pthread_join(threads[i], NULL) == 0);
+		}
+		btrfs_unmount(fs);
 	}
-	for (i = 0; i < 8; i++) {
-		assert(pthread_join(threads[i], NULL) == 0);
-	}
-	btrfs_unmount(fs);
+	btrfs_cache_counts(cache, &hits, &misses);
+	assert(hits != 0 && misses != 0);
+	btrfs_cache_destroy(cache);
 	assert(image.live_allocations == 0 && image.live_bytes == 0);
 	btrfs_image_close(&image);
-	puts("8 concurrent readers and directory streams, shared immutable mount, balanced "
-	     "allocations: PASS");
+	printf("8 concurrent readers and directory streams, shared immutable mount, balanced "
+	       "allocations, also through a shared node cache (%llu hits, %llu misses): PASS\n",
+	    (unsigned long long)hits, (unsigned long long)misses);
 	return 0;
 }

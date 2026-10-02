@@ -155,10 +155,14 @@ recover(const char *path, int argc, char **argv)
 	return error == BTRFS_OK ? 0 : error == BTRFS_RECOVERY_REQUIRED ? 3 : 1;
 }
 
+/* Node cache for one command; the image does not change while it runs. */
+#define INSPECT_CACHE_BYTES (16U * 1024U * 1024U)
+
 int
 main(int argc, char **argv)
 {
 	struct btrfs_image image;
+	struct btrfs_cache *cache = NULL;
 	struct btrfs_fs *fs = NULL;
 	enum btrfs_result error;
 	uint64_t tree = 0;
@@ -182,11 +186,16 @@ main(int argc, char **argv)
 		perror("open image");
 		return 1;
 	}
-	error = btrfs_mount(&image.environment, tree, &fs);
+	error = btrfs_cache_create(&image.environment, NULL, INSPECT_CACHE_BYTES, &cache);
+	image.environment.cache = cache;
+	if (error == BTRFS_OK) {
+		error = btrfs_mount(&image.environment, tree, &fs);
+	}
 	if (error == BTRFS_OK) {
 		error = inspect(fs, argc - argument - 1, argv + argument + 1);
 	}
 	btrfs_unmount(fs);
+	btrfs_cache_destroy(cache);
 	if (getenv("BTRFS_IO_STATS") != NULL) {
 		fprintf(stderr,
 		    "reads=%" PRIu64 " bytes=%" PRIu64 " allocations=%" PRIu64 " live=%" PRIu64

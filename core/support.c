@@ -26,15 +26,14 @@ bt_u64(struct bt_le64 value)
 	return result;
 }
 
+/* A freestanding C implementation still provides memcpy, memmove, memset and
+ * memcmp (and so does the kernel); the builtins let the compiler inline small
+ * fixed sizes and call the platform's tuned routines otherwise. */
 void
 bt_copy(void *destination, const void *source, size_t length)
 {
-	uint8_t *out = destination;
-	const uint8_t *in = source;
-	size_t i;
-
-	for (i = 0; i < length; i++) {
-		out[i] = in[i];
+	if (length != 0) {
+		__builtin_memcpy(destination, source, length);
 	}
 }
 
@@ -42,43 +41,23 @@ bt_copy(void *destination, const void *source, size_t length)
 void
 bt_move(void *destination, const void *source, size_t length)
 {
-	uint8_t *out = destination;
-	const uint8_t *in = source;
-	size_t i;
-
-	if (out <= in) {
-		bt_copy(destination, source, length);
-		return;
-	}
-	for (i = length; i != 0; i--) {
-		out[i - 1] = in[i - 1];
+	if (length != 0) {
+		__builtin_memmove(destination, source, length);
 	}
 }
 
 void
 bt_zero(void *buffer, size_t length)
 {
-	uint8_t *out = buffer;
-	size_t i;
-
-	for (i = 0; i < length; i++) {
-		out[i] = 0;
+	if (length != 0) {
+		__builtin_memset(buffer, 0, length);
 	}
 }
 
 int
 bt_equal(const void *a, const void *b, size_t length)
 {
-	const uint8_t *left = a;
-	const uint8_t *right = b;
-	size_t i;
-
-	for (i = 0; i < length; i++) {
-		if (left[i] != right[i]) {
-			return 0;
-		}
-	}
-	return 1;
+	return length == 0 || __builtin_memcmp(a, b, length) == 0;
 }
 
 #if !defined(__clang__) || !defined(__aarch64__) || !defined(__ARM_FEATURE_CRC32)

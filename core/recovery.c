@@ -10,6 +10,7 @@ static enum btrfs_result
 bt_recovery_validate(
     const struct btrfs_environment *environment, const struct bt_disk_super *super, uint64_t offset)
 {
+	struct btrfs_environment uncached = *environment;
 	struct btrfs_fs *fs;
 	struct bt_space *space = NULL;
 	struct bt_root devices = { 0 };
@@ -17,7 +18,9 @@ bt_recovery_validate(
 	uint8_t *node;
 	enum btrfs_result error;
 
-	error = bt_mount_super(environment, super, offset, BTRFS_TOP_LEVEL_TREE, &fs);
+	/* A candidate may still be refused; its nodes never enter the cache. */
+	uncached.cache = NULL;
+	error = bt_mount_super(&uncached, super, offset, BTRFS_TOP_LEVEL_TREE, &fs);
 	if (error != BTRFS_OK) {
 		return error;
 	}

@@ -164,12 +164,14 @@ replacements update one payload/pointer without repacking the whole node; repeat
 edits reuse dirty paths. The allocator starts with 256 gap records and grows within
 an explicit bound. Keep allocation and I/O counts visible in tests.
 
-Follow PERFORMANCE.md for matched Linux comparisons. Remaining likely costs are
-repeated subvolume-root resolution, per-call cursors, attribute-rich enumeration,
-metadata caching and three barriers per operation, which
+Follow PERFORMANCE.md for matched Linux comparisons; `btrfs-bench` measures
+per-operation costs portably. A bounded, generation-aware node cache exists in
+the core; the native adapters still have to create one per mounted device (with
+their own lock) and drop it when anything but their commits changes the device.
+Remaining likely costs are repeated subvolume-root resolution, per-call cursor
+buffers, attribute-rich enumeration and three barriers per operation, which
 [group commit](GROUP_COMMIT.md) designs away; a mounted volume already keeps its
-allocation state across transactions. Optimize after measurement. Add a bounded,
-generation-aware cache with documented lifetime rules if it pays for itself.
+allocation state across transactions. Optimize after measurement.
 Do not claim a speed win from a userspace image reader versus a mounted guest.
 
 At delivery, report portable contracts, actual loaded native mounts, FSKit,

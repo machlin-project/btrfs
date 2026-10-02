@@ -114,6 +114,18 @@ visible to its caller. An I/O failure or checksum mismatch may retry a DUP copy
 with the same logical identity; no repair is written. A successful prefix before
 a later failure is reported explicitly; bytes beyond `completed` are invalid.
 
+An owner may give its mounts one bounded cache of verified tree nodes
+(`btrfs_cache`, in the environment), shared across threads through its own lock
+callbacks. Address, generation and level name one immutable node: a block is
+rewritten only after it is freed, and a reused address carries a newer
+generation, so a hit returns the node without device I/O or checksum, after
+the caller's owner check. Eight-way sets with CLOCK replacement bound each
+lookup. Nodes enter only from committed views: a transaction's private view
+excludes its own generation, and explicit recovery validates candidates without
+the cache, since a refused candidate's generation may be written again. The
+cache is valid only while the device changes through its owner's commits; it
+must be dropped when anything else changes the device.
+
 Inline data is protected by its leaf checksum. Sparse holes, hole items and
 unwritten preallocation return zeroes; a hole item may carry the nonzero offset
 Linux leaves when it splits or trims one. Shared regular extents honor the recorded extent

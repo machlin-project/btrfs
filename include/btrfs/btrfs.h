@@ -77,6 +77,8 @@ struct btrfs_directory;
  * length bytes or fails. Callbacks must support concurrent independent reads.
  * The caller drains operations before unmount and retains context until then.
  * No callback in this interface can authorize a write. */
+struct btrfs_cache;
+
 struct btrfs_environment {
 	void *context;
 	uint64_t size_bytes;
@@ -88,7 +90,31 @@ struct btrfs_environment {
 	 * The core checks stored data before invoking the codec. */
 	enum btrfs_result (*decompress)(void *context, enum btrfs_compression codec,
 	    const void *input, size_t input_size, void *output, size_t output_size);
+	/* Optional verified tree-node cache shared by the owner's mounts of this
+	 * device (btrfs_cache_create). */
+	struct btrfs_cache *cache;
 };
+
+/* Mutual exclusion for a cache shared by threads; NULL callbacks mean one
+ * thread at a time uses it. */
+struct btrfs_cache_locks {
+	void *context;
+	void (*lock)(void *context);
+	void (*unlock)(void *context);
+};
+
+/* A bounded cache of tree nodes that passed verification, keyed by address,
+ * generation and level, which together name one immutable node: a block is
+ * rewritten only after it is freed, and a reused address carries a newer
+ * generation. A hit skips the device read and the checksum; the caller's
+ * owner and level expectations are still checked. The cache serves one device
+ * that changes only through its owner's commits, so it must be destroyed when
+ * the device is changed otherwise (another writer, recovery to an older
+ * generation, a rewound test device). bytes bounds the node storage. */
+enum btrfs_result btrfs_cache_create(const struct btrfs_environment *environment,
+    const struct btrfs_cache_locks *locks, size_t bytes, struct btrfs_cache **result);
+void btrfs_cache_destroy(struct btrfs_cache *cache);
+void btrfs_cache_counts(const struct btrfs_cache *cache, uint64_t *hits, uint64_t *misses);
 
 struct btrfs_object_id {
 	uint64_t tree;

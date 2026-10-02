@@ -11,7 +11,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c',
-  'core/group.c')
+  'core/group.c', 'core/cache.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -30,6 +30,8 @@ codec_flags = zstd.found() ? ['-DBTRFS_HAVE_ZSTD=1'] : []
 posix = static_library('btrfs_posix', 'adapters/posix/image.c',
   include_directories: inc, dependencies: [zlib, zstd], c_args: codec_flags)
 inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
+executable('btrfs-bench', 'tools/bench.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',

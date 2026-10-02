@@ -77,17 +77,32 @@ bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *
 	return BTRFS_OK;
 }
 
+/* Snapshot blocks can retain the originating subvolume's owner. */
+static int
+bt_owner_matches(struct bt_root root, uint64_t owner)
+{
+	return bt_file_tree(root.owner) ? bt_file_tree(owner) : owner == root.owner;
+}
+
 enum btrfs_result
 bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
 {
+	const struct bt_disk_header *header = buffer;
+	struct btrfs_cache *cache = root.generation < fs->cache_limit ? fs->env.cache : NULL;
 	enum btrfs_result error = BTRFS_CORRUPT;
 	uint64_t physical;
+	uint64_t owner = 0;
 	unsigned mirrors = 1;
 	unsigned mirror;
 
 	if (root.level >= BT_MAX_LEVEL || root.address == 0 ||
 	    root.address % fs->info.sector_size != 0) {
 		return BTRFS_CORRUPT;
+	}
+	/* A stored node passed every check that depends only on its bytes. */
+	if (cache != NULL && root.generation != 0 && root.generation <= fs->info.generation &&
+	    bt_cache_get(cache, root, fs->info.node_size, buffer, &owner)) {
+		return bt_owner_matches(root, owner) ? BTRFS_OK : BTRFS_CORRUPT;
 	}
 	for (mirror = 0; mirror < mirrors; mirror++) {
 		error = bt_map(fs, root.address, fs->info.node_size,
@@ -99,6 +114,10 @@ bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
 		error = bt_read_physical(fs, physical, buffer, fs->info.node_size);
 		if (error == BTRFS_OK) {
 			error = bt_validate_node(fs, root, buffer);
+		}
+		if (error == BTRFS_OK && cache != NULL) {
+			bt_cache_put(
+			    cache, root, fs->info.node_size, buffer, bt_u64(header->owner));
 		}
 		if (error == BTRFS_OK || (error != BTRFS_CORRUPT && error != BTRFS_IO)) {
 			return error;

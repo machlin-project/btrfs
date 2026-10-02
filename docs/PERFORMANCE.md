@@ -29,9 +29,10 @@ operations re-resolve their root; enumeration with attributes fetches each inode
 each convenience read creates a new operation context. The XNU adapter now
 coalesces aligned device requests through private I/O buffers, with one-block
 bounce storage only at unaligned edges.
-Do not conceal these costs behind hot-cache numbers. Bounded generation-aware
-metadata caching, reusable read sessions and native
-I/O instrumentation are explicit follow-up work.
+Do not conceal these costs behind hot-cache numbers. A bounded,
+generation-aware node cache exists (see ARCHITECTURE.md); reusable read sessions
+and native I/O instrumentation are explicit follow-up work, as is enabling the
+cache in the native adapters.
 
 The private editor reuses its dirty paths; repeated fixed-size replacement in an
 already modified path allocates nothing. It updates payloads and child pointers
@@ -40,8 +41,7 @@ grows only when needed. A volume keeps its allocation state across transactions:
 only the admission transaction loads the extent tree and verifies the free-space
 and device trees, and later begins copy the kept state (on the small Linux
 fixtures a full load costs 18 to 39 reads and 72 to 588 KiB, which grows with
-the extent tree). Metadata caching needs measurements before native writable
-throughput can be competitive. Each commit still pays three barriers; grouping
+the extent tree). Verified tree nodes can be cached across operations (below). Each commit still pays three barriers; grouping
 operations into one commit is designed in [group commit](GROUP_COMMIT.md). Each backreference edit copies its
 extent item into a fresh node-sized buffer and probes for keyed items with a new
 cursor, so a shared-subvolume commit costs several hundred allocations; the test
@@ -50,6 +50,27 @@ as its extents are created, from rewrite pieces of at most 8 MiB; unaligned
 edges are read back through the private view. Compression costs one codec call
 per 128 KiB. Buffer reuse and extent-item caching are unmeasured follow-up
 work.
+
+## Measured implementation costs
+
+`btrfs-bench` (see DEVELOPMENT.md) measures this implementation on an image file
+through the host page cache: CPU and backend-call costs per operation, not a
+mounted filesystem and not a comparison with Linux. On `transactions` (4 KiB
+nodes) in a release build, the shared node cache (64 MiB) changed:
+
+| Operation | Without cache | With cache |
+| --- | --- | --- |
+| 4 KiB random read of a 4 MiB file | 4.8 us, 5 reads | 1.4 us, 1 read |
+| Path lookup in a 700-entry directory | 8.6 us, 8 reads | 1.2 us, 0 reads |
+| 700-entry directory stream | 28 us, 16 reads | 15 us, 0.1 reads |
+| 700-entry stream with each inode | 1,487 us, 1,416 reads | 203 us, 0 reads |
+| 1 MiB sequential read | 162 us, 5.2 reads | 141 us, 1 read |
+| Mount, create one file, commit | 236 us, 61 reads | 185 us, 16 reads |
+
+Remaining per-operation costs visible there: each lookup allocates a node buffer
+per tree level (8 allocations per lookup, 2 per inode attribute), and a commit
+still writes and barriers per operation. Generated benchmark reports keep the
+exact figures and build identities.
 
 ## Matched benchmark protocol
 

@@ -37,6 +37,19 @@ RECOVERY_REQUIRED; `tests/check_recovery.py` exercises it on a copy):
 .build/btrfs-inspect IMAGE recover --apply --acknowledged GENERATION
 ```
 
+`btrfs-bench IMAGE [--cache MiB] [--write]` measures per-operation wall time,
+backend reads, read bytes and allocations for sequential and random reads,
+lookups, directory streams with and without inode attributes, and (on a copy,
+which it modifies) single-file commits and an 8 MiB write. Build it without
+sanitizers for meaningful times:
+
+```sh
+meson setup .build-release --buildtype=release -Db_sanitize=none
+meson compile -C .build-release btrfs-bench
+cp artifacts/fixtures/transactions.raw /tmp/bench.raw
+.build-release/btrfs-bench /tmp/bench.raw --cache 64 --write
+```
+
 Useful inspection commands:
 
 ```sh
