@@ -7,8 +7,9 @@ belongs to LXNU in the XNU fork, not to this repository.
 Both native adapters mount read-only by default and read-write on request, on a
 portable CoW transaction writer: the XNU mount (`mount_machlin_btrfs -w`) and
 the FSKit extension, behind a privileged device barrier, pass the mounted read
-and write suites, and Linux verifies the images they write. Native power-cut
-durability and FSKit set-id metadata are not accepted.
+and write suites, and Linux verifies the images they write. The XNU mount keeps
+every acknowledged fsync through power cuts of its guest; FSKit power cuts and
+FSKit set-id metadata are not accepted.
 It reads single-device CRC32C filesystems with SINGLE/DUP chunks, 4–64 KiB nodes,
 inodes, byte-exact names, directories, hard links, symlinks, inline and regular
 extents, sparse and preallocated data, raw xattrs, subvolumes and snapshots.

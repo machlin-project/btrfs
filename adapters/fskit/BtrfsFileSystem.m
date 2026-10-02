@@ -5,10 +5,10 @@
 #include <btrfs/identity.h>
 #include <btrfs/native.h>
 #include <btrfs/volume.h>
+#include <btrfs/write.h>
 #include <zlib.h>
 
 #include <errno.h>
-#include <os/log.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +40,30 @@ btrfs_fskit_flags(uint64_t flags)
 		result |= UF_NODUMP;
 	}
 	return result;
+}
+
+/* Superblock copies left disagreeing by an interrupted publication make a
+ * writable open fail (RECOVERY_REQUIRED): a commit from the primary could reuse
+ * blocks a newer copy references. A writable volume resolves them by explicit
+ * recovery to the newest complete root set, never older than an acknowledged
+ * commit, and opens again. A read-only volume (writer NULL) never writes. */
+static enum btrfs_result
+btrfs_fskit_open_volume(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_volume_locks *locks,
+    struct btrfs_volume **volume)
+{
+	struct btrfs_recovery_report report;
+	enum btrfs_result result;
+
+	result = btrfs_volume_open(environment, writer, locks, 0, volume);
+	if (result != BTRFS_RECOVERY_REQUIRED || writer == NULL) {
+		return result;
+	}
+	result = btrfs_recover_supers(environment, writer, 0, &report);
+	NSLog(@"machlinbtrfs: superblock recovery selected generation %llu, rewrote %u copies: %s",
+	    (unsigned long long)report.generation, report.rewritten, btrfs_result_string(result));
+	return result == BTRFS_OK ? btrfs_volume_open(environment, writer, locks, 0, volume)
+				  : result;
 }
 
 NSError *
@@ -520,7 +544,7 @@ btrfs_timespec(struct btrfs_time time)
 		writer.compression = BTRFS_COMPRESSION_NONE;
 	}
 	*result =
-	    btrfs_volume_open(&environment, device == nil ? NULL : &writer, &locks, 0, &volume);
+	    btrfs_fskit_open_volume(&environment, device == nil ? NULL : &writer, &locks, &volume);
 	if (*result != BTRFS_OK) {
 		btrfs_fskit_locks_destroy(owned);
 		return nil;
@@ -1641,9 +1665,7 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 	}
 	barrier = [self barrierForDevice:device error:&error];
 	if (barrier == nil) {
-		os_log(OS_LOG_DEFAULT,
-		    "machlinbtrfs: %{public}@ stays read-only without the device barrier: "
-		    "%{public}@",
+		NSLog(@"machlinbtrfs: %@ stays read-only without the device barrier: %@",
 		    device.BSDName, error.localizedDescription);
 	}
 	return barrier;

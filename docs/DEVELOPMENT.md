@@ -611,3 +611,36 @@ with the manifest's line count and
 `BTRFS_NATIVE_PASS`: `btrfs check --readonly`, every manifest fact (SHA-256,
 mode, owner, links, listings, symlink, xattr, mtime, absent names), then a Linux
 read-write mount, write, `btrfs check` again and no orphan item left.
+
+### Native power cuts
+
+`tests/power_cut_macos.py` cuts the power of the same prepared guest while the
+loaded module writes. It keeps the authoritative image on the host, selects the
+Btrfs slot with a short menu timeout (restoring the menu afterwards) and, per
+iteration, mounts a new guest copy read-write (grouped and `-s` alternate),
+verifies every file acknowledged so far, runs `btrfs-power-cut write`, kills the
+virtual machine process after a random delay, boots it again and copies the
+crash image back. The workload prints a manifest line only after a file and its
+directory were synced, and churns unsynchronized renames, unlinks and open
+unlinked files around them. `btrfs-inspect IMAGE recover` (no writes) records
+whether a cut left disagreeing superblock copies; the next read-write mount must
+recover them itself. From the absolute lab directory, with the module loaded:
+
+```sh
+python3 ../btrfs/tests/power_cut_macos.py \
+  --lab "$PWD" --vm lxnu-btrfs-kext-lab \
+  --products "$PWD/artifacts/btrfs-kext" --share btrfs-kext \
+  --guest-directory /var/tmp/machlin-btrfs-powercut \
+  --image "$PWD/../btrfs/artifacts/fixtures/transactions-convert.raw" \
+  --workload "$PWD/../btrfs/.build/btrfs-power-cut" \
+  --mount-helper "$PWD/../btrfs/artifacts/kext/arm64e/mount_machlin_btrfs" \
+  --inspect "$PWD/../btrfs/.build/btrfs-inspect" \
+  --kernel-uuid "$btrfs_test_kernel_uuid" --module-uuid "$btrfs_test_module_uuid" \
+  --iterations 8 --seed 2 --linux \
+  --output "$PWD/artifacts/btrfs-kext/powercut-new-run"
+```
+
+`--linux` checks every crash image with the reference kernel: `btrfs check`,
+every fact acknowledged before that cut and a Linux read-write continuation.
+Require `PASS power cut` and a passing Linux check for every cut. Each cut
+reboots the guest, so allow about two minutes per iteration.

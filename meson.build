@@ -65,6 +65,7 @@ executable('btrfs-mounted-test', 'tests/mounted.c', dependencies: dependency('th
 if host_machine.system() == 'darwin'
   executable('btrfs-mounted-write-test', 'tests/mounted_write.c',
     dependencies: dependency('threads'), override_options: ['b_sanitize=none'])
+  executable('btrfs-power-cut', 'tests/power_cut.c', override_options: ['b_sanitize=none'])
 endif
 logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,

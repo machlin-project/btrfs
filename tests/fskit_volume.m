@@ -12,10 +12,14 @@
  * through the barrier, which the core, the namespace audit and the reference
  * audit then confirm; a failed barrier fails synchronization and every later
  * change. Admission: a load binds no barrier for --rdonly or a read-only
- * device, and a process without a signing team never connects to one. */
+ * device, and a process without a signing team never connects to one.
+ * Recovery: after a cut between the secondary and primary superblock writes,
+ * a read-only volume reads the primary and writes nothing, and a writable one
+ * recovers to the newer root set before it opens. */
 #import "../adapters/fskit/BtrfsDeviceBarrier.h"
 #import "../adapters/fskit/BtrfsFileSystemInternal.h"
 #include "../adapters/posix/image.h"
+#include <btrfs/write.h>
 #include "namespace_audit.h"
 #include "references.h"
 #include <copyfile.h>
@@ -49,6 +53,8 @@
 #define FILE_BYTES (300U * 1024U + 123U)
 #define WRITE_PIECE (64U * 1024U + 7U)
 #define TRUNCATED_BYTES (200U * 1024U + 1U)
+/* One Btrfs superblock (BTRFS_SUPER_INFO_SIZE); recovery reports their offsets. */
+#define SUPERBLOCK_BYTES 4096U
 /* Every standard attribute FSKit may want; it faults on a reply missing one. */
 #define STANDARD_ATTRIBUTES                                                                        \
 	(FSItemAttributeType | FSItemAttributeMode | FSItemAttributeLinkCount |                    \
@@ -1024,6 +1030,60 @@ admission_test(const char *fixture)
 	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
 }
 
+/* The state a cut leaves between the secondary and primary superblock writes:
+ * the primary one generation behind its secondary. */
+static void
+recovery_test(const char *fixture)
+{
+	NSString *path = scratch_copy(fixture);
+	TestFlusher *flusher = [TestFlusher new];
+	ImageReader *reader = [[ImageReader alloc] initWithPath:path.fileSystemRepresentation
+						       writable:YES];
+	BtrfsVolume *volume;
+	struct btrfs_image image;
+	struct btrfs_recovery_report report;
+	uint8_t primary[SUPERBLOCK_BYTES];
+	uint64_t offset;
+	unsigned i;
+	int descriptor;
+	NSError *error = nil;
+
+	REQUIRE(btrfs_image_open(path.fileSystemRepresentation, &image) == 0);
+	REQUIRE(btrfs_recover_supers(&image.environment, NULL, 0, &report) == BTRFS_OK);
+	btrfs_image_close(&image);
+	offset = report.copies[0].offset;
+	descriptor = open(path.fileSystemRepresentation, O_RDWR);
+	REQUIRE(descriptor >= 0 &&
+	    pread(descriptor, primary, sizeof(primary), (off_t)offset) == sizeof(primary));
+	volume = open_volume(reader, flusher);
+	REQUIRE(
+	    create(volume, root_item(volume), "after-cut", FSItemTypeFile, 0644, &error) != nil);
+	REQUIRE(synchronize(volume) == nil && [volume shutdown] == BTRFS_OK);
+	volume = nil;
+	REQUIRE(pwrite(descriptor, primary, sizeof(primary), (off_t)offset) == sizeof(primary) &&
+	    close(descriptor) == 0);
+	reader.writes = 0;
+	/* Read-only: the primary's root set, and no byte written. */
+	volume = open_volume(reader, nil);
+	REQUIRE(lookup(volume, root_item(volume), bytes_of("after-cut"), &error) == nil &&
+	    reader.writes == 0);
+	volume = nil;
+	/* Writable: recovery selects the newer root set and rewrites the primary. */
+	volume = open_volume(reader, flusher);
+	REQUIRE(lookup(volume, root_item(volume), bytes_of("after-cut"), NULL) != nil &&
+	    reader.writes != 0);
+	REQUIRE([volume shutdown] == BTRFS_OK);
+	volume = nil;
+	REQUIRE(btrfs_image_open(path.fileSystemRepresentation, &image) == 0);
+	REQUIRE(btrfs_recover_supers(&image.environment, NULL, 0, &report) == BTRFS_OK);
+	for (i = 0; i < BTRFS_SUPER_COPIES; i++) {
+		REQUIRE(report.copies[i].status != BTRFS_OK || report.copies[i].current);
+	}
+	btrfs_image_close(&image);
+	reader = nil;
+	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1051,6 +1111,7 @@ main(int argc, char **argv)
 		write_tests(argv[2]);
 		barrier_failure_test(argv[2]);
 		admission_test(argv[2]);
+		recovery_test(argv[2]);
 		printf(
 		    "FSKit volume: reads equal the core's (direct, bounced, partial), dot entries "
 		    "only without attributes across pages, read-only refusals, revocation, "
@@ -1058,7 +1119,7 @@ main(int argc, char **argv)
 		    "truncation, attributes, xattrs, links, renames, removal and eviction "
 		    "durable through the barrier and audited, barrier failure fails the "
 		    "volume, no barrier for --rdonly, read-only devices or an unsigned "
-		    "process PASS\n");
+		    "process, recovery only for a writable volume PASS\n");
 	}
 	return 0;
 }

@@ -61,8 +61,9 @@ enum btrfs_result btrfs_recover_supers(const struct btrfs_environment *environme
  * tree, quotas or mixed groups. At least two superblock copies must exist and
  * agree with the mounted primary; otherwise begin returns RECOVERY_REQUIRED.
  * Changes are confined to unshared top-level tree paths. Unsupported layouts
- * return before any media write. Native adapters remain read-only until their
- * visibility and page-cache contracts are wired.
+ * return before any media write. Native adapters open read-write only on
+ * request, and run btrfs_recover_supers first when admission returns
+ * RECOVERY_REQUIRED.
  *
  * Commit writes new metadata, barrier, secondary superblocks, barrier, primary,
  * barrier. Every crash point therefore retains a valid copy at the last

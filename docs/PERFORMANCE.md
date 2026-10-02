@@ -198,14 +198,12 @@ general read-path improvement. Read I/O and allocation counts are unchanged.
 CRC32C already uses general-register hardware
 instructions and parallel lanes. Kernel builds use `-mgeneral-regs-only` on
 arm64e, with a compile guard and zero SIMD/FP operands in the emitted core and
-adapter objects; `-mkernel` alone permits compiler-generated NEON copies.
-The first checkpoint passed full portable acceptance and thirteen independent
-Linux oracle profiles. Subsequent changes passed focused ASan/UBSan checks;
-the full suite and Linux oracle were not repeated for them. See ACCEPTANCE.md
-for the final concurrency and native-compilation evidence boundary.
-Raw trials, sampling profiles, binary identities and acceptance logs live under
-the ignored
-`logs/perf-commit-20261002/` and `artifacts/perf-commit-20261002/` directories.
+adapter objects; `-mkernel` alone permits compiler-generated NEON copies (x86_64
+kernel builds already avoid implicit SIMD). The final changes pass the full
+portable suite, the Linux oracle on all nineteen profiles and the native mounted
+suites (ACCEPTANCE.md). Raw trials, sampling profiles and binary identities
+live under the ignored `logs/perf-commit-20261002/` and
+`artifacts/perf-commit-20261002/` directories.
 These results do not establish a 2–4 times faster full commit or a win over
 Linux. Tree-log fsync and avoiding mounted-volume superblock rereads are
 separate changes with separate durability contracts.

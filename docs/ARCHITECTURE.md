@@ -708,8 +708,9 @@ synchronize that device's cache (`DKIOCSYNCHRONIZECACHE`); no data, descriptors
 or other ioctls cross the interface. A request without a reply within ten
 seconds fails its barrier. A writable resource loaded without `--rdonly` binds
 the barrier first; when the service is missing or refuses, the volume loads
-read-only and logs why. A filesystem the writer cannot admit fails a writable
-load, as a read-write mount does on Linux. Each write callback is one operation, applied completely or refused
+read-only and logs why. Superblock copies left disagreeing by a cut are
+recovered before a writable load, as for the XNU mount; any other filesystem the
+writer cannot admit fails a writable load, as a read-write mount does on Linux. Each write callback is one operation, applied completely or refused
 before its first change. The 26.x callbacks carry no caller credentials, so data
 writes, truncation and owner changes drop set-id bits and the file capability,
 as a writer without CAP_FSETID does; the extension's identity is never taken
@@ -774,10 +775,16 @@ saw committed.
 
 The owner must hold exclusive resource access and keep older readers' blocks
 pinned until those views retire. The native volume enforces this lifetime and
-makes an uncertain publication terminal. Recovery still needs the generation of
-the last acknowledged commit. Both adapters support explicit writable mounts
-and flush callbacks, but do not invoke superblock recovery or tree-log replay;
-native power-cut acceptance and FSKit dirty-page coherence remain open. Backup
+makes an uncertain publication terminal. A read-write mount whose superblock
+copies disagree, as a cut between their writes leaves them, runs this recovery
+before it opens, without an acknowledged generation: the newest checksum-valid
+copy names a complete tree, since the first barrier precedes every copy, and
+every acknowledged commit wrote all copies, so the selection is never older than
+one. Opening from the primary instead could reuse blocks a newer copy references.
+A read-only mount reads the primary and writes nothing. Neither adapter replays
+a tree log; the reader refuses filesystems that have one. The XNU adapter passes
+native power-cut acceptance; FSKit power cuts and dirty-page coherence remain
+open. Backup
 roots are rotating recovery hints, not permanently pinned snapshots. See
 ACCEPTANCE.md for the exact crash oracle scope and HANDOFF.md for the remaining
 writable-mount requirements.

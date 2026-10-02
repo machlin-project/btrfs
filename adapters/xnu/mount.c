@@ -321,6 +321,32 @@ btrfs_xnu_cache_unlock(void *context)
 	lck_mtx_unlock(((struct btrfs_xnu_mount *)context)->cache_lock);
 }
 
+/* Superblock copies left disagreeing by an interrupted publication make a
+ * writable open fail (RECOVERY_REQUIRED): a commit from the primary could reuse
+ * blocks a newer copy references. A read-write mount, which asked to write,
+ * resolves them by explicit recovery to the newest complete root set, which is
+ * never older than an acknowledged commit, and opens again. A read-only mount
+ * (writer NULL) never writes. */
+static enum btrfs_result
+btrfs_xnu_open_volume(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_volume_locks *locks,
+    struct btrfs_volume **volume)
+{
+	struct btrfs_recovery_report report;
+	enum btrfs_result result;
+
+	result = btrfs_volume_open(environment, writer, locks, 0, volume);
+	if (result != BTRFS_RECOVERY_REQUIRED || writer == NULL) {
+		return result;
+	}
+	result = btrfs_recover_supers(environment, writer, 0, &report);
+	printf("machlin_btrfs: superblock recovery selected generation %llu, rewrote %u "
+	       "copies: %s\n",
+	    (unsigned long long)report.generation, report.rewritten, btrfs_result_string(result));
+	return result == BTRFS_OK ? btrfs_volume_open(environment, writer, locks, 0, volume)
+				  : result;
+}
+
 int
 btrfs_xnu_commit(struct btrfs_xnu_mount *mount, uint64_t generation)
 {
@@ -528,10 +554,8 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	locks.unlock = btrfs_xnu_volume_unlock;
 	locks.wait = btrfs_xnu_volume_wait;
 	locks.wake = btrfs_xnu_volume_wake;
-	/* A read-write mount never recovers implicitly: superblock copies that
-	 * need recovery make admission fail (RECOVERY_REQUIRED). */
-	error = btrfs_xnu_error(
-	    btrfs_volume_open(&environment, read_only ? NULL : &writer, &locks, 0, &mount->volume));
+	error = btrfs_xnu_error(btrfs_xnu_open_volume(
+	    &environment, read_only ? NULL : &writer, &locks, &mount->volume));
 	if (error != 0) {
 		btrfs_xnu_free_mount(mount);
 		return error;
