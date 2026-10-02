@@ -667,6 +667,71 @@ compression_test(struct harness *harness)
 	printf("compressed volume writes: stored in a fraction of their size, read back PASS\n");
 }
 
+/* Decompressed extents the cache keeps follow the device: after an extent is
+ * freed and its space written by a newer generation, and after a refused
+ * transaction, whose generation and space the next one uses again; the
+ * running transaction's own extents never enter the cache. */
+static void
+compressed_test(struct harness *harness)
+{
+	struct btrfs_volume *volume;
+	struct btrfs_transaction *transaction;
+	struct btrfs_cache_counts before;
+	struct btrfs_cache_counts after;
+	const struct btrfs_fs *reader;
+	struct btrfs_object_id root;
+	struct btrfs_time time = { 1800000000, 0 };
+
+	harness->device.compress = btrfs_image_compress;
+	harness->device.compression = BTRFS_COMPRESSION_ZLIB;
+	REQUIRE(btrfs_volume_open(&harness->environment, &harness->device, &harness->callbacks,
+		    BTRFS_TOP_LEVEL_TREE, &volume) == BTRFS_OK);
+	root = root_id(volume);
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_compressed(transaction, root, "compressed-a", 1) == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	btrfs_cache_counts(harness->cache, &before);
+	require_committed_compressed(volume, "/compressed-a", 1);
+	btrfs_cache_counts(harness->cache, &after);
+	REQUIRE(after.extent_misses > before.extent_misses);
+	require_committed_compressed(volume, "/compressed-a", 1);
+	btrfs_cache_counts(harness->cache, &before);
+	REQUIRE(before.extent_hits > after.extent_hits);
+
+	/* The freed extents' space holds the next file's data. */
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_unlink(transaction, root, "compressed-a", strlen("compressed-a"),
+		    time, 0) == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_compressed(transaction, root, "compressed-b", 2) == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	require_committed_compressed(volume, "/compressed-b", 2);
+
+	/* A refused transaction's extents, read through its own view, stay out of
+	 * the cache; the next transaction reuses their generation and space. */
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_compressed(transaction, root, "compressed-c", 3) == BTRFS_OK);
+	reader = btrfs_transaction_reader(transaction);
+	REQUIRE(reader != NULL);
+	btrfs_cache_counts(harness->cache, &before);
+	require_compressed(reader, "/compressed-c", 3);
+	btrfs_cache_counts(harness->cache, &after);
+	REQUIRE(
+	    after.extent_hits == before.extent_hits && after.extent_misses == before.extent_misses);
+	btrfs_volume_abort(volume, transaction);
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_compressed(transaction, root, "compressed-c", 4) == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	require_committed_compressed(volume, "/compressed-c", 4);
+	require_committed_compressed(volume, "/compressed-b", 2);
+	btrfs_volume_close(volume);
+	harness->device.compress = NULL;
+	harness->device.compression = BTRFS_COMPRESSION_NONE;
+	printf("decompressed extents: kept for committed generations, read as written after "
+	       "their space is reused and after a refused transaction PASS\n");
+}
+
 /* Grouped operations: one running transaction, visible before it commits,
  * committed by sync, by a begin or for room, and failure isolation. */
 static void
@@ -1449,6 +1514,9 @@ main(int argc, char **argv)
 	harness_close(&harness);
 	harness_open(&harness, argv[1]);
 	compression_test(&harness);
+	harness_close(&harness);
+	harness_open(&harness, argv[1]);
+	compressed_test(&harness);
 	harness_close(&harness);
 	return 0;
 }

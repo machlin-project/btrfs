@@ -218,12 +218,15 @@ bt_compressed_read(struct bt_read_session *session, const struct bt_record *reco
 	const struct btrfs_fs *fs = session->checksums.fs;
 	const struct bt_disk_extent_header *header = (const void *)record->data;
 	const struct bt_disk_extent *extent = (const void *)record->data;
+	struct btrfs_cache *cache = NULL;
+	struct bt_extent_key key;
 	const uint8_t *input;
 	uint8_t *stored = NULL;
 	uint8_t *decoded;
 	size_t stored_size;
 	size_t decoded_size = (size_t)bt_u64(header->ram_bytes);
 	uint64_t offset = within;
+	int verified = (inode->flags & BT_INODE_NODATASUM) == 0;
 	enum btrfs_result error;
 
 	if (fs->env.decompress == NULL) {
@@ -234,18 +237,29 @@ bt_compressed_read(struct bt_read_session *session, const struct bt_record *reco
 		stored_size = record->size - sizeof(*header);
 	} else {
 		stored_size = (size_t)bt_u64(extent->disk_bytes);
+		offset += bt_u64(extent->offset);
+		/* Only committed extents: a refused transaction's generation and
+		 * space are used again. */
+		if (bt_u64(header->generation) < fs->cache_limit) {
+			cache = fs->env.cache;
+		}
+		key = (struct bt_extent_key){ bt_u64(extent->disk_bytenr), stored_size,
+			decoded_size, bt_u64(header->generation), header->compression };
+		if (cache != NULL &&
+		    bt_cache_extent_get(cache, &key, verified, offset, output, length)) {
+			return BTRFS_OK;
+		}
 		stored = fs->env.allocate(fs->env.context, stored_size);
 		if (stored == NULL) {
 			return BTRFS_NO_MEMORY;
 		}
 		error = bt_verified_read(&session->checksums, bt_u64(extent->disk_bytenr), stored,
-		    stored_size, (inode->flags & BT_INODE_NODATASUM) == 0);
+		    stored_size, verified);
 		if (error != BTRFS_OK) {
 			fs->env.release(fs->env.context, stored, stored_size);
 			return error;
 		}
 		input = stored;
-		offset += bt_u64(extent->offset);
 	}
 	decoded = fs->env.allocate(fs->env.context, decoded_size);
 	if (decoded == NULL) {
@@ -256,6 +270,9 @@ bt_compressed_read(struct bt_read_session *session, const struct bt_record *reco
 			input, stored_size, decoded, decoded_size);
 		if (error == BTRFS_OK) {
 			bt_copy(output, decoded + offset, length);
+			if (cache != NULL) {
+				bt_cache_extent_put(cache, &key, verified, decoded);
+			}
 		}
 		fs->env.release(fs->env.context, decoded, decoded_size);
 	}

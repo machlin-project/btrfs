@@ -176,6 +176,27 @@ const uint8_t *bt_cache_pin(struct btrfs_cache *cache, struct bt_root root, uint
     uint64_t *owner, size_t *handle, const void *hint);
 void bt_cache_unpin(struct btrfs_cache *cache, size_t handle);
 
+/* A decompressed data extent: its stored range, codec, decoded size and the
+ * committed generation of the item that names it. A stored extent is never
+ * rewritten while committed items name it, and its space is reused only by a
+ * newer generation, so the key names one immutable decoding. */
+struct bt_extent_key {
+	uint64_t disk_bytenr;
+	uint64_t disk_bytes;
+	uint64_t ram_bytes;
+	uint64_t generation;
+	uint8_t compression;
+};
+
+/* Decompressed extents kept by the shared cache when it has locks: get copies
+ * length bytes at offset of a stored decoding and is nonzero on a hit; a read
+ * that verifies data checksums takes only a decoding of verified data. put
+ * stores key->ram_bytes bytes, at most BT_MAX_COMPRESSED_SIZE. */
+int bt_cache_extent_get(struct btrfs_cache *cache, const struct bt_extent_key *key, int verified,
+    uint64_t offset, void *output, size_t length);
+void bt_cache_extent_put(
+    struct btrfs_cache *cache, const struct bt_extent_key *key, int verified, const void *bytes);
+
 void bt_copy(void *destination, const void *source, size_t length);
 void bt_move(void *destination, const void *source, size_t length);
 void bt_zero(void *buffer, size_t length);

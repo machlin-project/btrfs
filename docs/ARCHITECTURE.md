@@ -153,7 +153,12 @@ unwritten preallocation return zeroes; a hole item may carry the nonzero offset
 Linux leaves when it splits or trims one. Shared regular extents honor the recorded extent
 offset, not just disk_bytenr. Compressed extents verify their stored bytes before
 calling the adapter codec; input and decoded allocation are bounded independently.
-An absent codec returns unsupported. NODATASUM is honored as an explicit on-disk
+A shared cache with locks keeps up to sixteen decompressed extents, keyed by
+stored range, codec, decoded size and the naming item's generation, so reads
+within one extent decompress it once. Only committed generations are kept,
+since a refused transaction's generation and space are used again; a
+decompression of data read without checksum verification serves only reads that
+skip it as well. An absent codec returns unsupported. NODATASUM is honored as an explicit on-disk
 contract; it must not be confused with verified data.
 
 CRC32C uses ARM CRC instructions when the selected target guarantees them and the

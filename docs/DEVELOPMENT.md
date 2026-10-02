@@ -231,9 +231,9 @@ env -i PATH="$PATH" BTRFS_FUZZ_IMAGE="$PWD/artifacts/fixtures/plain.raw" \
   -artifact_prefix=artifacts/fuzz-findings/ artifacts/fuzz-corpus
 CC=/opt/homebrew/opt/llvm/bin/clang meson setup .build-tsan \
   -Db_sanitize=thread -Dfixtures=artifacts/fixtures
-meson compile -C .build-tsan btrfs-concurrent btrfs-volume-test
+meson compile -C .build-tsan btrfs-concurrent btrfs-volume-test btrfs-extents-test
 env -i PATH="$PATH" meson test -C .build-tsan --no-rebuild concurrent-readers \
-  native-volume-views native-volume-stress --print-errorlogs
+  native-volume-views native-volume-stress decompressed-extents --print-errorlogs
 ```
 
 `native-volume-stress` runs four readers against the shared native volume layer

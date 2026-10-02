@@ -139,6 +139,22 @@ image_write_flush(void *context)
 	return BTRFS_OK;
 }
 
+static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+cache_lock(void *context)
+{
+	(void)context;
+	pthread_mutex_lock(&cache_mutex);
+}
+
+static void
+cache_unlock(void *context)
+{
+	(void)context;
+	pthread_mutex_unlock(&cache_mutex);
+}
+
 static void
 volume_lock(void *context)
 {
@@ -303,6 +319,7 @@ write_series(const char *path, struct btrfs_cache *cache, int durable)
 int
 main(int argc, char **argv)
 {
+	struct btrfs_cache_locks cache_locks = { NULL, cache_lock, cache_unlock };
 	struct btrfs_cache *cache = NULL;
 	struct btrfs_cache_counts counts;
 	struct btrfs_fs *fs;
@@ -331,7 +348,7 @@ main(int argc, char **argv)
 		return 1;
 	}
 	if (cache_bytes != 0 &&
-	    btrfs_cache_create(&image.environment, NULL, cache_bytes, &cache) != BTRFS_OK) {
+	    btrfs_cache_create(&image.environment, &cache_locks, cache_bytes, &cache) != BTRFS_OK) {
 		return 1;
 	}
 	image.environment.cache = cache;
@@ -346,8 +363,11 @@ main(int argc, char **argv)
 	}
 	if (cache != NULL) {
 		btrfs_cache_counts(cache, &counts);
-		printf("node cache: %llu hits, %llu misses\n", (unsigned long long)counts.hits,
-		    (unsigned long long)counts.misses);
+		printf("node cache: %llu hits, %llu misses; decompressed extents: %llu hits, %llu "
+		       "misses\n",
+		    (unsigned long long)counts.hits, (unsigned long long)counts.misses,
+		    (unsigned long long)counts.extent_hits,
+		    (unsigned long long)counts.extent_misses);
 		btrfs_cache_destroy(cache);
 	}
 	btrfs_image_close(&image);

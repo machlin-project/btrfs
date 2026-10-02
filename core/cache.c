@@ -8,6 +8,9 @@
  * uses the stripe its caller's stack address selects. */
 #define BT_CACHE_STRIPES 16U
 #define BT_CACHE_LINE 64U
+/* Decompressed extents kept beside the nodes, each of at most
+ * BT_MAX_COMPRESSED_SIZE bytes. */
+#define BT_CACHE_EXTENTS 16U
 
 /* Lookups run without the lock. A lookup raises its stripe's pin counter of an
  * entry and then reads the entry's replacing flag; the lock holder replacing
@@ -23,6 +26,15 @@ struct bt_cache_entry {
 	uint8_t level;
 	uint8_t used;
 	uint8_t referenced;
+};
+
+/* A decompressed extent, used and replaced with the cache's lock held; used is
+ * its last use (zero for an empty slot). */
+struct bt_cache_extent {
+	struct bt_extent_key key;
+	uint64_t used;
+	uint8_t *bytes;
+	int verified;
 };
 
 /* Hits of one stripe, alone in its cache line. */
@@ -47,6 +59,10 @@ struct btrfs_cache {
 	/* Set (release) once the storage exists; lookups read it (acquire). */
 	int ready;
 	uint64_t misses;
+	struct bt_cache_extent extents[BT_CACHE_EXTENTS];
+	uint64_t extent_clock;
+	uint64_t extent_hits;
+	uint64_t extent_misses;
 };
 
 enum btrfs_result
@@ -114,8 +130,17 @@ bt_cache_release(struct btrfs_cache *cache)
 void
 btrfs_cache_destroy(struct btrfs_cache *cache)
 {
+	const struct btrfs_environment *env;
+	size_t i;
+
 	if (cache == NULL) {
 		return;
+	}
+	env = &cache->environment;
+	for (i = 0; i < BT_CACHE_EXTENTS; i++) {
+		if (cache->extents[i].bytes != NULL) {
+			env->release(env->context, cache->extents[i].bytes, BT_MAX_COMPRESSED_SIZE);
+		}
 	}
 	bt_cache_release(cache);
 	cache->environment.release(cache->environment.context, cache, sizeof(*cache));
@@ -152,6 +177,83 @@ btrfs_cache_counts(struct btrfs_cache *cache, struct btrfs_cache_counts *counts)
 	for (i = 0; cache->pins != NULL && i < BT_CACHE_STRIPES * bt_cache_entry_count(cache);
 	    i++) {
 		counts->pinned += __atomic_load_n(&cache->pins[i], __ATOMIC_RELAXED);
+	}
+	counts->extent_hits = cache->extent_hits;
+	counts->extent_misses = cache->extent_misses;
+	bt_cache_unlock(cache);
+}
+
+static int
+bt_cache_extent_same(const struct bt_extent_key *a, const struct bt_extent_key *b)
+{
+	return a->disk_bytenr == b->disk_bytenr && a->disk_bytes == b->disk_bytes &&
+	    a->ram_bytes == b->ram_bytes && a->generation == b->generation &&
+	    a->compression == b->compression;
+}
+
+int
+bt_cache_extent_get(struct btrfs_cache *cache, const struct bt_extent_key *key, int verified,
+    uint64_t offset, void *output, size_t length)
+{
+	struct bt_cache_extent *extent;
+	size_t i;
+	int found = 0;
+
+	/* Without locks, readers could see a decoding being replaced. */
+	if (cache->locks.lock == NULL || offset > key->ram_bytes ||
+	    length > key->ram_bytes - offset) {
+		return 0;
+	}
+	bt_cache_lock(cache);
+	for (i = 0; !found && i < BT_CACHE_EXTENTS; i++) {
+		extent = &cache->extents[i];
+		if (extent->used != 0 && bt_cache_extent_same(&extent->key, key) &&
+		    (extent->verified || !verified)) {
+			bt_copy(output, extent->bytes + offset, length);
+			extent->used = ++cache->extent_clock;
+			found = 1;
+		}
+	}
+	if (found) {
+		cache->extent_hits++;
+	} else {
+		cache->extent_misses++;
+	}
+	bt_cache_unlock(cache);
+	return found;
+}
+
+void
+bt_cache_extent_put(
+    struct btrfs_cache *cache, const struct bt_extent_key *key, int verified, const void *bytes)
+{
+	const struct btrfs_environment *env = &cache->environment;
+	struct bt_cache_extent *victim = &cache->extents[0];
+	size_t i;
+
+	if (cache->locks.lock == NULL || key->ram_bytes > BT_MAX_COMPRESSED_SIZE) {
+		return;
+	}
+	bt_cache_lock(cache);
+	for (i = 0; i < BT_CACHE_EXTENTS; i++) {
+		if (cache->extents[i].used != 0 &&
+		    bt_cache_extent_same(&cache->extents[i].key, key)) {
+			victim = &cache->extents[i];
+			break;
+		}
+		if (cache->extents[i].used < victim->used) {
+			victim = &cache->extents[i];
+		}
+	}
+	if (victim->bytes == NULL) {
+		victim->bytes = env->allocate(env->context, BT_MAX_COMPRESSED_SIZE);
+	}
+	/* Without storage the decoding is simply not kept. */
+	if (victim->bytes != NULL) {
+		bt_copy(victim->bytes, bytes, (size_t)key->ram_bytes);
+		victim->key = *key;
+		victim->verified = verified;
+		victim->used = ++cache->extent_clock;
 	}
 	bt_cache_unlock(cache);
 }

@@ -120,6 +120,13 @@ copies in physical order, merging contiguous ones into writes of at most
 1,000 grouped creates 19 for 211. No native adapter
 groups its operations yet.
 
+A cache with locks also keeps sixteen decompressed extents, so small reads
+within one compressed extent decompress it once. Sequential 4 KiB reads of the
+4 MiB file on the `zstd` and `zlib` fixtures take 0.5 and 1.3 us per read
+instead of 4.8 and 32 us (8.1 instead of 0.85 GB/s, and 3.1 instead of
+0.13 GB/s). Random reads across a file far larger than those 2 MiB gain
+little; there the native page cache keeps the pages already read.
+
 Concurrent cached lookups of names in one directory, each walking the same
 tree roots, scale with lock-free hits and striped pin counters: on the
 `transactions` image, 1.6, 3.1, 4.9 and 5.1 million lookups per second with one,

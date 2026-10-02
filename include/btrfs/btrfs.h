@@ -110,7 +110,12 @@ struct btrfs_cache_locks {
  * owner and level expectations are still checked. The cache serves one device
  * that changes only through its owner's commits, so it must be destroyed when
  * the device is changed otherwise (another writer, recovery to an older
- * generation, a rewound test device). bytes bounds the node storage. */
+ * generation, a rewound test device). bytes bounds the node storage. With
+ * locks, the cache also keeps up to sixteen decompressed data extents of
+ * committed generations (at most 2 MiB beside the nodes), keyed by their
+ * stored range, codec, size and generation, so reads within one compressed
+ * extent decompress it once; a read that verifies data checksums uses only a
+ * decompression of verified data. */
 enum btrfs_result btrfs_cache_create(const struct btrfs_environment *environment,
     const struct btrfs_cache_locks *locks, size_t bytes, struct btrfs_cache **result);
 /* Every mount using the cache must be unmounted and its streams closed first. */
@@ -123,6 +128,9 @@ struct btrfs_cache_counts {
 	uint64_t hits;
 	uint64_t misses;
 	uint64_t pinned;
+	/* Lookups of decompressed extents. */
+	uint64_t extent_hits;
+	uint64_t extent_misses;
 };
 
 void btrfs_cache_counts(struct btrfs_cache *cache, struct btrfs_cache_counts *counts);

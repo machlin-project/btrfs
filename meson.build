@@ -72,6 +72,8 @@ volume_window_test = executable('btrfs-volume-window-test', 'tests/volume.c',
   link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
 concurrent = executable('btrfs-concurrent', 'tests/concurrent.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
+extents_test = executable('btrfs-extents-test', 'tests/extents.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
 if get_option('fuzzer')
   executable('btrfs-fuzz', 'tests/fuzz_metadata.c', include_directories: inc,
     link_with: [posix, core], dependencies: [zlib, zstd],
@@ -92,6 +94,8 @@ if fixtures != ''
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   test('concurrent-readers', concurrent,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
+  test('decompressed-extents', extents_test, args: [join_paths(fixtures, 'zstd.raw'),
+    join_paths(fixtures, 'zlib.raw')], timeout: 180, suite: 'images')
   test('inline-transactions', transaction_test,
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 180, suite: 'images')
   test('inline-transactions-dup', transaction_test,
