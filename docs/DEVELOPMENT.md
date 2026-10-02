@@ -173,10 +173,10 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all nineteen
+Linux checks and a completed VM exit before consuming the image. Repeat all twenty
 profiles (512 MiB for `transactions-holes`, 1 GiB for `transactions-convert`,
-257 GiB for `transactions-copies`, created with `truncate` so it stays sparse and
-never copied byte by byte), then run the portable image and
+2 GiB for `transactions-scale`, 257 GiB for `transactions-copies`, created with
+`truncate` so they stay sparse and never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
 verifies 367 contracts (the six reader profiles and `transactions-holes`, whose
 split hole items it reads), and fails if any byte changed.

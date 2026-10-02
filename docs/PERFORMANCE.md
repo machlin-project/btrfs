@@ -42,7 +42,13 @@ and loads a block group's extents (verifying them and its free-space items)
 only when allocation reaches it or a change touches it, so admission costs a
 few node reads per block group instead of a pass over the whole extent tree
 (on the full-metadata fixture 20 node reads instead of 44; on the small
-fixtures about the same). A volume keeps the loaded state across transactions,
+fixtures about the same). On `transactions-scale`, Linux-written with 102,042
+extents in 15 block groups on 2 GiB, admission reads 35 nodes (0.14 MiB)
+instead of 2,270 (8.9 MiB); the first data write and its commit then load the
+groups they touch, so mount, admission, one create, a 64 KiB write and the
+commit read 541 nodes instead of 2,380. Full block groups are passed over
+without loading. The scale fixture is a measurement input, not part of the
+suite. A volume keeps the loaded state across transactions,
 and a transaction copies a class's free ranges only when it changes them.
 Verified tree nodes can be cached across operations (below). Each commit still
 pays three barriers; grouping operations into one commit is described in

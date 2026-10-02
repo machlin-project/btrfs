@@ -105,6 +105,7 @@ struct btrfs_allocation_map {
 
 static void bt_gaps_normalize(struct bt_gaps *list);
 static void bt_gaps_release(const struct btrfs_environment *env, struct bt_gaps *list);
+static uint64_t bt_space_excluded(const struct bt_chunk *chunk);
 
 /* Copies a borrowed list before its first change. */
 static enum btrfs_result
@@ -493,9 +494,20 @@ bt_space_load_chunk(struct bt_space *space, size_t index)
 	return BTRFS_OK;
 }
 
+/* Whether an unloaded chunk has no free bytes outside its stripes: a load
+ * would give it no free range, and it stays full until a change loads it. */
+static int
+bt_space_full(const struct bt_space *space, size_t index)
+{
+	const struct bt_chunk *chunk = &space->fs->chunks[index];
+
+	return space->used[index] >= chunk->length - bt_space_excluded(chunk);
+}
+
 /* Loads the lowest unloaded chunk of list's class when it lies below limit:
  * allocation never skips free space of a lower chunk, so its choices do not
- * depend on which chunks earlier transactions loaded. */
+ * depend on which chunks earlier transactions loaded. Full chunks hold no
+ * free space and are passed over without loading. */
 static enum btrfs_result
 bt_space_load_below(struct bt_space *space, struct bt_gaps *list, uint64_t limit, int *loaded)
 {
@@ -506,7 +518,7 @@ bt_space_load_below(struct bt_space *space, struct bt_gaps *list, uint64_t limit
 	*loaded = 0;
 	while (*frontier < fs->chunk_count &&
 	    (bt_space_class(space, &fs->chunks[*frontier]) != list || space->loaded[*frontier] ||
-		fs->chunks[*frontier].removed)) {
+		fs->chunks[*frontier].removed || bt_space_full(space, *frontier))) {
 		(*frontier)++;
 	}
 	if (*frontier == fs->chunk_count || fs->chunks[*frontier].logical >= limit) {
@@ -517,30 +529,71 @@ bt_space_load_below(struct bt_space *space, struct bt_gaps *list, uint64_t limit
 	return error;
 }
 
+/* Bytes of a chunk's logical range that superblock stripes cover: the same
+ * ranges bt_space_exclude removes, of every copy, merged. */
+static uint64_t
+bt_space_excluded(const struct bt_chunk *chunk)
+{
+	struct bt_gap ranges[2 * BT_SUPER_MIRRORS];
+	struct bt_gap swap;
+	uint64_t physical;
+	uint64_t covered = 0;
+	uint64_t position = 0;
+	size_t count = 0;
+	size_t i;
+	size_t j;
+	unsigned mirror;
+	unsigned copy;
+
+	for (copy = 0; copy < chunk->mirrors; copy++) {
+		for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
+			physical = bt_super_offset(mirror) & ~(BT_STRIPE_LENGTH - 1);
+			if (physical + BT_STRIPE_LENGTH <= chunk->physical[copy] ||
+			    physical >= chunk->physical[copy] + chunk->length) {
+				continue;
+			}
+			ranges[count].start =
+			    physical > chunk->physical[copy] ? physical - chunk->physical[copy] : 0;
+			ranges[count].end = physical + BT_STRIPE_LENGTH - chunk->physical[copy];
+			if (ranges[count].end > chunk->length) {
+				ranges[count].end = chunk->length;
+			}
+			count++;
+		}
+	}
+	for (i = 1; i < count; i++) {
+		for (j = i; j > 0 && ranges[j - 1].start > ranges[j].start; j--) {
+			swap = ranges[j];
+			ranges[j] = ranges[j - 1];
+			ranges[j - 1] = swap;
+		}
+	}
+	for (i = 0; i < count; i++) {
+		if (ranges[i].start < position) {
+			ranges[i].start = position;
+		}
+		if (ranges[i].end > ranges[i].start) {
+			covered += ranges[i].end - ranges[i].start;
+			position = ranges[i].end;
+		}
+	}
+	return covered;
+}
+
 /* Free bytes chunk index holds outside its superblock stripes, given its
  * block-group total. */
 static enum btrfs_result
-bt_space_estimate(struct bt_space *space, size_t index, struct bt_gaps *scratch, uint64_t *free)
+bt_space_estimate(struct bt_space *space, size_t index, uint64_t *free)
 {
 	const struct bt_chunk *chunk = &space->fs->chunks[index];
-	uint64_t room = 0;
-	size_t i;
-	enum btrfs_result error;
+	uint64_t room = chunk->length - bt_space_excluded(chunk);
 
-	scratch->count = 0;
-	scratch->next = 0;
-	error = bt_space_gap(space, scratch, chunk->logical, chunk->logical + chunk->length);
-	if (error == BTRFS_OK) {
-		error = bt_space_exclude(space, chunk, scratch);
+	*free = 0;
+	if (space->used[index] > room) {
+		return BTRFS_CORRUPT;
 	}
-	for (i = 0; error == BTRFS_OK && i < scratch->count; i++) {
-		room += scratch->items[i].end - scratch->items[i].start;
-	}
-	if (error == BTRFS_OK && space->used[index] > room) {
-		error = BTRFS_CORRUPT;
-	}
-	*free = error == BTRFS_OK ? room - space->used[index] : 0;
-	return error;
+	*free = room - space->used[index];
+	return BTRFS_OK;
 }
 
 /* Reads every block group's item: its total, and the free bytes it holds
@@ -552,7 +605,6 @@ bt_space_groups(struct bt_space *space)
 	const struct btrfs_fs *fs = space->fs;
 	const struct bt_chunk *chunk;
 	const struct bt_disk_block_group *group;
-	struct bt_gaps scratch = { NULL, 0, 0, 0, 0 };
 	struct bt_cursor cursor;
 	struct bt_record record;
 	struct bt_key key;
@@ -584,7 +636,7 @@ bt_space_groups(struct bt_space *space)
 		}
 		error = error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
 		if (error == BTRFS_OK) {
-			error = bt_space_estimate(space, i, &scratch, &free);
+			error = bt_space_estimate(space, i, &free);
 		}
 		if (error == BTRFS_OK && bt_space_class(space, chunk) == NULL) {
 			error = BTRFS_CORRUPT;
@@ -610,7 +662,6 @@ bt_space_groups(struct bt_space *space)
 		error = error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
 	}
 	bt_cursor_fini(&cursor);
-	bt_gaps_release(&fs->env, &scratch);
 	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
 		if (bt_space_class(space, &fs->chunks[i]) == &space->system) {
 			error = bt_space_load_chunk(space, i);

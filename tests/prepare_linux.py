@@ -18,7 +18,8 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-namespace": (4096, "single", ""),
             "transactions-holes": (4096, "dup", ""),
             "transactions-convert": (4096, "single", ""),
-            "transactions-copies": (4096, "single", "")}
+            "transactions-copies": (4096, "single", ""),
+            "transactions-scale": (4096, "single", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -79,13 +80,22 @@ NAMESPACE_DATA_BYTES = 65536
 # remaining links of the inode as extended references.
 EXTREF_NAME_BYTES = 200
 EXTREF_LINKS = 40
+# The scale profile measures writable admission on a volume with many block
+# groups and a large extent tree: many 4 KiB files (one extent each) and a large
+# file that fills the low data groups. mkfs defaults keep a free-space tree.
+SCALE_DEVICE_BYTES = 2 * 1024 * 1024 * 1024
+SCALE_DIRECTORIES = 100
+SCALE_FILES = 1000
+SCALE_FILE_BYTES = 4096
+SCALE_LARGE_MIB = 1024
 # Past 256 GiB a device holds the third superblock copy; the image is sparse.
 COPIES_DEVICE_BYTES = 257 * 1024 * 1024 * 1024
 THIRD_SUPER_OFFSET = 256 * 1024 * 1024 * 1024
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
                 "transactions-holes": 512 * 1024 * 1024,
                 "transactions-convert": 1024 * 1024 * 1024,
-                "transactions-copies": COPIES_DEVICE_BYTES}
+                "transactions-copies": COPIES_DEVICE_BYTES,
+                "transactions-scale": SCALE_DEVICE_BYTES}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
 FILL_XATTR_BYTES = 3800
 FILL_REMOVE_STRIDE = 7
@@ -314,6 +324,22 @@ echo BTRFS_REFERENCE_FST_TO_BITMAPS:$to_bitmaps
 echo BTRFS_REFERENCE_FST_TO_EXTENTS:$to_extents
 test "$to_bitmaps" = $((high + 1))
 test "$to_extents" = $((low - 1))'''
+    if profile == "transactions-scale":
+        fill = f'''test "$(blockdev --getsize64 /dev/vda)" = {SCALE_DEVICE_BYTES}
+dd if=/dev/zero of=/mnt/large bs=1M count={SCALE_LARGE_MIB} 2>/dev/null
+d=0
+while [ "$d" -lt {SCALE_DIRECTORIES} ]; do
+    mkdir /mnt/d$d
+    i=0
+    while [ "$i" -lt {SCALE_FILES} ]; do
+        head -c {SCALE_FILE_BYTES} /input/random > /mnt/d$d/f$i
+        i=$((i + 1))
+    done
+    d=$((d + 1))
+done
+btrfs filesystem sync /mnt
+echo BTRFS_REFERENCE_SCALE_EXTENTS:$(btrfs inspect-internal dump-tree -t extent /dev/vda | grep -c ' EXTENT_ITEM ')
+echo BTRFS_REFERENCE_SCALE_GROUPS:$(btrfs inspect-internal dump-tree -t extent /dev/vda | grep -c ' BLOCK_GROUP_ITEM ')'''
     if profile == "transactions-copies":
         fill = f'''test "$(blockdev --getsize64 /dev/vda)" = {COPIES_DEVICE_BYTES}
 btrfs filesystem sync /mnt
