@@ -319,5 +319,13 @@ enum btrfs_result btrfs_transaction_failure(const struct btrfs_transaction *tran
  * stays valid until the next call, commit or destroy; NULL when the
  * transaction is unusable or finished. */
 const struct btrfs_fs *btrfs_transaction_reader(struct btrfs_transaction *transaction);
+/* Whether one more operation that changes at most nodes tree nodes (its
+ * caller's bound) fits this transaction while leaving its commit room: half
+ * of each per-transaction limit (changed nodes, file trees, directory index
+ * and privilege slots, queued references) and free metadata space for twice
+ * the changed nodes are kept for the commit's own accounting. NO_SPACE means
+ * the caller should commit first; for an empty transaction it means the
+ * operation does not fit at all. */
+enum btrfs_result btrfs_transaction_room(const struct btrfs_transaction *transaction, size_t nodes);
 
 #endif

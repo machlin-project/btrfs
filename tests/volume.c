@@ -40,6 +40,17 @@
 #define STRESS_MAX_OPERATIONS 4U
 #define STRESS_LONG_PIN_MICROSECONDS 500L
 #define STRESS_DRAIN_MILLISECONDS 200L
+/* Tree nodes a grouped test operation declares (btrfs_volume_join). */
+#define GROUPED_NODES 64U
+/* Half the per-transaction node limit: the largest operation a transaction can
+ * take (btrfs_transaction_room). */
+#define GROUPED_MAX_NODES 2048U
+/* Allocation fault points tried to fail an operation after its first change. */
+#define GROUPED_FAULT_POINTS 256U
+/* The grouped stress test's sequence file, outside the stress names. */
+#define GROUPED_STAMP "grouped-stamp"
+/* Tree nodes a grouped stress operation declares. */
+#define GROUPED_STRESS_NODES 256U
 
 /* An allocation countdown for the writer thread only: readers never see
  * injected failures. */
@@ -520,6 +531,164 @@ views_test(struct harness *harness)
 	       "PASS\n");
 }
 
+/* Creates name as one grouped operation. */
+static enum btrfs_result
+grouped_create(struct btrfs_volume *volume, const char *name)
+{
+	struct btrfs_transaction *transaction;
+	enum btrfs_result result;
+
+	result = btrfs_volume_join(volume, GROUPED_NODES, &transaction);
+	if (result == BTRFS_OK) {
+		result = create_file(volume, transaction, name);
+		btrfs_volume_leave(volume, transaction);
+	}
+	return result;
+}
+
+static int
+newest_has(struct btrfs_volume *volume, const char *path, int *running)
+{
+	struct btrfs_volume_view *view;
+	const struct btrfs_fs *fs;
+	int present;
+
+	fs = btrfs_volume_read(volume, &view);
+	present = exists(fs, path);
+	*running = view == NULL;
+	btrfs_volume_unread(volume, view);
+	return present;
+}
+
+static int
+committed_has(struct btrfs_volume *volume, const char *path)
+{
+	struct btrfs_volume_view *view;
+	const struct btrfs_fs *fs;
+	int present;
+
+	fs = btrfs_volume_pin(volume, &view);
+	present = exists(fs, path);
+	btrfs_volume_unpin(volume, view);
+	return present;
+}
+
+/* Grouped operations: one running transaction, visible before it commits,
+ * committed by sync, by a begin or for room, and failure isolation. */
+static void
+grouped_test(struct harness *harness)
+{
+	struct btrfs_volume *volume;
+	struct btrfs_transaction *transaction;
+	char name[32];
+	uint64_t generation;
+	uint64_t pending;
+	size_t flushes;
+	size_t point;
+	int running;
+	enum btrfs_result result = BTRFS_OK;
+
+	REQUIRE(btrfs_volume_open(&harness->environment, &harness->device, &harness->callbacks,
+		    BTRFS_TOP_LEVEL_TREE, &volume) == BTRFS_OK);
+	generation = btrfs_volume_generation(volume);
+	flushes = harness->overlay.flushes;
+
+	/* Operations share the running transaction; readers see each at once. */
+	REQUIRE(btrfs_volume_join(volume, GROUPED_NODES, &transaction) == BTRFS_OK);
+	pending = btrfs_volume_pending(volume);
+	REQUIRE(pending == generation + 1);
+	REQUIRE(create_file(volume, transaction, "grouped-a") == BTRFS_OK);
+	btrfs_volume_leave(volume, transaction);
+	REQUIRE(newest_has(volume, "/grouped-a", &running) && running);
+	REQUIRE(grouped_create(volume, "grouped-b") == BTRFS_OK);
+	REQUIRE(grouped_create(volume, "grouped-a") == BTRFS_EXISTS);
+	REQUIRE(btrfs_volume_failure(volume) == BTRFS_OK);
+	REQUIRE(newest_has(volume, "/grouped-a", &running) &&
+	    newest_has(volume, "/grouped-b", &running));
+	REQUIRE(!committed_has(volume, "/grouped-a"));
+	REQUIRE(
+	    btrfs_volume_generation(volume) == generation && harness->overlay.flushes == flushes);
+
+	/* One sync commits them together; a second has nothing to do. */
+	REQUIRE(btrfs_volume_sync(volume, pending) == BTRFS_OK);
+	REQUIRE(btrfs_volume_generation(volume) == generation + 1);
+	REQUIRE(harness->overlay.flushes == flushes + 3);
+	REQUIRE(newest_has(volume, "/grouped-b", &running) && !running);
+	REQUIRE(committed_has(volume, "/grouped-a") && committed_has(volume, "/grouped-b"));
+	REQUIRE(btrfs_volume_sync(volume, pending) == BTRFS_OK);
+	REQUIRE(harness->overlay.flushes == flushes + 3);
+
+	/* A begin commits the running transaction before its own. */
+	REQUIRE(grouped_create(volume, "grouped-c") == BTRFS_OK);
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_volume_generation(volume) == generation + 2);
+	REQUIRE(create_file(volume, transaction, "grouped-d") == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	REQUIRE(committed_has(volume, "/grouped-c") && committed_has(volume, "/grouped-d"));
+	generation = btrfs_volume_generation(volume);
+
+	/* An operation larger than any transaction is refused; one that does not
+	 * fit beside the running transaction's changes commits them first. */
+	REQUIRE(btrfs_volume_join(volume, GROUPED_MAX_NODES + 1, &transaction) == BTRFS_NO_SPACE);
+	REQUIRE(btrfs_volume_failure(volume) == BTRFS_OK);
+	REQUIRE(grouped_create(volume, "grouped-e") == BTRFS_OK);
+	REQUIRE(btrfs_volume_join(volume, GROUPED_MAX_NODES, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_volume_generation(volume) == generation + 1);
+	REQUIRE(committed_has(volume, "/grouped-e"));
+	REQUIRE(create_file(volume, transaction, "grouped-f") == BTRFS_OK);
+	btrfs_volume_leave(volume, transaction);
+	pending = btrfs_volume_pending(volume);
+	REQUIRE(btrfs_volume_sync(volume, pending) == BTRFS_OK);
+	REQUIRE(committed_has(volume, "/grouped-f"));
+
+	/* An operation that fails after its first change, alone in the running
+	 * transaction, is discarded like an aborted transaction. */
+	for (point = 1; point <= GROUPED_FAULT_POINTS; point++) {
+		snprintf(name, sizeof(name), "discarded-%zu", point);
+		REQUIRE(btrfs_volume_join(volume, GROUPED_NODES, &transaction) == BTRFS_OK);
+		allocation_failure = point;
+		result = create_file(volume, transaction, name);
+		allocation_failure = 0;
+		if (result == BTRFS_OK || btrfs_transaction_failure(transaction) == BTRFS_OK) {
+			btrfs_volume_leave(volume, transaction);
+			REQUIRE(
+			    btrfs_volume_sync(volume, btrfs_volume_pending(volume)) == BTRFS_OK);
+			continue;
+		}
+		btrfs_volume_leave(volume, transaction);
+		break;
+	}
+	REQUIRE(point <= GROUPED_FAULT_POINTS && result == BTRFS_NO_MEMORY);
+	REQUIRE(btrfs_volume_failure(volume) == BTRFS_OK);
+	REQUIRE(!newest_has(volume, name, &running));
+
+	/* With earlier operations in it, the volume fails: their changes are lost
+	 * as at a crash, and no later operation or sync succeeds. */
+	REQUIRE(grouped_create(volume, "acknowledged") == BTRFS_OK);
+	pending = btrfs_volume_pending(volume);
+	for (point = 1; point <= GROUPED_FAULT_POINTS; point++) {
+		snprintf(name, sizeof(name), "poisoned-%zu", point);
+		REQUIRE(btrfs_volume_join(volume, GROUPED_NODES, &transaction) == BTRFS_OK);
+		allocation_failure = point;
+		result = create_file(volume, transaction, name);
+		allocation_failure = 0;
+		btrfs_volume_leave(volume, transaction);
+		if (btrfs_volume_failure(volume) != BTRFS_OK) {
+			break;
+		}
+		REQUIRE(btrfs_volume_pending(volume) == pending);
+	}
+	REQUIRE(point <= GROUPED_FAULT_POINTS && result == BTRFS_NO_MEMORY);
+	REQUIRE(btrfs_volume_failure(volume) == BTRFS_NO_MEMORY);
+	REQUIRE(btrfs_volume_join(volume, GROUPED_NODES, &transaction) == BTRFS_NO_MEMORY);
+	REQUIRE(btrfs_volume_sync(volume, pending) == BTRFS_NO_MEMORY);
+	REQUIRE(!newest_has(volume, "/acknowledged", &running) && !running);
+	btrfs_volume_close(volume);
+	printf("grouped operations: visible before commit, one commit per sync, commits for a "
+	       "begin and for room, refusals keep the transaction, failures discard or fail the "
+	       "volume PASS\n");
+}
+
 /* Every regular file of version v holds stress_size(v) copies of
  * stress_byte(v); version 0 is an absent name. */
 static uint8_t
@@ -891,6 +1060,192 @@ stress_test(struct harness *harness, size_t iterations)
 	free(buffer);
 }
 
+/* Grouped stress: each grouped operation applies stress_transaction and
+ * writes its sequence number into GROUPED_STAMP; the writer records the model
+ * of each sequence number before leaving. Readers read the newest state and
+ * check it against the model of the sequence number they see, so a view that
+ * mixes operations fails. Syncs come from the writer and from a reader. */
+struct grouped {
+	struct btrfs_volume *volume;
+	uint32_t (*models)[STRESS_FILES];
+	size_t capacity;
+	_Atomic int stop;
+	_Atomic uint64_t running_reads;
+	_Atomic uint64_t committed_reads;
+	_Atomic uint64_t reader_syncs;
+};
+
+struct grouped_reader {
+	struct grouped *grouped;
+	unsigned index;
+	pthread_t thread;
+};
+
+static uint64_t
+grouped_sequence(const struct btrfs_fs *fs)
+{
+	struct btrfs_inode inode;
+
+	struct btrfs_le_sequence {
+		uint8_t bytes[8];
+	} stamp;
+
+	uint64_t sequence = 0;
+	size_t completed;
+	unsigned i;
+
+	if (btrfs_image_lookup((struct btrfs_fs *)fs, "/" GROUPED_STAMP, &inode) != BTRFS_OK) {
+		return 0;
+	}
+	REQUIRE(btrfs_read(fs, &inode, 0, &stamp, sizeof(stamp), &completed) == BTRFS_OK &&
+	    completed == sizeof(stamp));
+	for (i = 0; i < sizeof(stamp.bytes); i++) {
+		sequence |= (uint64_t)stamp.bytes[i] << (8U * i);
+	}
+	return sequence;
+}
+
+static void *
+grouped_reader(void *context)
+{
+	struct grouped_reader *reader = context;
+	struct grouped *grouped = reader->grouped;
+	struct btrfs_volume_view *view;
+	const struct btrfs_fs *fs;
+	const char *difference;
+	uint32_t versions[STRESS_FILES];
+	uint8_t *buffer;
+	uint64_t sequence;
+
+	buffer = malloc(STRESS_MAX_SIZE);
+	REQUIRE(buffer != NULL);
+	while (!grouped->stop) {
+		fs = btrfs_volume_read(grouped->volume, &view);
+		sequence = grouped_sequence(fs);
+		REQUIRE(sequence < grouped->capacity);
+		memcpy(versions, grouped->models[sequence], sizeof(versions));
+		difference = stress_check(fs, versions, buffer);
+		if (view == NULL) {
+			grouped->running_reads++;
+		} else {
+			grouped->committed_reads++;
+		}
+		btrfs_volume_unread(grouped->volume, view);
+		if (difference != NULL) {
+			fprintf(stderr, "grouped reader %u, operation %llu: %s\n", reader->index,
+			    (unsigned long long)sequence, difference);
+			exit(1);
+		}
+		if (reader->index == 0 && sequence % 16U == 7U) {
+			REQUIRE(btrfs_volume_sync(grouped->volume,
+				    btrfs_volume_pending(grouped->volume)) == BTRFS_OK);
+			grouped->reader_syncs++;
+		}
+	}
+	free(buffer);
+	return NULL;
+}
+
+static void
+grouped_stress_test(struct harness *harness, size_t iterations)
+{
+	struct grouped grouped;
+	struct grouped_reader readers[STRESS_READERS];
+	struct stress_model model;
+	struct btrfs_volume_view *view;
+	struct btrfs_transaction *transaction;
+	struct btrfs_new_inode attributes;
+	struct btrfs_object_id stamp = { 0, 0 };
+	struct btrfs_inode root;
+	struct btrfs_time time = { 1800000000, 0 };
+	const struct btrfs_fs *fs;
+	uint8_t sequence[8];
+	uint8_t *data;
+	uint8_t *buffer;
+	uint32_t random = 0x9e3779b9U;
+	uint32_t version = 0;
+	uint64_t generation;
+	size_t syncs = 0;
+	size_t iteration;
+	unsigned i;
+
+	memset(&grouped, 0, sizeof(grouped));
+	memset(&model, 0, sizeof(model));
+	memset(&attributes, 0, sizeof(attributes));
+	attributes.mode = BTRFS_MODE_REGULAR | 0644;
+	grouped.capacity = iterations + 1U;
+	grouped.models = calloc(grouped.capacity, sizeof(*grouped.models));
+	data = malloc(STRESS_MAX_SIZE);
+	buffer = malloc(STRESS_MAX_SIZE);
+	REQUIRE(grouped.models != NULL && data != NULL && buffer != NULL);
+	REQUIRE(btrfs_volume_open(&harness->environment, &harness->device, &harness->callbacks,
+		    BTRFS_TOP_LEVEL_TREE, &grouped.volume) == BTRFS_OK);
+	fs = btrfs_volume_pin(grouped.volume, &view);
+	REQUIRE(btrfs_root(fs, &root) == BTRFS_OK);
+	REQUIRE(stress_check(fs, model.versions, buffer) == NULL && grouped_sequence(fs) == 0);
+	btrfs_volume_unpin(grouped.volume, view);
+	generation = btrfs_volume_generation(grouped.volume);
+	for (i = 0; i < STRESS_READERS; i++) {
+		readers[i].grouped = &grouped;
+		readers[i].index = i;
+		REQUIRE(pthread_create(&readers[i].thread, NULL, grouped_reader, &readers[i]) == 0);
+	}
+	for (iteration = 1; iteration <= iterations; iteration++) {
+		time.seconds++;
+		attributes.time = time;
+		REQUIRE(btrfs_volume_join(grouped.volume, GROUPED_STRESS_NODES, &transaction) ==
+		    BTRFS_OK);
+		REQUIRE(stress_transaction(transaction, root.id, &model, &random, &version, data,
+			    time) == BTRFS_OK);
+		if (stamp.inode == 0) {
+			REQUIRE(btrfs_transaction_create(transaction, root.id, GROUPED_STAMP,
+				    strlen(GROUPED_STAMP), &attributes, &stamp) == BTRFS_OK);
+		}
+		for (i = 0; i < sizeof(sequence); i++) {
+			sequence[i] = (uint8_t)(iteration >> (8U * i));
+		}
+		REQUIRE(btrfs_transaction_write(
+			    transaction, stamp, 0, sequence, sizeof(sequence), time) == BTRFS_OK);
+		/* Readers see this model once the operation leaves. */
+		memcpy(grouped.models[iteration], model.versions, sizeof(model.versions));
+		btrfs_volume_leave(grouped.volume, transaction);
+		if (stress_random(&random) % 8U == 0) {
+			REQUIRE(btrfs_volume_sync(grouped.volume,
+				    btrfs_volume_pending(grouped.volume)) == BTRFS_OK);
+			syncs++;
+		}
+	}
+	REQUIRE(
+	    btrfs_volume_sync(grouped.volume, btrfs_volume_pending(grouped.volume)) == BTRFS_OK);
+	grouped.stop = 1;
+	for (i = 0; i < STRESS_READERS; i++) {
+		REQUIRE(pthread_join(readers[i].thread, NULL) == 0);
+	}
+	REQUIRE(btrfs_volume_failure(grouped.volume) == BTRFS_OK);
+	generation = btrfs_volume_generation(grouped.volume) - generation;
+	btrfs_volume_close(grouped.volume);
+
+	/* The medium holds the last operation. */
+	REQUIRE(btrfs_volume_open(&harness->environment, NULL, &harness->callbacks,
+		    BTRFS_TOP_LEVEL_TREE, &grouped.volume) == BTRFS_OK);
+	fs = btrfs_volume_pin(grouped.volume, &view);
+	REQUIRE(grouped_sequence(fs) == iterations);
+	REQUIRE(stress_check(fs, model.versions, buffer) == NULL);
+	btrfs_volume_unpin(grouped.volume, view);
+	btrfs_volume_close(grouped.volume);
+	REQUIRE(grouped.running_reads != 0 && grouped.committed_reads != 0 && generation != 0 &&
+	    generation < iterations);
+	printf("grouped volume stress: %zu operations in %llu commits (%zu writer and %llu "
+	       "reader syncs), %llu reads of the running transaction and %llu of committed "
+	       "views PASS\n",
+	    iterations, (unsigned long long)generation, syncs,
+	    (unsigned long long)grouped.reader_syncs, (unsigned long long)grouped.running_reads,
+	    (unsigned long long)grouped.committed_reads);
+	free(grouped.models);
+	free(data);
+	free(buffer);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -898,6 +1253,14 @@ main(int argc, char **argv)
 	char *end;
 	unsigned long iterations;
 
+	if (argc == 4 && strcmp(argv[1], "--grouped") == 0) {
+		iterations = strtoul(argv[2], &end, 10);
+		REQUIRE(*end == '\0' && iterations != 0 && iterations < 1000000UL);
+		harness_open(&harness, argv[3]);
+		grouped_stress_test(&harness, (size_t)iterations);
+		harness_close(&harness);
+		return 0;
+	}
 	if (argc == 4 && strcmp(argv[1], "--stress") == 0) {
 		iterations = strtoul(argv[2], &end, 10);
 		REQUIRE(*end == '\0' && iterations != 0 && iterations < 1000000UL);
@@ -909,6 +1272,9 @@ main(int argc, char **argv)
 	REQUIRE(argc == 2);
 	harness_open(&harness, argv[1]);
 	views_test(&harness);
+	harness_close(&harness);
+	harness_open(&harness, argv[1]);
+	grouped_test(&harness);
 	harness_close(&harness);
 	return 0;
 }

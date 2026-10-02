@@ -45,6 +45,9 @@ enum btrfs_result bt_space_reserve_data(
  * new data chunk could take: Linux reserves a buffered write's data space
  * before accepting it. */
 int bt_space_data_available(const struct bt_space *space, uint64_t length);
+/* Whether nodes tree nodes fit in free metadata space and in device space a
+ * new metadata chunk could take. */
+int bt_space_metadata_available(const struct bt_space *space, uint64_t nodes);
 /* Returns exactly length bytes of contiguous free data space (a compressed
  * extent's size), from the first gap that holds them. */
 enum btrfs_result bt_space_reserve_exact(

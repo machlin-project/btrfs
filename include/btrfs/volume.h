@@ -60,4 +60,35 @@ enum btrfs_result btrfs_volume_commit(
     struct btrfs_volume *volume, struct btrfs_transaction *transaction);
 void btrfs_volume_abort(struct btrfs_volume *volume, struct btrfs_transaction *transaction);
 
+/* Grouped operations (docs/GROUP_COMMIT.md). Operations share one running
+ * transaction and return before it commits; their changes are visible to
+ * readers at once and durable after the commit that contains them, which
+ * btrfs_volume_sync requests. join waits for the writer turn and returns the
+ * running transaction, beginning one when none runs. When the running
+ * transaction lacks room for an operation that changes at most nodes tree
+ * nodes (btrfs_transaction_room), join commits it first; NO_SPACE means the
+ * operation does not fit an empty transaction. The caller applies its
+ * changes and calls leave. An operation that made the transaction unusable
+ * fails the volume when earlier operations' changes are in it: they are lost
+ * as at a crash and the volume becomes read-only; alone, it is discarded as an
+ * aborted transaction. A begin commits the running transaction first. */
+enum btrfs_result btrfs_volume_join(
+    struct btrfs_volume *volume, size_t nodes, struct btrfs_transaction **transaction);
+void btrfs_volume_leave(struct btrfs_volume *volume, struct btrfs_transaction *transaction);
+/* The generation that will publish an operation applied now; record it
+ * between join and leave. */
+uint64_t btrfs_volume_pending(struct btrfs_volume *volume);
+/* Makes every change of generation or earlier durable: commits the running
+ * transaction if it may hold them and waits for that commit. A commit that
+ * fails fails the volume. */
+enum btrfs_result btrfs_volume_sync(struct btrfs_volume *volume, uint64_t generation);
+/* A read of the newest state. Between operations of a running transaction it
+ * is that transaction's view, shared with other readers and excluding
+ * operations and commits until btrfs_volume_unread; otherwise the current
+ * committed view, pinned. Readers finish within the call: no directory stream
+ * or other state of the view outlives the read. */
+const struct btrfs_fs *btrfs_volume_read(
+    struct btrfs_volume *volume, struct btrfs_volume_view **view);
+void btrfs_volume_unread(struct btrfs_volume *volume, struct btrfs_volume_view *view);
+
 #endif

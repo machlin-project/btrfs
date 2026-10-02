@@ -3,6 +3,7 @@
  * self-test and metadata exhaustion. */
 #define _POSIX_C_SOURCE 200809L
 #include "scenario.h"
+#include <btrfs/volume.h>
 
 void
 admission_tests(struct context *context)
@@ -669,6 +670,85 @@ exhaustion_commit_test(
 	    high, low);
 }
 
+/* Tree nodes a grouped inline rewrite declares. */
+#define GROUPED_REWRITE_NODES 16U
+
+/* The exhaustion test runs one thread: the volume never has to wait. */
+static void
+single_lock(void *context)
+{
+	(void)context;
+}
+
+static void
+single_wait(void *context, const void *channel)
+{
+	(void)context;
+	(void)channel;
+	REQUIRE(0);
+}
+
+static void
+single_wake(void *context, const void *channel)
+{
+	(void)context;
+	(void)channel;
+}
+
+/* Grouped operations on full metadata: the volume refuses an operation
+ * before its first change, commits the running transaction when it lacks
+ * room, and no commit runs out of space; every acknowledged rewrite is on the
+ * medium after the last sync. The device is restored afterwards. */
+static void
+grouped_exhaustion_test(struct context *context, const struct btrfs_object_id *ids, size_t count,
+    const uint8_t *data, size_t size)
+{
+	struct btrfs_volume_locks locks = { NULL, single_lock, single_lock, single_wait,
+		single_wake };
+	struct btrfs_volume *volume;
+	struct btrfs_volume_view *view;
+	struct btrfs_transaction *transaction;
+	struct btrfs_time time = { 1700000001, 0 };
+	struct btrfs_inode inode;
+	const struct btrfs_fs *fs;
+	uint8_t check[INLINE_LIMIT];
+	uint64_t generation;
+	size_t acknowledged;
+	size_t completed;
+	enum btrfs_result result = BTRFS_OK;
+
+	REQUIRE(btrfs_volume_open(&context->env, &context->writer, &locks, BTRFS_TOP_LEVEL_TREE,
+		    &volume) == BTRFS_OK);
+	generation = btrfs_volume_generation(volume);
+	for (acknowledged = 0; acknowledged < count; acknowledged++) {
+		result = btrfs_volume_join(volume, GROUPED_REWRITE_NODES, &transaction);
+		if (result != BTRFS_OK) {
+			break;
+		}
+		REQUIRE(btrfs_transaction_write_inline(
+			    transaction, ids[acknowledged], data, size, time) == BTRFS_OK);
+		btrfs_volume_leave(volume, transaction);
+		REQUIRE(btrfs_volume_failure(volume) == BTRFS_OK);
+	}
+	REQUIRE(result == BTRFS_NO_SPACE && acknowledged != 0);
+	REQUIRE(btrfs_volume_failure(volume) == BTRFS_OK);
+	REQUIRE(btrfs_volume_sync(volume, btrfs_volume_pending(volume)) == BTRFS_OK);
+	REQUIRE(btrfs_volume_generation(volume) > generation);
+	fs = btrfs_volume_pin(volume, &view);
+	for (completed = 0; completed < acknowledged; completed++) {
+		REQUIRE(
+		    btrfs_get_inode(fs, ids[completed], &inode) == BTRFS_OK && inode.size == size);
+	}
+	REQUIRE(btrfs_read(fs, &inode, 0, check, size, &completed) == BTRFS_OK &&
+	    completed == size && memcmp(check, data, size) == 0);
+	btrfs_volume_unpin(volume, view);
+	printf("grouped exhaustion: %zu rewrites acknowledged in %llu commits, the next refused "
+	       "before any change PASS\n",
+	    acknowledged, (unsigned long long)(btrfs_volume_generation(volume) - generation));
+	btrfs_volume_close(volume);
+	truncate_writes(context->device, 0);
+}
+
 /* The Linux fixture's metadata is full and fragmented. A transaction needing
  * more nodes than remain must fail with NO_SPACE before any media write. */
 void
@@ -708,6 +788,7 @@ exhaustion_test(struct context *context)
 		data[i] = (uint8_t)i;
 	}
 	exhaustion_commit_test(context, fs, ids, count);
+	grouped_exhaustion_test(context, ids, count, data, INLINE_LIMIT);
 	context->device->issued = 0;
 	context->device->flushes = 0;
 	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_OK);

@@ -1,14 +1,12 @@
 # Group commit design
 
-Status: design; the core provides a transaction's reader view
-(`btrfs_transaction_reader`), and grouping is not implemented yet. The XNU
-adapter commits each namespace and
-attribute operation in its own transaction, and every commit pays three device
-barriers (metadata, secondary superblocks, primary). Durable throughput is
-therefore bounded by barrier latency, about one operation per three flushes.
+Status: the portable volume groups operations (below, "Implemented in the
+volume"); no native adapter uses it yet. The XNU adapter commits each namespace
+and attribute operation in its own transaction, and every commit pays three
+device barriers (metadata, secondary superblocks, primary). Durable throughput
+is therefore bounded by barrier latency, about one operation per three flushes.
 Linux amortizes the same barriers over every change of a running transaction.
-This document fixes the contracts a grouped commit must keep before any code
-changes.
+This document fixes the contracts a grouped commit must keep.
 
 ## What Linux does
 
@@ -80,11 +78,54 @@ read-only.
   namespace operations) and reservations must cover every later failure point
   except I/O.
 
+## Implemented in the volume
+
+`include/btrfs/volume.h` adds grouped operations beside the existing
+transaction-per-operation calls:
+
+- `btrfs_volume_join(volume, nodes, &transaction)` takes the writer turn and
+  returns the running transaction, beginning one when none runs. The caller
+  bounds the tree nodes its operation may change; `btrfs_transaction_room`
+  keeps half of every per-transaction limit (changed nodes, file trees,
+  directory index and privilege slots, queued references) and free metadata
+  space for twice the changed nodes plus a fixed allowance for the commit's
+  accounting. A running transaction without room commits first; an operation
+  that does not fit an empty transaction is refused with NO_SPACE before it
+  changes anything. The allowance is a measured margin, not a proven bound: on
+  the full-metadata fixture, inline rewrites run to refusal without a failed
+  commit, also with half the allowance, and fail an operation after its first
+  change without the space check.
+- `btrfs_volume_leave` publishes the operation's changes to readers. An
+  operation that made the transaction unusable is discarded with it when it
+  was alone in it (as an aborted transaction); with earlier operations in it,
+  the volume fails and becomes read-only, losing them as at a crash, which is
+  Linux's transaction abort.
+- `btrfs_volume_pending` names the generation that will publish an operation
+  applied now; `btrfs_volume_sync(volume, generation)` commits the running
+  transaction when it may hold changes of that generation and waits. Any
+  failure of a grouped commit fails the volume. `btrfs_volume_begin` commits a
+  running transaction before its own.
+- `btrfs_volume_read` returns the running transaction's view between
+  operations, shared by readers; otherwise it pins the committed view as
+  before. Operations and commits wait for readers of the running view, and
+  readers wait for them. The turn is phase-fair: the readers waiting when a
+  turn ends enter before the next writer, so a continuous writer does not
+  starve readers. A read of the running view must finish within the call; no
+  directory stream outlives it.
+
+`tests/volume.c` checks visibility before commit, one commit per sync, commits
+for a begin and for room, refusals that keep the transaction, and both failure
+cases; its grouped stress test writes a sequence number with every operation,
+and four readers (one also syncing) check that each view they read equals the
+model of the sequence number it shows, under ASan and TSan. Letting readers in
+during an operation makes them see torn state.
+
 ## Order of work
 
 1. Metadata reservations per operation and a commit reserve, with tests that
    accepted batches never fail at commit for space (extending the exhaustion
-   bisection), and that refusals leave the running transaction usable.
+   bisection), and that refusals leave the running transaction usable. Done as
+   the room check above; operation bounds per adapter call remain to be set.
 2. Read paths over the running transaction's view with a reader/writer lock,
    and TSan stress of concurrent readers against a running writer. The core
    part exists: `btrfs_transaction_reader` resolves the transaction's own trees
@@ -93,7 +134,9 @@ read-only.
    scenario harness requires every transaction's view, read through the public
    interface before commit, to equal the published view.
 3. Durability waits: per-object last-changing generation, `fsync`/`sync`
-   semantics, failure propagation to waiters.
+   semantics, failure propagation to waiters. The volume provides
+   `btrfs_volume_pending` and `btrfs_volume_sync`; adapters must record the
+   generation per object and call sync from `fsync`, `sync` and unmount.
 4. Commit triggers and limits, then adapter integration and the mounted write
    suite, including power-cut checks of every acknowledged `fsync` boundary.
 5. Measurements per PERFORMANCE.md: operations per barrier, fsync latency and

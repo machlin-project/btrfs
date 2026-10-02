@@ -37,8 +37,8 @@ transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
   'tests/scenario_random.c', 'tests/scenario_subvolume.c',
-  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
-  dependencies: [zlib, zstd])
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [volume, posix, core], dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
   'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core], dependencies: [zlib, zstd])
 unit = executable('btrfs-unit', 'tests/unit.c', include_directories: inc, link_with: core)
@@ -150,6 +150,9 @@ if fixtures != ''
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
   test('native-volume-stress', volume_test,
     args: ['--stress', '1000', join_paths(fixtures, 'transactions.raw')], timeout: 300,
+    suite: 'images')
+  test('native-volume-grouped', volume_test,
+    args: ['--grouped', '2000', join_paths(fixtures, 'transactions.raw')], timeout: 300,
     suite: 'images')
   test('metadata-exhaustion', transaction_test,
     args: ['--full', join_paths(fixtures, 'transactions-full.raw')], timeout: 180, suite: 'images')

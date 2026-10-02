@@ -526,6 +526,36 @@ bt_space_data_available(const struct bt_space *space, uint64_t length)
 	return unallocated / copies >= length - available;
 }
 
+int
+bt_space_metadata_available(const struct bt_space *space, uint64_t nodes)
+{
+	uint64_t node = space->fs->info.node_size;
+	uint64_t available = 0;
+	uint64_t unallocated = 0;
+	unsigned copies = 1;
+	size_t i;
+
+	for (i = space->metadata.next; i < space->metadata.count && available < nodes; i++) {
+		available += (space->metadata.items[i].end - space->metadata.items[i].start) / node;
+	}
+	if (available >= nodes) {
+		return 1;
+	}
+	if (!space->growth) {
+		return 0;
+	}
+	for (i = 0; i < space->fs->chunk_count; i++) {
+		if ((space->fs->chunks[i].type & BT_BLOCK_METADATA) != 0 &&
+		    (space->fs->chunks[i].type & BT_BLOCK_DUP) != 0) {
+			copies = 2;
+		}
+	}
+	for (i = space->device.next; i < space->device.count; i++) {
+		unallocated += space->device.items[i].end - space->device.items[i].start;
+	}
+	return unallocated / copies / node >= nodes - available;
+}
+
 enum btrfs_result
 bt_space_reserve_exact(struct bt_space *space, uint64_t length, uint64_t *logical)
 {

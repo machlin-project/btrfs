@@ -1263,3 +1263,32 @@ btrfs_transaction_reader(struct btrfs_transaction *transaction)
 	}
 	return reader;
 }
+
+/* Tree nodes the commit itself may change beyond twice the transaction's
+ * own: root items, block groups and free-space paths. */
+#define BT_COMMIT_FIXED_NODES 64U
+/* File trees and directory indexes one operation may add (a rename between
+ * directories, a snapshot). */
+#define BT_OPERATION_TREES 2U
+#define BT_OPERATION_INDEXES 2U
+
+enum btrfs_result
+btrfs_transaction_room(const struct btrfs_transaction *transaction, size_t nodes)
+{
+	size_t changed;
+
+	if (btrfs_transaction_failure(transaction) != BTRFS_OK) {
+		return btrfs_transaction_failure(transaction);
+	}
+	changed = bt_mutation_count(transaction->mutation);
+	if (nodes > BT_TRANSACTION_NODES / 2 || changed > BT_TRANSACTION_NODES / 2 - nodes ||
+	    transaction->tree_count + BT_OPERATION_TREES > BT_TRANSACTION_TREES / 2 ||
+	    transaction->index_count + BT_OPERATION_INDEXES > BT_TRANSACTION_INDEXES / 2 ||
+	    transaction->privileged_count + 1 > BT_TRANSACTION_PRIVILEGED / 2 ||
+	    transaction->ref_count > BT_TRANSACTION_REFERENCES / 2 ||
+	    !bt_space_metadata_available(
+		transaction->space, 2 * (uint64_t)(changed + nodes) + BT_COMMIT_FIXED_NODES)) {
+		return BTRFS_NO_SPACE;
+	}
+	return BTRFS_OK;
+}
