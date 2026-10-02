@@ -20,7 +20,7 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require twenty-nine passing test processes and all seven reader profiles (367
+Require thirty passing test processes and all seven reader profiles (367
 contracts). Twelve writable images are required by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
@@ -32,7 +32,8 @@ metadata with unallocated device space), `transactions-namespace` (name-hash
 collisions, extended references, compression properties) and
 `transactions-holes` (no NO_HOLES, DUP data), `transactions-convert` (1 GiB with
 a free-space tree whose conversions Linux measured) and `transactions-copies`
-(257 GiB sparse, three superblock copies). Missing fixtures
+(257 GiB sparse, three superblock copies); the Linux crash-state test needs the
+recorded `logwrites.log` and `logwrites-data.raw`. Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -72,10 +73,10 @@ only after successful durable publication; `seal` alone is not a commit.
    allocation maps are accepted (see ACCEPTANCE.md), including three copies
    with every tear combination across two secondaries, NO_SPACE from the commit's
    accounting fixed point, and explicit recovery of image files
-   (`btrfs-inspect IMAGE recover`). Remaining: a Linux-written crash state (Linux
-   as writer, this implementation recovering), and adapter use of recovery:
-   report RECOVERY_REQUIRED with the dry-run decision, persist the acknowledged
-   generation, and never recover implicitly at mount. Extend every new writer feature with scenarios in `tests/scenario_*.c`,
+   (`btrfs-inspect IMAGE recover`), and crash states Linux wrote (recorded
+   with dm-log-writes, replayed and recovered here). Remaining: adapter use of
+   recovery: report RECOVERY_REQUIRED with the dry-run decision, persist the
+   acknowledged generation, and never recover implicitly at mount. Extend every new writer feature with scenarios in `tests/scenario_*.c`,
    add its operations to the randomized model in `tests/scenario_random.c`, and
    export both to the Linux oracle.
 2. **Extend shared references.** CoW of shared blocks follows Linux's

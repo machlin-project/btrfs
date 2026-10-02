@@ -131,6 +131,10 @@ can extract the matching module archive. Put these modules in `root/modules/`:
 virtio_blk.ko xor-neon.ko xor.ko raid6_pq.ko crc32c_generic.ko libcrc32c.ko btrfs.ko
 ```
 
+The Linux crash-state recording also needs `dm-mod.ko` and `dm-log-writes.ko` in
+`root/modules/` and a static `dmsetup` at `root/sbin/dmsetup` (from the
+device-mapper-static APK, `usr/sbin/dmsetup.static`).
+
 The payload loads them in dependency order. Modules and the running guest kernel
 must match. A fresh checkout requires staging these external tools; the fixture
 preparer does not silently download or substitute them.
@@ -161,6 +165,38 @@ never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
 verifies 367 contracts (the six reader profiles and `transactions-holes`, whose
 split hole items it reads), and fails if any byte changed.
+
+## Linux-written crash states
+
+`tests/prepare_logwrites_linux.py` builds a payload that records every write of a
+Linux Btrfs workload with dm-log-writes: `/dev/mapper/logged` logs `/dev/vda`
+(256 MiB) into `/dev/vdb` (1 GiB); mkfs (without discards), six steps that each
+end with `sync` and a named mark (files, an overwrite, hard links, 50 inline
+files, a subvolume with an 8 MiB file and a snapshot, removals, truncation, 300
+files splitting the tree, a directory rename, a snapshot deletion), unmount and
+`btrfs check`. From the absolute lab directory, create both images without
+overwriting existing files and run:
+
+```sh
+python3 ../btrfs/tests/prepare_logwrites_linux.py \
+  --root artifacts/btrfs-reference/root --archive artifacts/btrfs-reference/logwrites.cpio
+.cache/linux-reference/linux-vm-external .cache/linux-reference/Image \
+  artifacts/btrfs-reference/logwrites.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/fixtures/logwrites-data.raw ../btrfs/artifacts/fixtures/logwrites.log \
+  > ../btrfs/logs/linux-logwrites.log 2>&1
+```
+
+Require `BTRFS_LOGWRITES_PASS`. `btrfs-logwrites-test LOG DATA` (Meson
+`linux-crash-states`) replays the log from a zeroed device. Epochs end at a
+flush (before its write) and at a FUA write or a mark (after it); every prefix
+after mkfs and eight random subsets of each epoch's writes are crash states.
+Each must mount, or be recovered explicitly when its superblock copies
+disagree (Linux writes the mirror after the FUA primary), and pass both
+audits, a transaction admission and full reads of every file; at each mark the
+synced files must be exact. Replaying the whole log must reproduce the final
+device image byte for byte. The inputs are generated deterministically on both
+sides, so no input file is shipped.
 
 ## Fuzzing and concurrency
 

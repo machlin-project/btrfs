@@ -54,6 +54,9 @@ native_test = executable('btrfs-native-policy', 'tests/native_policy.c', include
 test('native-xattr-policy', native_test, suite: 'core')
 executable('btrfs-mounted-test', 'tests/mounted.c', dependencies: dependency('threads'),
   override_options: ['b_sanitize=none'])
+logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
 volume_test = executable('btrfs-volume-test', 'tests/volume.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
 concurrent = executable('btrfs-concurrent', 'tests/concurrent.c', include_directories: inc,
@@ -72,6 +75,8 @@ if fixtures != ''
     '--tool', inspect, '--fixtures', fixtures], timeout: 300, suite: 'images')
   test('explicit-recovery', py, args: [files('tests/check_recovery.py'), '--tool', inspect,
     '--fixture', join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
+  test('linux-crash-states', logwrites_test, args: [join_paths(fixtures, 'logwrites.log'),
+    join_paths(fixtures, 'logwrites-data.raw')], timeout: 600, suite: 'images')
   test('malformed-faults-and-io-budgets', adversarial,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   test('concurrent-readers', concurrent,
