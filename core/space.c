@@ -218,17 +218,26 @@ bt_space_load(struct bt_space *space, struct bt_root root)
 	struct bt_key first = { 0 };
 	uint64_t position = fs->chunks[0].logical;
 	uint64_t used = 0;
+	uint64_t scanned = 0;
+	uint64_t limit = 0;
 	size_t index = 0;
-	size_t scanned = 0;
 	int group_found = 0;
 	enum btrfs_result error;
 
+	/* Every item needs its header in a metadata or system chunk, so no valid
+	 * extent tree holds more items than those chunks have room for. */
+	for (index = 0; index < fs->chunk_count; index++) {
+		if (fs->chunks[index].type & (BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) {
+			limit += fs->chunks[index].length / sizeof(struct bt_disk_item);
+		}
+	}
+	index = 0;
 	bt_cursor_init(&cursor, fs, root);
 	error = bt_cursor_seek(&cursor, first, 0);
 	while (error == BTRFS_OK) {
 		(void)bt_cursor_record(&cursor, &record);
-		if (++scanned > BT_MAX_TREE_ITEMS) {
-			error = BTRFS_UNSUPPORTED;
+		if (++scanned > limit) {
+			error = BTRFS_CORRUPT;
 			break;
 		}
 		if (record.key.type == BT_EXTENT_ITEM || record.key.type == BT_METADATA_ITEM ||

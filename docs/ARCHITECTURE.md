@@ -176,7 +176,7 @@ uses exported inflate APIs and paired kernel allocation callbacks.
 | Regular read window | 1 MiB per operation | Split into windows |
 | Compressed input/output | 128 KiB each | Corrupt extent |
 | Traversed file/xattr records per operation | 1,048,576 | Unsupported capacity |
-| Extent-tree items a writable mount verifies at admission | 1,048,576 | Unsupported capacity |
+| Extent-tree items a writable mount verifies at admission | metadata and system chunk bytes / 25-byte item header | Corrupt tree |
 | Free ranges per allocation class | 131,072 | Unsupported capacity |
 | Native identities per mount | 65,536 | Explicit range error |
 
