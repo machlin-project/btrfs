@@ -35,10 +35,14 @@ struct btrfs_fs {
 	uint64_t cache_limit;
 };
 
+/* blocks[level] is the cursor's own buffer (owned[level]) or a node read in
+ * place from the shared cache, pinned while pins[level] (handle + 1) is set. */
 struct bt_cursor {
 	const struct btrfs_fs *fs;
 	struct bt_root root;
-	uint8_t *blocks[BT_MAX_LEVEL];
+	const uint8_t *blocks[BT_MAX_LEVEL];
+	uint8_t *owned[BT_MAX_LEVEL];
+	size_t pins[BT_MAX_LEVEL];
 	struct bt_root loaded[BT_MAX_LEVEL];
 	uint32_t slots[BT_MAX_LEVEL];
 	int valid;
@@ -51,11 +55,15 @@ struct bt_record {
 };
 
 /* The shared node cache (core/cache.c): get copies a stored node and its
- * header owner into buffer; put stores a verified node. */
+ * header owner into buffer; put stores a verified node. pin returns a stored
+ * node in place, unchanged and never replaced until bt_cache_unpin(handle). */
 int bt_cache_get(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, void *buffer,
     uint64_t *owner);
 void bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
     const void *node, uint64_t owner);
+const uint8_t *bt_cache_pin(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
+    uint64_t *owner, size_t *handle);
+void bt_cache_unpin(struct btrfs_cache *cache, size_t handle);
 
 uint16_t bt_u16(struct bt_le16 value);
 uint32_t bt_u32(struct bt_le32 value);

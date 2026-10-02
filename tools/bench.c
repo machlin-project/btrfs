@@ -207,9 +207,8 @@ int
 main(int argc, char **argv)
 {
 	struct btrfs_cache *cache = NULL;
+	struct btrfs_cache_counts counts;
 	struct btrfs_fs *fs;
-	uint64_t hits;
-	uint64_t misses;
 	size_t cache_bytes = 0;
 	int write = 0;
 	int i;
@@ -246,9 +245,9 @@ main(int argc, char **argv)
 		write_series(argv[1], cache);
 	}
 	if (cache != NULL) {
-		btrfs_cache_counts(cache, &hits, &misses);
-		printf("node cache: %llu hits, %llu misses\n", (unsigned long long)hits,
-		    (unsigned long long)misses);
+		btrfs_cache_counts(cache, &counts);
+		printf("node cache: %llu hits, %llu misses\n", (unsigned long long)counts.hits,
+		    (unsigned long long)counts.misses);
 		btrfs_cache_destroy(cache);
 	}
 	btrfs_image_close(&image);

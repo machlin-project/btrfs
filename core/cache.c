@@ -8,6 +8,8 @@ struct bt_cache_entry {
 	uint64_t address;
 	uint64_t generation;
 	uint64_t owner;
+	/* Cursors reading the stored node in place; never replaced while nonzero. */
+	uint32_t pins;
 	uint8_t level;
 	uint8_t used;
 	uint8_t referenced;
@@ -25,6 +27,7 @@ struct btrfs_cache {
 	uint8_t *hands;
 	uint64_t hits;
 	uint64_t misses;
+	uint64_t pinned;
 };
 
 enum btrfs_result
@@ -85,13 +88,6 @@ btrfs_cache_destroy(struct btrfs_cache *cache)
 	cache->environment.release(cache->environment.context, cache, sizeof(*cache));
 }
 
-void
-btrfs_cache_counts(const struct btrfs_cache *cache, uint64_t *hits, uint64_t *misses)
-{
-	*hits = cache->hits;
-	*misses = cache->misses;
-}
-
 static void
 bt_cache_lock(struct btrfs_cache *cache)
 {
@@ -106,6 +102,16 @@ bt_cache_unlock(struct btrfs_cache *cache)
 	if (cache->locks.unlock != NULL) {
 		cache->locks.unlock(cache->locks.context);
 	}
+}
+
+void
+btrfs_cache_counts(struct btrfs_cache *cache, struct btrfs_cache_counts *counts)
+{
+	bt_cache_lock(cache);
+	counts->hits = cache->hits;
+	counts->misses = cache->misses;
+	counts->pinned = cache->pinned;
+	bt_cache_unlock(cache);
 }
 
 /* Storage for node_size nodes, allocated on first use. */
@@ -179,6 +185,52 @@ bt_cache_get(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
 	return found;
 }
 
+const uint8_t *
+bt_cache_pin(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, uint64_t *owner,
+    size_t *handle)
+{
+	struct bt_cache_entry *entry;
+	const uint8_t *node = NULL;
+	size_t set;
+	size_t index;
+	unsigned way;
+
+	bt_cache_lock(cache);
+	if (bt_cache_ready(cache, node_size)) {
+		set = bt_cache_set(cache, root.address);
+		for (way = 0; way < BT_CACHE_WAYS && node == NULL; way++) {
+			index = set * BT_CACHE_WAYS + way;
+			entry = &cache->entries[index];
+			if (entry->used && entry->address == root.address &&
+			    entry->generation == root.generation && entry->level == root.level &&
+			    entry->pins != UINT32_MAX) {
+				entry->pins++;
+				cache->pinned++;
+				entry->referenced = 1;
+				*owner = entry->owner;
+				*handle = index;
+				node = cache->nodes + index * node_size;
+			}
+		}
+		if (node != NULL) {
+			cache->hits++;
+		} else {
+			cache->misses++;
+		}
+	}
+	bt_cache_unlock(cache);
+	return node;
+}
+
+void
+bt_cache_unpin(struct btrfs_cache *cache, size_t handle)
+{
+	bt_cache_lock(cache);
+	cache->entries[handle].pins--;
+	cache->pinned--;
+	bt_cache_unlock(cache);
+}
+
 void
 bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, const void *node,
     uint64_t owner)
@@ -191,8 +243,18 @@ bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
 	bt_cache_lock(cache);
 	if (bt_cache_ready(cache, node_size)) {
 		set = bt_cache_set(cache, root.address);
-		/* CLOCK within the set: a free way, else the first unreferenced one
-		 * from the hand, clearing reference bits as it passes. */
+		/* Another reader may have stored the same node meanwhile. */
+		for (way = 0; way < BT_CACHE_WAYS; way++) {
+			entry = &cache->entries[set * BT_CACHE_WAYS + way];
+			if (entry->used && entry->address == root.address &&
+			    entry->generation == root.generation && entry->level == root.level) {
+				bt_cache_unlock(cache);
+				return;
+			}
+		}
+		entry = NULL;
+		/* CLOCK within the set: a free way, else the first unreferenced and
+		 * unpinned one from the hand, clearing reference bits as it passes. */
 		for (way = 0; way < BT_CACHE_WAYS && entry == NULL; way++) {
 			if (!cache->entries[set * BT_CACHE_WAYS + way].used) {
 				entry = &cache->entries[set * BT_CACHE_WAYS + way];
@@ -201,6 +263,9 @@ bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
 		for (step = 0; entry == NULL && step < 2 * BT_CACHE_WAYS; step++) {
 			way = cache->hands[set];
 			cache->hands[set] = (uint8_t)((way + 1) % BT_CACHE_WAYS);
+			if (cache->entries[set * BT_CACHE_WAYS + way].pins != 0) {
+				continue;
+			}
 			if (cache->entries[set * BT_CACHE_WAYS + way].referenced) {
 				cache->entries[set * BT_CACHE_WAYS + way].referenced = 0;
 			} else {

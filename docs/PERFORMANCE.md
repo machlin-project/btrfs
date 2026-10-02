@@ -41,8 +41,9 @@ grows only when needed. A volume keeps its allocation state across transactions:
 only the admission transaction loads the extent tree and verifies the free-space
 and device trees, and later begins copy the kept state (on the small Linux
 fixtures a full load costs 18 to 39 reads and 72 to 588 KiB, which grows with
-the extent tree). Verified tree nodes can be cached across operations (below). Each commit still pays three barriers; grouping
-operations into one commit is designed in [group commit](GROUP_COMMIT.md). Each backreference edit copies its
+the extent tree). Verified tree nodes can be cached across operations (below).
+Each commit still pays three barriers; grouping operations into one commit is
+designed in [group commit](GROUP_COMMIT.md). Each backreference edit copies its
 extent item into a fresh node-sized buffer and probes for keyed items with a new
 cursor, so a shared-subvolume commit costs several hundred allocations; the test
 output prints these counts per commit. New file data is written to the device
@@ -56,21 +57,22 @@ work.
 `btrfs-bench` (see DEVELOPMENT.md) measures this implementation on an image file
 through the host page cache: CPU and backend-call costs per operation, not a
 mounted filesystem and not a comparison with Linux. On `transactions` (4 KiB
-nodes) in a release build, the shared node cache (64 MiB) changed:
+nodes) in a release build, the shared node cache (64 MiB) and cursors that read
+cached nodes in place changed:
 
-| Operation | Without cache | With cache |
-| --- | --- | --- |
-| 4 KiB random read of a 4 MiB file | 4.8 us, 5 reads | 1.4 us, 1 read |
-| Path lookup in a 700-entry directory | 8.6 us, 8 reads | 1.2 us, 0 reads |
-| 700-entry directory stream | 28 us, 16 reads | 15 us, 0.1 reads |
-| 700-entry stream with each inode | 1,487 us, 1,416 reads | 203 us, 0 reads |
-| 1 MiB sequential read | 162 us, 5.2 reads | 141 us, 1 read |
-| Mount, create one file, commit | 236 us, 61 reads | 185 us, 16 reads |
+| Operation | Without cache | Cache, copied nodes | Cache, nodes in place |
+| --- | --- | --- | --- |
+| 4 KiB random read of a 4 MiB file | 4.8 us, 5 reads | 1.4 us, 1 read | 1.2 us, 1 read |
+| Path lookup in a 700-entry directory | 8.6 us, 8 reads | 1.3 us, 8 allocations | 0.9 us, 0 allocations |
+| 700-entry directory stream | 28 us, 16 reads | 15 us, 0.1 reads | 15 us, 0.1 reads |
+| 700-entry stream with each inode | 1,487 us, 1,416 reads | 203 us, 1,403 allocations | 137 us, 1 allocation |
+| 1 MiB sequential read | 162 us, 5.2 reads | 141 us, 1 read | 151 us, 1 read |
+| Mount, create one file, commit | 236 us, 61 reads | 150-220 us, 16 reads | 145-190 us, 16 reads |
 
-Remaining per-operation costs visible there: each lookup allocates a node buffer
-per tree level (8 allocations per lookup, 2 per inode attribute), and a commit
-still writes and barriers per operation. Generated benchmark reports keep the
-exact figures and build identities.
+Writes in this harness are dominated by host file I/O and vary by tens of
+percent between runs; compare them only within one run. A commit still writes
+and barriers per operation. Generated benchmark reports keep the exact figures
+and build identities.
 
 ## Matched benchmark protocol
 

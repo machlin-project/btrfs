@@ -366,11 +366,10 @@ harness_open(struct harness *harness, const char *path)
 static void
 harness_close(struct harness *harness)
 {
-	uint64_t hits;
-	uint64_t misses;
+	struct btrfs_cache_counts counts;
 
-	btrfs_cache_counts(harness->cache, &hits, &misses);
-	REQUIRE(hits != 0);
+	btrfs_cache_counts(harness->cache, &counts);
+	REQUIRE(counts.hits != 0 && counts.pinned == 0);
 	btrfs_cache_destroy(harness->cache);
 	pthread_mutex_destroy(&harness->cache_mutex);
 	REQUIRE(harness->image.live_allocations == 0);

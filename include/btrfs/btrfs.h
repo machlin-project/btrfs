@@ -113,8 +113,19 @@ struct btrfs_cache_locks {
  * generation, a rewound test device). bytes bounds the node storage. */
 enum btrfs_result btrfs_cache_create(const struct btrfs_environment *environment,
     const struct btrfs_cache_locks *locks, size_t bytes, struct btrfs_cache **result);
+/* Every mount using the cache must be unmounted and its streams closed first. */
 void btrfs_cache_destroy(struct btrfs_cache *cache);
-void btrfs_cache_counts(const struct btrfs_cache *cache, uint64_t *hits, uint64_t *misses);
+
+/* pinned counts nodes that tree cursors (including open directory streams)
+ * read in place; such nodes are never replaced. It is zero when no operation
+ * or stream is active. */
+struct btrfs_cache_counts {
+	uint64_t hits;
+	uint64_t misses;
+	uint64_t pinned;
+};
+
+void btrfs_cache_counts(struct btrfs_cache *cache, struct btrfs_cache_counts *counts);
 
 struct btrfs_object_id {
 	uint64_t tree;

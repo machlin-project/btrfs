@@ -84,26 +84,35 @@ bt_owner_matches(struct bt_root root, uint64_t owner)
 	return bt_file_tree(root.owner) ? bt_file_tree(owner) : owner == root.owner;
 }
 
-enum btrfs_result
-bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
+/* The shared cache holds only nodes committed in this view. */
+static struct btrfs_cache *
+bt_tree_cache(const struct btrfs_fs *fs, struct bt_root root)
+{
+	if (root.generation == 0 || root.generation >= fs->cache_limit ||
+	    root.generation > fs->info.generation) {
+		return NULL;
+	}
+	return fs->env.cache;
+}
+
+static int
+bt_tree_address(const struct btrfs_fs *fs, struct bt_root root)
+{
+	return root.level < BT_MAX_LEVEL && root.address != 0 &&
+	    root.address % fs->info.sector_size == 0;
+}
+
+/* Reads and verifies a node from the device, storing it in cache. */
+static enum btrfs_result
+bt_tree_fetch(
+    const struct btrfs_fs *fs, struct bt_root root, void *buffer, struct btrfs_cache *cache)
 {
 	const struct bt_disk_header *header = buffer;
-	struct btrfs_cache *cache = root.generation < fs->cache_limit ? fs->env.cache : NULL;
 	enum btrfs_result error = BTRFS_CORRUPT;
 	uint64_t physical;
-	uint64_t owner = 0;
 	unsigned mirrors = 1;
 	unsigned mirror;
 
-	if (root.level >= BT_MAX_LEVEL || root.address == 0 ||
-	    root.address % fs->info.sector_size != 0) {
-		return BTRFS_CORRUPT;
-	}
-	/* A stored node passed every check that depends only on its bytes. */
-	if (cache != NULL && root.generation != 0 && root.generation <= fs->info.generation &&
-	    bt_cache_get(cache, root, fs->info.node_size, buffer, &owner)) {
-		return bt_owner_matches(root, owner) ? BTRFS_OK : BTRFS_CORRUPT;
-	}
 	for (mirror = 0; mirror < mirrors; mirror++) {
 		error = bt_map(fs, root.address, fs->info.node_size,
 		    root.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM : BT_BLOCK_METADATA, mirror,
@@ -126,6 +135,22 @@ bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
 	return error;
 }
 
+enum btrfs_result
+bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
+{
+	struct btrfs_cache *cache = bt_tree_cache(fs, root);
+	uint64_t owner = 0;
+
+	if (!bt_tree_address(fs, root)) {
+		return BTRFS_CORRUPT;
+	}
+	/* A stored node passed every check that depends only on its bytes. */
+	if (cache != NULL && bt_cache_get(cache, root, fs->info.node_size, buffer, &owner)) {
+		return bt_owner_matches(root, owner) ? BTRFS_OK : BTRFS_CORRUPT;
+	}
+	return bt_tree_fetch(fs, root, buffer, cache);
+}
+
 void
 bt_cursor_init(struct bt_cursor *cursor, const struct btrfs_fs *fs, struct bt_root root)
 {
@@ -140,11 +165,16 @@ bt_cursor_fini(struct bt_cursor *cursor)
 	unsigned i;
 
 	for (i = 0; i < BT_MAX_LEVEL; i++) {
-		if (cursor->blocks[i] != NULL) {
-			cursor->fs->env.release(
-			    cursor->fs->env.context, cursor->blocks[i], cursor->fs->info.node_size);
-			cursor->blocks[i] = NULL;
+		if (cursor->pins[i] != 0) {
+			bt_cache_unpin(cursor->fs->env.cache, cursor->pins[i] - 1);
+			cursor->pins[i] = 0;
 		}
+		if (cursor->owned[i] != NULL) {
+			cursor->fs->env.release(
+			    cursor->fs->env.context, cursor->owned[i], cursor->fs->info.node_size);
+			cursor->owned[i] = NULL;
+		}
+		cursor->blocks[i] = NULL;
 	}
 	cursor->valid = 0;
 }
@@ -153,7 +183,11 @@ static enum btrfs_result
 bt_cursor_load(struct bt_cursor *cursor, struct bt_root root)
 {
 	const struct btrfs_fs *fs = cursor->fs;
+	struct btrfs_cache *cache;
+	const uint8_t *node;
 	struct bt_root *loaded;
+	uint64_t owner = 0;
+	size_t handle = 0;
 	enum btrfs_result error;
 
 	if (root.level >= BT_MAX_LEVEL) {
@@ -164,15 +198,38 @@ bt_cursor_load(struct bt_cursor *cursor, struct bt_root root)
 	    loaded->generation == root.generation && loaded->owner == root.owner) {
 		return BTRFS_OK;
 	}
-	if (cursor->blocks[root.level] == NULL) {
-		cursor->blocks[root.level] = fs->env.allocate(fs->env.context, fs->info.node_size);
-		if (cursor->blocks[root.level] == NULL) {
+	loaded->address = 0;
+	cursor->blocks[root.level] = NULL;
+	if (cursor->pins[root.level] != 0) {
+		bt_cache_unpin(fs->env.cache, cursor->pins[root.level] - 1);
+		cursor->pins[root.level] = 0;
+	}
+	if (!bt_tree_address(fs, root)) {
+		return BTRFS_CORRUPT;
+	}
+	/* A stored node is read in place instead of copied (see bt_tree_read). */
+	cache = bt_tree_cache(fs, root);
+	if (cache != NULL) {
+		node = bt_cache_pin(cache, root, fs->info.node_size, &owner, &handle);
+		if (node != NULL) {
+			cursor->pins[root.level] = handle + 1;
+			if (!bt_owner_matches(root, owner)) {
+				return BTRFS_CORRUPT;
+			}
+			cursor->blocks[root.level] = node;
+			*loaded = root;
+			return BTRFS_OK;
+		}
+	}
+	if (cursor->owned[root.level] == NULL) {
+		cursor->owned[root.level] = fs->env.allocate(fs->env.context, fs->info.node_size);
+		if (cursor->owned[root.level] == NULL) {
 			return BTRFS_NO_MEMORY;
 		}
 	}
-	loaded->address = 0;
-	error = bt_tree_read(fs, root, cursor->blocks[root.level]);
+	error = bt_tree_fetch(fs, root, cursor->owned[root.level], cache);
 	if (error == BTRFS_OK) {
+		cursor->blocks[root.level] = cursor->owned[root.level];
 		*loaded = root;
 	}
 	return error;

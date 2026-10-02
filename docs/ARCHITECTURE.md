@@ -120,7 +120,11 @@ callbacks. Address, generation and level name one immutable node: a block is
 rewritten only after it is freed, and a reused address carries a newer
 generation, so a hit returns the node without device I/O or checksum, after
 the caller's owner check. Eight-way sets with CLOCK replacement bound each
-lookup. Nodes enter only from committed views: a transaction's private view
+lookup. Tree cursors read a stored node in place while they hold a pin on it,
+so a hit copies nothing; a pinned node is never replaced, and a set whose ways
+are all pinned stores nothing new until a pin is released. Open directory
+streams hold their pins, so every stream must be closed and every mount
+unmounted before the cache is destroyed. Nodes enter only from committed views: a transaction's private view
 excludes its own generation, and explicit recovery validates candidates without
 the cache, since a refused candidate's generation may be written again. The
 cache is valid only while the device changes through its owner's commits; it
