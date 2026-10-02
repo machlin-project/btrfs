@@ -109,6 +109,13 @@ A per-operation commit pays three barriers, which dominate durable latency;
 grouping amortizes them over the running transaction. No native adapter
 groups its operations yet.
 
+Concurrent cached lookups of names in one directory, each walking the same
+tree roots, scale with lock-free hits and striped pin counters: on the
+`transactions` image, 1.6, 3.1, 4.9 and 5.1 million lookups per second with one,
+two, four and eight threads, where a cache lock gave 1.6, 1.0, 0.4 and 0.5
+million. Through the native volume, its lock on every read still limits eight
+threads to about 1.1 million.
+
 ## Matched benchmark protocol
 
 1. Freeze binaries, fixture images and mount options in generated reports. Record

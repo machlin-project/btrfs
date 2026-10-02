@@ -233,7 +233,7 @@ bt_cursor_load(struct bt_cursor *cursor, struct bt_root root)
 	/* A stored node is read in place instead of copied (see bt_tree_read). */
 	cache = bt_tree_cache(fs, root);
 	if (cache != NULL) {
-		node = bt_cache_pin(cache, root, fs->info.node_size, &owner, &handle);
+		node = bt_cache_pin(cache, root, fs->info.node_size, &owner, &handle, cursor);
 		if (node != NULL) {
 			cursor->pins[root.level] = handle + 1;
 			if (!bt_owner_matches(root, owner)) {

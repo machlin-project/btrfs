@@ -133,8 +133,10 @@ int bt_cache_get(struct btrfs_cache *cache, struct bt_root root, uint32_t node_s
     uint64_t *owner);
 void bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
     const void *node, uint64_t owner);
+/* hint is any address on the caller's stack: it spreads concurrent callers'
+ * pin counters over separate cache lines. */
 const uint8_t *bt_cache_pin(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
-    uint64_t *owner, size_t *handle);
+    uint64_t *owner, size_t *handle, const void *hint);
 void bt_cache_unpin(struct btrfs_cache *cache, size_t handle);
 
 void bt_copy(void *destination, const void *source, size_t length);

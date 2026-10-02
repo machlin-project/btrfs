@@ -95,8 +95,8 @@ struct btrfs_environment {
 	struct btrfs_cache *cache;
 };
 
-/* Mutual exclusion for a cache shared by threads; NULL callbacks mean one
- * thread at a time uses it. */
+/* Mutual exclusion for storing nodes in a cache shared by threads (lookups do
+ * not take it); NULL callbacks mean one thread at a time stores. */
 struct btrfs_cache_locks {
 	void *context;
 	void (*lock)(void *context);

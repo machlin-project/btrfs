@@ -118,8 +118,13 @@ reported explicitly; bytes beyond `completed` are invalid and never hold
 unverified file data.
 
 An owner may give its mounts one bounded cache of verified tree nodes
-(`btrfs_cache`, in the environment), shared across threads through its own lock
-callbacks. Address, generation and level name one immutable node: a block is
+(`btrfs_cache`, in the environment), shared across threads. Lookups take no
+lock: a lookup raises a pin counter of the entry, one of sixteen chosen by its
+stack address so that concurrent lookups of the same tree roots touch separate
+cache lines, and then checks that the entry is not being replaced; storing a
+node takes the owner's lock and replaces only an entry it finds unpinned in
+every counter after marking it, both steps sequentially consistent so that one
+side always sees the other. Address, generation and level name one immutable node: a block is
 rewritten only after it is freed, and a reused address carries a newer
 generation, so a hit returns the node without device I/O or checksum, after
 the caller's owner check. Eight-way sets with CLOCK replacement bound each
