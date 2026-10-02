@@ -134,13 +134,15 @@ only after successful durable publication; `seal` alone is not a commit.
 
 ## Executable gates for writable mounts
 
-`tests/mounted_contracts.py --suite write --disposable-guest` already requires
-exclusive create, unaligned overwrite, mmap/pread/pwrite coherence, shrink/grow
-zeroing, metadata/xattr mutations, links, rename replacement, cross-directory
-rename, nonempty-directory failure, open-unlink lifetime and file/directory fsync.
-It has not passed for this driver. Missing contracts must fail, not be removed or
-blanket-skipped. Extend with remount persistence, concurrent append/rename and
-full-disk behavior.
+`tests/mounted_write.c` (run by `tests/run_macos.py` in both commit modes)
+requires exclusive create, unaligned overwrite, mmap/pread/pwrite coherence,
+shrink/grow zeroing, metadata/xattr mutations, links, rename replacement,
+cross-directory rename, nonempty-directory failure, open-unlink lifetime,
+file/directory fsync, remount persistence, concurrent append/rename, set-id
+writes and full-disk behavior. It passes on the loaded XNU module with Linux
+verification of every written image; `tests/mounted_contracts.py --suite write`
+has not run for this driver. Missing contracts must fail, not be removed or
+blanket-skipped. Power-cut checks of native `fsync` boundaries remain.
 
 For each operation sequence and each device fault:
 

@@ -533,11 +533,14 @@ python3 ../btrfs/tests/run_macos.py \
   --guest-directory /var/tmp/machlin-btrfs-tests \
   --expected-session "$btrfs_test_session" --expected-module-uuid "$btrfs_test_module_uuid" \
   --probe "$PWD/../btrfs/.build/btrfs-mounted-test" \
-  --mount-helper "$PWD/../btrfs/artifacts/kext-final/arm64e/mount_machlin_btrfs" \
+  --mount-helper "$PWD/../btrfs/artifacts/kext/arm64e/mount_machlin_btrfs" \
+  --write-probe "$PWD/../btrfs/.build/btrfs-mounted-write-test" \
   --image "$PWD/../btrfs/artifacts/fixtures/plain.raw" \
   --image "$PWD/../btrfs/artifacts/fixtures/small-nodes.raw" \
   --image "$PWD/../btrfs/artifacts/fixtures/large-nodes.raw" \
   --image "$PWD/../btrfs/artifacts/fixtures/zlib.raw" \
+  --write-image "$PWD/../btrfs/artifacts/fixtures/plain.raw" \
+  --write-image "$PWD/../btrfs/artifacts/fixtures/small-nodes.raw" \
   --output "$PWD/artifacts/btrfs-kext/mounted-new-run"
 ```
 
@@ -547,3 +550,40 @@ the filesystem's authorization uses their actual credentials. Every image is
 attached read-only, verified by raw-device hash, mounted, tested, normally
 unmounted, hashed again and detached. A failed cleanup or missing image is not a
 pass. Keep FSKit and LXNU acceptance separate from these native XNU results.
+
+A `--write-image` is copied into the guest and attached writable; its source
+fixture must not change. Each `--write-mode` (default: both) uses its own copy:
+`grouped` mounts it read-write (`mount_machlin_btrfs -w`), where operations
+share a running transaction until `fsync`, `sync`, the commit interval or
+unmount commits it, and `synchronous` adds `-s` (`MNT_SYNCHRONOUS`, one commit
+per operation). The runner runs `btrfs-mounted-write-test write` (exclusive create, unaligned
+overwrite, mmap/pread/pwrite coherence, shrink and grow zeroing, chmod, xattrs,
+hard and symbolic links, rename over a file and across directories, a nonempty
+rmdir, open-unlink lifetime, file and directory fsync, an 8 MiB file, four
+concurrent O_APPEND writers while the name is renamed 200 times, set-id writes
+by the superuser and by another user, and filling the device until fsync, or
+the write itself on a synchronous mount, reports ENOSPC, then deleting and
+writing again), unmounts, mounts again and runs
+`verify`, which checks the same facts after the remount and prints a manifest.
+The runner saves it as `NAME-MODE.manifest.tsv` and copies the written image
+back as `NAME-MODE-written.raw`. Then Linux checks the image macOS wrote, from the lab
+directory, on a disposable copy:
+
+```sh
+python3 ../btrfs/tests/prepare_native_linux.py \
+  --root artifacts/btrfs-reference/root \
+  --manifest artifacts/btrfs-kext/mounted-new-run/plain-grouped.manifest.tsv \
+  --archive artifacts/btrfs-reference/native-check-plain.cpio --device-bytes 268435456
+python3 -c 'import shutil,sys; from pathlib import Path; shutil.copyfileobj(Path(sys.argv[1]).open("rb"), Path(sys.argv[2]).open("xb"))' \
+  artifacts/btrfs-kext/mounted-new-run/plain-grouped-written.raw ../btrfs/artifacts/native-plain-work.raw
+.cache/linux-reference/linux-vm .cache/linux-reference/Image \
+  artifacts/btrfs-reference/native-check-plain.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/native-plain-work.raw > ../btrfs/logs/linux-native-plain.log 2>&1
+```
+
+Repeat with the `synchronous` manifest and image. Require `BTRFS_NATIVE_CHECKS:N`
+with the manifest's line count and
+`BTRFS_NATIVE_PASS`: `btrfs check --readonly`, every manifest fact (SHA-256,
+mode, owner, links, listings, symlink, xattr, mtime, absent names), then a Linux
+read-write mount, write, `btrfs check` again and no orphan item left.

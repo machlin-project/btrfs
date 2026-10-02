@@ -5,10 +5,13 @@
 #include <sys/buf.h>
 #include <sys/disk.h>
 #include <sys/errno.h>
+#include <sys/fcntl.h>
 #include <sys/kauth.h>
 #include <sys/malloc.h>
 #include <sys/param.h>
+#include <sys/proc.h>
 #include <sys/systm.h>
+#include <sys/ubc.h>
 #include <sys/vnode_if.h>
 
 int
@@ -40,6 +43,16 @@ btrfs_xnu_error(enum btrfs_result result)
 		return EEXIST;
 	case BTRFS_NO_SPACE:
 		return ENOSPC;
+	case BTRFS_NOT_EMPTY:
+		return ENOTEMPTY;
+	case BTRFS_CROSS_TREE:
+		return EXDEV;
+	case BTRFS_TOO_MANY_LINKS:
+		return EMLINK;
+	case BTRFS_NAME_TOO_LONG:
+		return ENAMETOOLONG;
+	case BTRFS_NOT_PERMITTED:
+		return EPERM;
 	default:
 		return EIO;
 	}
@@ -191,12 +204,196 @@ btrfs_xnu_device_read(void *context, uint64_t offset, void *buffer, size_t lengt
 	return result;
 }
 
+static enum btrfs_result
+btrfs_xnu_write_aligned(
+    struct btrfs_xnu_mount *mount, uint64_t offset, const void *buffer, size_t length)
+{
+	buf_t request;
+	int error;
+
+	request = buf_alloc(mount->device);
+	if (request == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	buf_setflags(request, B_WRITE);
+	buf_setblkno(request, (daddr64_t)(offset / mount->device_block_size));
+	buf_setlblkno(request, (daddr64_t)(offset / mount->device_block_size));
+	buf_setcount(request, (uint32_t)length);
+	buf_setsize(request, (uint32_t)length);
+	buf_setresid(request, (uint32_t)length);
+	buf_setdataptr(request, (uintptr_t)buffer);
+	/* Completion of a write buffer ends the device's write accounting. */
+	vnode_startwrite(mount->device);
+	error = VNOP_STRATEGY(request);
+	if (error == 0) {
+		error = buf_biowait(request);
+	}
+	if (error == 0 && buf_resid(request) != 0) {
+		error = EIO;
+	}
+	buf_free(request);
+	return error == 0 ? BTRFS_OK : BTRFS_IO;
+}
+
+/* The core writes whole sectors at sector-aligned offsets. */
+static enum btrfs_result
+btrfs_xnu_device_write(void *context, uint64_t offset, const void *bytes, size_t length)
+{
+	struct btrfs_xnu_mount *mount = context;
+	const uint8_t *source = bytes;
+	size_t amount;
+	enum btrfs_result result = BTRFS_OK;
+
+	if (offset % mount->device_block_size != 0 || length % mount->device_block_size != 0 ||
+	    offset > mount->device_bytes || length > mount->device_bytes - offset) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (vnode_getwithref(mount->device) != 0) {
+		return BTRFS_IO;
+	}
+	while (length != 0 && result == BTRFS_OK) {
+		amount = length > MAXPHYS ? MAXPHYS : length;
+		result = btrfs_xnu_write_aligned(mount, offset, source, amount);
+		offset += amount;
+		source += amount;
+		length -= amount;
+	}
+	vnode_put(mount->device);
+	return result;
+}
+
+/* A full cache flush: every completed write is durable when it returns. */
+static enum btrfs_result
+btrfs_xnu_device_flush(void *context)
+{
+	struct btrfs_xnu_mount *mount = context;
+	dk_synchronize_t synchronize;
+	vfs_context_t ioctl_context;
+	int error;
+
+	if (vnode_getwithref(mount->device) != 0) {
+		return BTRFS_IO;
+	}
+	bzero(&synchronize, sizeof(synchronize));
+	ioctl_context = vfs_context_create(NULL);
+	error = VNOP_IOCTL(
+	    mount->device, DKIOCSYNCHRONIZE, (caddr_t)&synchronize, FWRITE, ioctl_context);
+	vfs_context_rele(ioctl_context);
+	vnode_put(mount->device);
+	return error == 0 ? BTRFS_OK : BTRFS_IO;
+}
+
+static void
+btrfs_xnu_volume_lock(void *context)
+{
+	lck_mtx_lock(((struct btrfs_xnu_mount *)context)->volume_lock);
+}
+
+static void
+btrfs_xnu_volume_unlock(void *context)
+{
+	lck_mtx_unlock(((struct btrfs_xnu_mount *)context)->volume_lock);
+}
+
+static void
+btrfs_xnu_volume_wait(void *context, const void *channel)
+{
+	(void)msleep((event_t)(uintptr_t)channel, ((struct btrfs_xnu_mount *)context)->volume_lock,
+	    PRIBIO, "btrfsvol", NULL);
+}
+
+static void
+btrfs_xnu_volume_wake(void *context, const void *channel)
+{
+	(void)context;
+	wakeup((event_t)(uintptr_t)channel);
+}
+
+static void
+btrfs_xnu_cache_lock(void *context)
+{
+	lck_mtx_lock(((struct btrfs_xnu_mount *)context)->cache_lock);
+}
+
+static void
+btrfs_xnu_cache_unlock(void *context)
+{
+	lck_mtx_unlock(((struct btrfs_xnu_mount *)context)->cache_lock);
+}
+
+int
+btrfs_xnu_commit(struct btrfs_xnu_mount *mount, uint64_t generation)
+{
+	if (generation == 0) {
+		return 0;
+	}
+	return btrfs_xnu_error(btrfs_volume_sync(mount->volume, generation));
+}
+
+/* Commits the running transaction every BTRFS_XNU_COMMIT_SECONDS; with
+ * nodes_lock held. */
+static void
+btrfs_xnu_arm_committer(struct btrfs_xnu_mount *mount)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline(BTRFS_XNU_COMMIT_SECONDS, NSEC_PER_SEC, &deadline);
+	mount->committer_armed = 1;
+	(void)thread_call_enter_delayed(mount->committer, deadline);
+}
+
+static void
+btrfs_xnu_commit_tick(thread_call_param_t parameter, thread_call_param_t unused)
+{
+	struct btrfs_xnu_mount *mount = parameter;
+
+	(void)unused;
+	(void)btrfs_volume_sync(mount->volume, btrfs_volume_pending(mount->volume));
+	lck_mtx_lock(mount->nodes_lock);
+	if (mount->stopping) {
+		/* The last access to the mount: unmount may free it once woken. */
+		mount->committer_armed = 0;
+		wakeup(&mount->committer_armed);
+	} else {
+		btrfs_xnu_arm_committer(mount);
+	}
+	lck_mtx_unlock(mount->nodes_lock);
+}
+
+/* Stops the committer and waits for a running tick, with the public thread
+ * call interface only: a cancel that removes the scheduled call ends it,
+ * otherwise the running tick ends it. */
+static void
+btrfs_xnu_stop_committer(struct btrfs_xnu_mount *mount)
+{
+	if (mount->committer == NULL) {
+		return;
+	}
+	lck_mtx_lock(mount->nodes_lock);
+	mount->stopping = 1;
+	if (mount->committer_armed && thread_call_cancel(mount->committer)) {
+		mount->committer_armed = 0;
+	}
+	while (mount->committer_armed) {
+		(void)msleep(
+		    &mount->committer_armed, mount->nodes_lock, PRIBIO, "btrfscommit", NULL);
+	}
+	lck_mtx_unlock(mount->nodes_lock);
+}
+
 static void
 btrfs_xnu_free_mount(struct btrfs_xnu_mount *mount)
 {
+	btrfs_xnu_stop_committer(mount);
+	if (mount->committer != NULL) {
+		(void)thread_call_free(mount->committer);
+	}
 	btrfs_identity_destroy(mount->identities);
-	if (mount->fs != NULL) {
-		btrfs_unmount(mount->fs);
+	btrfs_volume_close(mount->volume);
+	/* After every view and stream of the mount is gone. */
+	btrfs_cache_destroy(mount->cache);
+	if (mount->cache_lock != NULL) {
+		lck_mtx_free(mount->cache_lock, btrfs_xnu_locks);
 	}
 	if (mount->nodes_lock != NULL) {
 		lck_mtx_free(mount->nodes_lock, btrfs_xnu_locks);
@@ -204,8 +401,32 @@ btrfs_xnu_free_mount(struct btrfs_xnu_mount *mount)
 	if (mount->creation_lock != NULL) {
 		lck_mtx_free(mount->creation_lock, btrfs_xnu_locks);
 	}
+	if (mount->volume_lock != NULL) {
+		lck_mtx_free(mount->volume_lock, btrfs_xnu_locks);
+	}
 	vnode_rele(mount->device);
 	_FREE(mount, M_TEMP);
+}
+
+/* Linux removes orphaned inodes of the mounted tree at a read-write mount. */
+static int
+btrfs_xnu_clean_orphans(struct btrfs_xnu_mount *mount)
+{
+	struct btrfs_transaction *transaction;
+	size_t cleaned = 0;
+	enum btrfs_result result;
+
+	result = btrfs_volume_begin(mount->volume, &transaction);
+	if (result == BTRFS_OK) {
+		result = btrfs_transaction_clean_orphans(
+		    transaction, mount->info.default_tree, &cleaned);
+		if (result == BTRFS_OK && cleaned != 0) {
+			result = btrfs_volume_commit(mount->volume, transaction);
+		} else {
+			btrfs_volume_abort(mount->volume, transaction);
+		}
+	}
+	return btrfs_xnu_error(result);
 }
 
 static int
@@ -213,18 +434,22 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 {
 	struct btrfs_xnu_mount *mount;
 	struct btrfs_environment environment;
+	struct btrfs_write_environment writer;
+	struct btrfs_volume_locks locks;
+	struct btrfs_cache_locks cache_locks;
+	struct btrfs_volume_view *view;
+	const struct btrfs_fs *fs;
 	struct btrfs_inode root;
 	struct vfsioattr io;
 	uint64_t blocks;
 	uint32_t block_size;
+	uint32_t writable = 0;
+	int read_only = (vfs_flags(mp) & MNT_RDONLY) != 0;
 	int error;
 
 	(void)data;
 	if (vfs_flags(mp) & MNT_UPDATE) {
 		return ENOTSUP;
-	}
-	if (!(vfs_flags(mp) & MNT_RDONLY)) {
-		return EROFS;
 	}
 	if (device == NULL || vnode_vtype(device) != VBLK) {
 		return ENOTBLK;
@@ -241,6 +466,12 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	    (block_size & (block_size - 1)) != 0 || blocks > INT64_MAX / block_size) {
 		return ENOTSUP;
 	}
+	if (!read_only) {
+		error = VNOP_IOCTL(device, DKIOCISWRITABLE, (caddr_t)&writable, 0, context);
+		if (error != 0 || writable == 0) {
+			return EROFS;
+		}
+	}
 	mount = _MALLOC(sizeof(*mount), M_TEMP, M_WAITOK | M_ZERO | M_NULL);
 	if (mount == NULL) {
 		return ENOMEM;
@@ -253,37 +484,90 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	mount->mount = mp;
 	mount->device = device;
 	mount->device_block_size = block_size;
+	mount->device_bytes = blocks * block_size;
 	mount->nodes_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
 	mount->creation_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
-	if (mount->nodes_lock == NULL || mount->creation_lock == NULL) {
+	mount->volume_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
+	mount->cache_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
+	if (mount->nodes_lock == NULL || mount->creation_lock == NULL ||
+	    mount->volume_lock == NULL || mount->cache_lock == NULL) {
 		btrfs_xnu_free_mount(mount);
 		return ENOMEM;
 	}
+	/* Durability needs a working cache flush before any write. */
+	if (!read_only && btrfs_xnu_device_flush(mount) != BTRFS_OK) {
+		btrfs_xnu_free_mount(mount);
+		return ENOTSUP;
+	}
 	bzero(&environment, sizeof(environment));
 	environment.context = mount;
-	environment.size_bytes = blocks * block_size;
+	environment.size_bytes = mount->device_bytes;
 	environment.read = btrfs_xnu_device_read;
 	environment.allocate = btrfs_xnu_allocate;
 	environment.release = btrfs_xnu_release;
 	environment.decompress = btrfs_xnu_decompress;
-	error = btrfs_xnu_error(btrfs_mount(&environment, 0, &mount->fs));
+	cache_locks.context = mount;
+	cache_locks.lock = btrfs_xnu_cache_lock;
+	cache_locks.unlock = btrfs_xnu_cache_unlock;
+	/* Storage is allocated at first use; without it reads bypass the cache. */
+	error = btrfs_xnu_error(
+	    btrfs_cache_create(&environment, &cache_locks, BTRFS_XNU_CACHE_BYTES, &mount->cache));
 	if (error != 0) {
 		btrfs_xnu_free_mount(mount);
 		return error;
 	}
-	btrfs_get_info(mount->fs, &mount->info);
-	(void)btrfs_root(mount->fs, &root);
-	error = btrfs_xnu_error(btrfs_identity_create(&environment, root.id, &mount->identities));
+	environment.cache = mount->cache;
+	writer.context = mount;
+	writer.write = btrfs_xnu_device_write;
+	writer.flush = btrfs_xnu_device_flush;
+	/* The kernel adapter writes no compressed data yet. */
+	writer.compress = NULL;
+	writer.compression = BTRFS_COMPRESSION_NONE;
+	locks.context = mount;
+	locks.lock = btrfs_xnu_volume_lock;
+	locks.unlock = btrfs_xnu_volume_unlock;
+	locks.wait = btrfs_xnu_volume_wait;
+	locks.wake = btrfs_xnu_volume_wake;
+	/* A read-write mount never recovers implicitly: superblock copies that
+	 * need recovery make admission fail (RECOVERY_REQUIRED). */
+	error = btrfs_xnu_error(
+	    btrfs_volume_open(&environment, read_only ? NULL : &writer, &locks, 0, &mount->volume));
 	if (error != 0) {
 		btrfs_xnu_free_mount(mount);
 		return error;
 	}
-	if (mount->info.sector_size < block_size) {
+	fs = btrfs_volume_pin(mount->volume, &view);
+	btrfs_get_info(fs, &mount->info);
+	error = btrfs_xnu_error(btrfs_root(fs, &root));
+	btrfs_volume_unpin(mount->volume, view);
+	if (error == 0) {
+		error = btrfs_xnu_error(
+		    btrfs_identity_create(&environment, root.id, &mount->identities));
+	}
+	if (error == 0 && mount->info.sector_size < block_size) {
+		error = ENOTSUP;
+	}
+	if (error == 0 && !read_only) {
+		error = btrfs_xnu_clean_orphans(mount);
+	}
+	mount->synchronous = (vfs_flags(mp) & MNT_SYNCHRONOUS) != 0;
+	/* A synchronous mount commits its operations and synchronous writes;
+	 * data pushed otherwise (mapped pages, write-behind) still waits. */
+	if (error == 0 && !read_only) {
+		mount->committer = thread_call_allocate(btrfs_xnu_commit_tick, mount);
+		error = mount->committer == NULL ? ENOMEM : 0;
+	}
+	if (error != 0) {
 		btrfs_xnu_free_mount(mount);
-		return ENOTSUP;
+		return error;
+	}
+	if (mount->committer != NULL) {
+		lck_mtx_lock(mount->nodes_lock);
+		btrfs_xnu_arm_committer(mount);
+		lck_mtx_unlock(mount->nodes_lock);
 	}
 	vfs_setfsprivate(mp, mount);
-	vfs_setflags(mp, MNT_LOCAL | MNT_RDONLY);
+	vfs_setflags(mp, read_only ? MNT_LOCAL | MNT_RDONLY : MNT_LOCAL);
 	vfs_getnewfsid(mp);
 	vfs_setlocklocal(mp);
 	vfs_ioattr(mp, &io);
@@ -293,16 +577,47 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 }
 
 static int
+btrfs_xnu_sync_vnode(vnode_t vnode, void *argument)
+{
+	int *wait = argument;
+
+	if (vnode_vtype(vnode) == VREG) {
+		(void)ubc_msync(
+		    vnode, 0, ubc_getsize(vnode), NULL, UBC_PUSHDIRTY | (*wait ? UBC_SYNC : 0));
+	}
+	return VNODE_RETURNED;
+}
+
+int
+btrfs_xnu_sync_all(mount_t mp, int wait)
+{
+	struct btrfs_xnu_mount *mount = vfs_fsprivate(mp);
+	int error;
+
+	if (!btrfs_volume_writable(mount->volume)) {
+		return 0;
+	}
+	(void)vnode_iterate(mp, 0, btrfs_xnu_sync_vnode, &wait);
+	/* The pushed data and every earlier operation. */
+	error = btrfs_xnu_commit(mount, btrfs_volume_pending(mount->volume));
+	return error != 0 ? error : btrfs_xnu_error(btrfs_volume_failure(mount->volume));
+}
+
+static int
 btrfs_xnu_unmount_volume(mount_t mp, int flags, vfs_context_t context)
 {
 	struct btrfs_xnu_mount *mount = vfs_fsprivate(mp);
 	int error;
 
 	(void)context;
+	(void)btrfs_xnu_sync_all(mp, 1);
 	error = vflush(mp, NULL, (flags & MNT_FORCE) ? FORCECLOSE : 0);
 	if (error != 0) {
 		return error;
 	}
+	/* Inactive orphans evicted during vflush joined the running transaction. */
+	btrfs_xnu_stop_committer(mount);
+	(void)btrfs_xnu_commit(mount, btrfs_volume_pending(mount->volume));
 	vfs_setfsprivate(mp, NULL);
 	btrfs_xnu_free_mount(mount);
 	return 0;
@@ -312,30 +627,36 @@ static int
 btrfs_xnu_root(mount_t mp, vnode_t *result, vfs_context_t context)
 {
 	(void)context;
-	return btrfs_xnu_get_node(vfs_fsprivate(mp), BTRFS_NATIVE_ROOT_ID, NULL, NULL, result);
+	return btrfs_xnu_root_node(vfs_fsprivate(mp), result);
 }
 
 static int
 btrfs_xnu_vget(mount_t mp, ino64_t number, vnode_t *result, vfs_context_t context)
 {
 	(void)context;
-	return btrfs_xnu_get_node(vfs_fsprivate(mp), number, NULL, NULL, result);
+	return btrfs_xnu_number_node(vfs_fsprivate(mp), number, result);
 }
 
 static int
 btrfs_xnu_volume_attributes(mount_t mp, struct vfs_attr *attributes, vfs_context_t context)
 {
 	struct btrfs_xnu_mount *mount = vfs_fsprivate(mp);
-	struct btrfs_info *info = &mount->info;
+	struct btrfs_volume_view *view;
+	struct btrfs_info info;
 
 	(void)context;
-	VFSATTR_RETURN(attributes, f_bsize, info->sector_size);
-	VFSATTR_RETURN(attributes, f_iosize, info->sector_size);
-	VFSATTR_RETURN(attributes, f_blocks, info->total_bytes / info->sector_size);
+	btrfs_get_info(btrfs_volume_pin(mount->volume, &view), &info);
+	btrfs_volume_unpin(mount->volume, view);
+	VFSATTR_RETURN(attributes, f_bsize, info.sector_size);
+	VFSATTR_RETURN(attributes, f_iosize, info.sector_size);
+	VFSATTR_RETURN(attributes, f_blocks, info.total_bytes / info.sector_size);
 	VFSATTR_RETURN(
-	    attributes, f_bfree, (info->total_bytes - info->used_bytes) / info->sector_size);
-	VFSATTR_RETURN(attributes, f_bavail, 0);
-	VFSATTR_RETURN(attributes, f_bused, info->used_bytes / info->sector_size);
+	    attributes, f_bfree, (info.total_bytes - info.used_bytes) / info.sector_size);
+	VFSATTR_RETURN(attributes, f_bavail,
+	    btrfs_volume_writable(mount->volume)
+		? (info.total_bytes - info.used_bytes) / info.sector_size
+		: 0);
+	VFSATTR_RETURN(attributes, f_bused, info.used_bytes / info.sector_size);
 	VFSATTR_RETURN(attributes, f_files, 0);
 	VFSATTR_RETURN(attributes, f_ffree, 0);
 	VFSATTR_RETURN(attributes, f_fssubtype, 0);
@@ -345,10 +666,8 @@ btrfs_xnu_volume_attributes(mount_t mp, struct vfs_attr *attributes, vfs_context
 static int
 btrfs_xnu_sync(mount_t mp, int flags, vfs_context_t context)
 {
-	(void)mp;
-	(void)flags;
 	(void)context;
-	return 0;
+	return btrfs_xnu_sync_all(mp, (flags & MNT_WAIT) != 0);
 }
 
 struct vfsops btrfs_xnu_vfsops = { .vfs_mount = btrfs_xnu_mount_volume,

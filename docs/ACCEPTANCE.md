@@ -1,8 +1,9 @@
 # Acceptance
 
-The portable reader, four-profile read-only XNU mount and a narrow CoW writer
-have executable acceptance. General writable mounts, installed FSKit, Linux ABI
-conformance and a performance win over Linux remain open.
+The portable reader, four-profile read-only XNU mount, the CoW writer and
+explicit read-write XNU mounts in both commit modes have executable acceptance.
+Native power-cut durability, installed FSKit, Linux ABI conformance and a
+performance win over Linux remain open.
 
 ## Established evidence
 
@@ -31,11 +32,12 @@ conformance and a performance win over Linux remain open.
 | Corruption / concurrency | Adversarial/fault/budget tests and eight concurrent readers pass; prior reader TSAN and bounded fuzz runs passed | `tests/adversarial.c`, `tests/concurrent.c`, `logs/fuzz-final.log` |
 | Native volume views | Pins keep committed root sets, the next writer waits for older views, empty/aborted transactions publish nothing, an uncertain commit fails the volume; under ASan/UBSan and TSan, four readers check every pinned view against the writer's per-generation model through 1,000 transactions with aborts, injected allocation failures and a failed final commit; removing the drain wait or the pin lock fails the test | `tests/volume.c` (`--stress`) |
 | Freestanding core | Stack frames bounded to 2 KiB, including writer | Meson freestanding target |
-| Native compilation | arm64e and x86_64 kexts, unsigned FSKit application/extension pass; no unresolved owned symbols | `logs/kext-final-*.log`, `logs/fskit-final.log` |
+| Native compilation | arm64e and x86_64 kexts bind only public BSD, Mach and libkern KPIs; unsigned FSKit application/extension pass; no unresolved owned symbols | `logs/kext-final-*.log`, `logs/fskit-final.log` |
 | Loaded XNU and mounted reads | Actual custom guest kernel/module identities verified; plain, 4 KiB nodes, 64 KiB nodes and zlib profiles pass; media hashes unchanged | Lab `artifacts/btrfs-kext/` reports; `tests/run_macos.py`, `tests/mounted.c` |
-| Installed FSKit | Not accepted; compilation only | Actual module signing/registration and mounted tests remain |
+| Loaded XNU and mounted writes | `mount_machlin_btrfs -w` on copies of the plain and 4 KiB-node profiles, grouped and `-w -s` synchronous: the write suite (data, mmap coherence, truncation, links, renames, xattrs, open-unlink, fsync, concurrent appends, set-id, ENOSPC and recovery from it), unmount, remount and its persistence checks pass; Linux then passes `btrfs check --readonly`, all 14 manifest facts, a read-write mount, write and second check on each of the four written images | Lab `artifacts/btrfs-kext/` reports and manifests; `tests/run_macos.py`, `tests/mounted_write.c`, `tests/prepare_native_linux.py`, `tests/native_oracle.sh` |
+| Installed FSKit | Not accepted; component-tested writable volume behind the device barrier, compilation only | Actual module signing/registration, barrier service approval and mounted tests remain |
 | LXNU ABI semantics | Not run for Btrfs | No XNU-fork hooks or ABI matrix completion claimed |
-| Native durable writes / comparative performance | Not accepted | Native writers remain disabled; no matched Linux benchmark |
+| Native power-cut durability / comparative performance | Not accepted | No power-cut checks of native `fsync` boundaries; no matched Linux benchmark |
 
 Source revisions belong to Git. Kernel/module UUIDs, artifact hashes, precise
 commands and individual observations live in generated reports. The 367 reader
@@ -120,7 +122,7 @@ remaining durability gates pass.
 
 Native data writeback, relocation trees, system-chunk growth, chunk removal and
 balance, free-space representation conversion, the v1 space cache, quotas,
-accepted native writable mounts with a cleaner, and UBC/FSKit coherence; adapter
+power-cut acceptance of native writable mounts, and FSKit dirty-page coherence; adapter
 use of superblock recovery and tree-log replay; LZO/alternate checksums/RAID;
 full Linux authorization semantics; provisioning and mounted FSKit acceptance;
 matched Linux performance measurements.

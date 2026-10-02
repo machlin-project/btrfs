@@ -604,6 +604,45 @@ makes it read-only for the rest of the mount, since only explicit superblock
 recovery may decide what became durable. A read-write open admits a first
 transaction, so copies needing recovery fail the mount rather than a later write.
 
+The XNU adapter groups operations ([group commit](GROUP_COMMIT.md)): every
+namespace and attribute operation joins the volume's running transaction and
+returns once applied; readers see it at once. A commit publishes the running
+transaction when `fsync` asks for an object whose last change it holds, on
+`sync`, every five seconds, when the transaction lacks room for the next
+operation, and at unmount. A mount with `-o sync` (`MNT_SYNCHRONOUS`) instead
+commits each namespace and attribute operation before it returns. File data
+follows the unified buffer cache: `write`, `ftruncate` and mmap stores change
+cached pages and the file's logical size; pageout, `fsync`, `sync` and unmount push them to
+`VNOP_STRATEGY`, which applies each pushed range in the running transaction
+as copy-on-write data clipped to the logical size, or to the end of the write
+in progress, whose pages `cluster_write` may push before the size covers them.
+A synchronous write (`O_SYNC`, `O_DSYNC` or a synchronous mount) pushes its
+data and commits once before it returns; `fsync` also pushes pages stored
+through a mapping. Shrinking discards cached pages beyond the new size before
+its operation; growing applies first. Every commit ends with the publication
+barriers and a device cache flush (`DKIOCSYNCHRONIZE`), which a read-write
+mount probes before it starts, so a returned `fsync` is durable, as is every
+operation and write on a synchronous mount. A failed operation on pushed data
+is reported by the next `fsync` or synchronous write (ENOSPC, EIO); a failed commit makes the mount read-only.
+Read paths gather what they return before copying it to user space, so no
+reader of the running transaction waits on a page fault. Vnodes are looked up by native number
+and inode generation, so an inode number reused after deletion gets a new vnode;
+unlinking a name that is still open keeps an orphan item until `VNOP_INACTIVE`
+evicts it, and a read-write mount cleans orphans of its tree as Linux does.
+
+Authorization stays with XNU's VFS, which checks the caller's credential against
+the attributes the adapter reports, including immutable and append-only flags.
+New objects take the caller's uid and the directory's group (BSD creation);
+directories with a default POSIX ACL refuse creation (ENOTSUP) because ACL
+inheritance is not translated. A write or truncation by a non-superuser removes
+set-id bits and a file capability through the core's `drop_privileges` in its
+own transaction; a superuser's keeps them (`keep_privileges`), and data pushed
+without a recorded superuser decision never keeps them. A change of owner by a
+non-superuser clears set-id bits and removes the capability in the same
+transaction. Only `user.` xattrs are visible; other names stay unsupported, as
+on read. Device, FIFO and socket vnodes need special-file operations the adapter
+does not have (ENOTSUP).
+
 The FSKit volume runs on the shared volume layer: reads take the newest view and
 changes are operations of the running transaction, committed at least every
 five seconds, at synchronization and at unmount. FSKit's block resource offers

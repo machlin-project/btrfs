@@ -62,6 +62,10 @@ native_test = executable('btrfs-native-policy', 'tests/native_policy.c', include
 test('native-xattr-policy', native_test, suite: 'core')
 executable('btrfs-mounted-test', 'tests/mounted.c', dependencies: dependency('threads'),
   override_options: ['b_sanitize=none'])
+if host_machine.system() == 'darwin'
+  executable('btrfs-mounted-write-test', 'tests/mounted_write.c',
+    dependencies: dependency('threads'), override_options: ['b_sanitize=none'])
+endif
 logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
