@@ -371,6 +371,98 @@ expect_corrupt_map(struct context *context, const char *name)
 	printf("allocation map %s: PASS (corrupt)\n", name);
 }
 
+/* The first data extent of a chunk, from the extent tree. */
+static int
+chunk_extent(const struct btrfs_fs *fs, struct bt_root extents, const struct bt_chunk *chunk,
+    uint64_t *address, uint64_t *length)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { .objectid = chunk->logical };
+	int found = 0;
+
+	bt_cursor_init(&cursor, fs, extents);
+	if (bt_cursor_seek(&cursor, key, 0) == BTRFS_OK) {
+		do {
+			(void)bt_cursor_record(&cursor, &record);
+			if (record.key.objectid >= chunk->logical + chunk->length) {
+				break;
+			}
+			if (record.key.type == BT_EXTENT_ITEM) {
+				*address = record.key.objectid;
+				*length = record.key.offset;
+				found = 1;
+			}
+		} while (!found && bt_cursor_next(&cursor) == BTRFS_OK);
+	}
+	bt_cursor_fini(&cursor);
+	return found;
+}
+
+/* A release in a higher data chunk loads it before any lower one; a later
+ * data reservation must still take the lowest free range of the class, as it
+ * does after loading every chunk, so allocation never depends on which chunks
+ * happen to be loaded. */
+static void
+load_order_test(struct context *context)
+{
+	struct bt_space *full;
+	struct bt_space *partial;
+	struct btrfs_fs *fs;
+	struct bt_root extents;
+	uint64_t address = 0;
+	uint64_t length = 0;
+	uint64_t full_logical;
+	uint64_t full_size;
+	uint64_t partial_logical;
+	uint64_t partial_size;
+	uint64_t want;
+	size_t low = SIZE_MAX;
+	size_t high = SIZE_MAX;
+	size_t i;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
+	for (i = 0; i < fs->chunk_count; i++) {
+		if ((fs->chunks[i].type & (BT_BLOCK_DATA | BT_BLOCK_METADATA)) != BT_BLOCK_DATA) {
+			continue;
+		}
+		if (low == SIZE_MAX) {
+			low = i;
+		} else if (chunk_extent(fs, extents, &fs->chunks[i], &address, &length)) {
+			high = i;
+		}
+	}
+	if (low == SIZE_MAX || high == SIZE_MAX) {
+		printf("allocation after an out-of-order load: not constructed on this image "
+		       "(needs two data chunks)\n");
+		btrfs_unmount(fs);
+		return;
+	}
+	REQUIRE(chunk_extent(fs, extents, &fs->chunks[high], &address, &length));
+	/* A reservation the lower chunk can hold, so a skip would show. */
+	want = context->sector_size;
+	REQUIRE(bt_space_create(fs, extents, NULL, TRANSACTION_NODE_LIMIT, &full) == BTRFS_OK);
+	REQUIRE(bt_space_load_all(full) == BTRFS_OK);
+	REQUIRE(bt_space_reserve_data(full, want, &full_logical, &full_size) == BTRFS_OK);
+	REQUIRE(bt_space_create(fs, extents, NULL, TRANSACTION_NODE_LIMIT, &partial) == BTRFS_OK);
+	REQUIRE(bt_space_change_used(partial, address, length, 0) == BTRFS_OK);
+	REQUIRE(bt_space_reserve_data(partial, want, &partial_logical, &partial_size) == BTRFS_OK);
+	if (full_logical - fs->chunks[low].logical >= fs->chunks[low].length) {
+		printf("allocation after an out-of-order load: not constructed on this image "
+		       "(the lowest data chunk is full)\n");
+	} else {
+		REQUIRE(partial_logical == full_logical && partial_size == full_size);
+		printf("allocation after an out-of-order load: the higher chunk loaded first, the "
+		       "reservation still takes %llu in the lowest chunk PASS\n",
+		    (unsigned long long)full_logical);
+	}
+	bt_space_destroy(full);
+	bt_space_destroy(partial);
+	btrfs_unmount(fs);
+	REQUIRE(context->image.live_allocations == 0);
+}
+
 /* Checksum-correct allocation maps damaged by this test, not by the writer. */
 void
 allocation_map_tests(struct context *context)
@@ -395,6 +487,7 @@ allocation_map_tests(struct context *context)
 	uint32_t slot;
 	size_t i;
 
+	load_order_test(context);
 	leaf = malloc(BT_MAX_NODE_SIZE);
 	REQUIRE(leaf != NULL);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
