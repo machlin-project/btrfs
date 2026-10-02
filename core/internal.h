@@ -84,6 +84,21 @@ struct bt_chunk {
 	uint8_t removed;
 };
 
+/* Bits of a CRC32C register. */
+#define BT_CRC_BITS 32U
+/* Lanes bt_crc32c_block checksums in parallel, and the shortest lane worth
+ * joining them. */
+#define BT_CRC_BLOCK_LANES 3U
+#define BT_CRC_BLOCK_MINIMUM 256U
+
+/* Joins lanes of one block's CRC: column i advances register bit i over one
+ * lane of zero bytes. Zero lane: no join, a single chain. */
+struct bt_crc_shift {
+	size_t length;
+	size_t lane;
+	uint32_t columns[BT_CRC_BITS];
+};
+
 struct btrfs_fs {
 	struct btrfs_environment env;
 	struct btrfs_info info;
@@ -91,6 +106,8 @@ struct btrfs_fs {
 	struct btrfs_inode root_inode;
 	uint8_t metadata_uuid[BTRFS_UUID_SIZE], device_uuid[BTRFS_UUID_SIZE];
 	uint64_t device_id, device_size;
+	/* Joins the lanes of a node checksum (node_size - BT_CSUM_SIZE bytes). */
+	struct bt_crc_shift node_crc;
 	/* Sorted by logical address; chunk_capacity entries are allocated. */
 	struct bt_chunk *chunks;
 	size_t chunk_count;
@@ -161,6 +178,12 @@ uint32_t bt_crc32c(uint32_t seed, const void *buffer, size_t length);
 #define BT_CRC_BATCH 64U
 /* checksums[i] = Btrfs CRC32C (~bt_crc32c(UINT32_MAX, ...)) of sector i. */
 void bt_crc32c_sectors(const void *data, size_t sector_size, size_t count, uint32_t *checksums);
+/* Prepares bt_crc32c_block for blocks of length bytes. */
+void bt_crc_shift_init(struct bt_crc_shift *shift, size_t length);
+/* bt_crc32c of a block in parallel lanes when shift was prepared for its
+ * length; otherwise a single chain. */
+uint32_t bt_crc32c_block(
+    const struct bt_crc_shift *shift, uint32_t seed, const void *buffer, size_t length);
 int bt_name_valid(const void *name, size_t length);
 int bt_xattr_name_valid(const void *name, size_t length);
 enum btrfs_result bt_read_physical(

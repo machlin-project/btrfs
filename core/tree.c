@@ -81,8 +81,8 @@ bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *
 	bt_copy(&checksum, header->csum, sizeof(checksum));
 	if ((!built &&
 		bt_u32(checksum) !=
-		    ~bt_crc32c(
-			UINT32_MAX, block + BT_CSUM_SIZE, fs->info.node_size - BT_CSUM_SIZE)) ||
+		    ~bt_crc32c_block(&fs->node_crc, UINT32_MAX, block + BT_CSUM_SIZE,
+			fs->info.node_size - BT_CSUM_SIZE)) ||
 	    !bt_equal(header->fsid, fs->metadata_uuid, BTRFS_UUID_SIZE) ||
 	    bt_u64(header->bytenr) != root.address || header->level != root.level ||
 	    bt_u64(header->generation) != root.generation || root.generation == 0 ||

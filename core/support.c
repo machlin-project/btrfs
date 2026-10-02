@@ -417,6 +417,83 @@ bt_crc32c_sectors(const void *data, size_t sector_size, size_t count, uint32_t *
 }
 #endif
 
+/* The register after advancing crc over a lane of zero bytes: the CRC is
+ * linear in its register, so crc(s, A || B) = shift(crc(s, A)) ^ crc(0, B). */
+static uint32_t
+bt_crc_advance(const struct bt_crc_shift *shift, uint32_t crc)
+{
+	uint32_t result = 0;
+	unsigned bit;
+
+	for (bit = 0; bit < BT_CRC_BITS; bit++) {
+		result ^= shift->columns[bit] & (0U - ((crc >> bit) & 1U));
+	}
+	return result;
+}
+
+void
+bt_crc_shift_init(struct bt_crc_shift *shift, size_t length)
+{
+	static const uint8_t zeros[sizeof(uint64_t)] = { 0 };
+	size_t lane = length / BT_CRC_BLOCK_LANES / sizeof(uint64_t) * sizeof(uint64_t);
+	size_t i;
+	unsigned bit;
+
+	bt_zero(shift, sizeof(*shift));
+	if (lane < BT_CRC_BLOCK_MINIMUM) {
+		return;
+	}
+	for (bit = 0; bit < BT_CRC_BITS; bit++) {
+		shift->columns[bit] = UINT32_C(1) << bit;
+	}
+	/* The columns are independent chains. */
+	for (i = 0; i < lane; i += sizeof(zeros)) {
+		for (bit = 0; bit < BT_CRC_BITS; bit++) {
+			shift->columns[bit] = bt_crc32c(shift->columns[bit], zeros, sizeof(zeros));
+		}
+	}
+	shift->length = length;
+	shift->lane = lane;
+}
+
+#ifdef BT_CRC_HARDWARE
+BT_CRC_TARGET uint32_t
+bt_crc32c_block(const struct bt_crc_shift *shift, uint32_t seed, const void *buffer, size_t length)
+{
+	const uint8_t *bytes = buffer;
+	uint32_t middle = 0;
+	uint32_t last = 0;
+	size_t lane = shift->lane;
+	size_t i;
+
+	if (lane == 0 || length != shift->length) {
+		return bt_crc32c(seed, buffer, length);
+	}
+	for (i = 0; i < lane; i += sizeof(uint64_t)) {
+		seed = bt_crc_word(seed, bt_crc_load(bytes + i));
+		middle = bt_crc_word(middle, bt_crc_load(bytes + lane + i));
+		last = bt_crc_word(last, bt_crc_load(bytes + 2 * lane + i));
+	}
+	seed = bt_crc_advance(shift, bt_crc_advance(shift, seed) ^ middle) ^ last;
+	return bt_crc32c(seed, bytes + 3 * lane, length - 3 * lane);
+}
+#else
+uint32_t
+bt_crc32c_block(const struct bt_crc_shift *shift, uint32_t seed, const void *buffer, size_t length)
+{
+	const uint8_t *bytes = buffer;
+	size_t lane = shift->lane;
+
+	if (lane == 0 || length != shift->length) {
+		return bt_crc32c(seed, buffer, length);
+	}
+	seed =
+	    bt_crc_advance(shift, bt_crc32c(seed, bytes, lane)) ^ bt_crc32c(0, bytes + lane, lane);
+	seed = bt_crc_advance(shift, seed) ^ bt_crc32c(0, bytes + 2 * lane, lane);
+	return bt_crc32c(seed, bytes + 3 * lane, length - 3 * lane);
+}
+#endif
+
 static int
 bt_raw_name_valid(const void *name, size_t length, int xattr)
 {

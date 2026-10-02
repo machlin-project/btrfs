@@ -141,8 +141,8 @@ bt_mut_checksum(struct bt_mutation *mutation, struct bt_mutable_node *node)
 	if (!node->checksum_valid) {
 		bt_zero(header->csum, sizeof(header->csum));
 		bt_put32(&checksum,
-		    ~bt_crc32c(UINT32_MAX, node->bytes + BT_CSUM_SIZE,
-			mutation->view.info.node_size - BT_CSUM_SIZE));
+		    ~bt_crc32c_block(&mutation->view.node_crc, UINT32_MAX,
+			node->bytes + BT_CSUM_SIZE, mutation->view.info.node_size - BT_CSUM_SIZE));
 		bt_copy(header->csum, &checksum, sizeof(checksum));
 		node->checksum_valid = 1;
 	}

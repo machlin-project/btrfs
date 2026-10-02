@@ -91,7 +91,10 @@ view, without copying them, and from reusing the primary superblock a transactio
 instead of reading it again. Sequential reads gained from checksumming four data
 sectors in independent CRC instruction chains and from reading aligned sectors
 into the caller's buffer instead of copying them out of a window (the table's
-first sequential figures predate both). The remaining reads are superblocks: the primary at
+first sequential figures predate both). Node checksums run in three such chains
+over thirds of the node, joined by an operator computed at mount that advances
+a CRC over a third of zero bytes: on the development host, 33 GB/s instead of 11
+for every node size. The remaining reads are superblocks: the primary at
 mount, and at both begin and commit the primary and each secondary copy present
 on the device. The written images are byte-identical to those before these
 changes. Writes in
