@@ -11,6 +11,8 @@
 
 #define BT_TRANSACTION_NODES 4096U
 #define BT_TRANSACTION_TREES 16U
+/* Chunks one transaction may grow; growth beyond waits for the next. */
+#define BT_TRANSACTION_CHUNKS 64U
 /* Queued file reference changes of one transaction. */
 #define BT_TRANSACTION_REFERENCES 65536U
 #define BT_INLINE_WRITE_LIMIT 2048U

@@ -88,8 +88,10 @@ struct btrfs_fs {
 	struct btrfs_inode root_inode;
 	uint8_t metadata_uuid[BTRFS_UUID_SIZE], device_uuid[BTRFS_UUID_SIZE];
 	uint64_t device_id, device_size;
+	/* Sorted by logical address; chunk_capacity entries are allocated. */
 	struct bt_chunk *chunks;
 	size_t chunk_count;
+	size_t chunk_capacity;
 	/* Nodes of this generation and later are not committed in this view (a
 	 * transaction's private nodes) and never enter the shared node cache. */
 	uint64_t cache_limit;
@@ -156,6 +158,10 @@ enum btrfs_result bt_super_check(const struct bt_disk_super *super, uint64_t off
 int bt_super_same(const struct bt_disk_super *a, const struct bt_disk_super *b);
 enum btrfs_result bt_mount_super(const struct btrfs_environment *environment,
     const struct bt_disk_super *super, uint64_t offset, uint64_t tree, struct btrfs_fs **result);
+/* Index of the first chunk at or after logical; chunk_count if none. */
+size_t bt_chunk_position(const struct btrfs_fs *fs, uint64_t logical);
+/* Index of the chunk holding logical; chunk_count if none. */
+size_t bt_chunk_containing(const struct btrfs_fs *fs, uint64_t logical);
 enum btrfs_result bt_chunk_add(
     struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap);
 enum btrfs_result bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,

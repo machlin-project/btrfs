@@ -157,7 +157,8 @@ bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk
 	error = bt_super_decode(fs, super, offset);
 	if (error == BTRFS_OK) {
 		fs->chunks = environment->allocate(
-		    environment->context, BT_MAX_CHUNKS * sizeof(*fs->chunks));
+		    environment->context, BT_INITIAL_CHUNKS * sizeof(*fs->chunks));
+		fs->chunk_capacity = BT_INITIAL_CHUNKS;
 		if (fs->chunks == NULL) {
 			error = BTRFS_NO_MEMORY;
 		}
@@ -236,7 +237,7 @@ btrfs_unmount(struct btrfs_fs *fs)
 	}
 	env = fs->env;
 	if (fs->chunks != NULL) {
-		env.release(env.context, fs->chunks, BT_MAX_CHUNKS * sizeof(*fs->chunks));
+		env.release(env.context, fs->chunks, fs->chunk_capacity * sizeof(*fs->chunks));
 	}
 	env.release(env.context, fs, sizeof(*fs));
 }

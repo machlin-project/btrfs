@@ -26,7 +26,10 @@ struct bt_le64 {
 #define BT_SYSTEM_ARRAY_SIZE 2048U
 #define BT_MAX_LEVEL 8U
 #define BT_MAX_NODE_SIZE 65536U
-#define BT_MAX_CHUNKS 4096U
+/* Chunks of one filesystem; the table holds the chunks actually present,
+ * starting from BT_INITIAL_CHUNKS entries. */
+#define BT_MAX_CHUNKS 1048576U
+#define BT_INITIAL_CHUNKS 4U
 #define BT_MAX_COMPRESSED_SIZE (128U * 1024U)
 #define BT_READ_WINDOW (1024U * 1024U)
 #define BT_STRIPE_LENGTH UINT64_C(65536)

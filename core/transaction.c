@@ -131,8 +131,10 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	transaction->roots = base->root_tree;
 	transaction->chunks = base->chunk_tree;
 	transaction->fs = *base;
-	transaction->fs.chunks =
-	    base->env.allocate(base->env.context, BT_MAX_CHUNKS * sizeof(*base->chunks));
+	/* Room for the chunks this transaction may grow. */
+	transaction->fs.chunk_capacity = base->chunk_count + BT_TRANSACTION_CHUNKS;
+	transaction->fs.chunks = base->env.allocate(
+	    base->env.context, transaction->fs.chunk_capacity * sizeof(*base->chunks));
 	if (transaction->fs.chunks != NULL) {
 		bt_copy(transaction->fs.chunks, base->chunks,
 		    base->chunk_count * sizeof(*base->chunks));
@@ -1194,7 +1196,7 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 	}
 	if (transaction->fs.chunks != NULL) {
 		env->release(env->context, transaction->fs.chunks,
-		    BT_MAX_CHUNKS * sizeof(*transaction->fs.chunks));
+		    transaction->fs.chunk_capacity * sizeof(*transaction->fs.chunks));
 	}
 	env->release(env->context, transaction, sizeof(*transaction));
 }

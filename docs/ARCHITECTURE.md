@@ -171,14 +171,18 @@ uses exported inflate APIs and paired kernel allocation callbacks.
 | --- | --- | --- |
 | Tree levels | 8 (levels 0 through 7) | Corrupt format |
 | Node/sector size | powers of two, 4 through 64 KiB; node >= sector | Corrupt geometry |
-| Chunks | 4096 | Unsupported capacity |
+| Chunks | 1,048,576; the table holds the chunks present | Unsupported capacity |
+| Chunks one transaction grows | 64 | NO_SPACE until the next transaction |
 | Regular read window | 1 MiB per operation | Split into windows |
 | Compressed input/output | 128 KiB each | Corrupt extent |
 | Traversed file/xattr records per operation | 1,048,576 | Unsupported capacity |
+| Extent-tree items a writable mount verifies at admission | 1,048,576 | Unsupported capacity |
+| Free ranges per allocation class | 131,072 | Unsupported capacity |
 | Native identities per mount | 65,536 | Explicit range error |
 
-The chunk table consumes a fixed bounded allocation; cursors allocate only the
-levels they visit. Kernel-stack compilation enforces 2 KiB frames. These limits
+The chunk table starts with four entries and doubles as the chunk tree and
+the superblock array name more; a transaction copies it with room for the
+chunks it may grow. Cursors allocate only the levels they visit. Kernel-stack compilation enforces 2 KiB frames. These limits
 are development contracts, not a claim that all valid Linux volumes fit them.
 
 ## Write architecture

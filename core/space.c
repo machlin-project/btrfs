@@ -32,7 +32,12 @@ struct bt_space {
 	struct bt_gaps system;
 	/* Unallocated physical ranges of the device, known after verification. */
 	struct bt_gaps device;
+	/* Bytes used per chunk; used_capacity entries (the chunk table's). */
 	uint64_t *used;
+	size_t used_capacity;
+	/* Copies a new data or metadata chunk takes (DUP profiles). */
+	unsigned data_copies;
+	unsigned metadata_copies;
 	size_t original_chunks;
 	int growth;
 	struct bt_space_change *changes;
@@ -52,6 +57,8 @@ struct btrfs_allocation_map {
 	uint8_t uuid[BTRFS_UUID_SIZE];
 	struct bt_chunk *chunks;
 	size_t chunk_count;
+	/* Entries allocated for chunks and used. */
+	size_t capacity;
 	uint64_t *used;
 	struct bt_gaps metadata;
 	struct bt_gaps data;
@@ -363,7 +370,8 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	int fits;
 	enum btrfs_result error;
 
-	if (!space->growth || fs->chunk_count == BT_MAX_CHUNKS) {
+	if (!space->growth || fs->chunk_count >= fs->chunk_capacity ||
+	    fs->chunk_count >= space->used_capacity || fs->chunk_count == BT_MAX_CHUNKS) {
 		return BTRFS_NO_SPACE;
 	}
 	/* The chunk item and device item updates need system space first. */
@@ -502,7 +510,6 @@ bt_space_data_available(const struct bt_space *space, uint64_t length)
 {
 	uint64_t available = 0;
 	uint64_t unallocated = 0;
-	unsigned copies = 1;
 	size_t i;
 
 	for (i = space->data.next; i < space->data.count && available < length; i++) {
@@ -514,16 +521,10 @@ bt_space_data_available(const struct bt_space *space, uint64_t length)
 	if (!space->growth) {
 		return 0;
 	}
-	for (i = 0; i < space->fs->chunk_count; i++) {
-		if ((space->fs->chunks[i].type & BT_BLOCK_DATA) != 0 &&
-		    (space->fs->chunks[i].type & BT_BLOCK_DUP) != 0) {
-			copies = 2;
-		}
-	}
 	for (i = space->device.next; i < space->device.count; i++) {
 		unallocated += space->device.items[i].end - space->device.items[i].start;
 	}
-	return unallocated / copies >= length - available;
+	return unallocated / space->data_copies >= length - available;
 }
 
 int
@@ -532,7 +533,6 @@ bt_space_metadata_available(const struct bt_space *space, uint64_t nodes)
 	uint64_t node = space->fs->info.node_size;
 	uint64_t available = 0;
 	uint64_t unallocated = 0;
-	unsigned copies = 1;
 	size_t i;
 
 	for (i = space->metadata.next; i < space->metadata.count && available < nodes; i++) {
@@ -544,16 +544,10 @@ bt_space_metadata_available(const struct bt_space *space, uint64_t nodes)
 	if (!space->growth) {
 		return 0;
 	}
-	for (i = 0; i < space->fs->chunk_count; i++) {
-		if ((space->fs->chunks[i].type & BT_BLOCK_METADATA) != 0 &&
-		    (space->fs->chunks[i].type & BT_BLOCK_DUP) != 0) {
-			copies = 2;
-		}
-	}
 	for (i = space->device.next; i < space->device.count; i++) {
 		unallocated += space->device.items[i].end - space->device.items[i].start;
 	}
-	return unallocated / copies / node >= nodes - available;
+	return unallocated / space->metadata_copies / node >= nodes - available;
 }
 
 enum btrfs_result
@@ -590,6 +584,35 @@ bt_space_release(void *context, uint64_t address)
 	 * prevents reuse by the same transaction; destroy releases them together. */
 	(void)context;
 	(void)address;
+}
+
+/* Allocates the per-chunk usage for every chunk the table can hold and
+ * records the copies new chunks of each class take. */
+static enum btrfs_result
+bt_space_counts(struct bt_space *space)
+{
+	const struct btrfs_fs *fs = space->fs;
+	size_t i;
+
+	space->used_capacity = fs->chunk_capacity;
+	space->used =
+	    fs->env.allocate(fs->env.context, space->used_capacity * sizeof(*space->used));
+	if (space->used == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	space->data_copies = 1;
+	space->metadata_copies = 1;
+	for (i = 0; i < fs->chunk_count; i++) {
+		if ((fs->chunks[i].type & BT_BLOCK_DUP) != 0 &&
+		    (fs->chunks[i].type & BT_BLOCK_DATA) != 0) {
+			space->data_copies = 2;
+		}
+		if ((fs->chunks[i].type & BT_BLOCK_DUP) != 0 &&
+		    (fs->chunks[i].type & BT_BLOCK_METADATA) != 0) {
+			space->metadata_copies = 2;
+		}
+	}
+	return BTRFS_OK;
 }
 
 enum btrfs_result
@@ -630,8 +653,10 @@ bt_space_create(
 	space->fs = fs;
 	space->node_limit = node_limit;
 	space->original_chunks = fs->chunk_count;
-	space->used = fs->env.allocate(fs->env.context, BT_MAX_CHUNKS * sizeof(*space->used));
-	error = space->used == NULL ? BTRFS_NO_MEMORY : bt_space_load(space, extent_root);
+	error = bt_space_counts(space);
+	if (error == BTRFS_OK) {
+		error = bt_space_load(space, extent_root);
+	}
 	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
 		error = bt_space_exclude_chunk(space, i);
 	}
@@ -862,26 +887,22 @@ enum btrfs_result
 bt_space_change_used(struct bt_space *space, uint64_t address, uint64_t size, int allocate)
 {
 	const struct bt_chunk *chunk;
-	size_t i;
+	size_t i = bt_chunk_containing(space->fs, address);
 	enum btrfs_result error;
 
-	for (i = 0; i < space->fs->chunk_count; i++) {
-		chunk = &space->fs->chunks[i];
-		if (address >= chunk->logical && address < chunk->logical + chunk->length) {
-			if (size > chunk->logical + chunk->length - address ||
-			    (allocate ? size > chunk->length - space->used[i]
-				      : size > space->used[i])) {
-				return BTRFS_CORRUPT;
-			}
-			error = bt_space_log(space, i, address, size, allocate);
-			if (error == BTRFS_OK) {
-				space->used[i] =
-				    allocate ? space->used[i] + size : space->used[i] - size;
-			}
-			return error;
-		}
+	if (i == space->fs->chunk_count) {
+		return BTRFS_CORRUPT;
 	}
-	return BTRFS_CORRUPT;
+	chunk = &space->fs->chunks[i];
+	if (size > chunk->logical + chunk->length - address ||
+	    (allocate ? size > chunk->length - space->used[i] : size > space->used[i])) {
+		return BTRFS_CORRUPT;
+	}
+	error = bt_space_log(space, i, address, size, allocate);
+	if (error == BTRFS_OK) {
+		space->used[i] = allocate ? space->used[i] + size : space->used[i] - size;
+	}
+	return error;
 }
 
 uint64_t
@@ -908,7 +929,8 @@ bt_space_destroy(struct bt_space *space)
 		    space->data.capacity * sizeof(*space->data.items));
 	}
 	if (space->used != NULL) {
-		env->release(env->context, space->used, BT_MAX_CHUNKS * sizeof(*space->used));
+		env->release(
+		    env->context, space->used, space->used_capacity * sizeof(*space->used));
 	}
 	if (space->system.items != NULL) {
 		env->release(env->context, space->system.items,
@@ -1159,9 +1181,10 @@ btrfs_allocation_map_create(
 	}
 	bt_zero(map, sizeof(*map));
 	map->env = *environment;
+	map->capacity = BT_INITIAL_CHUNKS;
 	map->chunks =
-	    environment->allocate(environment->context, BT_MAX_CHUNKS * sizeof(*map->chunks));
-	map->used = environment->allocate(environment->context, BT_MAX_CHUNKS * sizeof(*map->used));
+	    environment->allocate(environment->context, map->capacity * sizeof(*map->chunks));
+	map->used = environment->allocate(environment->context, map->capacity * sizeof(*map->used));
 	if (map->chunks == NULL || map->used == NULL) {
 		btrfs_allocation_map_destroy(map);
 		return BTRFS_NO_MEMORY;
@@ -1190,10 +1213,10 @@ btrfs_allocation_map_destroy(struct btrfs_allocation_map *map)
 	bt_space_map_clear(map);
 	if (map->chunks != NULL) {
 		map->env.release(
-		    map->env.context, map->chunks, BT_MAX_CHUNKS * sizeof(*map->chunks));
+		    map->env.context, map->chunks, map->capacity * sizeof(*map->chunks));
 	}
 	if (map->used != NULL) {
-		map->env.release(map->env.context, map->used, BT_MAX_CHUNKS * sizeof(*map->used));
+		map->env.release(map->env.context, map->used, map->capacity * sizeof(*map->used));
 	}
 	map->env.release(map->env.context, map, sizeof(*map));
 }
@@ -1221,6 +1244,41 @@ bt_space_map_fits(const struct btrfs_allocation_map *map, const struct btrfs_fs 
 	    bt_equal(map->chunks, fs->chunks, fs->chunk_count * sizeof(*fs->chunks));
 }
 
+/* Grows the map's chunk table to hold count chunks. */
+static enum btrfs_result
+bt_space_map_room(struct btrfs_allocation_map *map, size_t count)
+{
+	struct bt_chunk *chunks;
+	uint64_t *used;
+	size_t capacity = map->capacity;
+
+	if (count <= capacity) {
+		return BTRFS_OK;
+	}
+	while (capacity < count) {
+		capacity *= 2;
+	}
+	chunks = map->env.allocate(map->env.context, capacity * sizeof(*chunks));
+	used = map->env.allocate(map->env.context, capacity * sizeof(*used));
+	if (chunks == NULL || used == NULL) {
+		if (chunks != NULL) {
+			map->env.release(map->env.context, chunks, capacity * sizeof(*chunks));
+		}
+		if (used != NULL) {
+			map->env.release(map->env.context, used, capacity * sizeof(*used));
+		}
+		return BTRFS_NO_MEMORY;
+	}
+	bt_copy(chunks, map->chunks, map->chunk_count * sizeof(*chunks));
+	bt_copy(used, map->used, map->chunk_count * sizeof(*used));
+	map->env.release(map->env.context, map->chunks, map->capacity * sizeof(*map->chunks));
+	map->env.release(map->env.context, map->used, map->capacity * sizeof(*map->used));
+	map->chunks = chunks;
+	map->used = used;
+	map->capacity = capacity;
+	return BTRFS_OK;
+}
+
 enum btrfs_result
 bt_space_map_save(const struct bt_space *space, struct btrfs_allocation_map *map)
 {
@@ -1228,6 +1286,10 @@ bt_space_map_save(const struct bt_space *space, struct btrfs_allocation_map *map
 	enum btrfs_result error;
 
 	bt_space_map_clear(map);
+	error = bt_space_map_room(map, fs->chunk_count);
+	if (error != BTRFS_OK) {
+		return error;
+	}
 	bt_copy(map->chunks, fs->chunks, fs->chunk_count * sizeof(*fs->chunks));
 	bt_copy(map->used, space->used, fs->chunk_count * sizeof(*map->used));
 	map->chunk_count = fs->chunk_count;
@@ -1270,8 +1332,7 @@ bt_space_from_map(struct btrfs_fs *fs, struct btrfs_allocation_map *map, size_t 
 	space->node_limit = node_limit;
 	space->original_chunks = fs->chunk_count;
 	space->growth = map->growth;
-	space->used = fs->env.allocate(fs->env.context, BT_MAX_CHUNKS * sizeof(*space->used));
-	error = space->used == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+	error = bt_space_counts(space);
 	if (error == BTRFS_OK) {
 		bt_copy(space->used, map->used, fs->chunk_count * sizeof(*space->used));
 		error = bt_gaps_copy(&fs->env, &space->metadata, &map->metadata);
@@ -1311,39 +1372,40 @@ bt_space_map_class(struct btrfs_allocation_map *map, const struct bt_chunk *chun
 static enum btrfs_result
 bt_space_map_devices(struct btrfs_allocation_map *map, uint64_t device_size)
 {
+	struct bt_gaps stripes = { NULL, 0, 0, 0 };
 	uint64_t position = BT_DEVICE_RESERVED;
-	uint64_t next;
-	uint64_t best;
 	size_t i;
 	unsigned stripe;
 	enum btrfs_result error = BTRFS_OK;
 
 	bt_gaps_release(&map->env, &map->device);
-	/* Stripes in ascending physical order; at most BT_MAX_CHUNKS * 2 passes. */
-	while (error == BTRFS_OK) {
-		next = UINT64_MAX;
-		best = 0;
-		for (i = 0; i < map->chunk_count; i++) {
-			for (stripe = 0; stripe < map->chunks[i].mirrors; stripe++) {
-				if (map->chunks[i].physical[stripe] >= position &&
-				    map->chunks[i].physical[stripe] < next) {
-					next = map->chunks[i].physical[stripe];
-					best = map->chunks[i].length;
-				}
-			}
+	/* Every stripe as a physical range, sorted; the device extents are the
+	 * same ranges in the same order. At most two stripes per chunk. */
+	stripes.capacity = 2 * map->chunk_count + 1;
+	stripes.items =
+	    map->env.allocate(map->env.context, stripes.capacity * sizeof(*stripes.items));
+	if (stripes.items == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	for (i = 0; i < map->chunk_count; i++) {
+		for (stripe = 0; stripe < map->chunks[i].mirrors; stripe++) {
+			stripes.items[stripes.count++] =
+			    (struct bt_gap){ map->chunks[i].physical[stripe],
+				    map->chunks[i].physical[stripe] + map->chunks[i].length };
 		}
-		if (next == UINT64_MAX) {
-			break;
-		}
-		if (next > position) {
+	}
+	bt_gaps_normalize(&stripes);
+	for (i = 0; error == BTRFS_OK && i < stripes.count; i++) {
+		if (stripes.items[i].start > position) {
 			error = bt_gaps_open(&map->env, &map->device, map->device.count);
 			if (error == BTRFS_OK) {
 				map->device.items[map->device.count - 1] =
-				    (struct bt_gap){ position, next };
+				    (struct bt_gap){ position, stripes.items[i].start };
 			}
 		}
-		position = next + best;
+		position = stripes.items[i].end;
 	}
+	bt_gaps_release(&map->env, &stripes);
 	if (error == BTRFS_OK && position < device_size) {
 		error = bt_gaps_open(&map->env, &map->device, map->device.count);
 		if (error == BTRFS_OK) {
@@ -1370,6 +1432,7 @@ bt_space_map_commit(
 	if (!map->valid || map->chunk_count != space->original_chunks) {
 		return BTRFS_CORRUPT;
 	}
+	error = bt_space_map_room(map, fs->chunk_count);
 	/* Chunks the transaction grew: free as a whole, minus superblock stripes,
 	 * with the same exclusion a fresh scan applies. */
 	for (i = map->chunk_count; error == BTRFS_OK && i < fs->chunk_count; i++) {

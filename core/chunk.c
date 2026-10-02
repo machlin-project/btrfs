@@ -1,6 +1,60 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "internal.h"
 
+size_t
+bt_chunk_position(const struct btrfs_fs *fs, uint64_t logical)
+{
+	size_t low = 0;
+	size_t high = fs->chunk_count;
+	size_t middle;
+
+	while (low < high) {
+		middle = low + (high - low) / 2;
+		if (fs->chunks[middle].logical < logical) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low;
+}
+
+size_t
+bt_chunk_containing(const struct btrfs_fs *fs, uint64_t logical)
+{
+	size_t index = bt_chunk_position(fs, logical);
+
+	if (index < fs->chunk_count && fs->chunks[index].logical == logical) {
+		return index;
+	}
+	if (index > 0 && logical - fs->chunks[index - 1].logical < fs->chunks[index - 1].length) {
+		return index - 1;
+	}
+	return fs->chunk_count;
+}
+
+/* Doubles the table, up to BT_MAX_CHUNKS. */
+static enum btrfs_result
+bt_chunk_grow(struct btrfs_fs *fs)
+{
+	struct bt_chunk *grown;
+	size_t capacity;
+
+	if (fs->chunk_capacity >= BT_MAX_CHUNKS) {
+		return BTRFS_UNSUPPORTED;
+	}
+	capacity = fs->chunk_capacity * 2 > BT_MAX_CHUNKS ? BT_MAX_CHUNKS : fs->chunk_capacity * 2;
+	grown = fs->env.allocate(fs->env.context, capacity * sizeof(*grown));
+	if (grown == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	bt_copy(grown, fs->chunks, fs->chunk_count * sizeof(*grown));
+	fs->env.release(fs->env.context, fs->chunks, fs->chunk_capacity * sizeof(*fs->chunks));
+	fs->chunks = grown;
+	fs->chunk_capacity = capacity;
+	return BTRFS_OK;
+}
+
 enum btrfs_result
 bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap)
 {
@@ -13,6 +67,7 @@ bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t le
 	unsigned count;
 	unsigned j;
 	size_t i;
+	enum btrfs_result error;
 
 	if (key.objectid != BT_FIRST_CHUNK_OBJECTID || key.type != BT_CHUNK_ITEM ||
 	    length < sizeof(*disk)) {
@@ -59,30 +114,30 @@ bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t le
 	    chunk.physical[1] < chunk.physical[0] + chunk.length) {
 		return BTRFS_CORRUPT;
 	}
-	for (i = 0; i < fs->chunk_count; i++) {
+	/* The table is sorted and disjoint, so a new chunk can only collide with
+	 * its neighbours. */
+	i = bt_chunk_position(fs, chunk.logical);
+	if (i < fs->chunk_count && fs->chunks[i].logical == chunk.logical) {
 		existing = &fs->chunks[i];
-		if (existing->logical == chunk.logical) {
-			if (bootstrap || existing->confirmed || existing->length != chunk.length ||
-			    existing->type != chunk.type || existing->mirrors != chunk.mirrors ||
-			    !bt_equal(existing->physical, chunk.physical, sizeof(chunk.physical))) {
-				return BTRFS_CORRUPT;
-			}
-			existing->confirmed = 1;
-			return BTRFS_OK;
-		}
-		if (existing->logical < chunk.logical + chunk.length &&
-		    chunk.logical < existing->logical + existing->length) {
+		if (bootstrap || existing->confirmed || existing->length != chunk.length ||
+		    existing->type != chunk.type || existing->mirrors != chunk.mirrors ||
+		    !bt_equal(existing->physical, chunk.physical, sizeof(chunk.physical))) {
 			return BTRFS_CORRUPT;
 		}
+		existing->confirmed = 1;
+		return BTRFS_OK;
 	}
-	if (fs->chunk_count == BT_MAX_CHUNKS) {
-		return BTRFS_UNSUPPORTED;
+	if ((i > 0 && fs->chunks[i - 1].logical + fs->chunks[i - 1].length > chunk.logical) ||
+	    (i < fs->chunk_count && chunk.logical + chunk.length > fs->chunks[i].logical)) {
+		return BTRFS_CORRUPT;
 	}
-	i = fs->chunk_count;
-	while (i > 0 && fs->chunks[i - 1].logical > chunk.logical) {
-		fs->chunks[i] = fs->chunks[i - 1];
-		i--;
+	if (fs->chunk_count == fs->chunk_capacity) {
+		error = bt_chunk_grow(fs);
+		if (error != BTRFS_OK) {
+			return error;
+		}
 	}
+	bt_move(&fs->chunks[i + 1], &fs->chunks[i], (fs->chunk_count - i) * sizeof(*fs->chunks));
 	fs->chunks[i] = chunk;
 	fs->chunk_count++;
 	return BTRFS_OK;
