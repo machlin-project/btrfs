@@ -237,6 +237,11 @@ enum btrfs_result bt_chunk_add(
 enum btrfs_result bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,
     unsigned mirror, uint64_t *physical, unsigned *mirrors);
 enum btrfs_result bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer);
+/* bt_tree_read that returns a node in place when it can: *node is a stored
+ * node, pinned until bt_tree_release(*handle), or buffer after a device read. */
+enum btrfs_result bt_tree_source(const struct btrfs_fs *fs, struct bt_root root, void *buffer,
+    const uint8_t **node, size_t *handle);
+void bt_tree_release(const struct btrfs_fs *fs, size_t handle);
 enum btrfs_result bt_node_items(const struct btrfs_fs *fs, const uint8_t *block);
 void bt_cursor_init(struct bt_cursor *cursor, const struct btrfs_fs *fs, struct bt_root root);
 void bt_cursor_fini(struct bt_cursor *cursor);

@@ -327,6 +327,8 @@ static enum btrfs_result
 bt_mut_cow(struct bt_mutation *mutation, struct bt_root root, struct bt_mutable_node **result)
 {
 	struct bt_mutable_node *node;
+	const uint8_t *source;
+	size_t handle;
 	enum btrfs_result error;
 
 	node = bt_mut_find_node(mutation, root.address);
@@ -339,10 +341,12 @@ bt_mut_cow(struct bt_mutation *mutation, struct bt_root root, struct bt_mutable_
 		*result = node;
 		return BTRFS_OK;
 	}
-	error = bt_tree_read(mutation->base, root, mutation->scratch);
-	return error == BTRFS_OK
-	    ? bt_mut_new(mutation, root, mutation->scratch, root.address, result)
-	    : error;
+	error = bt_tree_source(mutation->base, root, mutation->scratch, &source, &handle);
+	if (error == BTRFS_OK) {
+		error = bt_mut_new(mutation, root, source, root.address, result);
+	}
+	bt_tree_release(mutation->base, handle);
+	return error;
 }
 
 /* Copies node into buffer and describes its entries as records from first on. */
@@ -680,6 +684,7 @@ bt_mut_merge(struct bt_mutation *mutation, struct bt_mutable_node *parent, uint3
 	struct bt_root root;
 	const uint8_t *bytes;
 	size_t capacity = mutation->view.info.node_size - sizeof(struct bt_disk_header);
+	size_t handle;
 	size_t first;
 	size_t count;
 	uint32_t index;
@@ -700,16 +705,19 @@ bt_mut_merge(struct bt_mutation *mutation, struct bt_mutable_node *parent, uint3
 		root.address = bt_u64(pointers[index].bytenr);
 		root.generation = bt_u64(pointers[index].generation);
 		sibling = bt_mut_find_node(mutation, root.address);
+		handle = 0;
 		if (sibling != NULL) {
 			bytes = sibling->bytes;
 		} else {
-			error = bt_tree_read(mutation->base, root, mutation->merge_scratch);
+			error = bt_tree_source(
+			    mutation->base, root, mutation->merge_scratch, &bytes, &handle);
 			if (error != BTRFS_OK) {
+				bt_tree_release(mutation->base, handle);
 				return error;
 			}
-			bytes = mutation->merge_scratch;
 		}
 		if (bt_mut_used(bytes) + bt_mut_used(child->bytes) > capacity) {
+			bt_tree_release(mutation->base, handle);
 			continue;
 		}
 		if (sibling == NULL) {
@@ -717,6 +725,7 @@ bt_mut_merge(struct bt_mutation *mutation, struct bt_mutable_node *parent, uint3
 		} else {
 			error = bt_mut_cow(mutation, root, &sibling);
 		}
+		bt_tree_release(mutation->base, handle);
 		if (error != BTRFS_OK) {
 			return error;
 		}

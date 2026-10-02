@@ -197,6 +197,48 @@ bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
 	return bt_tree_fetch(fs, root, buffer, cache);
 }
 
+enum btrfs_result
+bt_tree_source(const struct btrfs_fs *fs, struct bt_root root, void *buffer, const uint8_t **node,
+    size_t *handle)
+{
+	struct btrfs_cache *cache = bt_tree_cache(fs, root);
+	const uint8_t *stored;
+	uint64_t owner = 0;
+	size_t pin = 0;
+	enum btrfs_result error;
+
+	*handle = 0;
+	*node = buffer;
+	if (!bt_tree_address(fs, root)) {
+		return BTRFS_CORRUPT;
+	}
+	error = bt_tree_private(fs, root, node);
+	if (error != BTRFS_NOT_FOUND) {
+		return error;
+	}
+	*node = buffer;
+	stored = cache == NULL
+	    ? NULL
+	    : bt_cache_pin(cache, root, fs->info.node_size, &owner, &pin, &owner);
+	if (stored != NULL) {
+		*handle = pin + 1;
+		if (!bt_owner_matches(root, owner)) {
+			return BTRFS_CORRUPT;
+		}
+		*node = stored;
+		return BTRFS_OK;
+	}
+	return bt_tree_fetch(fs, root, buffer, cache);
+}
+
+void
+bt_tree_release(const struct btrfs_fs *fs, size_t handle)
+{
+	if (handle != 0) {
+		bt_cache_unpin(fs->env.cache, handle - 1);
+	}
+}
+
 void
 bt_cursor_init(struct bt_cursor *cursor, const struct btrfs_fs *fs, struct bt_root root)
 {
