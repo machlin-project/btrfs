@@ -83,7 +83,8 @@ Against the first cached measurement (lookup 1.2 us, stat during enumeration
 203 us, a create commit 185 us), the gains came from cursors reading cached
 nodes in place, inlined key and integer decoding, a commit adding its published
 nodes to the cache, and a transaction reading its own nodes without checksumming
-them twice, and from reusing the primary superblock a transaction has just read
+them twice or rescanning their items on every read (it checks each node's
+items once, when it seals them), and from reusing the primary superblock a transaction has just read
 instead of reading it again. Sequential reads gained from checksumming four data
 sectors in independent CRC instruction chains and from reading aligned sectors
 into the caller's buffer instead of copying them out of a window (the table's

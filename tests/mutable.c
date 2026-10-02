@@ -522,6 +522,49 @@ failures(void)
 	}
 }
 
+/* A node the editor left malformed is refused at seal, before any write. */
+static void
+malformed_seal(void)
+{
+	struct fixture fixture;
+	struct bt_mutation *mutation;
+	struct bt_mutated_block block;
+	struct bt_disk_item *items;
+	struct bt_root root;
+	uint8_t value[8] = { 0 };
+	uint8_t original[4096];
+	unsigned corruption;
+	unsigned i;
+
+	for (corruption = 0; corruption < 2; corruption++) {
+		initialize(&fixture, 4096, 0);
+		memcpy(original, fixture.medium + fixture.root.address, sizeof(original));
+		root = fixture.root;
+		mutation = begin(&fixture, 8);
+		for (i = 0; i < 3; i++) {
+			REQUIRE(bt_mutation_edit(mutation, &root, key(i), value, sizeof(value),
+				    BT_INSERT) == BTRFS_OK);
+		}
+		REQUIRE(root.level == 0 && bt_mutation_count(mutation) == 1);
+		REQUIRE(bt_mutation_block(mutation, 0, &block) == BTRFS_OK);
+		items = (void *)((uint8_t *)block.bytes + sizeof(struct bt_disk_header));
+		if (corruption == 0) {
+			items[2].key = items[1].key;
+		} else {
+			bt_put32(&items[1].offset, (uint32_t)block.size);
+		}
+		REQUIRE(bt_mutation_seal(mutation) == BTRFS_CORRUPT);
+		REQUIRE(bt_mutation_seal(mutation) == BTRFS_CORRUPT);
+		REQUIRE(bt_mutation_accept(mutation) == BTRFS_INVALID_ARGUMENT);
+		REQUIRE(bt_mutation_view(mutation) == NULL);
+		bt_mutation_destroy(mutation);
+		REQUIRE(fixture.live_bytes == 0 && fixture.reservations == 0);
+		REQUIRE(
+		    memcmp(original, fixture.medium + fixture.root.address, sizeof(original)) == 0);
+		free(fixture.medium);
+	}
+}
+
 int
 main(void)
 {
@@ -531,6 +574,7 @@ main(void)
 	exercise(16384, 1);
 	exercise(65536, 0);
 	failures();
+	malformed_seal();
 	puts("private CoW trees: model, split/grow/shrink/merge, snapshot isolation, abort/faults "
 	     "PASS");
 	return 0;

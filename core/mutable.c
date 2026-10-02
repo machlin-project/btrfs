@@ -1045,6 +1045,7 @@ bt_mutation_block(struct bt_mutation *mutation, size_t index, struct bt_mutated_
 enum btrfs_result
 bt_mutation_seal(struct bt_mutation *mutation)
 {
+	enum btrfs_result error;
 	size_t i;
 
 	if (mutation == NULL) {
@@ -1052,6 +1053,18 @@ bt_mutation_seal(struct bt_mutation *mutation)
 	}
 	if (mutation->failure != BTRFS_OK) {
 		return mutation->failure;
+	}
+	/* Reads within the transaction trust its own nodes' items; every node it
+	 * will write is checked once here instead. */
+	for (i = 0; i < mutation->count; i++) {
+		if (mutation->nodes[i]->discarded) {
+			continue;
+		}
+		error = bt_node_items(&mutation->view, mutation->nodes[i]->bytes);
+		if (error != BTRFS_OK) {
+			mutation->failure = error;
+			return error;
+		}
 	}
 	for (i = 0; i < mutation->count; i++) {
 		bt_mut_checksum(mutation, mutation->nodes[i]);

@@ -18,29 +18,68 @@ bt_node_key(const uint8_t *block, uint8_t level, uint32_t slot)
 	return bt_key_decode((const void *)(body + slot * stride));
 }
 
-/* checksummed is zero only for a transaction's own private nodes, whose
- * checksum is computed when they are written. */
-static enum btrfs_result
-bt_validate_node(
-    const struct btrfs_fs *fs, struct bt_root root, const uint8_t *block, int checksummed)
+/* Checks a node's item count, key order, leaf data bounds and child pointers
+ * against its own header level and generation. */
+enum btrfs_result
+bt_node_items(const struct btrfs_fs *fs, const uint8_t *block)
 {
 	const struct bt_disk_header *header = (const void *)block;
 	const struct bt_disk_item *items = (const void *)(header + 1);
 	const struct bt_disk_pointer *pointers = (const void *)(header + 1);
-	struct bt_le32 checksum;
 	struct bt_key previous = { 0 };
 	struct bt_key key;
-	uint64_t owner;
-	uint32_t count;
+	uint64_t generation = bt_u64(header->generation);
+	uint32_t count = bt_count(block);
 	uint32_t i;
+	uint8_t level = header->level;
 	size_t body_size = fs->info.node_size - sizeof(*header);
-	size_t stride = root.level == 0 ? sizeof(*items) : sizeof(*pointers);
+	size_t stride = level == 0 ? sizeof(*items) : sizeof(*pointers);
 	size_t start;
 	size_t size;
 	size_t end = body_size;
 
+	if (count > body_size / stride || (level != 0 && count == 0)) {
+		return BTRFS_CORRUPT;
+	}
+	for (i = 0; i < count; i++) {
+		key = bt_node_key(block, level, i);
+		if (i != 0 && bt_key_compare(previous, key) >= 0) {
+			return BTRFS_CORRUPT;
+		}
+		previous = key;
+		if (level == 0) {
+			start = bt_u32(items[i].offset);
+			size = bt_u32(items[i].size);
+			if (start < count * stride || start > end || size > end - start) {
+				return BTRFS_CORRUPT;
+			}
+			end = start;
+		} else if (bt_u64(pointers[i].bytenr) == 0 ||
+		    bt_u64(pointers[i].bytenr) % fs->info.sector_size != 0 ||
+		    bt_u64(pointers[i].generation) == 0 ||
+		    bt_u64(pointers[i].generation) > generation) {
+			return BTRFS_CORRUPT;
+		}
+	}
+	return BTRFS_OK;
+}
+
+/* built is nonzero only for a transaction's own nodes, which its editor built
+ * in memory: their identity and item count are checked here, their items when
+ * the transaction seals them, and their checksum when they are written. */
+static enum btrfs_result
+bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *block, int built)
+{
+	const struct bt_disk_header *header = (const void *)block;
+	struct bt_le32 checksum;
+	uint64_t owner;
+	uint32_t count;
+	size_t body_size = fs->info.node_size - sizeof(*header);
+	size_t stride =
+	    root.level == 0 ? sizeof(struct bt_disk_item) : sizeof(struct bt_disk_pointer);
+
 	bt_copy(&checksum, header->csum, sizeof(checksum));
-	if ((checksummed &&
+	if ((!built &&
 		bt_u32(checksum) !=
 		    ~bt_crc32c(
 			UINT32_MAX, block + BT_CSUM_SIZE, fs->info.node_size - BT_CSUM_SIZE)) ||
@@ -59,27 +98,7 @@ bt_validate_node(
 	if (count > body_size / stride || (root.level != 0 && count == 0)) {
 		return BTRFS_CORRUPT;
 	}
-	for (i = 0; i < count; i++) {
-		key = bt_node_key(block, root.level, i);
-		if (i != 0 && bt_key_compare(previous, key) >= 0) {
-			return BTRFS_CORRUPT;
-		}
-		previous = key;
-		if (root.level == 0) {
-			start = bt_u32(items[i].offset);
-			size = bt_u32(items[i].size);
-			if (start < count * stride || start > end || size > end - start) {
-				return BTRFS_CORRUPT;
-			}
-			end = start;
-		} else if (bt_u64(pointers[i].bytenr) == 0 ||
-		    bt_u64(pointers[i].bytenr) % fs->info.sector_size != 0 ||
-		    bt_u64(pointers[i].generation) == 0 ||
-		    bt_u64(pointers[i].generation) > root.generation) {
-			return BTRFS_CORRUPT;
-		}
-	}
-	return BTRFS_OK;
+	return built ? BTRFS_OK : bt_node_items(fs, block);
 }
 
 /* Snapshot blocks can retain the originating subvolume's owner. */
@@ -127,7 +146,7 @@ bt_tree_fetch(
 		}
 		error = bt_read_physical(fs, physical, buffer, fs->info.node_size);
 		if (error == BTRFS_OK) {
-			error = bt_validate_node(fs, root, buffer, 1);
+			error = bt_validate_node(fs, root, buffer, 0);
 		}
 		if (error == BTRFS_OK && cache != NULL) {
 			bt_cache_put(
@@ -140,7 +159,7 @@ bt_tree_fetch(
 	return error;
 }
 
-/* A transaction's own node, still checked for structure and identity. */
+/* A transaction's own node, still checked for identity and item count. */
 static enum btrfs_result
 bt_tree_private(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
 {
@@ -150,7 +169,7 @@ bt_tree_private(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
 		return BTRFS_NOT_FOUND;
 	}
 	error = fs->private_read(fs->private_context, root, buffer);
-	return error == BTRFS_OK ? bt_validate_node(fs, root, buffer, 0) : error;
+	return error == BTRFS_OK ? bt_validate_node(fs, root, buffer, 1) : error;
 }
 
 enum btrfs_result

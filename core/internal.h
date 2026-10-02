@@ -169,6 +169,7 @@ enum btrfs_result bt_chunk_add(
 enum btrfs_result bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,
     unsigned mirror, uint64_t *physical, unsigned *mirrors);
 enum btrfs_result bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer);
+enum btrfs_result bt_node_items(const struct btrfs_fs *fs, const uint8_t *block);
 void bt_cursor_init(struct bt_cursor *cursor, const struct btrfs_fs *fs, struct bt_root root);
 void bt_cursor_fini(struct bt_cursor *cursor);
 enum btrfs_result bt_cursor_seek(struct bt_cursor *cursor, struct bt_key key, int predecessor);
