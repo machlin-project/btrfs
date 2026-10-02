@@ -1376,6 +1376,7 @@ btrfs_transaction_reader(struct btrfs_transaction *transaction)
 	 * readers do not use the transaction's buffers. */
 	*reader = *bt_mutation_view(transaction->mutation);
 	reader->env = transaction->base->env;
+	reader->private_borrow = 1;
 	reader->private_root = bt_tx_private_root;
 	reader->private_root_context = transaction;
 	/* Chunks grown for data since the mutation last allocated a node. */

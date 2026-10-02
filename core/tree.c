@@ -203,6 +203,7 @@ bt_cursor_init(struct bt_cursor *cursor, const struct btrfs_fs *fs, struct bt_ro
 	bt_zero(cursor, sizeof(*cursor));
 	cursor->fs = fs;
 	cursor->root = root;
+	cursor->borrow = fs->private_borrow;
 }
 
 void
