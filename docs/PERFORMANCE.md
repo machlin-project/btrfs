@@ -83,8 +83,22 @@ mount, and at both begin and commit the primary and each secondary copy present
 on the device. The written images are byte-identical to those before these
 changes. Writes in
 this harness depend on host file I/O and vary between runs; compare them only
-within one run. A commit still writes and barriers per operation. Generated
-benchmark reports keep the exact figures and build identities.
+within one run. Generated benchmark reports keep the exact figures and build
+identities.
+
+The volume series create 200 empty files, each in its own transaction and
+commit, then as grouped operations followed by one sync
+([group commit](GROUP_COMMIT.md)). With `--durable`, every barrier is the
+image file's `F_FULLFSYNC` on the host SSD:
+
+| Create | Barriers skipped | `--durable` |
+| --- | --- | --- |
+| One transaction and commit each | 195 us, 5 reads, 51 allocations | 28.9 ms |
+| Grouped, one sync for all | 21 us, 3.7 allocations | 0.15 ms |
+
+A per-operation commit pays three barriers, which dominate durable latency;
+grouping amortizes them over the running transaction. No native adapter
+groups its operations yet.
 
 ## Matched benchmark protocol
 

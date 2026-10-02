@@ -4,11 +4,13 @@
  * numbers measure this implementation's CPU and call costs, not a mounted
  * filesystem against Linux (see docs/PERFORMANCE.md). Build without
  * sanitizers for meaningful times. A writable copy of the image is required
- * for the write series, which modifies it. */
+ * for the write series, which modifies it. Barriers are skipped unless
+ * --durable keeps the image's F_FULLFSYNC. */
 #define _POSIX_C_SOURCE 200809L
 #include "../adapters/posix/image.h"
-#include <btrfs/write.h>
+#include <btrfs/volume.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +23,14 @@ struct sample {
 	uint64_t allocations;
 };
 
+/* Files the volume series create. */
+#define VOLUME_FILES 200U
+/* Tree nodes a grouped create declares. */
+#define CREATE_NODES 64U
+
 static struct btrfs_image image;
+static pthread_mutex_t volume_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t volume_condition = PTHREAD_COND_INITIALIZER;
 
 static void
 begin_sample(struct sample *sample)
@@ -131,7 +140,92 @@ image_write_flush(void *context)
 }
 
 static void
-write_series(const char *path, struct btrfs_cache *cache)
+volume_lock(void *context)
+{
+	(void)context;
+	pthread_mutex_lock(&volume_mutex);
+}
+
+static void
+volume_unlock(void *context)
+{
+	(void)context;
+	pthread_mutex_unlock(&volume_mutex);
+}
+
+static void
+volume_wait(void *context, const void *channel)
+{
+	(void)context;
+	(void)channel;
+	pthread_cond_wait(&volume_condition, &volume_mutex);
+}
+
+static void
+volume_wake(void *context, const void *channel)
+{
+	(void)context;
+	(void)channel;
+	pthread_cond_broadcast(&volume_condition);
+}
+
+/* Creates as one transaction each, then as grouped operations with one sync. */
+static void
+volume_series(const struct btrfs_write_environment *writer)
+{
+	struct btrfs_volume_locks locks = { NULL, volume_lock, volume_unlock, volume_wait,
+		volume_wake };
+	struct btrfs_new_inode attributes;
+	struct btrfs_volume *volume;
+	struct btrfs_volume_view *view;
+	struct btrfs_transaction *transaction;
+	struct btrfs_object_id id;
+	struct btrfs_inode root;
+	struct sample sample;
+	const struct btrfs_fs *fs;
+	char name[32];
+	unsigned i;
+
+	if (btrfs_volume_open(&image.environment, writer, &locks, BTRFS_TOP_LEVEL_TREE, &volume) !=
+	    BTRFS_OK) {
+		exit(1);
+	}
+	fs = btrfs_volume_pin(volume, &view);
+	(void)btrfs_root(fs, &root);
+	btrfs_volume_unpin(volume, view);
+	memset(&attributes, 0, sizeof(attributes));
+	attributes.mode = BTRFS_MODE_REGULAR | 0644;
+	attributes.time.seconds = 1800000000;
+	begin_sample(&sample);
+	for (i = 0; i < VOLUME_FILES; i++) {
+		snprintf(name, sizeof(name), "single-%04u", i);
+		if (btrfs_volume_begin(volume, &transaction) != BTRFS_OK ||
+		    btrfs_transaction_create(
+			transaction, root.id, name, strlen(name), &attributes, &id) != BTRFS_OK ||
+		    btrfs_volume_commit(volume, transaction) != BTRFS_OK) {
+			exit(1);
+		}
+	}
+	end_sample(&sample, "create, commit each", VOLUME_FILES, 0);
+	begin_sample(&sample);
+	for (i = 0; i < VOLUME_FILES; i++) {
+		snprintf(name, sizeof(name), "grouped-%04u", i);
+		if (btrfs_volume_join(volume, CREATE_NODES, &transaction) != BTRFS_OK ||
+		    btrfs_transaction_create(
+			transaction, root.id, name, strlen(name), &attributes, &id) != BTRFS_OK) {
+			exit(1);
+		}
+		btrfs_volume_leave(volume, transaction);
+	}
+	if (btrfs_volume_sync(volume, btrfs_volume_pending(volume)) != BTRFS_OK) {
+		exit(1);
+	}
+	end_sample(&sample, "create, grouped, one sync", VOLUME_FILES, 0);
+	btrfs_volume_close(volume);
+}
+
+static void
+write_series(const char *path, struct btrfs_cache *cache, int durable)
 {
 	struct btrfs_write_environment writer;
 	struct btrfs_new_inode attributes;
@@ -153,8 +247,10 @@ write_series(const char *path, struct btrfs_cache *cache)
 	}
 	btrfs_image_writer(&image, &writer);
 	image.environment.cache = cache;
-	/* Barriers cost the host's fsync, which this series does not measure. */
-	writer.flush = image_write_flush;
+	/* Without --durable, barriers (the host's F_FULLFSYNC) are not measured. */
+	if (!durable) {
+		writer.flush = image_write_flush;
+	}
 	data = malloc(8 * 1024 * 1024);
 	if (data == NULL) {
 		exit(1);
@@ -201,6 +297,7 @@ write_series(const char *path, struct btrfs_cache *cache)
 	}
 	end_sample(&sample, "write 8 MiB file", 4, 4 * 8 * 1024 * 1024);
 	free(data);
+	volume_series(&writer);
 }
 
 int
@@ -211,11 +308,14 @@ main(int argc, char **argv)
 	struct btrfs_fs *fs;
 	size_t cache_bytes = 0;
 	int write = 0;
+	int durable = 0;
 	int i;
 
 	for (i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "--write") == 0) {
 			write = 1;
+		} else if (strcmp(argv[i], "--durable") == 0) {
+			durable = 1;
 		} else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
 			cache_bytes = (size_t)strtoull(argv[++i], NULL, 0) * 1024 * 1024;
 		} else {
@@ -223,7 +323,7 @@ main(int argc, char **argv)
 		}
 	}
 	if (argc < 2) {
-		fprintf(stderr, "Usage: btrfs-bench IMAGE [--cache MiB] [--write]\n");
+		fprintf(stderr, "Usage: btrfs-bench IMAGE [--cache MiB] [--write [--durable]]\n");
 		return 2;
 	}
 	if (btrfs_image_open(argv[1], &image) != 0) {
@@ -242,7 +342,7 @@ main(int argc, char **argv)
 	read_series(fs);
 	btrfs_unmount(fs);
 	if (write) {
-		write_series(argv[1], cache);
+		write_series(argv[1], cache, durable);
 	}
 	if (cache != NULL) {
 		btrfs_cache_counts(cache, &counts);

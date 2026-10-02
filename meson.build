@@ -32,7 +32,7 @@ posix = static_library('btrfs_posix', 'adapters/posix/image.c',
 inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 executable('btrfs-bench', 'tools/bench.c', include_directories: inc,
-  link_with: [posix, core], dependencies: [zlib, zstd])
+  link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
 transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
