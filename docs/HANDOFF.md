@@ -125,8 +125,10 @@ only after successful durable publication; `seal` alone is not a commit.
    and authorize using actual credentials. Clear security metadata only through
    the owning transaction contract; no root impersonation or post-write repairs.
    Existing EROFS paths stay until mounted write suites pass.
-7. **Complete FSKit/LXNU policy and release acceptance.** Provision/register the
-   actual FSKit module and run its mounted suite; an unsigned build is insufficient.
+7. **Complete FSKit/LXNU policy and release acceptance.** The signed module and its
+   device barrier pass the mounted suites on stock macOS 26.5.2 except set-id
+   metadata (ACCEPTANCE.md); a distribution (Developer ID, notarized) build and
+   macOS 27 remain.
    Add native/LXNU ACL, capability, immutable/append and set-id contracts at the
    owning boundary. Linux namei and object provenance belong to the XNU fork's
    `bsd/lxnu/vfs` and `bsd/lxnu/xnu`. Run existing Linux conformance and native

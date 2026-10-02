@@ -2,9 +2,9 @@
 
 The portable reader, four-profile read-only XNU mount, the CoW writer and
 explicit read-write XNU mounts in both commit modes have executable acceptance;
-installed FSKit reads and writes pass in the lab guest. Native power-cut
-durability, FSKit on a stock kernel with an approved service, FSKit set-id
-metadata, Linux ABI conformance and a performance win over Linux remain open.
+installed FSKit reads and writes pass on stock macOS 26.5.2. Native power-cut
+durability, FSKit set-id metadata, Linux ABI conformance and a performance win
+over Linux remain open.
 
 ## Established evidence
 
@@ -36,7 +36,7 @@ metadata, Linux ABI conformance and a performance win over Linux remain open.
 | Native compilation | arm64e and x86_64 kexts bind only public BSD, Mach and libkern KPIs; unsigned FSKit application/extension pass; no unresolved owned symbols | `logs/kext-final-*.log`, `logs/fskit-final.log` |
 | Loaded XNU and mounted reads | Actual custom guest kernel/module identities verified; plain, 4 KiB nodes, 64 KiB nodes and zlib profiles pass; media hashes unchanged | Lab `artifacts/btrfs-kext/` reports; `tests/run_macos.py`, `tests/mounted.c` |
 | Loaded XNU and mounted writes | `mount_machlin_btrfs -w` on copies of the plain and 4 KiB-node profiles, grouped and `-w -s` synchronous: the write suite (data, mmap coherence, truncation, links, renames, xattrs, open-unlink, fsync, concurrent appends, set-id, ENOSPC and recovery from it), unmount, remount and its persistence checks pass; Linux then passes `btrfs check --readonly`, all 14 manifest facts, a read-write mount, write and second check on each of the four written images | Lab `artifacts/btrfs-kext/` reports and manifests; `tests/run_macos.py`, `tests/mounted_write.c`, `tests/prepare_native_linux.py`, `tests/native_oracle.sh` |
-| Installed FSKit | A team-signed build in the lab guest (macOS 26.4 on the LXNU development kernel, SIP off), enabled under File System Extensions: Disk Arbitration mounts through FSKit read-only and, with the device barrier, read-write; the read-only mounted suite passes, and the write suite passes except its set-id group, a recorded failure (no 26.x caller credentials; stale live mode, correct on disk), followed by remount persistence and Linux `btrfs check`, 12 manifest facts and a read-write mount. The barrier daemon was loaded with `launchctl`, since approving the ServiceManagement registration needs the guest's administrator password. Not run on a stock Apple kernel | Lab `artifacts/btrfs-kext/fskit-20261002/`; `tests/mounted.c`, `tests/mounted_write.c --skip-set-id` |
+| Installed FSKit | A team-signed development build on stock macOS 26.5.2 (Apple RELEASE kernel, SIP and authenticated root on, Gatekeeper on), enabled under File System Extensions, with the device barrier registered through ServiceManagement and approved by the administrator: Disk Arbitration mounts through FSKit read-only and read-write; the read-only suite passes on the plain, 4 KiB-node, 64 KiB-node and zlib profiles with media unchanged; the write suite passes on the plain and 4 KiB-node profiles apart from its set-id group, with remount persistence, and Linux passes `btrfs check`, 12 manifest facts and a read-write mount on both written images. The set-id group fails, a recorded failure: no 26.x caller credentials, and a live `stat` keeps bits that are gone on disk and after a remount. The same suites also pass in the lab guest (macOS 26.4 on the LXNU development kernel) | Lab `artifacts/btrfs-kext/fskit-stock-20261002/` and `fskit-20261002/`; `tests/mounted.c`, `tests/mounted_write.c --skip-set-id` |
 | LXNU ABI semantics | Not run for Btrfs | No XNU-fork hooks or ABI matrix completion claimed |
 | Native power-cut durability / comparative performance | Not accepted | No power-cut checks of native `fsync` boundaries; no matched Linux benchmark |
 
