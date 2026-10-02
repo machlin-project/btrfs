@@ -114,8 +114,9 @@ only after successful durable publication; `seal` alone is not a commit.
    and directory indexes unique across a mount's transactions; the native volume
    layer attaches them. Subvolumes and snapshots are created and deleted
    (`core/subvolume.c`), and the reader resolves unreferenced subvolume entries
-   to stubs; native writers still need a cleaner. Remaining: O_TMPFILE links, rename exchange/whiteout; truncation orphans of pre-3.12
-   kernels are dropped as Linux does. Native writers supply time, mode, owner,
+   to stubs; native writers still need a cleaner. O_TMPFILE files, RENAME_EXCHANGE
+   and RENAME_WHITEOUT follow Linux. Remaining: exchanging subvolume entries;
+   truncation orphans of pre-3.12 kernels are dropped as Linux does. Native writers supply time, mode, owner,
    set-id and ACL decisions.
 6. **Connect native writers.** Define versioned operation views, read pins,
    publication locks and UBC/FSKit dirty-page ownership first. Supply real exact

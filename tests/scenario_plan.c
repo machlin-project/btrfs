@@ -1118,6 +1118,40 @@ plan_clean_subvolumes(struct plan *plan, size_t commit, size_t budget, size_t dr
 }
 
 void
+plan_tmpfile(struct plan *plan, size_t commit, const char *handle, uint32_t mode)
+{
+	struct operation *operation = plan_namespace(plan, commit, OPERATION_TMPFILE, handle, NULL);
+
+	operation->mode = mode;
+	operation->uid = NAMESPACE_UID;
+	operation->gid = NAMESPACE_GID;
+}
+
+void
+plan_link_tmpfile(struct plan *plan, size_t commit, const char *handle, const char *path)
+{
+	(void)plan_namespace(plan, commit, OPERATION_LINK_TMPFILE, handle, path);
+}
+
+void
+plan_exchange(struct plan *plan, size_t commit, const char *path, const char *target)
+{
+	(void)plan_namespace(plan, commit, OPERATION_EXCHANGE, path, target);
+}
+
+void
+plan_rename_whiteout(
+    struct plan *plan, size_t commit, const char *path, const char *target, int open)
+{
+	struct operation *operation =
+	    plan_namespace(plan, commit, OPERATION_RENAME_WHITEOUT, path, target);
+
+	operation->uid = NAMESPACE_UID;
+	operation->gid = NAMESPACE_GID;
+	operation->flags = open;
+}
+
+void
 plan_remove_groups(struct plan *plan, size_t commit, size_t removed)
 {
 	plan_namespace(plan, commit, OPERATION_REMOVE_GROUPS, "/", NULL)->size = removed;

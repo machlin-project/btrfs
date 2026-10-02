@@ -1609,6 +1609,107 @@ namespace_flag_refusals(struct context *context)
 	printf("immutable, append-only and set-id refusals PASS\n");
 }
 
+/* O_TMPFILE as Linux's btrfs_tmpfile and btrfs_link: a nameless file in a
+ * COMPRESS directory inherits its flag, is written, then gains a name, which
+ * removes its orphan item; another stays nameless across the commit as an
+ * orphan until orphan cleanup deletes it. Linking a named file through the
+ * tmpfile path and a tmpfile through the plain path are refused. */
+static void
+namespace_tmpfile_plan(struct context *context)
+{
+	static const char *const added[] = { "linked", NULL };
+	static uint8_t data[NAMESPACE_DATA_BYTES];
+	struct plan plan;
+
+	fill_pattern(data, sizeof(data), 71);
+	namespace_plan(context, &plan, "namespace-tmpfile");
+	plan_tmpfile(&plan, 1, "/ns/compress/.tmp-a", BTRFS_MODE_REGULAR | 0640);
+	plan_write_new(&plan, 1, "/ns/compress/.tmp-a", 0, data, sizeof(data));
+	plan_link(&plan, 1, "/ns/compress/.tmp-a", "/ns/compress/plain");
+	plan_expect_refusal(&plan, 1, BTRFS_NOT_FOUND);
+	plan_link_tmpfile(&plan, 1, "/ns/compress/.tmp-a", "/ns/compress/linked");
+	plan_link_tmpfile(&plan, 1, "/ns/one", "/ns/one-again");
+	plan_expect_refusal(&plan, 1, BTRFS_INVALID_ARGUMENT);
+	plan_tmpfile(&plan, 1, "/ns/.tmp-b", BTRFS_MODE_REGULAR | 0600);
+	plan_write_new(&plan, 1, "/ns/.tmp-b", 0, data, 5000);
+	plan_clean(&plan, 2, BTRFS_TOP_LEVEL_TREE, 1);
+
+	expect_listing(context, &plan, 1, LAST_STAGE, "/ns/compress", added, NULL);
+	expect_listing(context, &plan, 1, LAST_STAGE, "/ns", NULL, NULL);
+	expect_file(&plan, 1, LAST_STAGE, "/ns/compress/linked", data, sizeof(data));
+	expect_owner(&plan, 1, LAST_STAGE, "/ns/compress/linked", BTRFS_MODE_REGULAR | 0640,
+	    NAMESPACE_UID, NAMESPACE_GID, 1);
+	expect_flags(
+	    &plan, 1, LAST_STAGE, "/ns/compress/linked", BT_INODE_COMPRESS, BT_INODE_COMPRESS);
+	expect_absent(&plan, 1, LAST_STAGE, "/ns/one-again");
+	run_plan(context, &plan);
+}
+
+/* RENAME_EXCHANGE as Linux's btrfs_rename_exchange: two files across
+ * directories, a file with two names and a directory across directories (the
+ * directory's back reference moves with it), and between two names of one
+ * inode nothing changes; a directory exchanged into its own subtree and a
+ * missing name are refused. */
+static void
+namespace_exchange_plan(struct context *context)
+{
+	static const char *const exchanged[] = { "after", NULL };
+	const char *moved[] = { "b" };
+	struct plan plan;
+
+	namespace_plan(context, &plan, "namespace-exchange");
+	plan_exchange(&plan, 1, "/ns/victim", "/ns/full/inner");
+	plan_exchange(&plan, 1, "/ns/one", "/ns/tree/a");
+	plan_exchange(&plan, 2, "/ns/tree/a", "/ns/tree/one-link");
+	plan_create(&plan, 2, "/ns/tree/after", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_exchange(&plan, 2, "/ns/one", "/ns/one/b/deep");
+	plan_expect_refusal(&plan, 2, BTRFS_INVALID_ARGUMENT);
+	plan_exchange(&plan, 2, "/ns/victim", "/ns/missing");
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_FOUND);
+
+	expect_current(context, &plan, 1, LAST_STAGE, "/ns/victim", "/ns/full/inner");
+	expect_current(context, &plan, 1, LAST_STAGE, "/ns/full/inner", "/ns/victim");
+	expect_current(context, &plan, 1, LAST_STAGE, "/ns/tree/a", "/ns/one");
+	expect_same(&plan, 1, LAST_STAGE, "/ns/tree/a", "/ns/tree/one-link");
+	expect_names(&plan, 1, LAST_STAGE, "/ns/one", moved, 1);
+	expect_current(context, &plan, 1, LAST_STAGE, "/ns/one/b/deep", "/ns/tree/a/b/deep");
+	expect_listing(context, &plan, 1, LAST_STAGE, "/ns", NULL, NULL);
+	expect_listing(context, &plan, 1, 1, "/ns/tree", NULL, NULL);
+	expect_listing(context, &plan, 2, LAST_STAGE, "/ns/tree", exchanged, NULL);
+	run_plan(context, &plan);
+}
+
+/* RENAME_WHITEOUT: a file moves and leaves a whiteout, a character device 0:0
+ * without permission bits owned by the caller; another replaces an existing
+ * target; between two names of one inode nothing changes and no whiteout
+ * appears. */
+static void
+namespace_whiteout_plan(struct context *context)
+{
+	static const char *const added[] = { "moved", NULL };
+	static const char *const later[] = { "moved", "after", NULL };
+	struct plan plan;
+
+	namespace_plan(context, &plan, "namespace-whiteout");
+	plan_rename_whiteout(&plan, 1, "/ns/victim", "/ns/moved", 0);
+	plan_rename_whiteout(&plan, 1, "/ns/full/inner", "/ns/tree/a/b/deep", 0);
+	plan_rename_whiteout(&plan, 2, "/ns/one", "/ns/tree/one-link", 0);
+	plan_create(&plan, 2, "/ns/after", BTRFS_MODE_REGULAR | 0644, NULL);
+
+	expect_current(context, &plan, 1, LAST_STAGE, "/ns/moved", "/ns/victim");
+	expect_current(context, &plan, 1, LAST_STAGE, "/ns/tree/a/b/deep", "/ns/full/inner");
+	expect_owner(&plan, 1, LAST_STAGE, "/ns/victim", BTRFS_MODE_CHARACTER, NAMESPACE_UID,
+	    NAMESPACE_GID, 1);
+	expect_value(&plan, 1, LAST_STAGE, EXPECT_DEVICE, "/ns/victim", 0);
+	expect_owner(&plan, 1, LAST_STAGE, "/ns/full/inner", BTRFS_MODE_CHARACTER, NAMESPACE_UID,
+	    NAMESPACE_GID, 1);
+	expect_listing(context, &plan, 1, 1, "/ns", added, NULL);
+	expect_listing(context, &plan, 2, LAST_STAGE, "/ns", later, NULL);
+	expect_current(context, &plan, 2, LAST_STAGE, "/ns/one", "/ns/one");
+	expect_same(&plan, 2, LAST_STAGE, "/ns/one", "/ns/tree/one-link");
+	run_plan(context, &plan);
+}
+
 /* Removing every other one of 200 one-sector files leaves about a hundred
  * free extents in their data block group, past its high threshold: the group
  * converts to bitmaps in that commit, as Linux's
@@ -1664,4 +1765,7 @@ namespace_scenarios(struct context *context)
 	namespace_nocow_plan(context);
 	namespace_nocow_exclusive(context);
 	namespace_fst_bitmaps_plan(context);
+	namespace_tmpfile_plan(context);
+	namespace_exchange_plan(context);
+	namespace_whiteout_plan(context);
 }

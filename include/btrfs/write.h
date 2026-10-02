@@ -147,6 +147,19 @@ enum btrfs_result btrfs_transaction_create(struct btrfs_transaction *transaction
 enum btrfs_result btrfs_transaction_link(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, struct btrfs_object_id parent, const void *name, size_t length,
     struct btrfs_time time);
+/* O_TMPFILE, as Linux's btrfs_tmpfile: a regular file inheriting from parent
+ * like a created one, with no link and an orphan item, so that eviction or
+ * orphan cleanup deletes it unless btrfs_transaction_link_tmpfile names it
+ * first; that link removes the orphan item (btrfs_link). Linking an inode
+ * without links that is not such a file is INVALID_ARGUMENT, and plain
+ * btrfs_transaction_link of it NOT_FOUND. Adapters enforce Linux's
+ * I_LINKABLE rule (O_EXCL tmpfiles never gain a name). */
+enum btrfs_result btrfs_transaction_create_tmpfile(struct btrfs_transaction *transaction,
+    struct btrfs_object_id parent, const struct btrfs_new_inode *attributes,
+    struct btrfs_object_id *result);
+enum btrfs_result btrfs_transaction_link_tmpfile(struct btrfs_transaction *transaction,
+    struct btrfs_object_id id, struct btrfs_object_id parent, const void *name, size_t length,
+    struct btrfs_time time);
 /* Removes a name; directories must be empty. An inode losing its last name is
  * deleted with its data, unless it is still open: then an orphan item keeps it
  * until btrfs_transaction_evict, or orphan cleanup after a crash. */
@@ -160,6 +173,21 @@ enum btrfs_result btrfs_transaction_rename(struct btrfs_transaction *transaction
     struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
     struct btrfs_object_id new_parent, const void *new_name, size_t new_length,
     struct btrfs_time time, int target_open);
+/* renameat2 RENAME_WHITEOUT: the rename, then a whiteout under the old name,
+ * a character device 0:0 without permission bits owned by uid and gid (the
+ * caller's credentials). Two names of one inode change nothing. */
+enum btrfs_result btrfs_transaction_rename_whiteout(struct btrfs_transaction *transaction,
+    struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
+    struct btrfs_object_id new_parent, const void *new_name, size_t new_length, uint32_t uid,
+    uint32_t gid, struct btrfs_time time, int target_open);
+/* renameat2 RENAME_EXCHANGE: both names exist and each then names the other
+ * inode, of any types, across directories of one tree; a directory cannot
+ * move below itself (INVALID_ARGUMENT). Subvolume entries are refused
+ * (CROSS_TREE). */
+enum btrfs_result btrfs_transaction_exchange(struct btrfs_transaction *transaction,
+    struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
+    struct btrfs_object_id new_parent, const void *new_name, size_t new_length,
+    struct btrfs_time time);
 /* Raw xattrs with Linux's CREATE/REPLACE semantics; name and value must fit one
  * leaf item (NO_SPACE). btrfs.compression is Linux's property: its value must
  * name a codec or be "no"/"none" on an inode with data checksums, an empty

@@ -185,7 +185,11 @@ enum operation_kind {
 	OPERATION_DELETE_SUBVOLUME,
 	OPERATION_CLEAN_SUBVOLUMES,
 	OPERATION_REMOVE_GROUPS,
-	OPERATION_SYSTEM_GROWTH
+	OPERATION_SYSTEM_GROWTH,
+	OPERATION_TMPFILE,
+	OPERATION_LINK_TMPFILE,
+	OPERATION_EXCHANGE,
+	OPERATION_RENAME_WHITEOUT
 };
 
 /* Operations name objects by path. A path created, renamed or removed by an
@@ -480,6 +484,13 @@ void expect_bitmaps(struct plan *plan, size_t first, size_t last, const char *pa
 void expect_groups(
     struct plan *plan, size_t first, size_t last, uint64_t groups, uint32_t system_entries);
 void plan_remove_groups(struct plan *plan, size_t commit, size_t removed);
+/* An O_TMPFILE file in handle's parent directory; handle (never a name on
+ * disk) then refers to it until plan_link_tmpfile names it. */
+void plan_tmpfile(struct plan *plan, size_t commit, const char *handle, uint32_t mode);
+void plan_link_tmpfile(struct plan *plan, size_t commit, const char *handle, const char *path);
+void plan_exchange(struct plan *plan, size_t commit, const char *path, const char *target);
+void plan_rename_whiteout(
+    struct plan *plan, size_t commit, const char *path, const char *target, int open);
 void plan_system_growth(struct plan *plan, size_t commit);
 void plan_volatile(
     struct plan *plan, size_t commit, const char *path, uint64_t offset, uint64_t length);

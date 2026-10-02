@@ -1128,100 +1128,94 @@ bt_ns_poison(struct btrfs_transaction *transaction, enum btrfs_result error)
 	return error;
 }
 
-enum btrfs_result
-btrfs_transaction_create(struct btrfs_transaction *transaction, struct btrfs_object_id parent,
-    const void *name, size_t length, const struct btrfs_new_inode *attributes,
-    struct btrfs_object_id *result)
+/* Validates a new inode's attributes: a known type, permission bits only,
+ * and a target exactly for symlinks. */
+static enum btrfs_result
+bt_ns_check_new(const struct btrfs_new_inode *attributes, uint8_t *type)
 {
-	struct bt_owned_root *tree = NULL;
-	struct bt_disk_inode directory;
-	struct bt_disk_inode item;
-	struct bt_disk_extent_header *extent;
-	const struct bt_codec *codec = NULL;
-	struct bt_key key;
-	struct bt_key none = { 0, 0, 0 };
-	uint64_t transid;
-	uint64_t flags = 0;
-	uint64_t inode = 0;
-	uint64_t index = 0;
-	size_t size;
-	uint8_t type;
-	enum btrfs_result error;
-
-	if (attributes == NULL || result == NULL ||
-	    attributes->time.nanoseconds >= BT_NANOSECONDS) {
+	if (attributes == NULL || attributes->time.nanoseconds >= BT_NANOSECONDS) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	type = bt_ns_type(attributes->mode);
-	if (type == BTRFS_FT_UNKNOWN ||
+	*type = bt_ns_type(attributes->mode);
+	if (*type == BTRFS_FT_UNKNOWN ||
 	    (attributes->mode & ~(uint32_t)(BTRFS_MODE_TYPE | BT_MODE_PERMISSIONS)) != 0) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	if (type == BTRFS_FT_SYMLINK
+	if (*type == BTRFS_FT_SYMLINK
 		? attributes->target == NULL || attributes->target_length == 0
 		: attributes->target != NULL || attributes->target_length != 0) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	error = bt_ns_name(name, length);
-	if (error == BTRFS_OK) {
-		error = bt_ns_begin(transaction, parent.tree, &tree);
+	return BTRFS_OK;
+}
+
+/* A new inode decided before any change: its number, inherited flags and
+ * compression property. */
+struct bt_new_inode {
+	uint64_t inode;
+	uint64_t flags;
+	const struct bt_codec *codec;
+};
+
+/* Linux's btrfs_create_new_inode decisions: the parent's inheritable flags
+ * and compression property, and the next inode number. */
+static enum btrfs_result
+bt_ns_plan_inode(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t parent,
+    const struct bt_disk_inode *directory, const struct btrfs_new_inode *attributes,
+    struct bt_new_inode *plan)
+{
+	uint8_t type = bt_ns_type(attributes->mode);
+	enum btrfs_result error = BTRFS_OK;
+
+	plan->codec = NULL;
+	plan->inode = 0;
+	plan->flags = bt_ns_inherit(bt_u64(directory->flags), attributes->mode);
+	if (type == BTRFS_FT_REGULAR || type == BTRFS_FT_DIRECTORY) {
+		error = bt_ns_inherited_codec(
+		    transaction, tree, parent, bt_u64(directory->flags), &plan->codec);
 	}
-	if (error == BTRFS_OK && type == BTRFS_FT_SYMLINK &&
-	    (attributes->target_length > BT_SYMLINK_LIMIT ||
-		attributes->target_length > bt_ns_item_limit(transaction) - sizeof(*extent))) {
-		error = BTRFS_NAME_TOO_LONG;
+	if (plan->codec != NULL && !bt_ns_can_compress(plan->flags)) {
+		plan->codec = NULL;
 	}
-	if (error == BTRFS_OK) {
-		error = bt_ns_parent(transaction, tree, parent.inode, &directory);
-	}
-	if (error == BTRFS_OK) {
-		error = bt_ns_absent(transaction, tree, parent.inode, name, length);
-	}
-	if (error == BTRFS_OK && bt_ns_immutable(&directory)) {
-		error = BTRFS_NOT_PERMITTED;
-	}
-	if (error == BTRFS_OK) {
-		error = bt_ns_room(transaction, tree, parent.inode, name, length, 1, 0, NULL);
-	}
-	if (error == BTRFS_OK) {
-		error = bt_ns_index(transaction, tree, parent.inode, &index);
-	}
-	if (error == BTRFS_OK) {
-		flags = bt_ns_inherit(bt_u64(directory.flags), attributes->mode);
-		if (type == BTRFS_FT_REGULAR || type == BTRFS_FT_DIRECTORY) {
-			error = bt_ns_inherited_codec(
-			    transaction, tree, parent.inode, bt_u64(directory.flags), &codec);
-		}
-		if (codec != NULL && !bt_ns_can_compress(flags)) {
-			codec = NULL;
-		}
-		if (codec != NULL) {
-			flags = (flags & ~BT_INODE_NOCOMPRESS) | BT_INODE_COMPRESS;
-		}
+	if (plan->codec != NULL) {
+		plan->flags = (plan->flags & ~BT_INODE_NOCOMPRESS) | BT_INODE_COMPRESS;
 	}
 	if (error == BTRFS_OK) {
-		error = bt_ns_objectid(transaction, tree, &inode);
+		error = bt_ns_objectid(transaction, tree, &plan->inode);
 	}
-	if (error != BTRFS_OK) {
-		return error;
-	}
-	/* Linux's btrfs_create_new_inode: one link, all four times now, the
-	 * generation of this transaction, the parent's inheritable flags and its
-	 * compression property. */
-	transid = bt_ns_transid(transaction);
+	return error;
+}
+
+/* Writes the planned inode as btrfs_create_new_inode does: links links, all
+ * four times now, the generation of this transaction, and a symlink's target
+ * as an inline extent. */
+static enum btrfs_result
+bt_ns_make_inode(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    const struct btrfs_new_inode *attributes, uint32_t links, const struct bt_new_inode *plan)
+{
+	struct bt_disk_inode item;
+	struct bt_disk_extent_header *extent;
+	struct bt_key key;
+	struct bt_key none = { 0, 0, 0 };
+	uint64_t transid = bt_ns_transid(transaction);
+	uint64_t inode = plan->inode;
+	size_t size;
+	uint8_t type = bt_ns_type(attributes->mode);
+	enum btrfs_result error;
+
 	bt_zero(&item, sizeof(item));
 	bt_put64(&item.generation, transid);
 	bt_put64(&item.transid, transid);
 	bt_put64(&item.size, attributes->target_length);
 	bt_put64(&item.nbytes, attributes->target_length);
-	bt_put32(&item.links, 1);
+	bt_put32(&item.links, links);
 	bt_put32(&item.uid, attributes->uid);
 	bt_put32(&item.gid, attributes->gid);
 	bt_put32(&item.mode, attributes->mode);
 	if (type == BTRFS_FT_CHARACTER || type == BTRFS_FT_BLOCK) {
 		bt_put64(&item.device, attributes->device);
 	}
-	bt_put64(&item.flags, flags);
+	bt_put64(&item.flags, plan->flags);
 	bt_put64(&item.atime.seconds, (uint64_t)attributes->time.seconds);
 	bt_put32(&item.atime.nanoseconds, attributes->time.nanoseconds);
 	item.ctime = item.atime;
@@ -1240,38 +1234,152 @@ btrfs_transaction_create(struct btrfs_transaction *transaction, struct btrfs_obj
 		error = bt_tx_edit(transaction, &tree->root, key, extent,
 		    sizeof(*extent) + attributes->target_length, BT_INSERT);
 	}
-	if (error == BTRFS_OK && codec != NULL) {
+	if (error == BTRFS_OK && plan->codec != NULL) {
 		size = bt_ns_length(BT_COMPRESSION_PROPERTY);
 		key = (struct bt_key){ inode, bt_ns_hash(BT_COMPRESSION_PROPERTY, size),
 			BT_XATTR_ITEM };
 		size = bt_ns_dir_entry(transaction->entry, none, transid, BT_COMPRESSION_PROPERTY,
-		    size, codec->name, bt_ns_length(codec->name), BTRFS_FT_XATTR);
+		    size, plan->codec->name, bt_ns_length(plan->codec->name), BTRFS_FT_XATTR);
 		error =
 		    bt_tx_edit(transaction, &tree->root, key, transaction->entry, size, BT_INSERT);
-		bt_ns_require_feature(transaction, codec->feature);
+		bt_ns_require_feature(transaction, plan->codec->feature);
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_transaction_create(struct btrfs_transaction *transaction, struct btrfs_object_id parent,
+    const void *name, size_t length, const struct btrfs_new_inode *attributes,
+    struct btrfs_object_id *result)
+{
+	struct bt_owned_root *tree = NULL;
+	struct bt_disk_inode directory;
+	struct bt_new_inode plan;
+	uint64_t index = 0;
+	uint8_t type = BTRFS_FT_UNKNOWN;
+	enum btrfs_result error;
+
+	if (result == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_ns_check_new(attributes, &type);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	error = bt_ns_name(name, length);
+	if (error == BTRFS_OK) {
+		error = bt_ns_begin(transaction, parent.tree, &tree);
+	}
+	if (error == BTRFS_OK && type == BTRFS_FT_SYMLINK &&
+	    (attributes->target_length > BT_SYMLINK_LIMIT ||
+		attributes->target_length >
+		    bt_ns_item_limit(transaction) - sizeof(struct bt_disk_extent_header))) {
+		error = BTRFS_NAME_TOO_LONG;
 	}
 	if (error == BTRFS_OK) {
-		error = bt_ns_add_entry(transaction, tree, parent.inode, name, length, inode, type,
-		    index, attributes->time);
+		error = bt_ns_parent(transaction, tree, parent.inode, &directory);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_absent(transaction, tree, parent.inode, name, length);
+	}
+	if (error == BTRFS_OK && bt_ns_immutable(&directory)) {
+		error = BTRFS_NOT_PERMITTED;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_room(transaction, tree, parent.inode, name, length, 1, 0, NULL);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_index(transaction, tree, parent.inode, &index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_plan_inode(
+		    transaction, tree, parent.inode, &directory, attributes, &plan);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	error = bt_ns_make_inode(transaction, tree, attributes, 1, &plan);
+	if (error == BTRFS_OK) {
+		error = bt_ns_add_entry(transaction, tree, parent.inode, name, length, plan.inode,
+		    type, index, attributes->time);
 	}
 	if (error == BTRFS_OK) {
 		if (type == BTRFS_FT_DIRECTORY) {
-			bt_ns_new_directory(transaction, tree->root.owner, inode);
+			bt_ns_new_directory(transaction, tree->root.owner, plan.inode);
 		}
 		transaction->changed = 1;
 		result->tree = parent.tree;
-		result->inode = inode;
+		result->inode = plan.inode;
 	}
 	return bt_ns_poison(transaction, error);
 }
 
+/* Linux's btrfs_tmpfile: a regular file without a name, inheriting from
+ * parent as a created one does, with no link and an orphan item; the parent
+ * directory does not change. */
 enum btrfs_result
-btrfs_transaction_link(struct btrfs_transaction *transaction, struct btrfs_object_id id,
-    struct btrfs_object_id parent, const void *name, size_t length, struct btrfs_time time)
+btrfs_transaction_create_tmpfile(struct btrfs_transaction *transaction,
+    struct btrfs_object_id parent, const struct btrfs_new_inode *attributes,
+    struct btrfs_object_id *result)
+{
+	struct bt_owned_root *tree = NULL;
+	struct bt_disk_inode directory;
+	struct bt_new_inode plan;
+	struct bt_key orphan = { BT_ORPHAN_OBJECTID, 0, BT_ORPHAN_ITEM };
+	uint8_t type = BTRFS_FT_UNKNOWN;
+	enum btrfs_result error;
+
+	if (result == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_ns_check_new(attributes, &type);
+	if (error == BTRFS_OK && type != BTRFS_FT_REGULAR) {
+		error = BTRFS_INVALID_ARGUMENT;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_begin(transaction, parent.tree, &tree);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_parent(transaction, tree, parent.inode, &directory);
+	}
+	if (error == BTRFS_OK && bt_ns_immutable(&directory)) {
+		error = BTRFS_NOT_PERMITTED;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_plan_inode(
+		    transaction, tree, parent.inode, &directory, attributes, &plan);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	error = bt_ns_make_inode(transaction, tree, attributes, 0, &plan);
+	if (error == BTRFS_OK) {
+		orphan.offset = plan.inode;
+		error = bt_tx_edit(transaction, &tree->root, orphan, NULL, 0, BT_INSERT);
+		error = error == BTRFS_EXISTS ? BTRFS_CORRUPT : error;
+	}
+	if (error == BTRFS_OK) {
+		transaction->changed = 1;
+		result->tree = parent.tree;
+		result->inode = plan.inode;
+	}
+	return bt_ns_poison(transaction, error);
+}
+
+/* A new name for an inode, as btrfs_link adds it. A file created with
+ * O_TMPFILE (tmpfile) has no link and an orphan item; its first name removes
+ * the orphan item. Other inodes without links cannot gain a name. */
+static enum btrfs_result
+bt_ns_link(struct btrfs_transaction *transaction, struct btrfs_object_id id,
+    struct btrfs_object_id parent, const void *name, size_t length, struct btrfs_time time,
+    int tmpfile)
 {
 	struct bt_owned_root *tree = NULL;
 	struct bt_disk_inode directory;
 	struct bt_disk_inode item;
+	struct bt_key orphan = { BT_ORPHAN_OBJECTID, id.inode, BT_ORPHAN_ITEM };
+	uint8_t marker[1];
+	size_t size;
 	uint64_t index = 0;
 	enum btrfs_result error;
 
@@ -1294,12 +1402,20 @@ btrfs_transaction_link(struct btrfs_transaction *transaction, struct btrfs_objec
 	if (error == BTRFS_OK) {
 		if (bt_ns_is_directory(&item)) {
 			error = BTRFS_IS_DIRECTORY;
-		} else if (bt_u32(item.links) == 0) {
-			/* An unlinked inode kept open cannot gain a name. */
-			error = BTRFS_NOT_FOUND;
+		} else if (tmpfile != (bt_u32(item.links) == 0)) {
+			/* An unlinked inode kept open cannot gain a name; only a
+			 * tmpfile's first name goes through the tmpfile path. */
+			error = tmpfile ? BTRFS_INVALID_ARGUMENT : BTRFS_NOT_FOUND;
 		} else if (bt_u32(item.links) >= BT_LINK_MAX) {
 			error = BTRFS_TOO_MANY_LINKS;
 		}
+	}
+	if (error == BTRFS_OK && tmpfile) {
+		error = bt_mutation_find(
+		    transaction->mutation, tree->root, orphan, marker, sizeof(marker), &size);
+		error = error == BTRFS_NOT_FOUND     ? BTRFS_INVALID_ARGUMENT
+		    : error == BTRFS_OK && size != 0 ? BTRFS_CORRUPT
+						     : error;
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_absent(transaction, tree, parent.inode, name, length);
@@ -1326,7 +1442,24 @@ btrfs_transaction_link(struct btrfs_transaction *transaction, struct btrfs_objec
 		bt_put32(&item.links, bt_u32(item.links) + 1);
 		error = bt_ns_store(transaction, tree, id.inode, &item, time);
 	}
+	if (error == BTRFS_OK && tmpfile) {
+		error = bt_tx_edit(transaction, &tree->root, orphan, NULL, 0, BT_DELETE);
+	}
 	return bt_ns_poison(transaction, error);
+}
+
+enum btrfs_result
+btrfs_transaction_link(struct btrfs_transaction *transaction, struct btrfs_object_id id,
+    struct btrfs_object_id parent, const void *name, size_t length, struct btrfs_time time)
+{
+	return bt_ns_link(transaction, id, parent, name, length, time, 0);
+}
+
+enum btrfs_result
+btrfs_transaction_link_tmpfile(struct btrfs_transaction *transaction, struct btrfs_object_id id,
+    struct btrfs_object_id parent, const void *name, size_t length, struct btrfs_time time)
+{
+	return bt_ns_link(transaction, id, parent, name, length, time, 1);
 }
 
 enum btrfs_result
@@ -1410,13 +1543,15 @@ bt_ns_ancestor(struct btrfs_transaction *transaction, struct bt_owned_root *tree
 	return error;
 }
 
-enum btrfs_result
-btrfs_transaction_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_parent,
+/* Linux's btrfs_rename; *moved reports whether anything changed (two names
+ * of one inode leave everything as it is). */
+static enum btrfs_result
+bt_ns_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_parent,
     const void *old_name, size_t old_length, struct btrfs_object_id new_parent,
-    const void *new_name, size_t new_length, struct btrfs_time time, int target_open)
+    const void *new_name, size_t new_length, struct btrfs_time time, int target_open, int *moved)
 {
 	struct bt_owned_root *tree = NULL;
-	struct bt_disk_inode moved;
+	struct bt_disk_inode item;
 	struct bt_disk_inode target;
 	struct bt_disk_inode old_directory;
 	struct bt_disk_inode directory;
@@ -1453,10 +1588,10 @@ btrfs_transaction_rename(struct btrfs_transaction *transaction, struct btrfs_obj
 		    transaction, tree, old_parent.inode, old_name, old_length, &source);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_ns_named_inode(transaction, tree, source.inode, &moved);
+		error = bt_ns_named_inode(transaction, tree, source.inode, &item);
 	}
 	if (error == BTRFS_OK) {
-		is_directory = bt_ns_is_directory(&moved);
+		is_directory = bt_ns_is_directory(&item);
 		error = bt_ns_lookup(
 		    transaction, tree, new_parent.inode, new_name, new_length, &replaced);
 		exists = error == BTRFS_OK;
@@ -1464,6 +1599,7 @@ btrfs_transaction_rename(struct btrfs_transaction *transaction, struct btrfs_obj
 			error = BTRFS_OK;
 		}
 	}
+	*moved = 0;
 	if (error == BTRFS_OK && exists && replaced.inode == source.inode) {
 		/* Two names of one inode: POSIX rename does nothing. */
 		return BTRFS_OK;
@@ -1471,7 +1607,7 @@ btrfs_transaction_rename(struct btrfs_transaction *transaction, struct btrfs_obj
 	/* Linux's may_delete for the old name and a replaced one, may_create for
 	 * a new name. */
 	if (error == BTRFS_OK &&
-	    (bt_ns_frozen(&old_directory) || bt_ns_frozen(&moved) || bt_ns_immutable(&directory) ||
+	    (bt_ns_frozen(&old_directory) || bt_ns_frozen(&item) || bt_ns_immutable(&directory) ||
 		(exists && (bt_u64(directory.flags) & BT_INODE_APPEND) != 0))) {
 		error = BTRFS_NOT_PERMITTED;
 	}
@@ -1524,10 +1660,192 @@ btrfs_transaction_rename(struct btrfs_transaction *transaction, struct btrfs_obj
 		    source.inode, source.type, index, time);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_ns_named_inode(transaction, tree, source.inode, &moved);
+		error = bt_ns_named_inode(transaction, tree, source.inode, &item);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_ns_store(transaction, tree, source.inode, &moved, time);
+		error = bt_ns_store(transaction, tree, source.inode, &item, time);
+	}
+	*moved = error == BTRFS_OK;
+	return bt_ns_poison(transaction, error);
+}
+
+enum btrfs_result
+btrfs_transaction_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_parent,
+    const void *old_name, size_t old_length, struct btrfs_object_id new_parent,
+    const void *new_name, size_t new_length, struct btrfs_time time, int target_open)
+{
+	int moved = 0;
+
+	return bt_ns_rename(transaction, old_parent, old_name, old_length, new_parent, new_name,
+	    new_length, time, target_open, &moved);
+}
+
+/* RENAME_WHITEOUT: the rename, then a whiteout (a character device 0:0
+ * without permission bits, owned by uid and gid) under the old name, created
+ * as btrfs_rename creates it after the move. */
+enum btrfs_result
+btrfs_transaction_rename_whiteout(struct btrfs_transaction *transaction,
+    struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
+    struct btrfs_object_id new_parent, const void *new_name, size_t new_length, uint32_t uid,
+    uint32_t gid, struct btrfs_time time, int target_open)
+{
+	struct btrfs_new_inode whiteout;
+	struct btrfs_object_id id;
+	int moved = 0;
+	enum btrfs_result error;
+
+	error = bt_ns_rename(transaction, old_parent, old_name, old_length, new_parent, new_name,
+	    new_length, time, target_open, &moved);
+	if (error != BTRFS_OK || !moved) {
+		return error;
+	}
+	bt_zero(&whiteout, sizeof(whiteout));
+	whiteout.mode = BTRFS_MODE_CHARACTER;
+	whiteout.uid = uid;
+	whiteout.gid = gid;
+	whiteout.time = time;
+	error =
+	    btrfs_transaction_create(transaction, old_parent, old_name, old_length, &whiteout, &id);
+	return bt_ns_poison(transaction, error);
+}
+
+/* RENAME_EXCHANGE as btrfs_rename_exchange does it: each name now names the
+ * other inode. Both indexes are taken first (the source's in the new
+ * directory), both back references inserted, both old names removed, then
+ * both entries inserted under the swapped indexes. Directories may be
+ * exchanged across parents unless one would move below itself. */
+enum btrfs_result
+btrfs_transaction_exchange(struct btrfs_transaction *transaction, struct btrfs_object_id old_parent,
+    const void *old_name, size_t old_length, struct btrfs_object_id new_parent,
+    const void *new_name, size_t new_length, struct btrfs_time time)
+{
+	struct bt_owned_root *tree = NULL;
+	struct bt_disk_inode old_directory;
+	struct bt_disk_inode new_directory;
+	struct bt_disk_inode source_item;
+	struct bt_disk_inode target_item;
+	struct bt_entry source;
+	struct bt_entry target;
+	struct bt_key location = { 0, 0, BT_INODE_ITEM };
+	uint64_t source_index = 0;
+	uint64_t target_index = 0;
+	int ancestor = 0;
+	enum btrfs_result error;
+
+	if (time.nanoseconds >= BT_NANOSECONDS) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_ns_name(old_name, old_length);
+	if (error == BTRFS_OK) {
+		error = bt_ns_name(new_name, new_length);
+	}
+	if (error == BTRFS_OK && old_parent.tree != new_parent.tree) {
+		error = BTRFS_CROSS_TREE;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_begin(transaction, old_parent.tree, &tree);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_parent(transaction, tree, old_parent.inode, &old_directory);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_parent(transaction, tree, new_parent.inode, &new_directory);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_lookup(
+		    transaction, tree, old_parent.inode, old_name, old_length, &source);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_lookup(
+		    transaction, tree, new_parent.inode, new_name, new_length, &target);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_named_inode(transaction, tree, source.inode, &source_item);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_named_inode(transaction, tree, target.inode, &target_item);
+	}
+	if (error == BTRFS_OK && source.inode == target.inode) {
+		return BTRFS_OK;
+	}
+	/* Linux's may_delete for both names in both directories. */
+	if (error == BTRFS_OK &&
+	    (bt_ns_frozen(&old_directory) || bt_ns_frozen(&new_directory) ||
+		bt_ns_frozen(&source_item) || bt_ns_frozen(&target_item))) {
+		error = BTRFS_NOT_PERMITTED;
+	}
+	if (error == BTRFS_OK && old_parent.inode != new_parent.inode &&
+	    bt_ns_is_directory(&source_item)) {
+		error =
+		    bt_ns_ancestor(transaction, tree, new_parent.inode, source.inode, &ancestor);
+	}
+	if (error == BTRFS_OK && !ancestor && old_parent.inode != new_parent.inode &&
+	    bt_ns_is_directory(&target_item)) {
+		error =
+		    bt_ns_ancestor(transaction, tree, old_parent.inode, target.inode, &ancestor);
+	}
+	if (error == BTRFS_OK && ancestor) {
+		error = BTRFS_INVALID_ARGUMENT;
+	}
+	/* The back references are inserted while the old ones still exist. */
+	if (error == BTRFS_OK) {
+		error = bt_ns_room(transaction, tree, new_parent.inode, new_name, new_length, 0,
+		    source.inode, NULL);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_room(transaction, tree, old_parent.inode, old_name, old_length, 0,
+		    target.inode, NULL);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_index(transaction, tree, new_parent.inode, &source_index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_index(transaction, tree, old_parent.inode, &target_index);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	error = bt_ns_add_ref(
+	    transaction, tree, new_parent.inode, new_name, new_length, source.inode, source_index);
+	if (error == BTRFS_OK) {
+		error = bt_ns_add_ref(transaction, tree, old_parent.inode, old_name, old_length,
+		    target.inode, target_index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_remove_entry(
+		    transaction, tree, old_parent.inode, old_name, old_length, &source, time);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_remove_entry(
+		    transaction, tree, new_parent.inode, new_name, new_length, &target, time);
+	}
+	if (error == BTRFS_OK) {
+		location.objectid = source.inode;
+		error = bt_ns_insert_entry(transaction, tree, new_parent.inode, new_name,
+		    new_length, location, source.type, source_index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_directory(transaction, tree, new_parent.inode, new_length, 1, time);
+	}
+	if (error == BTRFS_OK) {
+		location.objectid = target.inode;
+		error = bt_ns_insert_entry(transaction, tree, old_parent.inode, old_name,
+		    old_length, location, target.type, target_index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_directory(transaction, tree, old_parent.inode, old_length, 1, time);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_named_inode(transaction, tree, source.inode, &source_item);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_store(transaction, tree, source.inode, &source_item, time);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_named_inode(transaction, tree, target.inode, &target_item);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_store(transaction, tree, target.inode, &target_item, time);
 	}
 	return bt_ns_poison(transaction, error);
 }

@@ -54,11 +54,14 @@ enum random_kind {
 	RANDOM_ATTRIBUTES,
 	RANDOM_CLEAN,
 	RANDOM_REFUSAL,
+	RANDOM_EXCHANGE,
+	RANDOM_WHITEOUT,
 	RANDOM_KINDS
 };
 
 /* Weights of the operation kinds, in random_kind order. */
-static const unsigned random_weights[RANDOM_KINDS] = { 9, 4, 3, 4, 6, 7, 5, 2, 12, 4, 4, 1, 4 };
+static const unsigned random_weights[RANDOM_KINDS] = { 9, 4, 3, 4, 6, 7, 5, 2, 12, 4, 4, 1, 4, 2,
+	2 };
 
 struct model_inode {
 	int live;
@@ -503,8 +506,58 @@ random_unlink(struct model *model, struct plan *plan)
 	return 1;
 }
 
+/* RENAME_EXCHANGE of two names: each then names the other's inode, and both
+ * directories change; a directory may not end up below itself. Exchanged
+ * directories keep their committed paths for the rest of the commit. */
 static int
-random_rename(struct model *model, struct plan *plan)
+random_exchange(struct model *model, struct plan *plan)
+{
+	char source[RANDOM_PATH];
+	char target[RANDOM_PATH];
+	uint32_t first = model_pick_entry(model, accept_any);
+	uint32_t second = model_pick_entry(model, accept_any);
+	uint32_t a;
+	uint32_t b;
+	int directories;
+
+	if (first == MODEL_NONE || second == MODEL_NONE || first == second) {
+		return 0;
+	}
+	a = model->entries[first].child;
+	b = model->entries[second].child;
+	directories = model_type(&model->inodes[a]) == BTRFS_MODE_DIRECTORY ||
+	    model_type(&model->inodes[b]) == BTRFS_MODE_DIRECTORY;
+	if ((model_type(&model->inodes[a]) == BTRFS_MODE_DIRECTORY &&
+		model_below_directory(model, model->entries[second].parent, a)) ||
+	    (model_type(&model->inodes[b]) == BTRFS_MODE_DIRECTORY &&
+		model_below_directory(model, model->entries[first].parent, b))) {
+		return 0;
+	}
+	model_entry_path(model, first, source, sizeof(source));
+	model_entry_path(model, second, target, sizeof(target));
+	if (directories && (strlen(source) > RANDOM_PATH / 4 || strlen(target) > RANDOM_PATH / 4)) {
+		return 0;
+	}
+	plan_exchange(plan, model->commit, source, target);
+	if (a == b) {
+		/* Two names of one inode: nothing changes. */
+		return 1;
+	}
+	model->entries[first].child = b;
+	model->entries[second].child = a;
+	model->inodes[model->entries[first].parent].modify_seconds = model->now;
+	model->inodes[model->entries[second].parent].modify_seconds = model->now;
+	if (model_type(&model->inodes[a]) == BTRFS_MODE_DIRECTORY) {
+		model->inodes[a].frozen = 1;
+	}
+	if (model_type(&model->inodes[b]) == BTRFS_MODE_DIRECTORY) {
+		model->inodes[b].frozen = 1;
+	}
+	return 1;
+}
+
+static int
+random_rename(struct model *model, struct plan *plan, int whiteout)
 {
 	char source[RANDOM_PATH];
 	char target[RANDOM_PATH];
@@ -513,12 +566,17 @@ random_rename(struct model *model, struct plan *plan)
 	uint32_t moved;
 	uint32_t name;
 	uint32_t existing;
+	uint32_t old_parent;
+	uint32_t old_name;
+	uint32_t whiteout_inode;
 	int directory_moved;
 	int open = 0;
 
 	if (entry == MODEL_NONE || directory == MODEL_NONE) {
 		return 0;
 	}
+	old_parent = model->entries[entry].parent;
+	old_name = model->entries[entry].name;
 	moved = model->entries[entry].child;
 	directory_moved = model_type(&model->inodes[moved]) == BTRFS_MODE_DIRECTORY;
 	if (directory_moved && model_below_directory(model, directory, moved)) {
@@ -546,7 +604,11 @@ random_rename(struct model *model, struct plan *plan)
 	strcat(target, random_names[name]);
 	if (existing != MODEL_NONE && model->entries[existing].child == moved) {
 		/* Two names of one inode: nothing changes. */
-		plan_rename(plan, model->commit, source, target, 0);
+		if (whiteout) {
+			plan_rename_whiteout(plan, model->commit, source, target, 0);
+		} else {
+			plan_rename(plan, model->commit, source, target, 0);
+		}
 		return 1;
 	}
 	if (existing != MODEL_NONE &&
@@ -554,7 +616,11 @@ random_rename(struct model *model, struct plan *plan)
 	    model->inodes[model->entries[existing].child].links == 1) {
 		open = model_below(model, 4) == 0;
 	}
-	plan_rename(plan, model->commit, source, target, open);
+	if (whiteout) {
+		plan_rename_whiteout(plan, model->commit, source, target, open);
+	} else {
+		plan_rename(plan, model->commit, source, target, open);
+	}
 	model->inodes[model->entries[entry].parent].modify_seconds = model->now;
 	model->entries[entry].used = 0;
 	if (existing != MODEL_NONE) {
@@ -563,6 +629,13 @@ random_rename(struct model *model, struct plan *plan)
 	model_add_entry(model, directory, name, moved);
 	if (directory_moved) {
 		model->inodes[moved].frozen = 1;
+	}
+	if (whiteout) {
+		/* The whiteout under the old name; the harness resolves it by name
+		 * only from the next commit on. */
+		whiteout_inode = model_new_inode(model, BTRFS_MODE_CHARACTER);
+		model_add_entry(model, old_parent, old_name, whiteout_inode);
+		model->inodes[whiteout_inode].frozen = 1;
 	}
 	return 1;
 }
@@ -843,7 +916,11 @@ random_operation(struct model *model, struct plan *plan, enum random_kind kind)
 	case RANDOM_UNLINK:
 		return random_unlink(model, plan);
 	case RANDOM_RENAME:
-		return random_rename(model, plan);
+		return random_rename(model, plan, 0);
+	case RANDOM_EXCHANGE:
+		return random_exchange(model, plan);
+	case RANDOM_WHITEOUT:
+		return random_rename(model, plan, 1);
 	case RANDOM_SET_XATTR:
 		return random_set_xattr(model, plan, model_below(model, 8) == 0);
 	case RANDOM_REMOVE_XATTR:
@@ -856,8 +933,10 @@ random_operation(struct model *model, struct plan *plan, enum random_kind kind)
 		return random_attributes(model, plan);
 	case RANDOM_CLEAN:
 		return random_clean(model, plan);
-	default:
+	case RANDOM_REFUSAL:
 		return random_refusal(model, plan);
+	default:
+		return 0;
 	}
 }
 
@@ -913,6 +992,10 @@ model_expect(const struct model *model, struct plan *plan, size_t stage)
 			break;
 		case BTRFS_MODE_SYMLINK:
 			expect_symlink(plan, stage, stage, path, inode->target);
+			break;
+		case BTRFS_MODE_CHARACTER:
+			/* A whiteout: device 0:0. */
+			expect_value(plan, stage, stage, EXPECT_DEVICE, path, 0);
 			break;
 		default:
 			count = 0;

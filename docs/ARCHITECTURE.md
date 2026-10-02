@@ -413,6 +413,18 @@ Linux's orphan cleanup does at mount (an orphan item of a missing or still
 linked inode only goes away). Rename removes the old name, then any replaced
 name and its link, then adds the new name, all in one transaction; two names of
 one inode make it a no-op, and a directory cannot move below itself.
+renameat2's RENAME_WHITEOUT then creates, under the old name, a whiteout: a
+character device 0:0 without permission bits owned by the caller.
+RENAME_EXCHANGE follows `btrfs_rename_exchange`: both indexes are taken (the
+source's in the new directory first), both back references inserted while the
+old ones still exist, both old names removed, and both entries inserted under
+the swapped indexes; files and directories may be exchanged across directories
+unless one would move below itself, and subvolume entries are refused.
+O_TMPFILE follows `btrfs_tmpfile`: a nameless regular file inherits from its
+directory like a created one, with zero links and an orphan item; its first
+name, through `btrfs_transaction_link_tmpfile`, removes the orphan item
+(`btrfs_link`), otherwise eviction or orphan cleanup deletes it. Linux's
+I_LINKABLE rule (O_EXCL) stays with the adapter.
 
 Setting or removing `btrfs.compression` is Linux's property operation: the value
 must start with zlib, lzo or zstd, or be "no"/"none", and the inode must keep
@@ -424,8 +436,7 @@ otherwise uninterpreted; native policy decides which namespaces callers may use.
 Every refusal (existing or missing name, wrong type, non-empty directory, full
 packed item, exhausted numbering, read-only snapshot, crossing a subvolume entry
 or tree) is decided before the first change and leaves the transaction usable. A
-failure after a change poisons the transaction. O_TMPFILE links of unlinked
-inodes, rename exchange and whiteouts are not part of this interface.
+failure after a change poisons the transaction.
 
 ## Subvolumes and snapshots
 

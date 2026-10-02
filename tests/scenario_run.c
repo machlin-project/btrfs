@@ -649,9 +649,18 @@ prepare_paths(struct path_table *table, struct btrfs_fs *fs, const struct operat
 		path_prepare(table, fs, operation->path, 1);
 		break;
 	case OPERATION_RENAME:
+	case OPERATION_EXCHANGE:
+	case OPERATION_RENAME_WHITEOUT:
 		path_prepare(table, fs, operation->path, 0);
 		path_prepare(table, fs, operation->path, 1);
 		path_prepare(table, fs, operation->target, 0);
+		path_prepare(table, fs, operation->target, 1);
+		break;
+	case OPERATION_TMPFILE:
+		path_prepare(table, fs, operation->path, 1);
+		break;
+	case OPERATION_LINK_TMPFILE:
+		path_prepare(table, fs, operation->path, 0);
 		path_prepare(table, fs, operation->target, 1);
 		break;
 	case OPERATION_EVICT:
@@ -710,6 +719,7 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 	struct btrfs_object_id none = { 0, 0 };
 	struct btrfs_object_id parent;
 	struct btrfs_object_id target;
+	struct btrfs_object_id other;
 	struct btrfs_object_id id;
 	const char *leaf = NULL;
 	const char *new_leaf = NULL;
@@ -777,6 +787,55 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 			replaced->id.inode == id.inode)) {
 			path_set(table, operation->path, none, 0);
 			path_set(table, operation->target, id, 1);
+		}
+		return result;
+	case OPERATION_TMPFILE:
+		parent = path_object(table, operation->path, 1, &leaf);
+		memset(&attributes, 0, sizeof(attributes));
+		attributes.mode = operation->mode;
+		attributes.uid = operation->uid;
+		attributes.gid = operation->gid;
+		attributes.time = time;
+		result = btrfs_transaction_create_tmpfile(transaction, parent, &attributes, &id);
+		if (result == BTRFS_OK) {
+			path_set(table, operation->path, id, 1);
+		}
+		return result;
+	case OPERATION_LINK_TMPFILE:
+		id = path_object(table, operation->path, 0, NULL);
+		parent = path_object(table, operation->target, 1, &leaf);
+		result = btrfs_transaction_link_tmpfile(
+		    transaction, id, parent, leaf, strlen(leaf), time);
+		if (result == BTRFS_OK) {
+			path_set(table, operation->target, id, 1);
+		}
+		return result;
+	case OPERATION_EXCHANGE:
+		parent = path_object(table, operation->path, 1, &leaf);
+		target = path_object(table, operation->target, 1, &new_leaf);
+		result = btrfs_transaction_exchange(transaction, parent, leaf, strlen(leaf), target,
+		    new_leaf, strlen(new_leaf), time);
+		if (result == BTRFS_OK) {
+			id = path_object(table, operation->path, 0, NULL);
+			other = path_object(table, operation->target, 0, NULL);
+			path_set(table, operation->path, other, 1);
+			path_set(table, operation->target, id, 1);
+		}
+		return result;
+	case OPERATION_RENAME_WHITEOUT:
+		id = path_object(table, operation->path, 0, NULL);
+		parent = path_object(table, operation->path, 1, &leaf);
+		target = path_object(table, operation->target, 1, &new_leaf);
+		result = btrfs_transaction_rename_whiteout(transaction, parent, leaf, strlen(leaf),
+		    target, new_leaf, strlen(new_leaf), operation->uid, operation->gid, time,
+		    operation->flags);
+		replaced = path_slot(table, operation->target);
+		if (result == BTRFS_OK &&
+		    !(replaced->path != NULL && replaced->present && replaced->id.tree == id.tree &&
+			replaced->id.inode == id.inode)) {
+			path_set(table, operation->target, id, 1);
+			/* The whiteout's inode is looked up by name when checked. */
+			path_set(table, operation->path, none, 0);
 		}
 		return result;
 	case OPERATION_SET_XATTR:
