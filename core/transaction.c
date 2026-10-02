@@ -1061,43 +1061,173 @@ bt_tx_publish(struct btrfs_transaction *transaction, unsigned mirror)
 	    transaction->io.context, offset, &transaction->super, sizeof(transaction->super));
 }
 
+/* Heap order by physical address: bounded and without allocation. */
+static void
+bt_tx_sift(struct bt_tx_write *writes, size_t root, size_t count)
+{
+	struct bt_tx_write swap;
+	size_t child;
+
+	for (;;) {
+		child = 2 * root + 1;
+		if (child >= count) {
+			return;
+		}
+		if (child + 1 < count && writes[child + 1].physical > writes[child].physical) {
+			child++;
+		}
+		if (writes[root].physical >= writes[child].physical) {
+			return;
+		}
+		swap = writes[root];
+		writes[root] = writes[child];
+		writes[child] = swap;
+		root = child;
+	}
+}
+
+static void
+bt_tx_sort(struct bt_tx_write *writes, size_t count)
+{
+	struct bt_tx_write swap;
+	size_t i;
+
+	for (i = count / 2; i != 0; i--) {
+		bt_tx_sift(writes, i - 1, count);
+	}
+	for (i = count; i > 1; i--) {
+		swap = writes[0];
+		writes[0] = writes[i - 1];
+		writes[i - 1] = swap;
+		bt_tx_sift(writes, 0, i - 1);
+	}
+}
+
+/* Lists every copy of every written node by physical address. Copies never
+ * overlap: chunk stripes were checked to be disjoint when space was loaded. */
 static enum btrfs_result
-bt_tx_persist(struct btrfs_transaction *transaction)
+bt_tx_writes(struct btrfs_transaction *transaction, struct bt_tx_write *writes, size_t capacity,
+    size_t *count)
 {
 	struct bt_mutated_block block;
 	uint64_t physical;
 	size_t i;
 	unsigned mirrors;
 	unsigned mirror;
-	unsigned level;
 	enum btrfs_result error;
 
-	/* New data was written when its extents were created; it and the
-	 * metadata naming it are durable at the first barrier. */
-	for (level = 0; level < BT_MAX_LEVEL; level++) {
-		for (i = 0; i < bt_mutation_count(transaction->mutation); i++) {
-			error = bt_mutation_block(transaction->mutation, i, &block);
+	*count = 0;
+	for (i = 0; i < bt_mutation_count(transaction->mutation); i++) {
+		error = bt_mutation_block(transaction->mutation, i, &block);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		if (block.discarded) {
+			continue;
+		}
+		mirrors = 1;
+		for (mirror = 0; mirror < mirrors; mirror++) {
+			error = bt_map(&transaction->fs, block.address, block.size,
+			    block.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM : BT_BLOCK_METADATA,
+			    mirror, &physical, &mirrors);
 			if (error != BTRFS_OK) {
 				return error;
 			}
-			if (block.discarded || block.level != level) {
-				continue;
+			if (*count == capacity) {
+				return BTRFS_CORRUPT;
 			}
-			mirrors = 1;
-			for (mirror = 0; mirror < mirrors; mirror++) {
-				error = bt_map(&transaction->fs, block.address, block.size,
-				    block.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM
-								 : BT_BLOCK_METADATA,
-				    mirror, &physical, &mirrors);
-				if (error == BTRFS_OK) {
-					error = transaction->io.write(transaction->io.context,
-					    physical, block.bytes, block.size);
-				}
-				if (error != BTRFS_OK) {
-					return error;
-				}
-			}
+			writes[(*count)++] = (struct bt_tx_write){ physical, block.bytes };
 		}
+	}
+	bt_tx_sort(writes, *count);
+	for (i = 1; i < *count; i++) {
+		if (writes[i].physical - writes[i - 1].physical < transaction->fs.info.node_size) {
+			return BTRFS_CORRUPT;
+		}
+	}
+	return BTRFS_OK;
+}
+
+/* Number of nodes in the run of physically contiguous copies at first. */
+static size_t
+bt_tx_run(const struct btrfs_transaction *transaction, const struct bt_tx_write *writes,
+    size_t count, size_t first)
+{
+	size_t node_size = transaction->fs.info.node_size;
+	size_t limit = BT_WRITE_RUN / node_size;
+	size_t end = first + 1;
+
+	while (end < count && end - first < limit &&
+	    writes[end].physical == writes[end - 1].physical + node_size) {
+		end++;
+	}
+	return end - first;
+}
+
+/* Writes every node copy, contiguous copies merged into single writes. All
+ * memory is allocated before the first write. */
+static enum btrfs_result
+bt_tx_write_nodes(struct btrfs_transaction *transaction)
+{
+	const struct btrfs_environment *env = &transaction->base->env;
+	struct bt_tx_write *writes;
+	uint8_t *staging = NULL;
+	size_t node_size = transaction->fs.info.node_size;
+	size_t capacity = BT_MAX_MIRRORS * bt_mutation_count(transaction->mutation);
+	size_t count;
+	size_t longest = 1;
+	size_t length;
+	size_t i;
+	size_t j;
+	enum btrfs_result error;
+
+	if (capacity == 0) {
+		return BTRFS_OK;
+	}
+	writes = env->allocate(env->context, capacity * sizeof(*writes));
+	if (writes == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	error = bt_tx_writes(transaction, writes, capacity, &count);
+	for (i = 0; error == BTRFS_OK && i < count; i += length) {
+		length = bt_tx_run(transaction, writes, count, i);
+		longest = length > longest ? length : longest;
+	}
+	if (error == BTRFS_OK && longest > 1) {
+		staging = env->allocate(env->context, longest * node_size);
+		error = staging == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+	}
+	for (i = 0; error == BTRFS_OK && i < count; i += length) {
+		length = bt_tx_run(transaction, writes, count, i);
+		if (length == 1) {
+			error = transaction->io.write(transaction->io.context, writes[i].physical,
+			    writes[i].bytes, node_size);
+			continue;
+		}
+		for (j = 0; j < length; j++) {
+			bt_copy(staging + j * node_size, writes[i + j].bytes, node_size);
+		}
+		error = transaction->io.write(
+		    transaction->io.context, writes[i].physical, staging, length * node_size);
+	}
+	if (staging != NULL) {
+		env->release(env->context, staging, longest * node_size);
+	}
+	env->release(env->context, writes, capacity * sizeof(*writes));
+	return error;
+}
+
+static enum btrfs_result
+bt_tx_persist(struct btrfs_transaction *transaction)
+{
+	enum btrfs_result error;
+	unsigned mirror;
+
+	/* New data was written when its extents were created; it and the
+	 * metadata naming it are durable at the first barrier. */
+	error = bt_tx_write_nodes(transaction);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	error = transaction->io.flush(transaction->io.context);
 	if (error != BTRFS_OK) {

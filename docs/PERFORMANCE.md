@@ -108,7 +108,11 @@ image file's `F_FULLFSYNC` on the host SSD:
 | Grouped, one sync for all | 21 us, 3.7 allocations | 0.15 ms |
 
 A per-operation commit pays three barriers, which dominate durable latency;
-grouping amortizes them over the running transaction. No native adapter
+grouping amortizes them over the running transaction. A commit writes its node
+copies in physical order, merging contiguous ones into writes of at most
+256 KiB: on `transactions`, a single create's commit issues 10.9 writes for
+15.2 nodes on average, a commit of 100 grouped creates 23 for 56, and one of
+1,000 grouped creates 19 for 211. No native adapter
 groups its operations yet.
 
 Concurrent cached lookups of names in one directory, each walking the same

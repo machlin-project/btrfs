@@ -1051,6 +1051,31 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	return result;
 }
 
+/* A commit's writes before its first barrier, from first on, are its node
+ * copies in ascending physical order, contiguous ones merged up to
+ * BT_WRITE_RUN bytes. */
+static void
+require_merged_writes(struct context *context, size_t first, size_t last)
+{
+	const struct saved_write *write;
+	const struct saved_write *previous = NULL;
+	size_t run = BT_WRITE_RUN / context->node_size * context->node_size;
+	size_t end;
+	size_t i;
+
+	for (i = first; i < last && context->device->writes[i].epoch == 0; i++) {
+		write = &context->device->writes[i];
+		REQUIRE(write->length % context->node_size == 0 && write->length <= run);
+		if (previous != NULL) {
+			end = previous->offset + previous->length;
+			REQUIRE(write->offset >= end &&
+			    (write->offset != end || previous->length == run));
+		}
+		previous = write;
+	}
+	REQUIRE(previous != NULL);
+}
+
 /* Writes [first, last) of the device are new data: they touch no superblock
  * copy and no metadata or system chunk (a data chunk grown in the transaction
  * lies outside every committed chunk). */
@@ -1346,6 +1371,7 @@ run_plan(struct context *context, struct plan *plan)
 		printf("%s commit %zu: %zu writes, %zu barriers, %llu allocations, %llu reads\n",
 		    plan->name, commit, totals.writes, totals.flushes,
 		    (unsigned long long)totals.allocations, (unsigned long long)totals.reads);
+		require_merged_writes(context, device->before_commit, device->count);
 		export_writes(context, &exporter);
 		audit_state(context, plan->name);
 		if (commit == 1 && plan->new_chunks != 0) {

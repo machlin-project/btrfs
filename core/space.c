@@ -751,7 +751,7 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	uint64_t limit = kind == BT_BLOCK_DATA ? BT_CHUNK_DATA_MAX
 	    : kind == BT_BLOCK_SYSTEM	       ? BT_CHUNK_SYSTEM_MAX
 					       : BT_CHUNK_METADATA_MAX;
-	uint64_t physical[2];
+	uint64_t physical[BT_MAX_MIRRORS];
 	size_t i;
 	unsigned stripes;
 	unsigned stripe;

@@ -16,6 +16,9 @@
 /* Queued file reference changes of one transaction. */
 #define BT_TRANSACTION_REFERENCES 65536U
 #define BT_INLINE_WRITE_LIMIT 2048U
+/* A commit merges physically contiguous node copies into writes of at most
+ * this many bytes. */
+#define BT_WRITE_RUN (256U * 1024U)
 #define BT_TRANSACTION_INDEXES 256U
 #define BT_COUNTER_TREES 64U
 /* Directory counter slots (a power of two) and the occupancy that empties the
@@ -79,6 +82,12 @@ struct btrfs_counters {
 	size_t directory_count;
 	/* How often the directory table was emptied. */
 	uint64_t forgotten;
+};
+
+/* One copy of a node a commit writes. */
+struct bt_tx_write {
+	uint64_t physical;
+	const void *bytes;
 };
 
 struct btrfs_transaction {

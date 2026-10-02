@@ -225,7 +225,7 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 	struct bt_shadow *shadow;
 	const struct btrfs_environment *env = &mutation->base->env;
 	uint64_t address;
-	uint64_t physical[2];
+	uint64_t physical[BT_MAX_MIRRORS];
 	uint64_t kind = root.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM : BT_BLOCK_METADATA;
 	unsigned mirrors = 1;
 	unsigned i;

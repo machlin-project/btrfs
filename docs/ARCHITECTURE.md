@@ -589,7 +589,9 @@ means an earlier publication was not resolved, and a new commit could reuse bloc
 that a newer copy still references. Commit re-reads every copy and returns STALE
 if any changed after `begin`.
 
-The publisher writes new metadata bottom-up, then:
+The publisher writes new metadata in physical order, merging contiguous node
+copies into writes of at most 256 KiB (an order the barrier below makes free to
+choose), then:
 
 1. barrier: the new tree is durable but unreferenced;
 2. secondary copies, barrier: the untouched primary still names the

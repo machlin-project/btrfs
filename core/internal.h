@@ -74,8 +74,11 @@ struct bt_root {
 	uint8_t level;
 };
 
+/* Copies of a block: SINGLE has one, DUP two on the same device. */
+#define BT_MAX_MIRRORS 2U
+
 struct bt_chunk {
-	uint64_t logical, length, type, physical[2];
+	uint64_t logical, length, type, physical[BT_MAX_MIRRORS];
 	uint8_t mirrors, confirmed;
 	/* A writer removes this unused block group at commit. */
 	uint8_t removed;
