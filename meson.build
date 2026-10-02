@@ -80,9 +80,11 @@ fskit_available = host_machine.system() == 'darwin' and add_languages('objc', re
 if fskit_available
   fskit_volume_test = executable('btrfs-fskit-volume-test', 'tests/fskit_volume.m',
     'adapters/fskit/BtrfsFileSystem.m', 'adapters/fskit/BtrfsVolumeMutation.m',
+    'adapters/fskit/BtrfsDeviceBarrier.m', 'adapters/fskit/BtrfsPeerIdentity.m',
     'tests/namespace_audit.c', 'tests/references.c', include_directories: inc,
     objc_args: ['-fobjc-arc', '-fblocks', '-mmacosx-version-min=26.5'],
-    link_args: ['-framework', 'Foundation', '-framework', 'FSKit', '-mmacosx-version-min=26.5'],
+    link_args: ['-framework', 'Foundation', '-framework', 'FSKit', '-framework', 'Security',
+      '-mmacosx-version-min=26.5'],
     link_with: [posix, identity, native, volume, core], dependencies: [zlib, zstd])
 endif
 if get_option('fuzzer')

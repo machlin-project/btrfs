@@ -11,7 +11,9 @@
  * file's eviction, each visible at once and durable after synchronization
  * through the barrier, which the core, the namespace audit and the reference
  * audit then confirm; a failed barrier fails synchronization and every later
- * change. */
+ * change. Admission: a load binds no barrier for --rdonly or a read-only
+ * device, and a process without a signing team never connects to one. */
+#import "../adapters/fskit/BtrfsDeviceBarrier.h"
 #import "../adapters/fskit/BtrfsFileSystemInternal.h"
 #include "../adapters/posix/image.h"
 #include "namespace_audit.h"
@@ -54,6 +56,7 @@
 @property(readonly) uint64_t physicalBlockSize;
 @property(getter=isRevoked) BOOL revoked;
 @property(readonly, getter=isWritable) BOOL writable;
+@property(readonly) NSString *BSDName;
 @property size_t partial;
 @property uint64_t calls;
 @property uint64_t writes;
@@ -71,6 +74,7 @@
 	self = [super init];
 	if (self != nil) {
 		_writable = writable;
+		_BSDName = @"disk9s9";
 		_descriptor = open(path, writable ? O_RDWR : O_RDONLY);
 		REQUIRE(_descriptor >= 0 && fstat(_descriptor, &status) == 0);
 		_blockSize = SECTOR_BYTES;
@@ -904,6 +908,77 @@ barrier_failure_test(const char *fixture)
 	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
 }
 
+/* A filesystem whose barrier is a stand-in, counting the loads that ask for it. */
+@interface AdmissionFileSystem : BtrfsFileSystem
+@property TestFlusher *barrier;
+@property uint64_t requests;
+@end
+
+@implementation AdmissionFileSystem
+
+- (id<BtrfsDeviceFlusher>)barrierForDevice:(FSBlockDeviceResource *)device error:(NSError **)error
+{
+	(void)device;
+	self.requests++;
+	if (self.barrier == nil) {
+		*error = [NSError errorWithDomain:NSPOSIXErrorDomain
+					     code:ECONNREFUSED
+					 userInfo:nil];
+	}
+	return self.barrier;
+}
+
+@end
+
+/* Which loads bind the device barrier. This process has no signing team, so the
+ * client cannot authenticate the service and refuses it before connecting. */
+static void
+admission_test(const char *fixture)
+{
+	BtrfsFileSystem *filesystem = [[BtrfsFileSystem alloc] init];
+	AdmissionFileSystem *counted = [[AdmissionFileSystem alloc] init];
+	NSString *path = scratch_copy(fixture);
+	ImageReader *writable = [[ImageReader alloc] initWithPath:path.fileSystemRepresentation
+							 writable:YES];
+	ImageReader *readonly = [[ImageReader alloc] initWithPath:fixture writable:NO];
+	TestOptions *options = [TestOptions new];
+	NSError *error = nil;
+
+	REQUIRE(btrfs_peer_requirement(BTRFS_BARRIER_IDENTIFIER) == nil);
+	REQUIRE([[BtrfsDeviceBarrier alloc] initWithDevice:writable.BSDName
+						 blockSize:writable.blockSize
+						blockCount:writable.blockCount
+						     error:&error] == nil);
+	REQUIRE([error.domain isEqualToString:NSPOSIXErrorDomain] && error.code == EACCES);
+	REQUIRE(![BtrfsDeviceBarrier isServiceAvailable]);
+	options.taskOptions = @[ @"--rdonly" ];
+	REQUIRE([filesystem flusherForDevice:(FSBlockDeviceResource *)writable
+				     options:(FSTaskOptions *)options] == nil);
+	options.taskOptions = @[];
+	REQUIRE([filesystem flusherForDevice:(FSBlockDeviceResource *)readonly
+				     options:(FSTaskOptions *)options] == nil);
+	REQUIRE([filesystem flusherForDevice:(FSBlockDeviceResource *)writable
+				     options:(FSTaskOptions *)options] == nil);
+	/* Only a writable device without --rdonly asks for the barrier. */
+	counted.barrier = [TestFlusher new];
+	options.taskOptions = @[ @"--rdonly" ];
+	REQUIRE([counted flusherForDevice:(FSBlockDeviceResource *)writable
+				  options:(FSTaskOptions *)options] == nil);
+	options.taskOptions = @[];
+	REQUIRE([counted flusherForDevice:(FSBlockDeviceResource *)readonly
+				  options:(FSTaskOptions *)options] == nil);
+	REQUIRE(counted.requests == 0);
+	REQUIRE([counted flusherForDevice:(FSBlockDeviceResource *)writable
+				  options:(FSTaskOptions *)options] == counted.barrier);
+	counted.barrier = nil;
+	REQUIRE([counted flusherForDevice:(FSBlockDeviceResource *)writable
+				  options:(FSTaskOptions *)options] == nil);
+	REQUIRE(counted.requests == 2);
+	REQUIRE(writable.writes == 0 && readonly.writes == 0);
+	writable = nil;
+	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -930,13 +1005,15 @@ main(int argc, char **argv)
 		btrfs_image_close(&image);
 		write_tests(argv[2]);
 		barrier_failure_test(argv[2]);
+		admission_test(argv[2]);
 		printf(
 		    "FSKit volume: reads equal the core's (direct, bounced, partial), dot entries "
 		    "only without attributes across pages, read-only refusals, revocation, "
 		    "maintenance refusals, Disk Arbitration type; writable creation, writes, "
 		    "truncation, attributes, xattrs, links, renames, removal and eviction "
 		    "durable through the barrier and audited, barrier failure fails the "
-		    "volume PASS\n");
+		    "volume, no barrier for --rdonly, read-only devices or an unsigned "
+		    "process PASS\n");
 	}
 	return 0;
 }

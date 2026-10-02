@@ -27,6 +27,50 @@ targets:
         HEADER_SEARCH_PATHS: $(SRCROOT)/../../include
         OTHER_CFLAGS: -ffreestanding -fno-builtin -Wdeclaration-after-statement
         SKIP_INSTALL: YES
+  BtrfsDeviceBarrier:
+    type: tool
+    platform: macOS
+    sources:
+      - DeviceBarrierService.m
+      - BtrfsPeerIdentity.m
+      - BtrfsDeviceBarrier.h
+    dependencies:
+      - sdk: Foundation.framework
+      - sdk: Security.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.machlin.btrfs.device-barrier
+        OTHER_CODE_SIGN_FLAGS: --identifier org.machlin.btrfs.device-barrier
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        OTHER_CFLAGS: -Wdeclaration-after-statement
+        SKIP_INSTALL: YES
+  BtrfsDeviceSetup:
+    type: application
+    platform: macOS
+    sources:
+      - DeviceSetup.swift
+      - path: group.org.machlin.btrfs.device-barrier.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchDaemons
+    dependencies:
+      - target: BtrfsDeviceBarrier
+        embed: true
+        link: false
+        copy:
+          destination: wrapper
+          subpath: Contents/Library/LaunchServices
+      - sdk: ServiceManagement.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.machlin.btrfs.device-setup
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Machlin btrfs Disk Service
+        SKIP_INSTALL: YES
   BtrfsFSKitExtension:
     type: extensionkit-extension
     platform: macOS
@@ -36,19 +80,26 @@ targets:
       - BtrfsVolumeMutation.m
       - BtrfsFileSystem.h
       - BtrfsFileSystemInternal.h
+      - BtrfsDeviceBarrier.h
+      - BtrfsDeviceBarrier.m
+      - BtrfsPeerIdentity.m
       - BridgingHeader.h
     dependencies:
       - target: BtrfsCore
       - sdk: libz.tbd
+      - sdk: Security.framework
       - sdk: FSKit.framework
       - sdk: ExtensionFoundation.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.machlin.btrfs.filesystem
+        PROVISIONING_PROFILE_SPECIFIER: $(BTRFS_EXTENSION_PROFILE)
         INFOPLIST_FILE: Extension-Info.plist
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_ENTITLEMENTS: Extension.entitlements
         ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        REGISTER_APP_GROUPS: YES
         SWIFT_OBJC_BRIDGING_HEADER: BridgingHeader.h
         HEADER_SEARCH_PATHS: $(SRCROOT)/../../include
         OTHER_CFLAGS: -Wdeclaration-after-statement
@@ -58,17 +109,38 @@ targets:
     platform: macOS
     sources:
       - App.swift
+      - ControlCommand.swift
+      - DeviceService.swift
+      - BtrfsDeviceBarrier.h
+      - BtrfsDeviceBarrier.m
+      - BtrfsPeerIdentity.m
+      - AppBridge.h
     dependencies:
       - target: BtrfsFSKitExtension
         embed: true
+      - target: BtrfsDeviceSetup
+        embed: true
+        link: false
+        copy:
+          destination: wrapper
+          subpath: Contents/Helpers
+      - sdk: Security.framework
+      - sdk: FSKit.framework
+      - sdk: ServiceManagement.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.machlin.btrfs
+        PROVISIONING_PROFILE_SPECIFIER: $(BTRFS_APP_PROFILE)
         PRODUCT_NAME: Machlin btrfs
         GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: App.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: AppBridge.h
         INFOPLIST_KEY_CFBundleDisplayName: Machlin btrfs
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        REGISTER_APP_GROUPS: YES
+        SKIP_INSTALL: NO
 schemes:
   BtrfsFSKitApp:
     build:
@@ -76,3 +148,5 @@ schemes:
         BtrfsFSKitApp: all
     run:
       config: Debug
+    archive:
+      config: Release

@@ -270,9 +270,48 @@ python3 scripts/build_kext.py --arch x86_64
 Outputs are unsigned by default. Builds do not install, register, load, attach
 devices or change boot policy. FSKit signed builds accept `--team` and optionally
 `--provision`; use only the personal identity and provision the filesystem-module
-capability in a dedicated guest workflow. No signing or installation acceptance
-has been established for this project. Do not use a different entitlement to
-pretend filesystem-module authorization exists.
+capability in a dedicated guest workflow. When automatic profiles omit the test
+guest, create a Mac App Development profile for `org.machlin.btrfs` and for
+`org.machlin.btrfs.filesystem` that include the guest's Provisioning UDID (not
+its Hardware UUID; read it again after a restore) and pass both, with `--clean`
+after a profile change:
+
+```sh
+python3 scripts/build_fskit.py --team YOUR_TEAM_ID --provision --clean \
+  --app-profile 'Machlin btrfs development devices' \
+  --extension-profile 'Machlin btrfs filesystem development devices' \
+  --configuration Release --build-number N \
+  --derived-data artifacts/fskit-signed/DerivedData
+```
+
+A signed build ends with `codesign --verify --deep --strict --all-architectures`.
+`--build-number` gives every bundle the same positive build number; increase it
+for each replacement. `--archive-path` creates a new Xcode archive (Release by
+default) and refuses an existing path. The app, extension, setup utility and
+device barrier use hardened runtime; the app and extension share the App Group
+`group.org.machlin.btrfs`, which prefixes the barrier's Mach service. No signing
+or installation acceptance has been established for this project. Do not use a
+different entitlement to pretend filesystem-module authorization exists.
+
+Install into `/Applications` of a dedicated guest, enable the module in System
+Settings → General → Login Items & Extensions → **By Category → File System
+Extensions**, and check FSKit's own state before mounting:
+
+```sh
+app='/Applications/Machlin btrfs.app/Contents/MacOS/Machlin btrfs'
+"$app" --control modules
+"$app" --control device-service setup
+"$app" --control device-service
+```
+
+`setup` opens the embedded setup utility (`Contents/Helpers/BtrfsDeviceSetup.app`),
+which registers the barrier daemon; approve it in System Settings. The utility also
+takes `--register`, `--unregister`, `--refresh` and `--status`, refuses to
+unregister while a `machlinbtrfs` volume is mounted, and after a bundle update
+`--refresh` unregisters and registers again, since registering an enabled service
+does not replace its code. Only the app's `device-service` query, which asks the
+daemon over its authenticated connection, shows a usable service; registration
+status alone does not.
 
 In an isolated guest with Python, mount a disposable copy of the plain fixture
 at its top-level subvolume, then run as root:

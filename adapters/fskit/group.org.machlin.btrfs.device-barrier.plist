@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>group.org.machlin.btrfs.device-barrier</string>
+    <key>BundleProgram</key><string>Contents/Library/LaunchServices/BtrfsDeviceBarrier</string>
+    <key>MachServices</key>
+    <dict><key>group.org.machlin.btrfs.device-barrier</key><true/></dict>
+    <key>AssociatedBundleIdentifiers</key>
+    <array><string>org.machlin.btrfs</string></array>
+    <key>UserName</key><string>root</string>
+    <key>ProcessType</key><string>Adaptive</string>
+</dict>
+</plist>

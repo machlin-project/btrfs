@@ -40,6 +40,16 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)synchronizeWithError:(NSError **)error;
 @end
 
+@interface BtrfsFileSystem ()
+/* The device barrier a load binds; nil, and so a read-only volume, for a
+ * mount with --rdonly, a read-only device or an unavailable service. */
+- (nullable id<BtrfsDeviceFlusher>)flusherForDevice:(FSBlockDeviceResource *)device
+					    options:(FSTaskOptions *)options;
+/* Binds the privileged service to device (BtrfsDeviceBarrier). */
+- (nullable id<BtrfsDeviceFlusher>)barrierForDevice:(FSBlockDeviceResource *)device
+					      error:(NSError **)error;
+@end
+
 /* The FSKit name of the filesystem type, without an underscore: Disk
  * Arbitration appends "_fskit" and cuts names at their first underscore. */
 #define BTRFS_FSKIT_TYPE_NAME @"machlinbtrfs"

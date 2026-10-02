@@ -610,8 +610,18 @@ five seconds, at synchronization and at unmount. FSKit's block resource offers
 direct writes but no device cache flush, so a volume accepts changes only with
 a device flusher that provides every barrier; a failed flush fails the commit
 and the volume, never acknowledging persistence. Without a flusher the volume
-is read-only, and until the privileged barrier service exists every installed
-volume is. Each write callback is one operation, applied completely or refused
+is read-only. The flusher is the device barrier, a root launch daemon that the
+app's setup utility registers through ServiceManagement and the administrator
+approves in System Settings. Its App Group Mach service accepts only the
+extension and the app, signed by the daemon's own team, and the extension
+requires the same of the daemon. Each connection binds one `/dev/diskN` or
+slice whose type, block size and block count match the resource, then can only
+synchronize that device's cache (`DKIOCSYNCHRONIZECACHE`); no data, descriptors
+or other ioctls cross the interface. A request without a reply within ten
+seconds fails its barrier. A writable resource loaded without `--rdonly` binds
+the barrier first; when the service is missing or refuses, the volume loads
+read-only and logs why. A filesystem the writer cannot admit fails a writable
+load, as a read-write mount does on Linux. Each write callback is one operation, applied completely or refused
 before its first change. The 26.x callbacks carry no caller credentials, so data
 writes, truncation and owner changes drop set-id bits and the file capability,
 as a writer without CAP_FSETID does; the extension's identity is never taken

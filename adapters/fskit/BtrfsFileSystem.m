@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
+#import "BtrfsDeviceBarrier.h"
 #import "BtrfsFileSystemInternal.h"
 #include <btrfs/btrfs.h>
 #include <btrfs/identity.h>
@@ -7,6 +8,7 @@
 #include <zlib.h>
 
 #include <errno.h>
+#include <os/log.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,12 @@
 #include <time.h>
 
 @implementation FSBlockDeviceResource (BtrfsBlockReader)
+@end
+
+@interface BtrfsDeviceBarrier (BtrfsDeviceFlusher) <BtrfsDeviceFlusher>
+@end
+
+@implementation BtrfsDeviceBarrier (BtrfsDeviceFlusher)
 @end
 
 NSError *
@@ -1498,16 +1506,43 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 	reply([FSProbeResult usableProbeResultWithName:name containerID:identifier], nil);
 }
 
+- (id<BtrfsDeviceFlusher>)barrierForDevice:(FSBlockDeviceResource *)device error:(NSError **)error
+{
+	return (id<BtrfsDeviceFlusher>)[[BtrfsDeviceBarrier alloc] initWithDevice:device.BSDName
+									blockSize:device.blockSize
+								       blockCount:device.blockCount
+									    error:error];
+}
+
+- (id<BtrfsDeviceFlusher>)flusherForDevice:(FSBlockDeviceResource *)device
+				   options:(FSTaskOptions *)options
+{
+	id<BtrfsDeviceFlusher> barrier;
+	NSError *error = nil;
+
+	if ([options.taskOptions containsObject:@"--rdonly"] || !device.isWritable) {
+		return nil;
+	}
+	barrier = [self barrierForDevice:device error:&error];
+	if (barrier == nil) {
+		os_log(OS_LOG_DEFAULT,
+		    "machlinbtrfs: %{public}@ stays read-only without the device barrier: "
+		    "%{public}@",
+		    device.BSDName, error.localizedDescription);
+	}
+	return barrier;
+}
+
 - (void)loadResource:(FSResource *)resource
 	     options:(FSTaskOptions *)options
 	replyHandler:(void (^)(FSVolume *, NSError *))reply
 {
 	struct btrfs_fskit_cache *cache = NULL;
+	FSBlockDeviceResource *device;
 	BtrfsVolume *volume = nil;
 	NSError *loadError = nil;
 	enum btrfs_result error = BTRFS_UNSUPPORTED;
 
-	(void)options;
 	@synchronized(self) {
 		if (_volume != nil) {
 			loadError = [NSError errorWithDomain:NSPOSIXErrorDomain
@@ -1515,13 +1550,13 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 						    userInfo:nil];
 		} else {
 			if ([resource isKindOfClass:FSBlockDeviceResource.class]) {
+				device = (FSBlockDeviceResource *)resource;
 				cache = btrfs_fskit_cache_create();
-				/* No device barrier service yet: the volume is read-only. */
-				volume =
-				    [BtrfsVolume volumeWithReader:(FSBlockDeviceResource *)resource
-							  flusher:nil
-							    cache:cache
-							   result:&error];
+				volume = [BtrfsVolume
+				    volumeWithReader:device
+					     flusher:[self flusherForDevice:device options:options]
+					       cache:cache
+					      result:&error];
 				if (volume == nil) {
 					btrfs_fskit_cache_destroy(cache);
 				}
