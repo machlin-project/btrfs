@@ -13,7 +13,10 @@
 #include <sys/vnode.h>
 
 #define BTRFS_XNU_NAME "machlin_btrfs"
-#define BTRFS_XNU_HASH_SIZE 128U
+/* Node hash buckets per mount: one for every eight vnodes the system keeps,
+ * at least the minimum. */
+#define BTRFS_XNU_VNODES_PER_BUCKET 8
+#define BTRFS_XNU_MINIMUM_BUCKETS 128
 /* Node cache per mount: 4,096 nodes of 4 KiB or 1,024 of 16 KiB. */
 #define BTRFS_XNU_CACHE_BYTES (16U * 1024U * 1024U)
 /* Seconds between commits of the running transaction (Linux's commit=). */
@@ -58,7 +61,9 @@ struct btrfs_xnu_mount {
 	 * device while it is mounted. */
 	struct btrfs_cache *cache;
 	lck_mtx_t *cache_lock;
-	struct btrfs_xnu_node_head nodes[BTRFS_XNU_HASH_SIZE];
+	/* Nodes by native number (nodes_lock); hashinit sizes it. */
+	struct btrfs_xnu_node_head *nodes;
+	u_long nodes_mask;
 };
 
 /* A vnode's object. inode is the newest state read; nodes_lock guards it and

@@ -4,7 +4,11 @@
 Read-only images are attached read-only and must stay byte-identical. A write
 image is copied, attached writable, mounted read-write for the write contracts,
 mounted again for the persistence check, and copied back for the Linux check;
-the source fixture never changes."""
+the source fixture never changes. With --walk-probe, every mounted image is also
+walked whole; the walk's manifest (one listing per directory with native
+numbers) goes into IMAGE-walk.manifest.tsv for a read-only image, or after the
+write manifest for a written image, walked on a read-only mount of the final
+image, for the Linux check of the same image."""
 
 import argparse
 from datetime import datetime, timezone
@@ -38,17 +42,22 @@ def main():
     parser.add_argument("--image", type=Path, action="append", default=[])
     parser.add_argument("--write-image", type=Path, action="append", default=[])
     parser.add_argument("--write-probe", type=Path)
+    parser.add_argument("--walk-probe", type=Path)
+    parser.add_argument("--walk-image", type=Path, action="append", default=[],
+                        help="Read-only image that is only walked")
     parser.add_argument("--write-mode", dest="write_modes", action="append",
                         choices=["grouped", "synchronous"],
                         help="Commit modes for each --write-image (default: both)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if not args.image and not args.write_image:
-        parser.error("name at least one --image or --write-image")
+    if not args.image and not args.write_image and not args.walk_image:
+        parser.error("name at least one --image, --write-image or --walk-image")
     if not args.write_modes:
         args.write_modes = ["grouped", "synchronous"]
     if args.write_image and args.write_probe is None:
         parser.error("--write-image needs --write-probe")
+    if args.walk_image and args.walk_probe is None:
+        parser.error("--walk-image needs --walk-probe")
     lab = args.lab.resolve()
     products = args.products.resolve()
     output = args.output.resolve()
@@ -93,6 +102,18 @@ def main():
 
     mountpoint = guest_dir + "/mount"
 
+    def walk(item):
+        """Walks the mounted image; returns its manifest lines."""
+        if args.walk_probe is None:
+            return b""
+        listing = guest("/usr/bin/sudo", "-n", guest_dir + "/" + args.walk_probe.name, mountpoint,
+                        timeout=3600)
+        summary = record["commands"][-1]["stderr"].strip().splitlines()
+        if not summary or not summary[-1].startswith("mounted walk:") or not summary[-1].endswith(" PASS"):
+            raise RuntimeError("Missing mounted walk success evidence")
+        item["walk"] = summary[-1]
+        return listing
+
     def write_case(source, mode):
         """mode: "grouped" (operations share a running transaction) or
         "synchronous" (mount -s: each namespace operation and each write
@@ -133,9 +154,21 @@ def main():
             guest("/usr/bin/sudo", "-n", helper, *flags, device, mountpoint)
             mounted = True
             manifest = guest("/usr/bin/sudo", "-n", probe, "verify", mountpoint, timeout=600)
-            (output / (source.stem + "-" + mode + ".manifest.tsv")).write_bytes(manifest)
             guest("/usr/bin/sudo", "-n", "/sbin/umount", mountpoint)
             mounted = False
+            if args.walk_probe is not None:
+                # macOS daemons may still change a writable mount (fseventsd
+                # removes its own log directory at unmount); walk the final
+                # image on a read-only mount, which must leave it unchanged.
+                final = guest("/usr/bin/sudo", "-n", "/usr/bin/shasum", "-a", "256", raw).decode().split()[0]
+                guest("/usr/bin/sudo", "-n", helper, device, mountpoint)
+                mounted = True
+                manifest += walk(item)
+                guest("/usr/bin/sudo", "-n", "/sbin/umount", mountpoint)
+                mounted = False
+                if guest("/usr/bin/sudo", "-n", "/usr/bin/shasum", "-a", "256", raw).decode().split()[0] != final:
+                    raise RuntimeError("The read-only walk changed the written image")
+            (output / (source.stem + "-" + mode + ".manifest.tsv")).write_bytes(manifest)
         finally:
             if mounted:
                 guest("/usr/bin/sudo", "-n", "/sbin/umount", mountpoint)
@@ -156,6 +189,8 @@ def main():
         binaries = [args.probe.resolve(), args.mount_helper.resolve()]
         if args.write_probe is not None:
             binaries.append(args.write_probe.resolve())
+        if args.walk_probe is not None:
+            binaries.append(args.walk_probe.resolve())
         for source in binaries:
             target = output / source.name
             shutil.copyfile(source, target)
@@ -165,7 +200,9 @@ def main():
             if actual != digest(source):
                 raise RuntimeError("Native binary changed in transit")
             record[source.name + "_sha256"] = actual
-        for source in args.image:
+        read_images = [(source, True) for source in args.image]
+        read_images += [(source, False) for source in args.walk_image]
+        for source, contracts in read_images:
             source = source.resolve()
             expected = digest(source)
             target = output / source.name
@@ -191,9 +228,14 @@ def main():
                     raise RuntimeError("Guest raw device differs from source")
                 guest("/usr/bin/sudo", "-n", guest_dir + "/" + args.mount_helper.name, device, mountpoint)
                 mounted = True
-                item["probe"] = guest("/usr/bin/sudo", "-n", guest_dir + "/" + args.probe.name, mountpoint).decode()
-                if "EROFS PASS" not in item["probe"]:
-                    raise RuntimeError("Missing mounted contract success evidence")
+                if contracts:
+                    item["probe"] = guest("/usr/bin/sudo", "-n", guest_dir + "/" + args.probe.name,
+                                          mountpoint).decode()
+                    if "EROFS PASS" not in item["probe"]:
+                        raise RuntimeError("Missing mounted contract success evidence")
+                listing = walk(item)
+                if listing:
+                    (output / (source.stem + "-walk.manifest.tsv")).write_bytes(listing)
                 guest("/usr/bin/sudo", "-n", "/sbin/umount", mountpoint)
                 mounted = False
                 if guest("/usr/bin/sudo", "-n", "/usr/bin/shasum", "-a", "256", raw).decode().split()[0] != expected:
@@ -206,7 +248,8 @@ def main():
                 raise RuntimeError("Native checks changed a fixture")
             item["result"] = "PASS"
             save()
-            print(f"PASS {source.name}: mounted contracts and unchanged media", flush=True)
+            print(f"PASS {source.name}: {'mounted contracts' if contracts else 'walk'} and "
+                  f"unchanged media{'; ' + item['walk'] if 'walk' in item else ''}", flush=True)
         for source in args.write_image:
             for mode in args.write_modes:
                 write_case(source.resolve(), mode)

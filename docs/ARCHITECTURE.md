@@ -103,10 +103,23 @@ Xattr names use separate validation: they are raw namespace keys and may contain
 rejected in both. Linux namespace authorization is outside this parser.
 
 The shared native identity table assigns mount-local IDs without truncation or
-hash collisions. Root is 2; every new pair gets a never-reused ID. Mappings survive
-FSItem/vnode reclaim until unmount. Native persistent-filehandle capability must
-remain disabled. The native adapter serializes table access; table allocation
-failure cannot publish an alias. Exhaustion is an explicit error.
+hash collisions. Root is 2. A tree gets a slot the first time one of its objects
+is numbered, the mount root's tree slot 0, and an object's number is
+`slot << 48 | inode` for inode numbers from 256 below 2^48. Objects of the
+mounted subvolume therefore report their Btrfs inode numbers, as Linux does,
+and numbering them allocates nothing, so a mount names any number of objects.
+Other subvolumes' objects have numbers at or above 2^48 (Linux distinguishes
+them by device instead). Object IDs outside that range, and trees after 32,768
+slots, get indirect numbers from 2^63, at most 65,536 per mount; exhaustion of
+those is an explicit error. Numbers are never reused for another pair, and the
+mapping is fixed until unmount, including after FSItem/vnode reclaim. Lookup
+decodes any direct number of a tree with a slot; the adapter then reads the
+object from disk, so an unused number is not found. Native persistent-
+filehandle capability must remain disabled. The native adapter serializes table
+access; allocation failure leaves the table unchanged and publishes no alias.
+The XNU adapter sizes its node hash from the system's vnode limit. A legacy
+readdir without extended entries carries 32-bit numbers; it fails with ERANGE at
+an entry whose number does not fit instead of truncating it.
 
 ## Data integrity and I/O cost
 

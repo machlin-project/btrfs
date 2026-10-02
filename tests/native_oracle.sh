@@ -28,6 +28,21 @@ list_names() {
     done | LC_ALL=C sort
 }
 
+# Each name of a directory with its inode number, or "-" for an object of
+# another subvolume (another device), sorted; native walks list the same.
+root_device=$(stat -c '%d' /mnt)
+inode_lines() {
+    directory=$1
+    list_names "$directory" | while IFS= read -r name; do
+        set -- $(stat -c '%d %i' -- "$directory/$name")
+        if [ "$1" = "$root_device" ]; then
+            printf '%s\t%s\n' "$name" "$2"
+        else
+            printf '%s\t-\n' "$name"
+        fi
+    done | LC_ALL=C sort
+}
+
 checks=0
 while IFS="$(printf '\t')" read -r kind path a b c d e; do
     target="/mnt/$path"
@@ -38,6 +53,8 @@ while IFS="$(printf '\t')" read -r kind path a b c d e; do
             test "$(stat -c '%a %u %g %h' "$target")" = "$b $c $d $e" ;;
     dir) test -d "$target" &&
         test "$(list_names "$target" | sha256sum | cut -d' ' -f1)" = "$a" ;;
+    inodes) test -d "$target" &&
+        test "$(inode_lines "$target" | sha256sum | cut -d' ' -f1)" = "$a" ;;
     symlink) test -L "$target" && test "$(readlink "$target")" = "$a" ;;
     xattr) test "$(getfattr --only-values -n "$a" "$target")" = "$b" ;;
     mtime) test "$(stat -c '%Y' "$target")" = "$a" ;;

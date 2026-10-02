@@ -208,6 +208,26 @@ These results do not establish a 2–4 times faster full commit or a win over
 Linux. Tree-log fsync and avoiding mounted-volume superblock rereads are
 separate changes with separate durability contracts.
 
+### Native numbering and whole-volume walks
+
+A mount could earlier number only 65,536 objects in its lifetime, each one an
+allocation in a fixed hash table, and XNU readdir numbered every entry it
+returned: listing more objects than that failed. Objects of the mounted
+subvolume now carry their inode numbers, computed without allocation or lock
+contention beyond the adapter's table lock; the XNU node hash has one bucket per
+eight vnodes the system keeps instead of 128 per mount.
+
+`btrfs-mounted-walk-test` reads a whole volume with readdir and lstat per name,
+as `find` or `ls -l` does. On the stock macOS 26.5.2 guest, installed FSKit
+build 7 walks `transactions-scale` (100,815 names in 104 directories,
+read-only mount) at 7,439 to 7,845 names per second in four runs (two of them
+while sampled), and the plain profiles at 6,178 to 8,661. A sample of the extension during the walk
+finds it busy for about a fifth of the time, most of that in B-tree descents
+for lookup and inode reads and in device reads for nodes outside the cache;
+the remainder is FSKit's per-name lookup and attribute requests. Build 6
+cannot finish the scale walk. These are single-guest measurements without a
+matched APFS, Apple FSKit or Linux comparison.
+
 ## Matched benchmark protocol
 
 1. Freeze binaries, fixture images and mount options in generated reports. Record

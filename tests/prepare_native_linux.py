@@ -12,7 +12,8 @@ import re
 import shutil
 import subprocess
 
-FIELDS = {"file": 7, "dir": 3, "symlink": 3, "xattr": 4, "mtime": 3, "absent": 2}
+FIELDS = {"file": 7, "dir": 3, "inodes": 3, "symlink": 3, "xattr": 4, "mtime": 3,
+          "absent": 2}
 PATH = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
 VALUE = re.compile(r"^[A-Za-z0-9 ._-]*$")
 MAX_DEVICE = 1 << 33

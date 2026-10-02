@@ -421,6 +421,9 @@ btrfs_xnu_free_mount(struct btrfs_xnu_mount *mount)
 	if (mount->cache_lock != NULL) {
 		lck_mtx_free(mount->cache_lock, btrfs_xnu_locks);
 	}
+	if (mount->nodes != NULL) {
+		hashdestroy(mount->nodes, M_TEMP, mount->nodes_mask);
+	}
 	if (mount->nodes_lock != NULL) {
 		lck_mtx_free(mount->nodes_lock, btrfs_xnu_locks);
 	}
@@ -515,8 +518,11 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	mount->creation_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
 	mount->volume_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
 	mount->cache_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
+	mount->nodes =
+	    hashinit(MAX(desiredvnodes / BTRFS_XNU_VNODES_PER_BUCKET, BTRFS_XNU_MINIMUM_BUCKETS),
+		M_TEMP, &mount->nodes_mask);
 	if (mount->nodes_lock == NULL || mount->creation_lock == NULL ||
-	    mount->volume_lock == NULL || mount->cache_lock == NULL) {
+	    mount->volume_lock == NULL || mount->cache_lock == NULL || mount->nodes == NULL) {
 		btrfs_xnu_free_mount(mount);
 		return ENOMEM;
 	}

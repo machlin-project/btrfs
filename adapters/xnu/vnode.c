@@ -68,7 +68,7 @@ btrfs_xnu_cached_node(
 	int error;
 
 	lck_mtx_lock(mount->nodes_lock);
-	LIST_FOREACH(node, &mount->nodes[number % BTRFS_XNU_HASH_SIZE], hash)
+	LIST_FOREACH(node, &mount->nodes[number & mount->nodes_mask], hash)
 	{
 		if (node->number == number) {
 			if (node->inode.generation == generation) {
@@ -174,7 +174,7 @@ btrfs_xnu_get_node(struct btrfs_xnu_mount *mount, const struct btrfs_inode *inod
 	}
 	node->vid = vnode_vid(node->vnode);
 	lck_mtx_lock(mount->nodes_lock);
-	LIST_INSERT_HEAD(&mount->nodes[number % BTRFS_XNU_HASH_SIZE], node, hash);
+	LIST_INSERT_HEAD(&mount->nodes[number & mount->nodes_mask], node, hash);
 	node->hashed = 1;
 	lck_mtx_unlock(mount->nodes_lock);
 	*result = node->vnode;

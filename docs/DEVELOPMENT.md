@@ -559,10 +559,12 @@ python3 ../btrfs/tests/run_macos.py \
   --probe "$PWD/../btrfs/.build/btrfs-mounted-test" \
   --mount-helper "$PWD/../btrfs/artifacts/kext/arm64e/mount_machlin_btrfs" \
   --write-probe "$PWD/../btrfs/.build/btrfs-mounted-write-test" \
+  --walk-probe "$PWD/../btrfs/.build/btrfs-mounted-walk-test" \
   --image "$PWD/../btrfs/artifacts/fixtures/plain.raw" \
   --image "$PWD/../btrfs/artifacts/fixtures/small-nodes.raw" \
   --image "$PWD/../btrfs/artifacts/fixtures/large-nodes.raw" \
   --image "$PWD/../btrfs/artifacts/fixtures/zlib.raw" \
+  --walk-image "$PWD/../btrfs/artifacts/fixtures/transactions-scale.raw" \
   --write-image "$PWD/../btrfs/artifacts/fixtures/plain.raw" \
   --write-image "$PWD/../btrfs/artifacts/fixtures/small-nodes.raw" \
   --output "$PWD/artifacts/btrfs-kext/mounted-new-run"
@@ -574,6 +576,21 @@ the filesystem's authorization uses their actual credentials. Every image is
 attached read-only, verified by raw-device hash, mounted, tested, normally
 unmounted, hashed again and detached. A failed cleanup or missing image is not a
 pass. Keep FSKit and LXNU acceptance separate from these native XNU results.
+
+`btrfs-mounted-walk-test MOUNT` walks a whole mounted volume and only reads. Each
+name's `d_ino` and `d_type` must match `lstat`, `.` and `..` must name the
+directory and its parent, and a number may be shared only by links of one file,
+by no more names than its link count. It prints one `inodes` manifest line per
+directory: the SHA-256 of the sorted `name<TAB>number` lines, with `-` for an
+object of another subvolume. With `--walk-probe`, the runner walks every
+`--image` after its contracts and saves `NAME-walk.manifest.tsv`, walks each
+`--walk-image` alone, and appends to each `--write-image` manifest the walk of
+the final image on a read-only mount, which must leave the raw device unchanged.
+A writable mount is not walked for the manifest: macOS daemons may still change
+it before unmount (fseventsd removes its own `.fseventsd` then).
+`transactions-scale` holds about 100,000 objects, beyond what an earlier fixed
+table could number. Linux checks a read-only walk manifest on a disposable copy
+of the unchanged fixture as below.
 
 A `--write-image` is copied into the guest and attached writable; its source
 fixture must not change. Each `--write-mode` (default: both) uses its own copy:
@@ -609,7 +626,8 @@ python3 -c 'import shutil,sys; from pathlib import Path; shutil.copyfileobj(Path
 Repeat with the `synchronous` manifest and image. Require `BTRFS_NATIVE_CHECKS:N`
 with the manifest's line count and
 `BTRFS_NATIVE_PASS`: `btrfs check --readonly`, every manifest fact (SHA-256,
-mode, owner, links, listings, symlink, xattr, mtime, absent names), then a Linux
+mode, owner, links, listings, inode numbers of the mounted subvolume and the
+subvolume boundary, symlink, xattr, mtime, absent names), then a Linux
 read-write mount, write, `btrfs check` again and no orphan item left.
 
 ### Native power cuts
