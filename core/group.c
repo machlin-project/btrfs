@@ -42,6 +42,7 @@ btrfs_transaction_remove_unused_groups(struct btrfs_transaction *transaction, si
 {
 	size_t i;
 	int cached = 0;
+	int unused = 0;
 	enum btrfs_result error = BTRFS_OK;
 
 	if (transaction == NULL || removed == NULL) {
@@ -52,8 +53,8 @@ btrfs_transaction_remove_unused_groups(struct btrfs_transaction *transaction, si
 		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
 	}
 	for (i = 0; error == BTRFS_OK && i < transaction->fs.chunk_count; i++) {
-		if (!bt_space_unused(transaction->space, i) ||
-		    !bt_group_has_sibling(transaction, i)) {
+		error = bt_space_unused(transaction->space, i, &unused);
+		if (error != BTRFS_OK || !unused || !bt_group_has_sibling(transaction, i)) {
 			continue;
 		}
 		error = bt_group_cached(transaction, &transaction->fs.chunks[i], &cached);

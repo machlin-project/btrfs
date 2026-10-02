@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "internal.h"
+#include "transaction.h"
 #include "../adapters/posix/image.h"
 #include <btrfs/write.h>
 #include <assert.h>
@@ -386,9 +387,9 @@ refuse_flush(void *context)
 	abort();
 }
 
-/* A writable transaction verifies every block group's free-space items
- * against the extent tree: an info item claiming one more extent than the
- * group's free runs refuses the transaction before any write. */
+/* A writable transaction verifies a block group's free-space items against
+ * the extent tree when it loads the group: an info item claiming one more
+ * extent than the group's free runs refuses it before any write. */
 static void
 free_space_tests(struct fixture *fixture)
 {
@@ -402,6 +403,7 @@ free_space_tests(struct fixture *fixture)
 	uint8_t *copy;
 	size_t payload;
 	size_t size;
+	enum btrfs_result result;
 
 	assert(btrfs_mount(&fixture->image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	assert(fs->info.readonly_features & BT_COMPAT_RO_FREE_SPACE_TREE);
@@ -417,9 +419,12 @@ free_space_tests(struct fixture *fixture)
 	environment.context = fixture;
 	environment.read = patched_read;
 	assert(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &patched) == BTRFS_OK);
-	transaction = (void *)(uintptr_t)1;
-	assert(btrfs_transaction_begin(patched, &writer, &transaction) == BTRFS_CORRUPT);
-	assert(transaction == NULL);
+	result = btrfs_transaction_begin(patched, &writer, &transaction);
+	if (result == BTRFS_OK) {
+		result = bt_space_load_all(transaction->space);
+		btrfs_transaction_destroy(transaction);
+	}
+	assert(result == BTRFS_CORRUPT);
 	btrfs_unmount(patched);
 	fixture->count = 0;
 	free(copy);

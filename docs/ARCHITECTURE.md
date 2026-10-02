@@ -176,7 +176,7 @@ uses exported inflate APIs and paired kernel allocation callbacks.
 | Regular read window | 1 MiB per operation | Split into windows |
 | Compressed input/output | 128 KiB each | Corrupt extent |
 | Traversed file/xattr records per operation | 1,048,576 | Unsupported capacity |
-| Extent-tree items a writable mount verifies at admission | metadata and system chunk bytes / 25-byte item header | Corrupt tree |
+| Extent-tree items a transaction's chunk loads visit | metadata and system chunk bytes / 25-byte item header | Corrupt tree |
 | Free ranges per allocation class | 131,072 | Unsupported capacity |
 | Native identities per mount | 65,536 | Explicit range error |
 
@@ -198,21 +198,31 @@ whole-node repacking. The original root and bytes remain immutable. A failed
 edit poisons the context; sealing computes checksums, and accepting transfers
 reservations only after the owning transaction's durable publication.
 
-`core/space.c` reads the extent tree in one ordered pass merged with the sorted
-chunk map. Every extent and block-group record must lie inside a chunk; extents
-must be aligned, disjoint and bounded by their chunk, and each chunk's extents must
-sum to its block-group total. It rejects physical chunk aliases, removes
-superblock stripes from candidate gaps, and produces bounded metadata reservations.
+`core/space.c` reads every block group's item when a transaction starts and
+loads a chunk's extents only when it needs them: when allocation reaches the
+chunk, never skipping free space of a lower chunk of the class, so its choices
+do not depend on which chunks are loaded, or when a change (a released block,
+an unused-group check) touches it. System chunks load at once. A load is one
+ordered pass from the previous chunk's end to the chunk's end: no extent or
+block-group record may lie between chunks (nor beyond the last one, checked at
+start), extents must be aligned, disjoint and bounded by their chunk, they must
+sum to its block-group total, and its free runs must equal its free-space items.
+Nothing is allocated in, or released into, a chunk before it is loaded. The
+start rejects physical chunk aliases; a load removes superblock stripes from the
+chunk's free ranges, and the allocator produces bounded metadata reservations.
+Until a chunk loads, its free bytes come from its block-group total, so the
+space checks see the whole class.
 It pins the committed allocation map for the whole transaction and never reuses a
 released reservation within that transaction. Free ranges are kept in canonical
 form: sorted, and merged only within one chunk.
 
 An owner may keep this state across its transactions (`btrfs_allocation_map`,
 `btrfs_transaction_begin_mapped`); the native volume does. A transaction whose
-base is the map's generation, filesystem and chunk map copies it instead of
-loading the extent tree and verifying the free-space and device trees again: the
-state was verified when the map was saved, and only this owner's commits changed
-it since. A successful commit replays into the map its grown chunks (free as a
+base is the map's generation, filesystem and chunk map borrows it instead of
+reading block groups and verifying the device tree again, and loads further
+chunks as it needs them: the state was verified when it was loaded, and only
+this owner's commits changed it since. A successful commit adds the chunks it
+loaded, then replays into the map its grown chunks (free as a
 whole, minus superblock stripes), its allocation log in order, its block-group
 totals and its removed groups, and derives the device's free ranges from the
 chunk map; a map that cannot follow is dropped, and any other base is loaded,

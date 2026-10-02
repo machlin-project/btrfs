@@ -41,6 +41,10 @@ bt_recovery_validate(
 	if (error == BTRFS_OK) {
 		error = bt_space_create(fs, extents, NULL, 1, &space);
 	}
+	/* A candidate's whole extent tree must verify. */
+	if (error == BTRFS_OK) {
+		error = bt_space_load_all(space);
+	}
 	bt_space_destroy(space);
 	btrfs_unmount(fs);
 	return error;

@@ -180,8 +180,9 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 		error = bt_tx_root(base, BT_DEV_TREE, &transaction->devices);
 	}
 	if (error == BTRFS_OK && mapped) {
-		error = bt_space_from_map(
-		    &transaction->fs, map, BT_TRANSACTION_NODES, &transaction->space);
+		error = bt_space_from_map(&transaction->fs, map, transaction->extents.root,
+		    transaction->has_free_space ? &transaction->free_space.root : NULL,
+		    BT_TRANSACTION_NODES, &transaction->space);
 		if (error == BTRFS_OK) {
 			transaction->chunks_published =
 			    bt_space_original_chunks(transaction->space);

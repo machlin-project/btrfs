@@ -345,6 +345,8 @@ match_chunk(const struct btrfs_fs *fs, const struct bt_cursor *cursor,
 	    (bt_u64(chunk->type) & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) == *type;
 }
 
+/* A damaged allocation state is refused before any write: at admission, or
+ * when the transaction loads the block group it names (here, every group). */
 static void
 expect_corrupt_map(struct context *context, const char *name)
 {
@@ -352,9 +354,16 @@ expect_corrupt_map(struct context *context, const char *name)
 	struct btrfs_transaction *transaction = NULL;
 	size_t writes = context->device->count;
 	uint64_t live = context->image.live_allocations;
+	enum btrfs_result result;
 
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
-	REQUIRE(btrfs_transaction_begin(fs, &context->writer, &transaction) == BTRFS_CORRUPT);
+	result = btrfs_transaction_begin(fs, &context->writer, &transaction);
+	if (result == BTRFS_OK) {
+		result = bt_space_load_all(transaction->space);
+		btrfs_transaction_destroy(transaction);
+		transaction = NULL;
+	}
+	REQUIRE(result == BTRFS_CORRUPT);
 	REQUIRE(transaction == NULL && context->device->count == writes);
 	btrfs_unmount(fs);
 	REQUIRE(context->image.live_allocations == live);
