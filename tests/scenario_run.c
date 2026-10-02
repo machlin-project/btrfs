@@ -1244,7 +1244,7 @@ check_map(struct context *context, const struct plan *plan, size_t commit,
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
 	REQUIRE(bt_find_root(fs, BT_DEV_TREE, &devices) == BTRFS_OK);
-	REQUIRE(bt_space_create(fs, extents, TRANSACTION_NODE_LIMIT, &space) == BTRFS_OK);
+	REQUIRE(bt_space_create(fs, extents, NULL, TRANSACTION_NODE_LIMIT, &space) == BTRFS_OK);
 	REQUIRE(bt_space_devices(space, fs->chunk_tree, devices) == BTRFS_OK);
 	if (bt_space_map_check(map, space) != BTRFS_OK) {
 		fprintf(stderr,

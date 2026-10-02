@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "space.h"
+#include "fst.h"
 
 #define BT_SPACE_MAX_GAPS 131072U
 /* New chunks: a tenth of the device, at most Linux's class limits. */
@@ -615,9 +616,48 @@ bt_space_counts(struct bt_space *space)
 	return BTRFS_OK;
 }
 
+/* Each block group's free runs, before superblock stripes are excluded, are
+ * its slice of the class list: the extent pass appends them in chunk order. */
+static enum btrfs_result
+bt_space_verify_free_space(struct bt_space *space, struct bt_root tree)
+{
+	const struct btrfs_fs *fs = space->fs;
+	const struct bt_chunk *chunk;
+	struct bt_gaps *list;
+	struct bt_fst_run *runs;
+	size_t positions[3] = { 0, 0, 0 };
+	size_t *position;
+	size_t capacity;
+	size_t count;
+	size_t i;
+	enum btrfs_result error = BTRFS_OK;
+
+	capacity = space->metadata.count;
+	capacity = space->data.count > capacity ? space->data.count : capacity;
+	capacity = space->system.count > capacity ? space->system.count : capacity;
+	runs = fs->env.allocate(fs->env.context, (capacity + 1) * sizeof(*runs));
+	if (runs == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
+		chunk = &fs->chunks[i];
+		list = bt_space_class(space, chunk);
+		position = &positions[list == &space->metadata ? 0 : list == &space->data ? 1 : 2];
+		for (count = 0; *position < list->count &&
+		    list->items[*position].start - chunk->logical < chunk->length;
+		    (*position)++) {
+			runs[count++] = (struct bt_fst_run){ list->items[*position].start,
+				list->items[*position].end };
+		}
+		error = bt_fst_verify_group(fs, tree, chunk, runs, count);
+	}
+	fs->env.release(fs->env.context, runs, (capacity + 1) * sizeof(*runs));
+	return error;
+}
+
 enum btrfs_result
-bt_space_create(
-    struct btrfs_fs *fs, struct bt_root extent_root, size_t node_limit, struct bt_space **result)
+bt_space_create(struct btrfs_fs *fs, struct bt_root extent_root, const struct bt_root *free_space,
+    size_t node_limit, struct bt_space **result)
 {
 	struct bt_space *space;
 	const struct bt_chunk *a;
@@ -656,6 +696,9 @@ bt_space_create(
 	error = bt_space_counts(space);
 	if (error == BTRFS_OK) {
 		error = bt_space_load(space, extent_root);
+	}
+	if (error == BTRFS_OK && free_space != NULL) {
+		error = bt_space_verify_free_space(space, *free_space);
 	}
 	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
 		error = bt_space_exclude_chunk(space, i);

@@ -39,7 +39,7 @@ bt_recovery_validate(
 		}
 	}
 	if (error == BTRFS_OK) {
-		error = bt_space_create(fs, extents, 1, &space);
+		error = bt_space_create(fs, extents, NULL, 1, &space);
 	}
 	bt_space_destroy(space);
 	btrfs_unmount(fs);

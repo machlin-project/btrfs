@@ -316,10 +316,10 @@ since the committed root set still maps it.
 ## Free-space tree
 
 Filesystems created with Linux defaults carry a free-space tree. Admission
-accepts it only with its VALID bit and first compares it, block group by block
-group, with the free space implied by the extent tree (superblock stripes are
+accepts it only with its VALID bit and compares it, block group by block group,
+with the free runs its single extent-tree pass found (superblock stripes are
 not subtracted, as Linux records them); any disagreement refuses the
-transaction. The allocator logs every allocation and release in order. Each
+transaction before any write. The allocator logs every allocation and release in order. Each
 round of the commit fixed point applies the logged changes to the free-space
 tree in the block group's current representation: free extents are trimmed,
 split or merged, bitmaps flip one bit per sector, and the info item's extent

@@ -168,11 +168,6 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	if (error == BTRFS_OK && transaction->has_free_space) {
 		error = bt_tx_root(base, BT_FREE_SPACE_TREE, &transaction->free_space);
 	}
-	/* A free-space tree that disagrees with the extent tree is not propagated. */
-	if (error == BTRFS_OK && transaction->has_free_space && !mapped) {
-		error =
-		    bt_fst_verify(base, transaction->free_space.root, transaction->extents.root);
-	}
 	if (error == BTRFS_OK) {
 		error = bt_tx_root(base, BT_UUID_TREE, &transaction->uuids);
 		transaction->has_uuids = error == BTRFS_OK;
@@ -192,7 +187,10 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 			    bt_space_original_chunks(transaction->space);
 		}
 	} else if (error == BTRFS_OK) {
+		/* A free-space tree that disagrees with the extent tree is not
+		 * propagated. */
 		error = bt_space_create(&transaction->fs, transaction->extents.root,
+		    transaction->has_free_space ? &transaction->free_space.root : NULL,
 		    BT_TRANSACTION_NODES, &transaction->space);
 		if (error == BTRFS_OK) {
 			transaction->chunks_published =

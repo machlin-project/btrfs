@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "internal.h"
 #include "../adapters/posix/image.h"
+#include <btrfs/write.h>
 #include <assert.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -368,6 +369,64 @@ tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 	unverified_tests(fixture, fs, logical);
 }
 
+static enum btrfs_result
+refuse_write(void *context, uint64_t offset, const void *buffer, size_t length)
+{
+	(void)context;
+	(void)offset;
+	(void)buffer;
+	(void)length;
+	abort();
+}
+
+static enum btrfs_result
+refuse_flush(void *context)
+{
+	(void)context;
+	abort();
+}
+
+/* A writable transaction verifies every block group's free-space items
+ * against the extent tree: an info item claiming one more extent than the
+ * group's free runs refuses the transaction before any write. */
+static void
+free_space_tests(struct fixture *fixture)
+{
+	struct btrfs_environment environment = fixture->image.environment;
+	struct btrfs_write_environment writer = { NULL, refuse_write, refuse_flush, NULL,
+		BTRFS_COMPRESSION_NONE };
+	struct btrfs_transaction *transaction = NULL;
+	struct btrfs_fs *fs;
+	struct btrfs_fs *patched;
+	struct bt_disk_free_space_info *info;
+	uint8_t *copy;
+	size_t payload;
+	size_t size;
+
+	assert(btrfs_mount(&fixture->image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	assert(fs->info.readonly_features & BT_COMPAT_RO_FREE_SPACE_TREE);
+	assert(btrfs_transaction_begin(fs, &writer, &transaction) == BTRFS_OK);
+	btrfs_transaction_destroy(transaction);
+	copy = record_patch(fixture, fs,
+	    (struct btrfs_object_id){ BT_FREE_SPACE_TREE, fs->chunks[0].logical },
+	    BT_FREE_SPACE_INFO, &payload, &size);
+	assert(size == sizeof(*info));
+	info = (void *)(copy + payload);
+	SET(info, extent_count, bt_u32(info->extent_count) + 1);
+	checksum(copy, fs->info.node_size);
+	environment.context = fixture;
+	environment.read = patched_read;
+	assert(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &patched) == BTRFS_OK);
+	transaction = (void *)(uintptr_t)1;
+	assert(btrfs_transaction_begin(patched, &writer, &transaction) == BTRFS_CORRUPT);
+	assert(transaction == NULL);
+	btrfs_unmount(patched);
+	fixture->count = 0;
+	free(copy);
+	btrfs_unmount(fs);
+	puts("free-space tree disagreeing with the extent tree refuses writes: PASS");
+}
+
 static void
 stream_tests(struct fixture *fixture)
 {
@@ -510,6 +569,7 @@ main(int argc, char **argv)
 	tree_tests(&fixture, fs);
 	btrfs_unmount(fs);
 	fault_tests(&fixture);
+	free_space_tests(&fixture);
 	stream_tests(&fixture);
 	btrfs_image_close(&fixture.image);
 	puts("adversarial contracts: PASS");

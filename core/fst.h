@@ -9,8 +9,14 @@
  * sector. Free space is the complement of the extent tree inside the block
  * group; superblock stripes are not subtracted. Items of block groups that no
  * longer exist are left alone, as Linux does. */
-enum btrfs_result bt_fst_verify(
-    const struct btrfs_fs *fs, struct bt_root tree, struct bt_root extents);
+struct bt_fst_run {
+	uint64_t start, end;
+};
+
+/* Verifies one block group's free-space items against its free runs as the
+ * extent tree gives them (ascending, disjoint and never adjacent). */
+enum btrfs_result bt_fst_verify_group(const struct btrfs_fs *fs, struct bt_root tree,
+    const struct bt_chunk *chunk, const struct bt_fst_run *expected, size_t count);
 /* Linux's set_free_space_tree_thresholds for a block group of length bytes:
  * free extent items take more room than the group's bitmaps above high; a
  * bitmap group returns to extent items below low (high minus 100, or 0). */

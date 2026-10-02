@@ -772,7 +772,7 @@ exhaustion_test(struct context *context)
 
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
-	REQUIRE(bt_space_create(fs, extents, TRANSACTION_NODE_LIMIT, &space) == BTRFS_OK);
+	REQUIRE(bt_space_create(fs, extents, NULL, TRANSACTION_NODE_LIMIT, &space) == BTRFS_OK);
 	bt_space_allocator(space, &allocator);
 	while (available < RESERVATION_PROBE_LIMIT &&
 	    allocator.reserve(allocator.context, BTRFS_TOP_LEVEL_TREE, 0, &logical) == BTRFS_OK) {

@@ -62,48 +62,6 @@ bt_runs_release(struct bt_runs *runs)
 	runs->count = runs->capacity = 0;
 }
 
-/* Free space by the extent tree: gaps between extents inside the group. */
-static enum btrfs_result
-bt_fst_expected(const struct btrfs_fs *fs, struct bt_root extents, const struct bt_chunk *chunk,
-    struct bt_runs *runs)
-{
-	struct bt_cursor cursor;
-	struct bt_record record;
-	struct bt_key key = { .objectid = chunk->logical };
-	uint64_t position = chunk->logical;
-	uint64_t end = chunk->logical + chunk->length;
-	uint64_t length;
-	enum btrfs_result error;
-
-	bt_cursor_init(&cursor, fs, extents);
-	error = bt_cursor_seek(&cursor, key, 0);
-	while (error == BTRFS_OK) {
-		(void)bt_cursor_record(&cursor, &record);
-		if (record.key.objectid >= end) {
-			break;
-		}
-		if (record.key.type == BT_EXTENT_ITEM || record.key.type == BT_METADATA_ITEM) {
-			length = record.key.type == BT_METADATA_ITEM ? fs->info.node_size
-								     : record.key.offset;
-			if (record.key.objectid < position || length > end - record.key.objectid) {
-				error = BTRFS_CORRUPT;
-				break;
-			}
-			error = bt_runs_add(runs, position, record.key.objectid);
-			if (error != BTRFS_OK) {
-				break;
-			}
-			position = record.key.objectid + length;
-		}
-		error = bt_cursor_next(&cursor);
-	}
-	bt_cursor_fini(&cursor);
-	if (error == BTRFS_NOT_FOUND || error == BTRFS_OK) {
-		error = bt_runs_add(runs, position, end);
-	}
-	return error;
-}
-
 static int
 bt_bit(const uint8_t *bits, uint64_t index)
 {
@@ -183,34 +141,29 @@ bt_fst_actual(const struct btrfs_fs *fs, struct bt_root tree, const struct bt_ch
 }
 
 enum btrfs_result
-bt_fst_verify(const struct btrfs_fs *fs, struct bt_root tree, struct bt_root extents)
+bt_fst_verify_group(const struct btrfs_fs *fs, struct bt_root tree, const struct bt_chunk *chunk,
+    const struct bt_fst_run *expected, size_t count)
 {
-	struct bt_runs expected = { &fs->env, NULL, 0, 0 };
 	struct bt_runs actual = { &fs->env, NULL, 0, 0 };
-	uint32_t count = 0;
+	uint32_t extents = 0;
 	uint32_t flags = 0;
 	size_t items = 0;
-	size_t chunk;
-	enum btrfs_result error = BTRFS_OK;
+	size_t i;
+	enum btrfs_result error;
 
-	for (chunk = 0; error == BTRFS_OK && chunk < fs->chunk_count; chunk++) {
-		expected.count = 0;
-		actual.count = 0;
-		error = bt_fst_expected(fs, extents, &fs->chunks[chunk], &expected);
-		if (error == BTRFS_OK) {
-			error = bt_fst_actual(
-			    fs, tree, &fs->chunks[chunk], &actual, &count, &flags, &items);
-		}
-		/* Linux keeps extent items maximal, so their number equals the runs. */
-		if (error == BTRFS_OK &&
-		    (expected.count != actual.count || count != actual.count ||
-			(!flags && items != actual.count) ||
-			!bt_equal(expected.items, actual.items,
-			    expected.count * sizeof(*expected.items)))) {
+	error = bt_fst_actual(fs, tree, chunk, &actual, &extents, &flags, &items);
+	/* Linux keeps extent items maximal, so their number equals the runs. */
+	if (error == BTRFS_OK &&
+	    (count != actual.count || extents != actual.count ||
+		(!flags && items != actual.count))) {
+		error = BTRFS_CORRUPT;
+	}
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		if (expected[i].start != actual.items[i].start ||
+		    expected[i].end != actual.items[i].end) {
 			error = BTRFS_CORRUPT;
 		}
 	}
-	bt_runs_release(&expected);
 	bt_runs_release(&actual);
 	return error;
 }
