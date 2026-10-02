@@ -242,6 +242,30 @@ require_packed(struct bt_mutation *mutation)
 	}
 }
 
+/* Whether a cursor, borrowing or not, reads the record at key from the bytes of
+ * one of the mutation's own nodes. */
+static int
+in_place(struct bt_mutation *mutation, struct bt_root root, struct bt_key wanted, int borrow)
+{
+	struct bt_mutated_block block;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	size_t i;
+	int found = 0;
+
+	bt_cursor_init(&cursor, bt_mutation_view(mutation), root);
+	cursor.borrow = borrow;
+	REQUIRE(bt_cursor_seek(&cursor, wanted, 0) == BTRFS_OK);
+	REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+	REQUIRE(bt_key_compare(record.key, wanted) == 0);
+	for (i = 0; i < bt_mutation_count(mutation); i++) {
+		REQUIRE(bt_mutation_block(mutation, i, &block) == BTRFS_OK);
+		found |= (uintptr_t)record.data - (uintptr_t)block.bytes < block.size;
+	}
+	bt_cursor_fini(&cursor);
+	return found;
+}
+
 static struct bt_mutation *
 begin(struct fixture *fixture, size_t limit)
 {
@@ -321,6 +345,13 @@ exercise(uint32_t node_size, int dup)
 	REQUIRE(node_size != 4096 || root.level >= 2);
 	verify(bt_mutation_view(mutation), root, model);
 	require_packed(mutation);
+	for (i = 0; i < KEYS; i += 7) {
+		REQUIRE(bt_mutation_find(mutation, root, key(i), value, sizeof(value), &length) ==
+		    BTRFS_OK);
+		REQUIRE(length == model[i].length && memcmp(value, model[i].bytes, length) == 0);
+		REQUIRE(
+		    in_place(mutation, root, key(i), 1) && !in_place(mutation, root, key(i), 0));
+	}
 	verify(&fixture.fs, fixture.root, original);
 	publish_tree(&fixture, mutation);
 	verify(&fixture.fs, root, model);

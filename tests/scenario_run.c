@@ -935,6 +935,7 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
     size_t point, struct btrfs_allocation_map *map, struct totals *totals)
 {
 	struct path_table table;
+	struct bt_cursor cursor;
 	struct namespace_digest pending;
 	struct namespace_digest published;
 	const struct btrfs_fs *reader;
@@ -994,6 +995,11 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 		digest_reads = context->image.reads;
 		reader = btrfs_transaction_reader(transaction);
 		REQUIRE(reader != NULL);
+		/* Its readers finish before the next operation, so its cursors
+		 * read the transaction's own nodes in place. */
+		bt_cursor_init(&cursor, reader, reader->selected_tree);
+		REQUIRE(cursor.borrow);
+		bt_cursor_fini(&cursor);
 		if (namespace_digest(reader, &pending) != 0) {
 			fprintf(stderr, "%s commit %zu: transaction view: %s\n", plan->name, commit,
 			    pending.failure);
