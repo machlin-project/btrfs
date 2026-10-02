@@ -35,7 +35,7 @@ enum btrfs_result bt_space_check_system(struct bt_space *space);
  * neither allocated nor freed anything in it. */
 int bt_space_unused(const struct bt_space *space, size_t chunk);
 /* Takes an unused group out of allocation and marks it removed. */
-void bt_space_retire(struct bt_space *space, size_t chunk);
+enum btrfs_result bt_space_retire(struct bt_space *space, size_t chunk);
 /* Chunks at or after this index were created by growth in this transaction. */
 size_t bt_space_original_chunks(const struct bt_space *space);
 void bt_space_allocator(struct bt_space *space, struct bt_mutation_allocator *allocator);

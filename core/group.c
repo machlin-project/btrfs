@@ -63,7 +63,9 @@ btrfs_transaction_remove_unused_groups(struct btrfs_transaction *transaction, si
 			error = bt_space_check_system(transaction->space);
 		}
 		if (error == BTRFS_OK && !cached) {
-			bt_space_retire(transaction->space, i);
+			error = bt_space_retire(transaction->space, i);
+		}
+		if (error == BTRFS_OK && !cached) {
 			transaction->changed = 1;
 			(*removed)++;
 		}

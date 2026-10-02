@@ -18,12 +18,15 @@ struct bt_gap {
 };
 
 /* Free ranges of one chunk class in ascending logical order. Reservations
- * consume them from next onward and never return a range to the list. */
+ * consume them from next onward and never return a range to the list. A
+ * transaction's list taken from a kept map is borrowed (the map owns items)
+ * until its first change copies it. */
 struct bt_gaps {
 	struct bt_gap *items;
 	size_t count;
 	size_t capacity;
 	size_t next;
+	int borrowed;
 };
 
 struct bt_space {
@@ -72,6 +75,36 @@ struct btrfs_allocation_map {
 
 static void bt_gaps_normalize(struct bt_gaps *list);
 
+/* Copies a borrowed list before its first change. */
+static enum btrfs_result
+bt_gaps_own(const struct btrfs_environment *env, struct bt_gaps *list)
+{
+	struct bt_gap *items;
+	size_t capacity = list->count == 0 ? 1 : list->count;
+
+	if (!list->borrowed) {
+		return BTRFS_OK;
+	}
+	items = env->allocate(env->context, capacity * sizeof(*items));
+	if (items == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	bt_copy(items, list->items, list->count * sizeof(*items));
+	list->items = items;
+	list->capacity = capacity;
+	list->borrowed = 0;
+	return BTRFS_OK;
+}
+
+/* Lends map's list to a transaction. */
+static void
+bt_gaps_borrow(struct bt_gaps *list, const struct bt_gaps *map)
+{
+	*list = *map;
+	list->capacity = 0;
+	list->borrowed = 1;
+}
+
 static struct bt_gaps *
 bt_space_class(struct bt_space *space, const struct bt_chunk *chunk)
 {
@@ -90,8 +123,13 @@ bt_space_gap(struct bt_space *space, struct bt_gaps *list, uint64_t start, uint6
 	struct bt_gap *gaps;
 	size_t capacity;
 	const struct btrfs_environment *env = &space->fs->env;
+	enum btrfs_result error;
 
 	if (list != NULL && start < end) {
+		error = bt_gaps_own(env, list);
+		if (error != BTRFS_OK) {
+			return error;
+		}
 		if (list->count == BT_SPACE_MAX_GAPS) {
 			return BTRFS_UNSUPPORTED;
 		}
@@ -131,6 +169,12 @@ bt_space_exclude_chunk(struct bt_space *space, size_t chunk_index)
 	unsigned copy;
 	enum btrfs_result error;
 
+	if (list != NULL) {
+		error = bt_gaps_own(&space->fs->env, list);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+	}
 	for (copy = 0; list != NULL && copy < chunk->mirrors; copy++) {
 		for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
 			physical = bt_super_offset(mirror) & ~(BT_STRIPE_LENGTH - 1);
@@ -364,7 +408,7 @@ enum btrfs_result
 bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 {
 	struct btrfs_fs *fs = space->fs;
-	struct bt_gaps saved = space->device;
+	struct bt_gaps saved;
 	struct bt_chunk *chunk;
 	struct bt_gap *copy;
 	uint64_t type = 0;
@@ -391,6 +435,11 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 			return error;
 		}
 	}
+	error = bt_gaps_own(&fs->env, &space->device);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	saved = space->device;
 	for (i = 0; i < fs->chunk_count; i++) {
 		if ((fs->chunks[i].type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) ==
 			kind &&
@@ -462,6 +511,10 @@ bt_space_reserve(void *context, uint64_t owner, uint8_t level, uint64_t *logical
 	enum btrfs_result error;
 
 	(void)level;
+	error = bt_gaps_own(&space->fs->env, list);
+	if (error != BTRFS_OK) {
+		return error;
+	}
 	for (;;) {
 		while (list->next < list->count) {
 			gap = &list->items[list->next];
@@ -494,6 +547,10 @@ bt_space_reserve_data(struct bt_space *space, uint64_t length, uint64_t *logical
 
 	if (length == 0 || length % sector != 0) {
 		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_gaps_own(&space->fs->env, &space->data);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	for (;;) {
 		while (space->data.next < space->data.count) {
@@ -570,6 +627,10 @@ bt_space_reserve_exact(struct bt_space *space, uint64_t length, uint64_t *logica
 
 	if (length == 0 || length % sector != 0) {
 		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_gaps_own(&space->fs->env, &space->data);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	for (;;) {
 		for (i = space->data.next; i < space->data.count; i++) {
@@ -871,19 +932,25 @@ bt_space_unused(const struct bt_space *space, size_t chunk)
 	return 0;
 }
 
-void
+enum btrfs_result
 bt_space_retire(struct bt_space *space, size_t chunk)
 {
 	struct bt_chunk *group = &space->fs->chunks[chunk];
 	struct bt_gaps *list = bt_space_class(space, group);
 	size_t i;
+	enum btrfs_result error;
 
+	error = bt_gaps_own(&space->fs->env, list);
+	if (error != BTRFS_OK) {
+		return error;
+	}
 	for (i = list->next; i < list->count; i++) {
 		if (list->items[i].start == group->logical) {
 			list->items[i].start = list->items[i].end;
 		}
 	}
 	group->removed = 1;
+	return BTRFS_OK;
 }
 
 void
@@ -972,11 +1039,11 @@ bt_space_destroy(struct bt_space *space)
 		return;
 	}
 	env = &space->fs->env;
-	if (space->metadata.items != NULL) {
+	if (space->metadata.items != NULL && !space->metadata.borrowed) {
 		env->release(env->context, space->metadata.items,
 		    space->metadata.capacity * sizeof(*space->metadata.items));
 	}
-	if (space->data.items != NULL) {
+	if (space->data.items != NULL && !space->data.borrowed) {
 		env->release(env->context, space->data.items,
 		    space->data.capacity * sizeof(*space->data.items));
 	}
@@ -984,11 +1051,11 @@ bt_space_destroy(struct bt_space *space)
 		env->release(
 		    env->context, space->used, space->used_capacity * sizeof(*space->used));
 	}
-	if (space->system.items != NULL) {
+	if (space->system.items != NULL && !space->system.borrowed) {
 		env->release(env->context, space->system.items,
 		    space->system.capacity * sizeof(*space->system.items));
 	}
-	if (space->device.items != NULL) {
+	if (space->device.items != NULL && !space->device.borrowed) {
 		env->release(env->context, space->device.items,
 		    space->device.capacity * sizeof(*space->device.items));
 	}
@@ -1387,16 +1454,11 @@ bt_space_from_map(struct btrfs_fs *fs, struct btrfs_allocation_map *map, size_t 
 	error = bt_space_counts(space);
 	if (error == BTRFS_OK) {
 		bt_copy(space->used, map->used, fs->chunk_count * sizeof(*space->used));
-		error = bt_gaps_copy(&fs->env, &space->metadata, &map->metadata);
-	}
-	if (error == BTRFS_OK) {
-		error = bt_gaps_copy(&fs->env, &space->data, &map->data);
-	}
-	if (error == BTRFS_OK) {
-		error = bt_gaps_copy(&fs->env, &space->system, &map->system);
-	}
-	if (error == BTRFS_OK) {
-		error = bt_gaps_copy(&fs->env, &space->device, &map->device);
+		/* Copied by the first change; untouched classes cost nothing. */
+		bt_gaps_borrow(&space->metadata, &map->metadata);
+		bt_gaps_borrow(&space->data, &map->data);
+		bt_gaps_borrow(&space->system, &map->system);
+		bt_gaps_borrow(&space->device, &map->device);
 	}
 	if (error != BTRFS_OK) {
 		bt_space_destroy(space);
@@ -1424,7 +1486,7 @@ bt_space_map_class(struct btrfs_allocation_map *map, const struct bt_chunk *chun
 static enum btrfs_result
 bt_space_map_devices(struct btrfs_allocation_map *map, uint64_t device_size)
 {
-	struct bt_gaps stripes = { NULL, 0, 0, 0 };
+	struct bt_gaps stripes = { NULL, 0, 0, 0, 0 };
 	uint64_t position = BT_DEVICE_RESERVED;
 	size_t i;
 	unsigned stripe;
