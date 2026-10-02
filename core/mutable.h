@@ -44,6 +44,11 @@ enum btrfs_result bt_mutation_create(const struct btrfs_fs *base,
     const struct bt_mutation_allocator *allocator, struct bt_mutation **result);
 enum btrfs_result bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root,
     struct bt_key key, const void *value, size_t length, enum bt_edit edit);
+/* Replaces an existing key with an absent key and value. Equal keys replace
+ * only the value. Same-size records within one packed leaf move in one edit;
+ * other cases retain delete/insert semantics. value must not borrow a node. */
+enum btrfs_result bt_mutation_rekey(struct bt_mutation *mutation, struct bt_root *root,
+    struct bt_key old_key, struct bt_key new_key, const void *value, size_t length);
 /* A new tree root owned by owner: with copy, a copy of source's node (a
  * snapshot's root, with the same items and child pointers); otherwise an
  * empty leaf whose header identifies this filesystem as source's does. */

@@ -565,7 +565,8 @@ bt_tx_children(struct btrfs_transaction *transaction, const uint8_t *node, uint6
  * parent-named children converts them back. The old block then loses this tree's
  * reference and is freed only with its last one. */
 static enum btrfs_result
-bt_tx_release(struct btrfs_transaction *transaction, const struct bt_mutated_block *block)
+bt_tx_release(struct btrfs_transaction *transaction, const struct bt_mutated_block *block,
+    const struct bt_root *replacement, int *replaced)
 {
 	struct bt_owned_root *tree = NULL;
 	struct bt_backref reference;
@@ -597,10 +598,15 @@ bt_tx_release(struct btrfs_transaction *transaction, const struct bt_mutated_blo
 	} else if (bt_file_tree(block->owner)) {
 		return BTRFS_CORRUPT;
 	}
-	error = bt_backref_info(
-	    transaction->mutation, transaction->extents.root, extent, &refs, &flags);
+	error = bt_backref_release_tree(transaction->mutation, &transaction->extents.root, extent,
+	    block->original_owner == block->owner ? block->owner : 0, replacement, &refs, &flags,
+	    &freed, replaced);
 	if (error != BTRFS_OK) {
 		return error;
+	}
+	if (freed) {
+		return bt_space_change_used(transaction->space, block->original_address,
+		    transaction->base->info.node_size, 0);
 	}
 	if (refs > 1 && !shareable) {
 		return BTRFS_CORRUPT;
@@ -658,7 +664,9 @@ bt_tx_account(struct btrfs_transaction *transaction)
 	} item;
 	struct bt_mutated_block block;
 	struct bt_key key;
+	struct bt_root replacement;
 	size_t i;
+	int replaced;
 	enum btrfs_result error;
 
 	for (i = 0; i < bt_mutation_count(transaction->mutation); i++) {
@@ -668,7 +676,18 @@ bt_tx_account(struct btrfs_transaction *transaction)
 		}
 		if (block.original_address != 0 &&
 		    !(transaction->accounted[i] & BT_ACCOUNT_ORIGINAL)) {
-			error = bt_tx_release(transaction, &block);
+			replacement = (struct bt_root){ block.address,
+				transaction->base->info.generation + 1, block.owner, block.level };
+			error = bt_tx_release(transaction, &block,
+			    !block.discarded && !(transaction->accounted[i] & BT_ACCOUNT_NEW)
+				? &replacement
+				: NULL,
+			    &replaced);
+			if (error == BTRFS_OK && replaced) {
+				error = bt_space_change_used(transaction->space, block.address,
+				    transaction->base->info.node_size, 1);
+				transaction->accounted[i] |= BT_ACCOUNT_NEW;
+			}
 			if (error != BTRFS_OK) {
 				return error;
 			}
@@ -905,29 +924,54 @@ bt_tx_publish_chunks(struct btrfs_transaction *transaction)
 	return error;
 }
 
-/* Applies the allocations and releases logged since the previous round. */
+/* Apply a snapshot of this round's log. Edits can allocate nodes and grow the
+ * log, so no pointer into it survives an edit. The original ordered log is
+ * retained for the allocation map; only the copied batch is normalized. */
 static enum btrfs_result
 bt_tx_free_space(struct btrfs_transaction *transaction)
 {
-	const struct bt_space_change *change;
+	const struct btrfs_environment *env = &transaction->base->env;
+	struct bt_space_change *changes;
+	size_t end;
+	size_t total;
+	size_t count;
+	size_t first;
+	size_t next;
 	enum btrfs_result error = BTRFS_OK;
 
 	if (!transaction->has_free_space) {
 		return BTRFS_OK;
 	}
-	for (; error == BTRFS_OK &&
-	    transaction->free_space_applied < bt_space_change_count(transaction->space);
-	    transaction->free_space_applied++) {
-		change = bt_space_change(transaction->space, transaction->free_space_applied);
-		if (change->chunk >= transaction->chunks_published) {
-			error = bt_tx_publish_chunks(transaction);
-			if (error != BTRFS_OK) {
-				break;
-			}
+	/* Each pass consumes at least one entry of the bounded allocation log. */
+	while (error == BTRFS_OK &&
+	    transaction->free_space_applied < bt_space_change_count(transaction->space)) {
+		end = bt_space_change_count(transaction->space);
+		total = end - transaction->free_space_applied;
+		changes = env->allocate(env->context, total * sizeof(*changes));
+		if (changes == NULL) {
+			return BTRFS_NO_MEMORY;
 		}
-		error = bt_fst_change(transaction->mutation, &transaction->free_space.root,
-		    &transaction->fs.chunks[change->chunk], change->start, change->length,
-		    change->allocate);
+		bt_copy(changes,
+		    bt_space_change(transaction->space, transaction->free_space_applied),
+		    total * sizeof(*changes));
+		count = total;
+		error = bt_space_coalesce(changes, &count);
+		for (first = 0; error == BTRFS_OK && first < count; first = next) {
+			for (next = first + 1;
+			    next < count && changes[next].chunk == changes[first].chunk; next++) {
+			}
+			if (changes[first].chunk >= transaction->chunks_published) {
+				error = bt_tx_publish_chunks(transaction);
+				if (error != BTRFS_OK) {
+					break;
+				}
+			}
+			error = bt_fst_changes(transaction->mutation, &transaction->free_space.root,
+			    &transaction->fs.chunks[changes[first].chunk], changes + first,
+			    next - first);
+		}
+		env->release(env->context, changes, total * sizeof(*changes));
+		transaction->free_space_applied = end;
 	}
 	if (error == BTRFS_OK &&
 	    transaction->free_space.root.address !=
@@ -1252,9 +1296,74 @@ bt_tx_persist(struct btrfs_transaction *transaction)
 	return error == BTRFS_OK ? transaction->io.flush(transaction->io.context) : error;
 }
 
-enum btrfs_result
-btrfs_transaction_commit(struct btrfs_transaction *transaction)
+/* The prepared root set and chunk map already describe the next generation.
+ * Validate its selected root through the sealed private nodes, then detach
+ * every private hook only after publication succeeds. No on-disk read can
+ * substitute a different generation for the one this commit acknowledged. */
+static enum btrfs_result
+bt_tx_committed_view(struct btrfs_transaction *transaction, uint64_t tree, struct btrfs_fs **result)
 {
+	const struct btrfs_environment *env = &transaction->base->env;
+	struct btrfs_fs *fs;
+	struct btrfs_object_id id;
+	size_t i;
+	enum btrfs_result error;
+
+	fs = env->allocate(env->context, sizeof(*fs));
+	if (fs == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	*fs = *bt_mutation_view(transaction->mutation);
+	fs->env = *env;
+	fs->root_tree = transaction->roots;
+	fs->chunk_tree = transaction->chunks;
+	fs->checksum_tree = transaction->checksums.root;
+	/* The base's selected-root shortcut names the previous generation. */
+	bt_zero(&fs->selected_tree, sizeof(fs->selected_tree));
+	fs->private_root = NULL;
+	fs->private_root_context = NULL;
+	fs->info.used_bytes = bt_u64(transaction->super.used_bytes);
+	fs->info.incompat_features = bt_u64(transaction->super.incompat);
+	fs->info.readonly_features = bt_u64(transaction->super.compat_ro);
+	fs->chunk_count = 0;
+	fs->chunk_capacity = transaction->fs.chunk_count;
+	fs->chunks = env->allocate(env->context, fs->chunk_capacity * sizeof(*fs->chunks));
+	if (fs->chunks == NULL) {
+		btrfs_unmount(fs);
+		return BTRFS_NO_MEMORY;
+	}
+	/* Growth appends in logical order; retired groups leave no mapping in the
+	 * next view, just as when the mount reads the committed chunk tree. */
+	for (i = 0; i < transaction->fs.chunk_count; i++) {
+		if (!transaction->fs.chunks[i].removed) {
+			fs->chunks[fs->chunk_count++] = transaction->fs.chunks[i];
+		}
+	}
+	error = tree == 0 ? bt_default_tree(fs, &tree) : BTRFS_OK;
+	if (error == BTRFS_OK) {
+		error = bt_find_root(fs, tree, &fs->selected_tree);
+	}
+	if (error == BTRFS_OK) {
+		fs->info.default_tree = tree;
+		id = (struct btrfs_object_id){ tree, BTRFS_ROOT_INODE };
+		error = btrfs_get_inode(fs, id, &fs->root_inode);
+		if (error == BTRFS_OK &&
+		    (fs->root_inode.mode & BTRFS_MODE_TYPE) != BTRFS_MODE_DIRECTORY) {
+			error = BTRFS_CORRUPT;
+		}
+	}
+	if (error != BTRFS_OK) {
+		btrfs_unmount(fs);
+		return error;
+	}
+	*result = fs;
+	return BTRFS_OK;
+}
+
+static enum btrfs_result
+bt_tx_commit(struct btrfs_transaction *transaction, uint64_t tree, struct btrfs_fs **view)
+{
+	struct btrfs_fs *prepared = NULL;
 	enum btrfs_result error;
 
 	if (transaction == NULL) {
@@ -1268,6 +1377,9 @@ btrfs_transaction_commit(struct btrfs_transaction *transaction)
 		return BTRFS_OK;
 	}
 	error = bt_tx_prepare(transaction);
+	if (error == BTRFS_OK && view != NULL) {
+		error = bt_tx_committed_view(transaction, tree, &prepared);
+	}
 	if (error == BTRFS_OK) {
 		error = bt_read_physical(
 		    transaction->base, BT_SUPER_OFFSET, transaction->scratch, BT_SUPER_SIZE);
@@ -1294,8 +1406,42 @@ btrfs_transaction_commit(struct btrfs_transaction *transaction)
 		transaction->base->info.generation + 1) != BTRFS_OK) {
 		bt_space_map_invalidate(transaction->map);
 	}
+	if (error == BTRFS_OK && prepared != NULL) {
+		/* The view owns its chunks and uses the base device/allocator. Private
+		 * nodes become ordinary durable nodes, cached when the editor retires. */
+		prepared->cache_limit = UINT64_MAX;
+		prepared->private_node = NULL;
+		prepared->private_context = NULL;
+		prepared->private_borrow = 0;
+		prepared->private_holders = NULL;
+		prepared->private_root = NULL;
+		prepared->private_root_context = NULL;
+		*view = prepared;
+	} else {
+		btrfs_unmount(prepared);
+	}
 	transaction->failure = error;
 	return error;
+}
+
+enum btrfs_result
+btrfs_transaction_commit(struct btrfs_transaction *transaction)
+{
+	return bt_tx_commit(transaction, 0, NULL);
+}
+
+enum btrfs_result
+btrfs_transaction_commit_view(
+    struct btrfs_transaction *transaction, uint64_t tree, struct btrfs_fs **view)
+{
+	if (view == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*view = NULL;
+	if (tree != 0 && !bt_file_tree(tree)) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	return bt_tx_commit(transaction, tree, view);
 }
 
 void

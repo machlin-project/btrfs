@@ -20,8 +20,9 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require thirty passing test processes and all seven reader profiles (367
-contracts). Twelve writable images are required by the transaction suites:
+Require thirty-six passing test processes on macOS (thirty-five elsewhere) and
+all seven reader profiles (367 contracts). Thirteen writable images are required
+by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
 fragmented metadata), `transactions-shared` (snapshots, reflinks, offset
@@ -158,16 +159,27 @@ For each operation sequence and each device fault:
 - Reduce every failure to a deterministic test. Record skipped unsupported
   recovery modes separately from successful recovery.
 
-The portable model covers every prefix, seeded reorder/tear states of the
-
+The portable model covers every prefix and seeded reorder/tear states between
+persistence barriers, followed by explicit recovery where needed. Native flush
+and power-cut behavior remain separate gates.
 
 ## Performance work
 
 Preserve read budgets and the absence of a mount-wide read lock. Private fixed-size
 replacements update one payload/pointer without repacking the whole node, and
 edits that fit an already packed leaf move only what follows the edited slot;
-repeated edits reuse dirty paths. The allocator starts with 256 gap records and grows within
-an explicit bound. Keep allocation and I/O counts visible in tests.
+the first CoW recognizes a packed source leaf without rewriting it. Packed
+equal-size key changes move only the interval between old and new slots, leaving
+occupancy constant; cross-leaf or resized changes retain delete/insert semantics.
+Free-space edge trims and adjoining releases often change just the existing key.
+Packed occupancy is constant-time, and exact lookups on entirely private paths avoid
+cursor setup while keeping identity and ancestor-bound checks. Repeated edits
+reuse dirty paths. Free-space accounting normalizes a bounded copy of each
+round's allocation log, cancels exact allocation/release pairs, merges adjacent
+ranges and updates group info once per batch. Preserve the original ordered
+allocator log and the additions-before-drops order of shared references.
+The allocator starts with 256 gap records and grows within an explicit bound.
+Keep allocation and I/O counts visible in tests.
 
 Follow PERFORMANCE.md for matched Linux comparisons; `btrfs-bench` measures
 per-operation costs portably. The core has a bounded, generation-aware node
@@ -180,11 +192,25 @@ volume groups operations into one running transaction
 barriers per operation, and its acceptance needs mounted runs in both commit
 modes plus power-cut checks of `fsync` boundaries. Writable admission loads
 block groups as allocation reaches them, and the chunk table follows the
-chunks present, so large volumes mount without a full extent-tree pass; no
-large Linux fixture measures that yet. Remaining measured costs: single-buffer
-node checksums, repeated subvolume-root resolution and attribute-rich
-enumeration. Optimize after measurement. Do not claim a speed win from a
-userspace image reader versus a mounted guest.
+chunks present, so large volumes mount without a full extent-tree pass;
+large-volume mount scaling still needs separate measurements. Repeated
+subvolume-root resolution and attribute-rich enumeration also need profiling.
+Do not claim a speed win from a userspace image reader versus a mounted guest.
+
+The commit-cost batch in PERFORMANCE.md reduces image-backend CPU per single
+create/commit by 22–31% and per grouped create by 33–35% on four profiles, including
+102,042 starting extents. It does not establish mounted or durable latency.
+Accepted editors now transfer buffers into the cache at destruction and reuse
+retired buffers. Sole-owner metadata CoW moves its inline extent record directly
+to the replacement block. A volume prepares the next immutable view before
+publication and receives it from commit without mounting again, saving one
+superblock read per commit. General extent-reference accounting, free-space
+fixed-point rounds and begin/commit superblock rereads remain candidates.
+Do not cancel reference
+additions/drops without preserving snapshot and FULL_BACKREF transitions.
+Tree-log fsync needs a separate replay and power-cut design. Hardware CRC uses
+general registers; arm64e kernel builds enforce `-mgeneral-regs-only`, since
+the adapter does not own SIMD state even for compiler-generated copies.
 
 At delivery, report portable contracts, actual loaded native mounts, FSKit,
 LXNU policy, recovery/durability and comparative performance separately. Preserve

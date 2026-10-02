@@ -22,6 +22,14 @@ struct bt_backref {
  * that Linux can continue the tree. Each operation validates the item first. */
 enum btrfs_result bt_backref_info(struct bt_mutation *mutation, struct bt_root extents,
     struct bt_key extent, uint64_t *refs, uint64_t *flags);
+/* Reads a metadata extent's reference state and drops its sole implicit owner
+ * reference in the same lookup. owner == 0, shared blocks and FULL_BACKREF
+ * blocks only return their state, leaving conversions to the caller. When a
+ * replacement is supplied, a sole inline reference can move directly to that
+ * new node; replaced reports that its extent item was also created. */
+enum btrfs_result bt_backref_release_tree(struct bt_mutation *mutation, struct bt_root *extents,
+    struct bt_key extent, uint64_t owner, const struct bt_root *replacement, uint64_t *refs,
+    uint64_t *flags, int *freed, int *replaced);
 /* The count of one reference: an inline or keyed item, 0 when absent. */
 enum btrfs_result bt_backref_count(struct bt_mutation *mutation, struct bt_root extents,
     struct bt_key extent, const struct bt_backref *reference, uint64_t *count);

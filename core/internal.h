@@ -4,6 +4,10 @@
 
 #include "disk.h"
 
+#if defined(KERNEL) && defined(__aarch64__) && defined(__ARM_NEON)
+#error "Compile the kernel core with -mgeneral-regs-only; the adapter does not own SIMD state"
+#endif
+
 struct bt_key {
 	uint64_t objectid, offset;
 	uint8_t type;
@@ -174,6 +178,14 @@ int bt_cache_get(struct btrfs_cache *cache, struct bt_root root, uint32_t node_s
     uint64_t *owner);
 void bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
     const void *node, uint64_t owner);
+/* Transfers a published node from the same allocator, clearing *node on
+ * success. With another allocator, stores a copy and leaves *node owned by
+ * the caller. The caller must have no remaining readers of the buffer. */
+void bt_cache_take(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
+    uint8_t **node, uint64_t owner, const struct btrfs_environment *source);
+/* Returns an unpinned, retired buffer owned by source's allocator, or NULL. */
+uint8_t *bt_cache_reuse(
+    struct btrfs_cache *cache, uint32_t node_size, const struct btrfs_environment *source);
 /* hint is any address on the caller's stack: it spreads concurrent callers'
  * pin counters over separate cache lines. */
 const uint8_t *bt_cache_pin(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
@@ -201,10 +213,40 @@ int bt_cache_extent_get(struct btrfs_cache *cache, const struct bt_extent_key *k
 void bt_cache_extent_put(
     struct btrfs_cache *cache, const struct bt_extent_key *key, int verified, const void *bytes);
 
-void bt_copy(void *destination, const void *source, size_t length);
-void bt_move(void *destination, const void *source, size_t length);
-void bt_zero(void *buffer, size_t length);
-int bt_equal(const void *a, const void *b, size_t length);
+/* A freestanding C implementation still provides memcpy, memmove, memset and
+ * memcmp (and so does the kernel); the builtins let the compiler inline small
+ * fixed sizes and call the platform's tuned routines otherwise. */
+static inline void
+bt_copy(void *destination, const void *source, size_t length)
+{
+	if (length != 0) {
+		__builtin_memcpy(destination, source, length);
+	}
+}
+
+/* Overlapping ranges are allowed. */
+static inline void
+bt_move(void *destination, const void *source, size_t length)
+{
+	if (length != 0) {
+		__builtin_memmove(destination, source, length);
+	}
+}
+
+static inline void
+bt_zero(void *buffer, size_t length)
+{
+	if (length != 0) {
+		__builtin_memset(buffer, 0, length);
+	}
+}
+
+static inline int
+bt_equal(const void *a, const void *b, size_t length)
+{
+	return length == 0 || __builtin_memcmp(a, b, length) == 0;
+}
+
 uint32_t bt_crc32c(uint32_t seed, const void *buffer, size_t length);
 /* Lanes bt_crc32c_sectors interleaves, and the sectors its callers checksum
  * per call (a stack array of results). */

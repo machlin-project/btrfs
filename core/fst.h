@@ -4,6 +4,8 @@
 
 #include "mutable.h"
 
+struct bt_space_change;
+
 /* Free-space tree (tree 10). Each block group has an info item (extent count
  * and bitmap flag) followed by free extents or by bitmaps of one bit per
  * sector. Free space is the complement of the extent tree inside the block
@@ -30,5 +32,9 @@ enum btrfs_result bt_fst_remove_group(
  * threshold converts the group between extent items and bitmaps at once. */
 enum btrfs_result bt_fst_change(struct bt_mutation *mutation, struct bt_root *tree,
     const struct bt_chunk *chunk, uint64_t start, uint64_t length, int allocate);
+/* Applies a normalized batch within one group, reading its info item once
+ * and replacing it only if its final count or representation changed. */
+enum btrfs_result bt_fst_changes(struct bt_mutation *mutation, struct bt_root *tree,
+    const struct bt_chunk *chunk, const struct bt_space_change *changes, size_t count);
 
 #endif

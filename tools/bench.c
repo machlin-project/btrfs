@@ -18,6 +18,7 @@
 
 struct sample {
 	struct timespec start;
+	struct timespec cpu_start;
 	uint64_t reads;
 	uint64_t bytes;
 	uint64_t allocations;
@@ -29,6 +30,7 @@ struct sample {
 #define CREATE_NODES 64U
 
 static struct btrfs_image image;
+static unsigned volume_files = VOLUME_FILES;
 static pthread_mutex_t volume_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t volume_condition = PTHREAD_COND_INITIALIZER;
 
@@ -39,22 +41,31 @@ begin_sample(struct sample *sample)
 	sample->bytes = atomic_load(&image.bytes_read);
 	sample->allocations = atomic_load(&image.allocations);
 	clock_gettime(CLOCK_MONOTONIC, &sample->start);
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &sample->cpu_start);
 }
 
 static void
 end_sample(const struct sample *sample, const char *name, uint64_t operations, uint64_t bytes)
 {
 	struct timespec end;
+	struct timespec cpu_end;
 	double seconds;
+	double cpu_seconds;
 
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end);
 	clock_gettime(CLOCK_MONOTONIC, &end);
+	cpu_seconds = (double)(cpu_end.tv_sec - sample->cpu_start.tv_sec) +
+	    (double)(cpu_end.tv_nsec - sample->cpu_start.tv_nsec) / 1e9;
 	seconds = (double)(end.tv_sec - sample->start.tv_sec) +
 	    (double)(end.tv_nsec - sample->start.tv_nsec) / 1e9;
-	printf("%-28s %10.2f us/op %9.1f MB/s %8.1f reads/op %9.1f KiB/op %8.1f allocs/op\n", name,
-	    seconds * 1e6 / (double)operations, bytes == 0 ? 0.0 : (double)bytes / seconds / 1e6,
+	printf("%-28s %10.2f us/op %9.1f MB/s %8.1f reads/op %9.1f KiB/op %8.1f allocs/op %9.2f "
+	       "CPU us/op\n",
+	    name, seconds * 1e6 / (double)operations,
+	    bytes == 0 ? 0.0 : (double)bytes / seconds / 1e6,
 	    (double)(atomic_load(&image.reads) - sample->reads) / (double)operations,
 	    (double)(atomic_load(&image.bytes_read) - sample->bytes) / 1024.0 / (double)operations,
-	    (double)(atomic_load(&image.allocations) - sample->allocations) / (double)operations);
+	    (double)(atomic_load(&image.allocations) - sample->allocations) / (double)operations,
+	    cpu_seconds * 1e6 / (double)operations);
 }
 
 static int
@@ -213,7 +224,7 @@ volume_series(const struct btrfs_write_environment *writer)
 	attributes.mode = BTRFS_MODE_REGULAR | 0644;
 	attributes.time.seconds = 1800000000;
 	begin_sample(&sample);
-	for (i = 0; i < VOLUME_FILES; i++) {
+	for (i = 0; i < volume_files; i++) {
 		snprintf(name, sizeof(name), "single-%04u", i);
 		if (btrfs_volume_begin(volume, &transaction) != BTRFS_OK ||
 		    btrfs_transaction_create(
@@ -222,9 +233,9 @@ volume_series(const struct btrfs_write_environment *writer)
 			exit(1);
 		}
 	}
-	end_sample(&sample, "create, commit each", VOLUME_FILES, 0);
+	end_sample(&sample, "create, commit each", volume_files, 0);
 	begin_sample(&sample);
-	for (i = 0; i < VOLUME_FILES; i++) {
+	for (i = 0; i < volume_files; i++) {
 		snprintf(name, sizeof(name), "grouped-%04u", i);
 		if (btrfs_volume_join(volume, CREATE_NODES, &transaction) != BTRFS_OK ||
 		    btrfs_transaction_create(
@@ -236,12 +247,12 @@ volume_series(const struct btrfs_write_environment *writer)
 	if (btrfs_volume_sync(volume, btrfs_volume_pending(volume)) != BTRFS_OK) {
 		exit(1);
 	}
-	end_sample(&sample, "create, grouped, one sync", VOLUME_FILES, 0);
+	end_sample(&sample, "create, grouped, one sync", volume_files, 0);
 	btrfs_volume_close(volume);
 }
 
 static void
-write_series(const char *path, struct btrfs_cache *cache, int durable)
+write_series(const char *path, struct btrfs_cache *cache, int durable, int volume_only)
 {
 	struct btrfs_write_environment writer;
 	struct btrfs_new_inode attributes;
@@ -266,6 +277,10 @@ write_series(const char *path, struct btrfs_cache *cache, int durable)
 	/* Without --durable, barriers (the host's F_FULLFSYNC) are not measured. */
 	if (!durable) {
 		writer.flush = image_write_flush;
+	}
+	if (volume_only) {
+		volume_series(&writer);
+		return;
 	}
 	data = malloc(8 * 1024 * 1024);
 	if (data == NULL) {
@@ -326,6 +341,7 @@ main(int argc, char **argv)
 	size_t cache_bytes = 0;
 	int write = 0;
 	int durable = 0;
+	int volume_only = 0;
 	int i;
 
 	for (i = 2; i < argc; i++) {
@@ -333,6 +349,18 @@ main(int argc, char **argv)
 			write = 1;
 		} else if (strcmp(argv[i], "--durable") == 0) {
 			durable = 1;
+		} else if (strcmp(argv[i], "--volume-only") == 0) {
+			volume_only = write = 1;
+		} else if (strcmp(argv[i], "--volume-files") == 0 && i + 1 < argc) {
+			char *end;
+			unsigned long value;
+
+			value = strtoul(argv[++i], &end, 10);
+			if (*end != '\0' || value == 0 || value > 100000) {
+				argc = 0;
+			} else {
+				volume_files = (unsigned)value;
+			}
 		} else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
 			cache_bytes = (size_t)strtoull(argv[++i], NULL, 0) * 1024 * 1024;
 		} else {
@@ -340,7 +368,9 @@ main(int argc, char **argv)
 		}
 	}
 	if (argc < 2) {
-		fprintf(stderr, "Usage: btrfs-bench IMAGE [--cache MiB] [--write [--durable]]\n");
+		fprintf(stderr,
+		    "Usage: btrfs-bench IMAGE [--cache MiB] [--write [--durable]] "
+		    "[--volume-only] [--volume-files 1..100000]\n");
 		return 2;
 	}
 	if (btrfs_image_open(argv[1], &image) != 0) {
@@ -356,10 +386,12 @@ main(int argc, char **argv)
 		fprintf(stderr, "cannot mount %s\n", argv[1]);
 		return 1;
 	}
-	read_series(fs);
+	if (!volume_only) {
+		read_series(fs);
+	}
 	btrfs_unmount(fs);
 	if (write) {
-		write_series(argv[1], cache, durable);
+		write_series(argv[1], cache, durable, volume_only);
 	}
 	if (cache != NULL) {
 		btrfs_cache_counts(cache, &counts);

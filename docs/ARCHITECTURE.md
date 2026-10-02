@@ -137,8 +137,15 @@ are all pinned stores nothing new until a pin is released. Open directory
 streams hold their pins, so every stream must be closed and every mount
 unmounted before the cache is destroyed.
 
-Nodes enter the cache from committed views, and a commit adds the nodes it
-wrote once its primary superblock is durable. A transaction's private view
+Nodes enter the cache from committed views. After its primary superblock is
+durable, an accepted transaction transfers its live node buffers to the cache
+when its private editor is destroyed. This keeps the private view valid until
+teardown and avoids copying each published node. Transfer requires the same
+allocation/release callbacks and context; other allocators use a copy. Payload
+buffers are allocated lazily. Up to eight retired buffers can be reused by the
+next private editor; cached and spare buffers together stay within the configured
+node-byte budget, with the same set count and lookup bound. A transaction's
+private view
 excludes its own generation; a refused or failed commit adds nothing, since the
 next commit may reuse that generation and those addresses; explicit recovery
 validates candidates without the cache, since a refused candidate's generation
@@ -172,6 +179,9 @@ SSE4.2; otherwise an immutable table. Data sectors are checksummed four at a
 time in independent instruction chains, which hide the instruction latency that
 bounds one chain. Kernel acceleration uses general registers only. There is no
 CPU feature probe, lazy global initialization or kernel SIMD use.
+The arm64e kernel build uses `-mgeneral-regs-only`: `-mkernel` alone permits
+compiler-generated NEON for copies and zeroing. A core header rejects ARM
+kernel compilation with NEON enabled, including for inline memory primitives.
 
 FSKit inhibits offloaded I/O so data passes through the core. The extension names
 its type `machlinbtrfs` with subtype zero: Disk Arbitration appends `_fskit` to a
@@ -231,6 +241,20 @@ one node; the sibling is CoWed like any edited block and merges cascade upward.
 Fixed-size replacements write the payload alone. An insertion, resize or
 deletion that fits a leaf the transaction has already packed moves only the item
 headers and data after the edited slot, leaving the bytes a full repack writes.
+On CoW the editor recognizes tightly packed source leaves and clears only their
+unused area, so their first edit can use this path too; valid source leaves with
+gaps still use the general repacker. Packed-leaf occupancy comes from the last
+payload offset in constant time instead of summing every item's size after each
+edit. Exact item lookups on wholly private paths copy the value directly,
+checking node identity, parent first keys and ancestor upper bounds without
+creating cursor buffers or pins. Reaching an untouched node falls back to the
+ordinary verified cursor. File-tree owner checks retain snapshot semantics.
+Replacing a key and an equal-size value within the same packed leaf moves only
+the interval between the old and new slots, once for headers and once for data.
+Occupancy stays constant, avoiding the transient underfull leaf of a separate
+delete and insert. A zero-size free-space item that keeps its slot changes only
+its key. Crossing the leaf's ancestor bounds, changing payload size or editing
+a gapped leaf falls back to the two ordinary bounded editor descents.
 The original root and bytes remain immutable. A failed
 edit poisons the context; sealing computes checksums, and accepting transfers
 reservations only after the owning transaction's durable publication.
@@ -318,6 +342,14 @@ ordering Linux obtains from its delayed-reference heads (additions before drops)
 is preserved without a persistent queue. Any inconsistency, such as a missing
 reference, a shared block in an unshareable position, or a sole implicit
 reference not owned by the CoWing tree, fails the transaction before writing.
+For a block with one implicit reference owned by the CoWing tree, the count
+lookup retains the loaded extent item. When its sole reference is inline and
+the replacement block is live, that item moves directly to the replacement
+address with its new generation and level; equal-size moves within a leaf use
+one edit. Both old-block release and new-block allocation still enter the space
+log. A release without a replacement drops the reference from the loaded copy,
+avoiding a second lookup and allocation. Shared and FULL_BACKREF cases follow
+the transitions above in the same order.
 Root `bytes_used` changes by one node per new block and per CoW'd original, as
 Linux records it for snapshots.
 
@@ -366,11 +398,23 @@ Filesystems created with Linux defaults carry a free-space tree. Admission
 accepts it only with its VALID bit and compares it, block group by block group,
 with the free runs its single extent-tree pass found (superblock stripes are
 not subtracted, as Linux records them); any disagreement refuses the
-transaction before any write. The allocator logs every allocation and release in order. Each
-round of the commit fixed point applies the logged changes to the free-space
-tree in the block group's current representation: free extents are trimmed,
-split or merged, bitmaps flip one bit per sector, and the info item's extent
-count tracks free runs. Changes to the free-space tree allocate and free blocks
+transaction before any write. The allocator logs every allocation and release
+in order, retaining that log for the kept allocation map. Each round of the
+commit fixed point copies its pending log, sorts it by group and address,
+cancels exact allocation/release pairs and merges adjacent changes of the same
+kind within one group. Reservations are never reused in a transaction, so logged
+ranges are disjoint except for those exact pairs; other overlaps are rejected.
+Heap sorting costs O(n log n), uses constant sorting storage, and the copied
+batch is bounded by the log's 131,072 entries (4 MiB on 64-bit targets).
+The batch applies to the free-space tree in the group's current representation:
+free extents are trimmed, split or merged, bitmaps flip one bit per sector, and
+the info item's extent count tracks free runs. Edge allocations and releases
+adjoining one free extent change the existing extent's key instead of deleting
+and reinserting it. A split adds only the second survivor; joining two neighbours
+deletes one and extends the other. A group's info item is read once per batch
+and written only when its final count or flags change. A bitmap and its neighbouring bits
+are read in one descent unless a neighbour lies in another bitmap item. Changes
+to the free-space tree allocate and free blocks
 themselves, which later rounds apply until nothing is pending. A change of the
 extent count converts the group at once, as Linux's
 `update_free_space_extent_count` does: above the high threshold its free
@@ -594,10 +638,15 @@ cleaner thread does.
 `adapters/common/volume.c` (`include/btrfs/volume.h`) owns a mounted volume's
 versioned views. Each committed root set is one immutable `btrfs_fs`; readers
 pin the current view for one operation and never see a private tree. One writer
-at a time runs a transaction on the current view; a commit that wrote media opens
-the next view and publishes it, and older views are released when their last
-pin goes. The next transaction waits until no view older than its base is
-pinned, because the blocks that commit freed may be reused. The volume counts
+at a time runs a transaction on the current view. `btrfs_transaction_commit_view`
+prepares the next view from the sealed private roots before commit writes: it
+owns a copy of the surviving chunk mappings and validates the selected tree and
+root inode. The volume also allocates the version wrapper before committing.
+Successful publication detaches every private-node hook and returns this
+immutable view without another mount or an allocation to open the view. Failure
+releases it; an unchanged transaction returns no new view. Older views are
+released when their last pin goes. The next transaction waits until no view
+older than its base is pinned, because the blocks that commit freed may be reused. The volume counts
 the writes and barriers a transaction issued: a commit that fails before any I/O
 leaves the volume usable (for example NO_SPACE), while one that fails after I/O
 makes it read-only for the rest of the mount, since only explicit superblock
@@ -723,14 +772,15 @@ disagreeing copies with positioned writes and a barrier that reaches stable
 storage (F_FULLFSYNC); `--acknowledged` passes the last generation the caller
 saw committed.
 
-The owner must hold exclusive resource access, drain readers before commit and
-retire the original mount after successful or uncertain publication. It must
-record the generation of each acknowledged commit and pass it to recovery. Live
-native read/write views, reader pins across commits, UBC dirty-page coherence and
-native flush callbacks are not connected yet. Both native adapters remain
-read-only and do not call recovery. Backup roots are rotating recovery hints, not
-permanently pinned snapshots. See ACCEPTANCE.md for the exact crash oracle scope
-and HANDOFF.md for the requirements before general writable mounts.
+The owner must hold exclusive resource access and keep older readers' blocks
+pinned until those views retire. The native volume enforces this lifetime and
+makes an uncertain publication terminal. Recovery still needs the generation of
+the last acknowledged commit. Both adapters support explicit writable mounts
+and flush callbacks, but do not invoke superblock recovery or tree-log replay;
+native power-cut acceptance and FSKit dirty-page coherence remain open. Backup
+roots are rotating recovery hints, not permanently pinned snapshots. See
+ACCEPTANCE.md for the exact crash oracle scope and HANDOFF.md for the remaining
+writable-mount requirements.
 
 ## Primary format references
 

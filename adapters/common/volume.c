@@ -119,6 +119,35 @@ volume_release_view(struct btrfs_volume *volume, struct btrfs_volume_view *view)
 	volume->environment.release(volume->environment.context, view, sizeof(*view));
 }
 
+/* Reserve the version wrapper before the commit can issue writes. The core
+ * prepares its owned reader state before publication and returns it only
+ * after the last barrier; a successful commit needs no remount or allocation. */
+static enum btrfs_result
+volume_commit_view(struct btrfs_volume *volume, struct btrfs_transaction *transaction,
+    struct btrfs_volume_view **result)
+{
+	struct btrfs_volume_view *view;
+	struct btrfs_info info;
+	enum btrfs_result error;
+
+	*result = NULL;
+	view = volume->environment.allocate(volume->environment.context, sizeof(*view));
+	if (view == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	__atomic_store_n(&view->pins, 0, __ATOMIC_RELAXED);
+	view->older = NULL;
+	error = btrfs_transaction_commit_view(transaction, volume->tree, &view->fs);
+	if (error != BTRFS_OK || view->fs == NULL) {
+		volume->environment.release(volume->environment.context, view, sizeof(*view));
+		return error;
+	}
+	btrfs_get_info(view->fs, &info);
+	view->generation = info.generation;
+	*result = view;
+	return BTRFS_OK;
+}
+
 /* Unlinks unpinned views older than the current one; called with the lock
  * held, returning the list to release after unlocking. */
 static struct btrfs_volume_view *
@@ -433,11 +462,8 @@ volume_commit_running(struct btrfs_volume *volume)
 	volume->operations = 0;
 	volume->locks.unlock(volume->locks.context);
 	volume->issued = 0;
-	error = btrfs_transaction_commit(transaction);
+	error = volume_commit_view(volume, transaction, &view);
 	btrfs_transaction_destroy(transaction);
-	if (error == BTRFS_OK && volume->issued != 0) {
-		error = volume_view(volume, &view);
-	}
 	volume->locks.lock(volume->locks.context);
 	retired = volume_publish(volume, view, error);
 	volume->locks.unlock(volume->locks.context);
@@ -498,12 +524,9 @@ btrfs_volume_commit(struct btrfs_volume *volume, struct btrfs_transaction *trans
 	 * references; only the commit's own writes can make the medium
 	 * uncertain. */
 	volume->issued = 0;
-	error = btrfs_transaction_commit(transaction);
+	error = volume_commit_view(volume, transaction, &view);
 	btrfs_transaction_destroy(transaction);
-	if (error == BTRFS_OK && volume->issued != 0) {
-		error = volume_view(volume, &view);
-		failure = error;
-	} else if (error != BTRFS_OK && volume->issued != 0) {
+	if (error != BTRFS_OK && volume->issued != 0) {
 		/* Some of the commit may be durable: the medium needs explicit
 		 * recovery before another transaction. */
 		failure = error;

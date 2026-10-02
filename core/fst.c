@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "fst.h"
 #include "encode.h"
+#include "space.h"
 
 #define BT_FST_RUN_LIMIT 1048576U
 /* Linux's gap between the two thresholds, against thrashing. */
@@ -232,8 +233,8 @@ bt_fst_extents(struct bt_mutation *mutation, struct bt_root *tree, const struct 
     uint64_t start, uint64_t end, int allocate, int64_t *delta)
 {
 	struct bt_key key = { .objectid = start, .type = BT_FREE_SPACE_EXTENT, .offset = 0 };
-	struct bt_key left;
-	struct bt_key right;
+	struct bt_key left = { 0 };
+	struct bt_key right = { 0 };
 	uint64_t chunk_end = chunk->logical + chunk->length;
 	uint64_t merged_start = start;
 	uint64_t merged_end = end;
@@ -251,19 +252,27 @@ bt_fst_extents(struct bt_mutation *mutation, struct bt_root *tree, const struct 
 		    left.offset < end - left.objectid || left.objectid > start) {
 			return BTRFS_CORRUPT;
 		}
-		error = bt_mutation_edit(mutation, tree, left, NULL, 0, BT_DELETE);
-		*delta = -1;
-		if (error == BTRFS_OK && left.objectid < start) {
+		if (left.objectid == start && end == left.objectid + left.offset) {
+			*delta = -1;
+			return bt_mutation_edit(mutation, tree, left, NULL, 0, BT_DELETE);
+		}
+		/* Keep the existing item for the surviving range. An edge allocation
+		 * usually changes only its key, without shifting any leaf contents. */
+		*delta = 0;
+		if (left.objectid < start) {
 			key = (struct bt_key){ left.objectid, start - left.objectid,
 				BT_FREE_SPACE_EXTENT };
-			error = bt_mutation_edit(mutation, tree, key, NULL, 0, BT_INSERT);
-			(*delta)++;
-		}
-		if (error == BTRFS_OK && end < left.objectid + left.offset) {
+			error = bt_mutation_rekey(mutation, tree, left, key, NULL, 0);
+			if (error == BTRFS_OK && end < left.objectid + left.offset) {
+				key = (struct bt_key){ end, left.objectid + left.offset - end,
+					BT_FREE_SPACE_EXTENT };
+				error = bt_mutation_edit(mutation, tree, key, NULL, 0, BT_INSERT);
+				(*delta)++;
+			}
+		} else {
 			key = (struct bt_key){ end, left.objectid + left.offset - end,
 				BT_FREE_SPACE_EXTENT };
-			error = bt_mutation_edit(mutation, tree, key, NULL, 0, BT_INSERT);
-			(*delta)++;
+			error = bt_mutation_rekey(mutation, tree, left, key, NULL, 0);
 		}
 		return error;
 	}
@@ -280,77 +289,142 @@ bt_fst_extents(struct bt_mutation *mutation, struct bt_root *tree, const struct 
 	    (has_right && right.objectid < end)) {
 		return BTRFS_CORRUPT;
 	}
-	*delta = 1;
-	if (has_left && left.objectid + left.offset == start) {
+	has_left = has_left && left.objectid + left.offset == start;
+	has_right = has_right && right.objectid == end;
+	*delta = 1 - has_left - has_right;
+	if (has_left) {
 		merged_start = left.objectid;
-		error = bt_mutation_edit(mutation, tree, left, NULL, 0, BT_DELETE);
-		(*delta)--;
 	}
-	if (error == BTRFS_OK && has_right && right.objectid == end) {
+	if (has_right) {
 		merged_end = end + right.offset;
+	}
+	/* Two adjacent runs become one; otherwise extend the single neighbour
+	 * directly. The count changes only when a run is added or removed. */
+	if (has_left && has_right) {
 		error = bt_mutation_edit(mutation, tree, right, NULL, 0, BT_DELETE);
-		(*delta)--;
 	}
 	if (error == BTRFS_OK) {
 		key = (struct bt_key){ merged_start, merged_end - merged_start,
 			BT_FREE_SPACE_EXTENT };
-		error = bt_mutation_edit(mutation, tree, key, NULL, 0, BT_INSERT);
+		error = has_left || has_right
+		    ? bt_mutation_rekey(mutation, tree, has_left ? left : right, key, NULL, 0)
+		    : bt_mutation_edit(mutation, tree, key, NULL, 0, BT_INSERT);
 	}
 	return error;
 }
 
-/* Reads one sector's bit, or sets bits [sector_start, *end) of the bitmap item
- * holding sector_start to value, each having had the opposite value; *end is
- * clipped to that item. Bitmaps cover consecutive ranges of the group. */
+/* Locate and copy the bitmap in one descent. The cursor must be closed before
+ * editing, because it can borrow the transaction's private nodes. */
 static enum btrfs_result
-bt_fst_bitmap(struct bt_mutation *mutation, struct bt_root *tree, const struct bt_chunk *chunk,
-    uint64_t sector_start, uint64_t *end, int *bit, int write)
+bt_fst_bitmap_load(struct bt_mutation *mutation, struct bt_root tree, const struct bt_chunk *chunk,
+    uint64_t position, struct bt_key *found, uint8_t *bits, size_t *length)
 {
 	const struct btrfs_fs *view = bt_mutation_view(mutation);
-	uint8_t bits[BT_FREE_SPACE_BITMAP_BYTES];
-	struct bt_key key = {
-		.objectid = sector_start, .type = BT_FREE_SPACE_BITMAP, .offset = UINT64_MAX
-	};
-	struct bt_key found;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { position, UINT64_MAX, BT_FREE_SPACE_BITMAP };
 	uint64_t sector = view->info.sector_size;
+	uint64_t end = chunk->logical + chunk->length;
+	enum btrfs_result error;
+
+	bt_cursor_init(&cursor, view, tree);
+	error = bt_cursor_seek(&cursor, key, 1);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		*found = record.key;
+		if (found->type != BT_FREE_SPACE_BITMAP || found->objectid < chunk->logical ||
+		    found->objectid > position || found->objectid >= end || found->offset == 0 ||
+		    found->offset > end - found->objectid || found->objectid % sector != 0 ||
+		    found->offset % sector != 0 || position - found->objectid >= found->offset ||
+		    record.size != (found->offset / sector + 7) / 8 ||
+		    record.size > BT_FREE_SPACE_BITMAP_BYTES) {
+			error = BTRFS_CORRUPT;
+		} else {
+			*length = record.size;
+			bt_copy(bits, record.data, record.size);
+		}
+	}
+	bt_cursor_fini(&cursor);
+	return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
+}
+
+static enum btrfs_result
+bt_fst_bitmap_bit(struct bt_mutation *mutation, struct bt_root tree, const struct bt_chunk *chunk,
+    uint64_t position, int *bit)
+{
+	uint8_t bits[BT_FREE_SPACE_BITMAP_BYTES];
+	struct bt_key found;
+	size_t length;
+	enum btrfs_result error;
+
+	error = bt_fst_bitmap_load(mutation, tree, chunk, position, &found, bits, &length);
+	if (error == BTRFS_OK) {
+		*bit = bt_bit(bits,
+		    (position - found.objectid) / bt_mutation_view(mutation)->info.sector_size);
+	}
+	return error;
+}
+
+/* Every sector in the range must change. Neighbours in the same bitmap come
+ * from the copy already held; only neighbours across an item boundary need
+ * another lookup. At most one bitmap is visited per sector in the range. */
+static enum btrfs_result
+bt_fst_bitmaps(struct bt_mutation *mutation, struct bt_root *tree, const struct bt_chunk *chunk,
+    uint64_t start, uint64_t end, int allocate, int64_t *delta)
+{
+	uint8_t bits[BT_FREE_SPACE_BITMAP_BYTES];
+	struct bt_key found;
+	uint64_t sector = bt_mutation_view(mutation)->info.sector_size;
+	uint64_t position;
+	uint64_t next;
 	uint64_t index;
 	uint64_t last;
 	size_t length;
-	int present;
+	int before = 0;
+	int after = 0;
 	enum btrfs_result error;
 
-	error = bt_fst_before(mutation, *tree, key, &found, &present);
-	if (error != BTRFS_OK) {
-		return error;
-	}
-	if (!present || found.objectid < chunk->logical ||
-	    found.offset > sizeof(bits) * 8 * sector ||
-	    sector_start - found.objectid >= found.offset) {
-		return BTRFS_CORRUPT;
-	}
-	error = bt_mutation_find(mutation, *tree, found, bits, sizeof(bits), &length);
-	if (error != BTRFS_OK) {
-		return error == BTRFS_RANGE ? BTRFS_CORRUPT : error;
-	}
-	index = (sector_start - found.objectid) / sector;
-	if (length * 8 < found.offset / sector) {
-		return BTRFS_CORRUPT;
-	}
-	if (!write) {
-		*bit = bt_bit(bits, index);
-		return BTRFS_OK;
-	}
-	if (*end > found.objectid + found.offset) {
-		*end = found.objectid + found.offset;
-	}
-	last = (*end - found.objectid) / sector;
-	for (; index < last; index++) {
-		if (bt_bit(bits, index) == *bit) {
-			return BTRFS_CORRUPT;
+	for (position = start; position < end; position = next) {
+		error = bt_fst_bitmap_load(mutation, *tree, chunk, position, &found, bits, &length);
+		if (error != BTRFS_OK) {
+			return error;
 		}
-		bits[index / 8] ^= (uint8_t)(1U << (index % 8));
+		next = found.objectid + found.offset < end ? found.objectid + found.offset : end;
+		index = (position - found.objectid) / sector;
+		last = (next - found.objectid) / sector;
+		if (position == start && start > chunk->logical) {
+			if (index != 0) {
+				before = bt_bit(bits, index - 1);
+			} else {
+				error = bt_fst_bitmap_bit(
+				    mutation, *tree, chunk, start - sector, &before);
+			}
+		}
+		if (error == BTRFS_OK && next == end && end < chunk->logical + chunk->length) {
+			if (last < found.offset / sector) {
+				after = bt_bit(bits, last);
+			} else {
+				error = bt_fst_bitmap_bit(mutation, *tree, chunk, end, &after);
+			}
+		}
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		for (; index < last; index++) {
+			if (bt_bit(bits, index) == !allocate) {
+				return BTRFS_CORRUPT;
+			}
+			bits[index / 8] ^= (uint8_t)(1U << (index % 8));
+		}
+		error = bt_mutation_edit(mutation, tree, found, bits, length, BT_REPLACE);
+		if (error != BTRFS_OK) {
+			return error;
+		}
 	}
-	return bt_mutation_edit(mutation, tree, found, bits, length, BT_REPLACE);
+	*delta = before && after ? (allocate ? 1 : -1)
+	    : !before && !after	 ? (allocate ? -1 : 1)
+				 : 0;
+	return BTRFS_OK;
 }
 
 void
@@ -547,76 +621,41 @@ bt_fst_remove_group(
 	return error;
 }
 
-enum btrfs_result
-bt_fst_change(struct bt_mutation *mutation, struct bt_root *tree, const struct bt_chunk *chunk,
-    uint64_t start, uint64_t length, int allocate)
+static enum btrfs_result
+bt_fst_apply(struct bt_mutation *mutation, struct bt_root *tree, const struct bt_chunk *chunk,
+    uint64_t start, uint64_t length, int allocate, struct bt_disk_free_space_info *info)
 {
-	const struct btrfs_fs *view = bt_mutation_view(mutation);
-	struct bt_disk_free_space_info info;
-	struct bt_key key = {
-		.objectid = chunk->logical, .type = BT_FREE_SPACE_INFO, .offset = chunk->length
-	};
-	uint64_t sector;
-	uint64_t position;
-	uint64_t next;
+	uint64_t sector = bt_mutation_view(mutation)->info.sector_size;
+	uint64_t end = chunk->logical + chunk->length;
 	int64_t delta = 0;
 	uint32_t count;
 	uint32_t flags;
 	uint32_t high;
 	uint32_t low;
-	int before = 0;
-	int after = 0;
-	int bit;
 	enum btrfs_result error;
 
-	if (view == NULL) {
-		return BTRFS_INVALID_ARGUMENT;
-	}
-	sector = view->info.sector_size;
-	if (length == 0 || start < chunk->logical ||
-	    length > chunk->logical + chunk->length - start || start % sector != 0 ||
-	    length % sector != 0) {
+	if (length == 0 || start < chunk->logical || start >= end || length > end - start ||
+	    start % sector != 0 || length % sector != 0) {
 		return BTRFS_CORRUPT;
 	}
-	error = bt_fst_info(mutation, *tree, chunk, &info);
-	if (error != BTRFS_OK) {
-		return error;
-	}
-	if (!(bt_u32(info.flags) & BT_FREE_SPACE_USING_BITMAPS)) {
+	if (!(bt_u32(info->flags) & BT_FREE_SPACE_USING_BITMAPS)) {
 		error =
 		    bt_fst_extents(mutation, tree, chunk, start, start + length, allocate, &delta);
 	} else {
-		/* Neighbouring sectors outside the range decide whether runs split or
-		 * merge, exactly as the extent count tracks free runs. */
-		if (start > chunk->logical) {
-			error =
-			    bt_fst_bitmap(mutation, tree, chunk, start - sector, NULL, &before, 0);
-		}
-		if (error == BTRFS_OK && start + length < chunk->logical + chunk->length) {
-			error =
-			    bt_fst_bitmap(mutation, tree, chunk, start + length, NULL, &after, 0);
-		}
-		for (position = start; error == BTRFS_OK && position < start + length;
-		    position = next) {
-			next = start + length;
-			bit = !allocate;
-			error = bt_fst_bitmap(mutation, tree, chunk, position, &next, &bit, 1);
-		}
-		delta = before && after ? (allocate ? 1 : -1)
-		    : !before && !after ? (allocate ? -1 : 1)
-					: 0;
+		error =
+		    bt_fst_bitmaps(mutation, tree, chunk, start, start + length, allocate, &delta);
 	}
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	if ((int64_t)bt_u32(info.extent_count) + delta < 0 ||
-	    (int64_t)bt_u32(info.extent_count) + delta > UINT32_MAX) {
+	if ((int64_t)bt_u32(info->extent_count) + delta < 0 ||
+	    (int64_t)bt_u32(info->extent_count) + delta > UINT32_MAX) {
 		return BTRFS_CORRUPT;
 	}
-	count = (uint32_t)((int64_t)bt_u32(info.extent_count) + delta);
-	flags = bt_u32(info.flags);
-	/* A changed count converts the group as update_free_space_extent_count
-	 * does: above the high threshold to bitmaps, below the low one back. */
+	count = (uint32_t)((int64_t)bt_u32(info->extent_count) + delta);
+	flags = bt_u32(info->flags);
+	/* Keep conversions bounded by Linux's thresholds, including during a
+	 * batch: deferring them could exhaust nodes on a fragmented group. */
 	bt_fst_thresholds(sector, chunk->length, &high, &low);
 	if (delta != 0 && !(flags & BT_FREE_SPACE_USING_BITMAPS) && count > high) {
 		error = bt_fst_to_bitmaps(mutation, tree, chunk, count);
@@ -628,7 +667,49 @@ bt_fst_change(struct bt_mutation *mutation, struct bt_root *tree, const struct b
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	bt_put32(&info.extent_count, count);
-	bt_put32(&info.flags, flags);
-	return bt_mutation_edit(mutation, tree, key, &info, sizeof(info), BT_REPLACE);
+	bt_put32(&info->extent_count, count);
+	bt_put32(&info->flags, flags);
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+bt_fst_changes(struct bt_mutation *mutation, struct bt_root *tree, const struct bt_chunk *chunk,
+    const struct bt_space_change *changes, size_t count)
+{
+	struct bt_disk_free_space_info original;
+	struct bt_disk_free_space_info info;
+	struct bt_key key = { chunk->logical, chunk->length, BT_FREE_SPACE_INFO };
+	size_t i;
+	enum btrfs_result error;
+
+	if (bt_mutation_view(mutation) == NULL || count == 0 || count > BT_SPACE_MAX_CHANGES) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_fst_info(mutation, *tree, chunk, &info);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	if (bt_u32(info.flags) & ~BT_FREE_SPACE_USING_BITMAPS) {
+		return BTRFS_UNSUPPORTED;
+	}
+	original = info;
+	for (i = 0; i < count; i++) {
+		error = bt_fst_apply(mutation, tree, chunk, changes[i].start, changes[i].length,
+		    changes[i].allocate, &info);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+	}
+	return bt_equal(&original, &info, sizeof(info))
+	    ? BTRFS_OK
+	    : bt_mutation_edit(mutation, tree, key, &info, sizeof(info), BT_REPLACE);
+}
+
+enum btrfs_result
+bt_fst_change(struct bt_mutation *mutation, struct bt_root *tree, const struct bt_chunk *chunk,
+    uint64_t start, uint64_t length, int allocate)
+{
+	struct bt_space_change change = { start, length, 0, allocate };
+
+	return bt_fst_changes(mutation, tree, chunk, &change, 1);
 }

@@ -1,40 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "internal.h"
 
-/* A freestanding C implementation still provides memcpy, memmove, memset and
- * memcmp (and so does the kernel); the builtins let the compiler inline small
- * fixed sizes and call the platform's tuned routines otherwise. */
-void
-bt_copy(void *destination, const void *source, size_t length)
-{
-	if (length != 0) {
-		__builtin_memcpy(destination, source, length);
-	}
-}
-
-/* Overlapping ranges are allowed. */
-void
-bt_move(void *destination, const void *source, size_t length)
-{
-	if (length != 0) {
-		__builtin_memmove(destination, source, length);
-	}
-}
-
-void
-bt_zero(void *buffer, size_t length)
-{
-	if (length != 0) {
-		__builtin_memset(buffer, 0, length);
-	}
-}
-
-int
-bt_equal(const void *a, const void *b, size_t length)
-{
-	return length == 0 || __builtin_memcmp(a, b, length) == 0;
-}
-
 /* Hardware CRC32C uses only general registers, so it is safe in the kernel
  * without SIMD state ownership. Every Intel Mac able to run the supported
  * macOS releases has the SSE4.2 CRC32 instruction. BT_CRC_PORTABLE selects

@@ -120,8 +120,8 @@ grouping amortizes them over the running transaction. A commit writes its node
 copies in physical order, merging contiguous ones into writes of at most
 256 KiB: on `transactions`, a single create's commit issues 10.9 writes for
 15.2 nodes on average, a commit of 100 grouped creates 23 for 56, and one of
-1,000 grouped creates 19 for 211. No native adapter
-groups its operations yet.
+1,000 grouped creates 19 for 211. Both native adapters use the volume's grouping;
+matched mounted performance remains a separate gate.
 
 A cache with locks also keeps sixteen decompressed extents, so small reads
 within one compressed extent decompress it once. Sequential 4 KiB reads of the
@@ -137,6 +137,78 @@ two, four and eight threads, where a cache lock gave 1.6, 1.0, 0.4 and 0.5
 million. Reads through the native volume pin its current view without a lock
 as well: eight threads reach 5.1 million there, where the volume lock limited
 them to 1.1 million.
+
+### Commit accounting and private-tree edits
+
+Seven alternating before/after trials of `--cache 64 --volume-only
+--volume-files 2000`, each on a fresh clone of its Linux-authored fixture, give
+the following median process CPU times. These are release builds through the
+image-file backend, with barriers skipped, not durable or mounted filesystem
+latencies. The grouped column includes its final sync, amortized over 2,000
+creates. Wall time is recorded separately because host I/O stalls especially
+affect the scale image.
+
+| Fixture | Single create + commit, before / after | Grouped create, before / after |
+| --- | --- | --- |
+| `transactions`, 4 KiB nodes | 39.94 / 31.03 us | 2.30 / 1.55 us |
+| `transactions-namespace`, free-space tree | 54.45 / 37.33 us | 2.39 / 1.55 us |
+| `transactions-fst`, 16 KiB DUP, bitmaps | 70.44 / 50.73 us | 2.17 / 1.41 us |
+| `transactions-scale`, 102,042 starting extents | 173.26 / 131.97 us | 2.67 / 1.80 us |
+
+Single-commit CPU cost falls by 22–31%; grouped create cost by 33–35% (up to
+1.54 times the throughput). The changes normalize a copy of each round's
+allocation log, cancel exact allocation/release pairs and merge adjacent ranges,
+read a group's free-space info once and avoid repeated bitmap descents. The
+editor recognizes packed source leaves before their first edit, computes packed
+occupancy in constant time, and finds exact items on entirely private paths
+without creating a cursor. Small memory primitives are inline so the compiler
+can specialize fixed-size copies. Accepted editors transfer their node buffers
+to the cache at destruction, and reuse up to eight retired cache buffers in the
+next transaction, within the configured node-byte budget.
+
+The common metadata CoW with one inline implicit owner moves its loaded extent
+item to the replacement block instead of dropping and recreating it. Equal-size
+key changes within a packed leaf move just the interval between the two slots;
+cross-leaf moves retain the ordinary delete/insert path. Free-space extent
+trimming and neighbour merging use the same operation, often changing only a
+key. Other ownership cases keep the existing conversion and reference order.
+The volume receives an independently owned committed view prepared before
+publication, eliminating its post-commit mount and the associated root reads.
+Source nodes and the allocator's original ordered log remain immutable; all
+three persistence barriers remain in force.
+
+Backend reads fall from 5 to 4 and read bytes from 20 to 16 KiB per single commit
+(5.2 to 4.1 reads and 20.6 to 16.6 KiB on scale). Despite temporary pending-log
+copies, the complete batch removes approximately seven to nine allocations per
+single commit. A pending-log copy is bounded by 4 MiB on 64-bit targets.
+Three additional alternating pairs compare the preceding buffer-transfer and
+reference-lookup checkpoint with the final view-handoff and key-move changes:
+single-commit CPU falls from 34.62 to 31.25 us on `transactions`, 40.81 to
+37.32 us on namespace and 58.49 to 50.13 us on the bitmap fixture (9–14%).
+Scale changes from 137.40 to 135.67 us (1%), with grouped costs broadly flat.
+These incremental trials and the full-batch comparison above are separate runs.
+
+A three-pair read-only control at the buffer-transfer checkpoint on `plain`
+shows sequential reads, random reads
+and lookup close to the baseline. Enumerating 700 entries with stat falls from
+40.00 to 28.36 us CPU. Enumeration without stat rises from 10.76 to 11.87 us CPU
+(wall time 12.05 to 12.24 us); these small control samples do not establish a
+general read-path improvement. Read I/O and allocation counts are unchanged.
+
+CRC32C already uses general-register hardware
+instructions and parallel lanes. Kernel builds use `-mgeneral-regs-only` on
+arm64e, with a compile guard and zero SIMD/FP operands in the emitted core and
+adapter objects; `-mkernel` alone permits compiler-generated NEON copies.
+The first checkpoint passed full portable acceptance and thirteen independent
+Linux oracle profiles. Subsequent changes passed focused ASan/UBSan checks;
+the full suite and Linux oracle were not repeated for them. See ACCEPTANCE.md
+for the final concurrency and native-compilation evidence boundary.
+Raw trials, sampling profiles, binary identities and acceptance logs live under
+the ignored
+`logs/perf-commit-20261002/` and `artifacts/perf-commit-20261002/` directories.
+These results do not establish a 2–4 times faster full commit or a win over
+Linux. Tree-log fsync and avoiding mounted-volume superblock rereads are
+separate changes with separate durability contracts.
 
 ## Matched benchmark protocol
 

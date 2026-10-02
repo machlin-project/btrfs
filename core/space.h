@@ -7,6 +7,8 @@
 
 struct bt_space;
 
+#define BT_SPACE_MAX_CHANGES 131072U
+
 struct bt_space_change {
 	uint64_t start;
 	uint64_t length;
@@ -65,6 +67,11 @@ enum btrfs_result bt_space_change_used(
 uint64_t bt_space_used(const struct bt_space *space, size_t chunk);
 size_t bt_space_change_count(const struct bt_space *space);
 const struct bt_space_change *bt_space_change(const struct bt_space *space, size_t index);
+/* Normalizes a copied allocation log, never the allocator's ordered log.
+ * Extents are disjoint except for an exact allocation/release pair: space is
+ * never reused in a transaction. Sorts by chunk/address, cancels those pairs
+ * and merges adjacent changes of the same kind within one chunk. */
+enum btrfs_result bt_space_coalesce(struct bt_space_change *changes, size_t *count);
 void bt_space_destroy(struct bt_space *space);
 
 /* The allocation map an owner keeps across transactions (btrfs_allocation_map

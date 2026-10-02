@@ -233,6 +233,37 @@ bt_mut_release(void *context, void *allocation, size_t size)
 	env->release(env->context, allocation, size);
 }
 
+/* A verified source often already has the packed layout. Recognize it once
+ * on CoW and clear only its unused area, so the first edit can move the
+ * affected suffix directly. Valid leaves with gaps
+ * retain the general unpack/repack path. Never alter the committed source. */
+static void
+bt_mut_adopt_layout(struct bt_mutation *mutation, struct bt_mutable_node *node)
+{
+	struct bt_disk_header *header = bt_mut_header(node);
+	const struct bt_disk_item *items = (const void *)(header + 1);
+	size_t end = mutation->view.info.node_size - sizeof(*header);
+	size_t used;
+	uint32_t count = bt_mut_count(node);
+	uint32_t i;
+
+	if (header->level == 0) {
+		for (i = 0; i < count; i++) {
+			if ((uint64_t)bt_u32(items[i].offset) + bt_u32(items[i].size) != end) {
+				return;
+			}
+			end = bt_u32(items[i].offset);
+		}
+		used = count * sizeof(*items);
+	} else {
+		used = count * sizeof(struct bt_disk_pointer);
+	}
+	if (used <= end) {
+		bt_zero((uint8_t *)(header + 1) + used, end - used);
+		node->packed = 1;
+	}
+}
+
 static enum btrfs_result
 bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source, uint64_t original,
     struct bt_mutable_node **result)
@@ -257,7 +288,12 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 		return BTRFS_NO_MEMORY;
 	}
 	bt_zero(node, sizeof(*node));
-	node->bytes = env->allocate(env->context, mutation->view.info.node_size);
+	if (env->cache != NULL) {
+		node->bytes = bt_cache_reuse(env->cache, mutation->view.info.node_size, env);
+	}
+	if (node->bytes == NULL) {
+		node->bytes = env->allocate(env->context, mutation->view.info.node_size);
+	}
 	if (node->bytes == NULL) {
 		env->release(env->context, node, sizeof(*node));
 		return BTRFS_NO_MEMORY;
@@ -301,6 +337,9 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 	bt_put64(&header->generation, mutation->view.info.generation);
 	bt_put64(&header->flags, BT_HEADER_WRITTEN | BT_HEADER_MIXED_BACKREF);
 	header->level = root.level;
+	if (original != 0) {
+		bt_mut_adopt_layout(mutation, node);
+	}
 	bucket = bt_mut_hash(address);
 	node->next = mutation->logical[bucket];
 	mutation->logical[bucket] = node;
@@ -575,9 +614,11 @@ bt_mut_leaf_in_place(struct bt_mutation *mutation, struct bt_mutable_node *node,
 		bt_put32(&items[slot].size, (uint32_t)new_length);
 		bt_copy(body + end - new_length, value, new_length);
 	}
-	for (i = edit == BT_DELETE ? slot : slot + 1; i < total; i++) {
-		bt_put32(&items[i].offset,
-		    (uint32_t)(bt_u32(items[i].offset) + old_length - new_length));
+	if (old_length != new_length) {
+		for (i = edit == BT_DELETE ? slot : slot + 1; i < total; i++) {
+			bt_put32(&items[i].offset,
+			    (uint32_t)(bt_u32(items[i].offset) + old_length - new_length));
+		}
 	}
 	if (moved > data_end) {
 		bt_zero(body + data_end, moved - data_end);
@@ -637,6 +678,76 @@ bt_mut_leaf(struct bt_mutation *mutation, struct bt_mutable_node *node, struct b
 	return bt_mut_rebuild(mutation, node, count, right);
 }
 
+/* Move a same-size record within one packed leaf. Only the interval between
+ * the two slots moves; its payload and headers each move once. Keeping the
+ * occupancy constant avoids a transient underfull leaf between delete and
+ * insert, and never changes the wire format or the committed source. */
+static enum btrfs_result
+bt_mut_leaf_rekey(struct bt_mutation *mutation, struct bt_mutable_node *node, struct bt_key old_key,
+    struct bt_key new_key, const void *value, size_t length, int *handled)
+{
+	struct bt_disk_header *header = bt_mut_header(node);
+	struct bt_disk_item *items = (void *)(header + 1);
+	uint8_t *body = (uint8_t *)(header + 1);
+	size_t body_size = mutation->view.info.node_size - sizeof(*header);
+	size_t old_offset;
+	size_t offset;
+	size_t end;
+	uint32_t count = bt_mut_count(node);
+	uint32_t from = bt_mut_slot(node, old_key, 0);
+	uint32_t to;
+	uint32_t i;
+
+	*handled = 1;
+	if (from == count || bt_key_compare(bt_mut_key(node, from), old_key) != 0) {
+		return BTRFS_NOT_FOUND;
+	}
+	if (!node->packed || bt_u32(items[from].size) != length) {
+		*handled = 0;
+		return BTRFS_OK;
+	}
+	to = bt_mut_slot(node, new_key, 0);
+	if (to < count && bt_key_compare(bt_mut_key(node, to), new_key) == 0) {
+		return BTRFS_EXISTS;
+	}
+	to -= to > from;
+	old_offset = bt_u32(items[from].offset);
+	offset = old_offset;
+	if (to > from) {
+		offset = bt_u32(items[to].offset);
+		if (length != 0) {
+			bt_move(body + offset + length, body + offset, old_offset - offset);
+		}
+		bt_move(items + from, items + from + 1, (to - from) * sizeof(*items));
+		if (length != 0) {
+			for (i = from; i < to; i++) {
+				bt_put32(
+				    &items[i].offset, bt_u32(items[i].offset) + (uint32_t)length);
+			}
+		}
+	} else if (to < from) {
+		end = to == 0 ? body_size : bt_u32(items[to - 1].offset);
+		offset = end - length;
+		if (length != 0) {
+			bt_move(body + old_offset, body + old_offset + length,
+			    end - old_offset - length);
+		}
+		bt_move(items + to + 1, items + to, (from - to) * sizeof(*items));
+		if (length != 0) {
+			for (i = to + 1; i <= from; i++) {
+				bt_put32(
+				    &items[i].offset, bt_u32(items[i].offset) - (uint32_t)length);
+			}
+		}
+	}
+	bt_key_encode(&items[to].key, new_key);
+	bt_put32(&items[to].offset, (uint32_t)offset);
+	bt_put32(&items[to].size, (uint32_t)length);
+	bt_copy(body + offset, value, length);
+	node->checksum_valid = 0;
+	return BTRFS_OK;
+}
+
 /* A sibling absorbed into the edited node (right), or the sibling that absorbed
  * it (left), as decided before the parent is updated. */
 struct bt_mut_merge {
@@ -662,6 +773,24 @@ bt_mut_used(const uint8_t *bytes)
 	return used;
 }
 
+/* Packed leaves put the last item's payload at the bottom of the data area.
+ * Its offset therefore gives the total occupancy without summing every item
+ * after every edit. Linux-authored leaves need not have this layout. */
+static size_t
+bt_mut_node_used(struct bt_mutation *mutation, struct bt_mutable_node *node)
+{
+	const struct bt_disk_header *header = bt_mut_header(node);
+	const struct bt_disk_item *items = (const void *)(header + 1);
+	uint32_t count = bt_mut_count(node);
+
+	if (header->level != 0 || !node->packed) {
+		return bt_mut_used(node->bytes);
+	}
+	return count == 0 ? 0
+			  : count * sizeof(*items) + mutation->view.info.node_size -
+		sizeof(*header) - bt_u32(items[count - 1].offset);
+}
+
 /* Linux rebalances leaves below a third and nodes below a quarter of capacity. */
 static int
 bt_mut_underfull(struct bt_mutation *mutation, struct bt_mutable_node *node)
@@ -669,7 +798,7 @@ bt_mut_underfull(struct bt_mutation *mutation, struct bt_mutable_node *node)
 	size_t capacity = mutation->view.info.node_size - sizeof(struct bt_disk_header);
 
 	return bt_mut_header(node)->level == 0
-	    ? bt_mut_used(node->bytes) < capacity / 3
+	    ? bt_mut_node_used(mutation, node) < capacity / 3
 	    : bt_mut_count(node) < capacity / sizeof(struct bt_disk_pointer) / 4;
 }
 
@@ -716,7 +845,9 @@ bt_mut_merge(struct bt_mutation *mutation, struct bt_mutable_node *parent, uint3
 				return error;
 			}
 		}
-		if (bt_mut_used(bytes) + bt_mut_used(child->bytes) > capacity) {
+		if ((sibling == NULL ? bt_mut_used(bytes) : bt_mut_node_used(mutation, sibling)) +
+			bt_mut_node_used(mutation, child) >
+		    capacity) {
 			bt_tree_release(mutation->base, handle);
 			continue;
 		}
@@ -813,9 +944,9 @@ bt_mut_parent(struct bt_mutation *mutation, struct bt_mutable_node *parent, uint
 	return bt_mut_rebuild(mutation, parent, count, split);
 }
 
-enum btrfs_result
-bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_key key,
-    const void *value, size_t length, enum bt_edit edit)
+static enum btrfs_result
+bt_mutation_apply(struct bt_mutation *mutation, struct bt_root *root, struct bt_key key,
+    const void *value, size_t length, enum bt_edit edit, const struct bt_key *replacement)
 {
 	struct bt_mutable_node *path[BT_MAX_LEVEL];
 	uint32_t slots[BT_MAX_LEVEL];
@@ -834,6 +965,8 @@ bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_k
 	uint8_t level;
 	uint8_t top;
 	int has_upper = 0;
+	int handled = 0;
+	int insert_after = 0;
 	enum btrfs_result error;
 
 	if (mutation == NULL || root == NULL || edit < BT_INSERT || edit > BT_DELETE ||
@@ -881,7 +1014,22 @@ bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_k
 		current.generation = bt_u64(pointers[slots[level]].generation);
 		current.level = level - 1;
 	}
-	error = bt_mut_leaf(mutation, path[0], key, value, length, edit, &right);
+	if (replacement != NULL && bt_key_compare(*replacement, key) != 0) {
+		/* Restrict the direct move to this leaf's existing parent interval.
+		 * Crossing it follows the ordinary two bounded editor descents. */
+		if (bt_mut_count(path[0]) != 0 &&
+		    bt_key_compare(*replacement, bt_mut_key(path[0], 0)) >= 0 &&
+		    (!has_upper || bt_key_compare(*replacement, upper) < 0)) {
+			error = bt_mut_leaf_rekey(
+			    mutation, path[0], key, *replacement, value, length, &handled);
+		}
+		if (!handled) {
+			error = bt_mut_leaf(mutation, path[0], key, NULL, 0, BT_DELETE, &right);
+			insert_after = 1;
+		}
+	} else {
+		error = bt_mut_leaf(mutation, path[0], key, value, length, edit, &right);
+	}
 	if (error != BTRFS_OK) {
 		goto failed;
 	}
@@ -943,10 +1091,26 @@ bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_k
 		node->packed = 0;
 	}
 	*root = bt_mut_root(node);
-	return BTRFS_OK;
+	return insert_after
+	    ? bt_mutation_apply(mutation, root, *replacement, value, length, BT_INSERT, NULL)
+	    : BTRFS_OK;
 failed:
 	mutation->failure = error;
 	return error;
+}
+
+enum btrfs_result
+bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_key key,
+    const void *value, size_t length, enum bt_edit edit)
+{
+	return bt_mutation_apply(mutation, root, key, value, length, edit, NULL);
+}
+
+enum btrfs_result
+bt_mutation_rekey(struct bt_mutation *mutation, struct bt_root *root, struct bt_key old_key,
+    struct bt_key new_key, const void *value, size_t length)
+{
+	return bt_mutation_apply(mutation, root, old_key, value, length, BT_REPLACE, &new_key);
 }
 
 enum btrfs_result
@@ -1049,12 +1213,85 @@ bt_mutation_new_root(struct bt_mutation *mutation, struct bt_root source, uint64
 	return BTRFS_OK;
 }
 
+/* Exact lookups whose entire path is private need no cursor buffers or pins:
+ * the single writer copies the value before another edit can run. Preserve
+ * identity, parent first-key and ancestor upper-bound checks. An untouched
+ * node falls back to the ordinary verified cursor, never to raw disk bytes. */
+static enum btrfs_result
+bt_mut_find_private(struct bt_mutation *mutation, struct bt_root root, struct bt_key key,
+    struct bt_record *record, int *handled)
+{
+	struct bt_mutable_node *node;
+	const struct bt_disk_header *header;
+	const struct bt_disk_item *items;
+	const struct bt_disk_pointer *pointers;
+	struct bt_key first = { 0 };
+	struct bt_key upper = { 0 };
+	uint8_t top = root.level;
+	uint32_t count;
+	uint32_t slot;
+	size_t stride;
+	int has_upper = 0;
+
+	*handled = 1;
+	if (root.level >= BT_MAX_LEVEL) {
+		return BTRFS_CORRUPT;
+	}
+	/* At most BT_MAX_LEVEL nodes; root.level decreases at each step. */
+	for (;;) {
+		node = bt_mut_find_node(mutation, root.address);
+		if (node == NULL) {
+			*handled = 0;
+			return BTRFS_OK;
+		}
+		header = bt_mut_header(node);
+		count = bt_mut_count(node);
+		stride = root.level == 0 ? sizeof(*items) : sizeof(*pointers);
+		if (node->discarded || header->level != root.level ||
+		    (bt_file_tree(root.owner) ? !bt_file_tree(bt_u64(header->owner))
+					      : bt_u64(header->owner) != root.owner) ||
+		    bt_u64(header->generation) != root.generation ||
+		    root.generation != mutation->view.info.generation ||
+		    !bt_equal(header->fsid, mutation->view.metadata_uuid, BTRFS_UUID_SIZE) ||
+		    count > (mutation->view.info.node_size - sizeof(*header)) / stride ||
+		    (count == 0 && root.level != 0)) {
+			return BTRFS_CORRUPT;
+		}
+		if (root.level < top &&
+		    (count == 0 || bt_key_compare(first, bt_mut_key(node, 0)) != 0 ||
+			(has_upper && bt_key_compare(bt_mut_key(node, count - 1), upper) >= 0))) {
+			return BTRFS_CORRUPT;
+		}
+		slot = bt_mut_slot(node, key, root.level != 0);
+		if (root.level == 0) {
+			if (slot == count || bt_key_compare(bt_mut_key(node, slot), key) != 0) {
+				return BTRFS_NOT_FOUND;
+			}
+			items = (const void *)(header + 1);
+			record->key = key;
+			record->data = (const uint8_t *)(header + 1) + bt_u32(items[slot].offset);
+			record->size = bt_u32(items[slot].size);
+			return BTRFS_OK;
+		}
+		pointers = (const void *)(header + 1);
+		first = bt_key_decode(&pointers[slot].key);
+		if (slot + 1 < count) {
+			upper = bt_key_decode(&pointers[slot + 1].key);
+			has_upper = 1;
+		}
+		root.address = bt_u64(pointers[slot].bytenr);
+		root.generation = bt_u64(pointers[slot].generation);
+		root.level--;
+	}
+}
+
 enum btrfs_result
 bt_mutation_find(struct bt_mutation *mutation, struct bt_root root, struct bt_key key, void *value,
     size_t capacity, size_t *length)
 {
 	struct bt_cursor cursor;
 	struct bt_record record;
+	int handled;
 	enum btrfs_result error;
 
 	if (length == NULL) {
@@ -1067,10 +1304,15 @@ bt_mutation_find(struct bt_mutation *mutation, struct bt_root root, struct bt_ke
 	if (mutation->failure != BTRFS_OK) {
 		return mutation->failure;
 	}
-	bt_cursor_init(&cursor, &mutation->view, root);
-	error = bt_cursor_seek(&cursor, key, 0);
+	error = bt_mut_find_private(mutation, root, key, &record, &handled);
+	if (!handled) {
+		bt_cursor_init(&cursor, &mutation->view, root);
+		error = bt_cursor_seek(&cursor, key, 0);
+		if (error == BTRFS_OK) {
+			(void)bt_cursor_record(&cursor, &record);
+		}
+	}
 	if (error == BTRFS_OK) {
-		(void)bt_cursor_record(&cursor, &record);
 		if (bt_key_compare(record.key, key) != 0) {
 			error = BTRFS_NOT_FOUND;
 		} else {
@@ -1084,7 +1326,9 @@ bt_mutation_find(struct bt_mutation *mutation, struct bt_root root, struct bt_ke
 			}
 		}
 	}
-	bt_cursor_fini(&cursor);
+	if (!handled) {
+		bt_cursor_fini(&cursor);
+	}
 	return error;
 }
 
@@ -1183,12 +1427,6 @@ bt_mutation_accept(struct bt_mutation *mutation)
 		if (mutation->nodes[i]->discarded) {
 			mutation->allocator.release(
 			    mutation->allocator.context, mutation->nodes[i]->address);
-		} else if (mutation->base->env.cache != NULL) {
-			/* Published and durable: the next view reads these bytes without
-			 * fetching and verifying them again. */
-			bt_cache_put(mutation->base->env.cache, bt_mut_root(mutation->nodes[i]),
-			    mutation->view.info.node_size, mutation->nodes[i]->bytes,
-			    bt_mut_root(mutation->nodes[i]).owner);
 		}
 	}
 	mutation->accepted = 1;
@@ -1219,8 +1457,15 @@ bt_mutation_destroy(struct bt_mutation *mutation)
 		node = mutation->nodes[i];
 		if (!mutation->accepted) {
 			mutation->allocator.release(mutation->allocator.context, node->address);
+		} else if (!node->discarded && env->cache != NULL) {
+			/* The published buffer outlives the transaction in the cache.
+			 * Transfer at destruction, after every private view has retired. */
+			bt_cache_take(env->cache, bt_mut_root(node), mutation->view.info.node_size,
+			    &node->bytes, bt_mut_root(node).owner, env);
 		}
-		env->release(env->context, node->bytes, mutation->view.info.node_size);
+		if (node->bytes != NULL) {
+			env->release(env->context, node->bytes, mutation->view.info.node_size);
+		}
 		env->release(env->context, node, sizeof(*node));
 	}
 	if (mutation->records != NULL) {

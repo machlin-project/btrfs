@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "encode.h"
 #include "mutable.h"
+#include "fst.h"
+#include "space.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -342,6 +344,47 @@ publish_tree(struct fixture *fixture, struct bt_mutation *mutation)
 	REQUIRE(fixture->live_bytes == 0);
 }
 
+/* Compare exact private lookups against the independent model on wholly
+ * private paths and paths that reach untouched committed children. */
+static void
+require_find(struct bt_mutation *mutation, struct bt_root root, const struct model_value *model)
+{
+	uint8_t bytes[VALUE_MAX];
+	struct bt_key absent;
+	struct bt_root invalid;
+	size_t length;
+	unsigned i;
+	enum btrfs_result error;
+
+	for (i = 0; i < KEYS; i++) {
+		error = bt_mutation_find(mutation, root, key(i), bytes, sizeof(bytes), &length);
+		REQUIRE(error == (model[i].present ? BTRFS_OK : BTRFS_NOT_FOUND));
+		if (model[i].present) {
+			REQUIRE(length == model[i].length &&
+			    memcmp(bytes, model[i].bytes, length) == 0);
+			invalid = root;
+			invalid.owner =
+			    root.owner == BTRFS_TOP_LEVEL_TREE ? 256 : BTRFS_TOP_LEVEL_TREE;
+			REQUIRE(bt_mutation_find(mutation, invalid, key(i), bytes, sizeof(bytes),
+				    &length) == BTRFS_OK);
+			REQUIRE(length == model[i].length &&
+			    memcmp(bytes, model[i].bytes, length) == 0);
+		}
+		absent = key(i);
+		absent.offset++;
+		REQUIRE(bt_mutation_find(mutation, root, absent, bytes, sizeof(bytes), &length) ==
+		    BTRFS_NOT_FOUND);
+	}
+	invalid = root;
+	invalid.generation++;
+	REQUIRE(bt_mutation_find(mutation, invalid, key(1), bytes, sizeof(bytes), &length) ==
+	    BTRFS_CORRUPT);
+	invalid = root;
+	invalid.level = BT_MAX_LEVEL;
+	REQUIRE(bt_mutation_find(mutation, invalid, key(1), bytes, sizeof(bytes), &length) ==
+	    BTRFS_CORRUPT);
+}
+
 static void
 exercise(uint32_t node_size, int dup)
 {
@@ -374,6 +417,7 @@ exercise(uint32_t node_size, int dup)
 		if (i % 100 == 0) {
 			verify(bt_mutation_view(mutation), root, model);
 			require_packed(mutation);
+			require_find(mutation, root, model);
 		}
 	}
 	REQUIRE(node_size != 4096 || root.level >= 2);
@@ -407,6 +451,7 @@ exercise(uint32_t node_size, int dup)
 			    model[index].length, BT_REPLACE) == BTRFS_OK);
 		if (i % 100 == 0) {
 			require_packed(mutation);
+			require_find(mutation, root, model);
 		}
 	}
 	verify(bt_mutation_view(mutation), root, model);
@@ -439,6 +484,7 @@ exercise(uint32_t node_size, int dup)
 		if (i % 100 == 0) {
 			verify(bt_mutation_view(mutation), root, model);
 			require_packed(mutation);
+			require_find(mutation, root, model);
 		}
 	}
 	REQUIRE(root.level == 0);
@@ -721,9 +767,310 @@ held_edit(void)
 	free(fixture.medium);
 }
 
+/* Tight and gapped, checksum-valid source leaves contain nonzero unused
+ * bytes. A CoW edit must preserve every value and the committed source, and
+ * structural edits must yield exactly the editor's canonical packed layout. */
+static void
+source_layout(void)
+{
+	struct fixture fixture;
+	struct bt_mutation *mutation;
+	struct bt_root root;
+	struct bt_disk_header *header;
+	struct bt_disk_item *items;
+	struct model_value *model;
+	struct bt_le32 checksum;
+	uint8_t *body;
+	uint8_t *original;
+	size_t end;
+	uint32_t node_size;
+	unsigned gapped;
+	unsigned i;
+
+	for (node_size = 4096; node_size <= 65536; node_size *= 4) {
+		for (gapped = 0; gapped < 2; gapped++) {
+			initialize(&fixture, node_size, 0);
+			model = calloc(KEYS, sizeof(*model));
+			original = malloc(node_size);
+			REQUIRE(model != NULL && original != NULL);
+			header = (void *)(fixture.medium + fixture.root.address);
+			body = (uint8_t *)(header + 1);
+			items = (void *)body;
+			end = node_size - sizeof(*header);
+			memset(body, 0xa5, end);
+			bt_put32(&header->count, 8);
+			for (i = 0; i < 8; i++) {
+				fill(&model[i], i, 0, i * 7);
+				end -= model[i].length + gapped * 3;
+				bt_key_encode(&items[i].key, key(i));
+				bt_put32(&items[i].offset, (uint32_t)end);
+				bt_put32(&items[i].size, (uint32_t)model[i].length);
+				memcpy(body + end, model[i].bytes, model[i].length);
+			}
+			bt_put32(&checksum,
+			    ~bt_crc32c(UINT32_MAX, (uint8_t *)header + BT_CSUM_SIZE,
+				node_size - BT_CSUM_SIZE));
+			memcpy(header->csum, &checksum, sizeof(checksum));
+			memcpy(original, header, node_size);
+			verify(&fixture.fs, fixture.root, model);
+			root = fixture.root;
+			mutation = begin(&fixture, 8);
+			fill(&model[2], 2, 1, model[2].length);
+			REQUIRE(bt_mutation_edit(mutation, &root, key(2), model[2].bytes,
+				    model[2].length, BT_REPLACE) == BTRFS_OK);
+			verify(bt_mutation_view(mutation), root, model);
+			if (!gapped) {
+				require_packed(mutation);
+			}
+			fill(&model[15], 15, 1, 27);
+			REQUIRE(bt_mutation_edit(mutation, &root, key(15), model[15].bytes,
+				    model[15].length, BT_INSERT) == BTRFS_OK);
+			verify(bt_mutation_view(mutation), root, model);
+			require_packed(mutation);
+			REQUIRE(bt_mutation_seal(mutation) == BTRFS_OK);
+			REQUIRE(memcmp(original, header, node_size) == 0);
+			bt_mutation_destroy(mutation);
+			REQUIRE(fixture.live_bytes == 0 && fixture.reservations == 0);
+			free(original);
+			free(model);
+			free(fixture.medium);
+		}
+	}
+}
+
+static void
+fst_model_verify(struct fixture *fixture, struct bt_mutation *mutation, struct bt_root root,
+    const uint8_t *free_sectors, size_t sectors)
+{
+	struct bt_fst_run *runs = malloc(sectors * sizeof(*runs));
+	size_t count = 0;
+	size_t i;
+	size_t first;
+	uint64_t sector = fixture->fs.info.sector_size;
+
+	REQUIRE(runs != NULL);
+	for (i = 0; i < sectors;) {
+		if (!free_sectors[i]) {
+			i++;
+			continue;
+		}
+		first = i;
+		while (i < sectors && free_sectors[i]) {
+			i++;
+		}
+		runs[count++] = (struct bt_fst_run){ fixture->chunk.logical + first * sector,
+			fixture->chunk.logical + i * sector };
+	}
+	REQUIRE(bt_fst_verify_group(
+		    bt_mutation_view(mutation), root, &fixture->chunk, runs, count) == BTRFS_OK);
+	free(runs);
+}
+
+/* A sector model checks batches in both representations, bitmap item edges,
+ * a short last bitmap, and all four combinations of neighbouring free bits. */
+static void
+fst_batches(void)
+{
+	struct fixture fixture;
+	struct bt_mutation *mutation;
+	struct bt_root root;
+	struct bt_disk_free_space_info info;
+	struct bt_space_change changes[16];
+	struct bt_key key;
+	uint8_t bits[BT_FREE_SPACE_BITMAP_BYTES];
+	uint8_t *model;
+	uint64_t sector;
+	uint64_t position;
+	uint64_t piece;
+	size_t sectors;
+	size_t first;
+	size_t last;
+	size_t i;
+	size_t j;
+	size_t count;
+	size_t length;
+	uint32_t seed = 1;
+	unsigned bitmap;
+	unsigned round;
+
+	for (bitmap = 0; bitmap < 2; bitmap++) {
+		initialize(&fixture, 4096, 0);
+		mutation = begin(&fixture, 512);
+		root = fixture.root;
+		sector = fixture.fs.info.sector_size;
+		sectors = (size_t)(fixture.chunk.length / sector);
+		model = malloc(sectors);
+		REQUIRE(model != NULL);
+		memset(model, 1, sectors);
+		bt_put32(&info.extent_count, 1);
+		bt_put32(&info.flags, bitmap ? BT_FREE_SPACE_USING_BITMAPS : 0);
+		key = (struct bt_key){ fixture.chunk.logical, fixture.chunk.length,
+			BT_FREE_SPACE_INFO };
+		REQUIRE(bt_mutation_edit(mutation, &root, key, &info, sizeof(info), BT_INSERT) ==
+		    BTRFS_OK);
+		if (!bitmap) {
+			key.type = BT_FREE_SPACE_EXTENT;
+			REQUIRE(
+			    bt_mutation_edit(mutation, &root, key, NULL, 0, BT_INSERT) == BTRFS_OK);
+		} else {
+			for (position = 0; position < fixture.chunk.length; position += piece) {
+				piece = fixture.chunk.length - position;
+				if (piece > sizeof(bits) * 8 * sector) {
+					piece = sizeof(bits) * 8 * sector;
+				}
+				memset(bits, 0, sizeof(bits));
+				for (i = 0; i < piece / sector; i++) {
+					bits[i / 8] |= (uint8_t)(1U << (i % 8));
+				}
+				key = (struct bt_key){ fixture.chunk.logical + position, piece,
+					BT_FREE_SPACE_BITMAP };
+				REQUIRE(
+				    bt_mutation_edit(mutation, &root, key, bits,
+					(size_t)((piece / sector + 7) / 8), BT_INSERT) == BTRFS_OK);
+			}
+		}
+		/* Across a bitmap boundary, then exactly up to and after it. */
+		for (round = 0; round < 6; round++) {
+			first = BT_FREE_SPACE_BITMAP_BYTES * 8 -
+			    (round < 2		? 1
+				    : round < 4 ? 2
+						: 0);
+			last = first + 2;
+			REQUIRE(bt_fst_change(mutation, &root, &fixture.chunk,
+				    fixture.chunk.logical + first * sector, (last - first) * sector,
+				    !(round & 1)) == BTRFS_OK);
+			memset(model + first, round & 1, last - first);
+			fst_model_verify(&fixture, mutation, root, model, sectors);
+		}
+		for (round = 0; round < 64; round++) {
+			count = 0;
+			for (i = 0; i < 16; i++) {
+				seed = seed * 1664525U + 1013904223U;
+				first = i * 256 + ((seed >> 16) % 240);
+				last = first + 1 + ((seed >> 24) % 15);
+				if (last > sectors) {
+					last = sectors;
+				}
+				for (j = first + 1; j < last && model[j] == model[first]; j++) {
+				}
+				last = j;
+				changes[count++] = (struct bt_space_change){ fixture.chunk.logical +
+					    first * sector,
+					(last - first) * sector, 0, model[first] };
+				memset(model + first, !model[first], last - first);
+			}
+			REQUIRE(bt_fst_changes(mutation, &root, &fixture.chunk, changes, count) ==
+			    BTRFS_OK);
+			fst_model_verify(&fixture, mutation, root, model, sectors);
+		}
+		REQUIRE(bt_fst_change(mutation, &root, &fixture.chunk,
+			    fixture.chunk.logical + fixture.chunk.length + sector, sector,
+			    1) == BTRFS_CORRUPT);
+		REQUIRE(bt_fst_change(mutation, &root, &fixture.chunk, fixture.chunk.logical, 0,
+			    1) == BTRFS_CORRUPT);
+		REQUIRE(bt_fst_change(mutation, &root, &fixture.chunk, fixture.chunk.logical + 1,
+			    sector, 1) == BTRFS_CORRUPT);
+		REQUIRE(bt_fst_change(mutation, &root, &fixture.chunk, fixture.chunk.logical,
+			    sector, !model[0]) == BTRFS_CORRUPT);
+		key = (struct bt_key){ fixture.chunk.logical, fixture.chunk.length,
+			BT_FREE_SPACE_INFO };
+		REQUIRE(bt_mutation_find(mutation, root, key, &info, sizeof(info), &length) ==
+		    BTRFS_OK);
+		bt_put32(&info.flags, UINT32_MAX);
+		REQUIRE(bt_mutation_edit(mutation, &root, key, &info, sizeof(info), BT_REPLACE) ==
+		    BTRFS_OK);
+		REQUIRE(bt_fst_change(mutation, &root, &fixture.chunk, fixture.chunk.logical,
+			    sector, model[0]) == BTRFS_UNSUPPORTED);
+		bt_mutation_destroy(mutation);
+		REQUIRE(fixture.live_bytes == 0 && fixture.reservations == 0);
+		free(model);
+		free(fixture.medium);
+	}
+}
+
+/* Rekey both ways inside leaves and across parent intervals, with equal,
+ * zero and changed payload lengths. The model also keeps the committed tree
+ * unchanged while the new tree is edited and checked in canonical layout. */
+static void
+rekeys(void)
+{
+	static const uint32_t sizes[] = { 4096, 16384, 65536 };
+	struct fixture fixture;
+	struct bt_mutation *mutation;
+	struct bt_root root;
+	struct model_value *model;
+	struct model_value *original;
+	size_t held;
+	size_t length;
+	unsigned size;
+	unsigned round;
+	unsigned from;
+	unsigned to;
+	unsigned i;
+
+	for (size = 0; size < sizeof(sizes) / sizeof(sizes[0]); size++) {
+		initialize(&fixture, sizes[size], 0);
+		model = calloc(KEYS, sizeof(*model));
+		original = calloc(KEYS, sizeof(*original));
+		REQUIRE(model != NULL && original != NULL);
+		root = fixture.root;
+		mutation = begin(&fixture, SLOTS / 2);
+		for (i = 0; i < KEYS; i += 2) {
+			fill(&model[i], i, 0, i % 4 == 0 ? 0 : 16 + i % 97);
+			REQUIRE(bt_mutation_edit(mutation, &root, key(i), model[i].bytes,
+				    model[i].length, BT_INSERT) == BTRFS_OK);
+		}
+		publish_tree(&fixture, mutation);
+		fixture.root = root;
+		held = fixture.reservations;
+		memcpy(original, model, KEYS * sizeof(*model));
+		mutation = begin(&fixture, SLOTS / 2);
+		for (round = 0; round < 350; round++) {
+			from = round * 137U % KEYS;
+			to = round * 281U % KEYS;
+			/* The model always has both present and absent keys. */
+			for (i = 0; i < KEYS && !model[from].present; i++) {
+				from = (from + 1) % KEYS;
+			}
+			REQUIRE(i < KEYS);
+			for (i = 0; i < KEYS && model[to].present; i++) {
+				to = (to + 1) % KEYS;
+			}
+			REQUIRE(i < KEYS);
+			length = model[from].length + (round % 11 == 0 ? 17 : 0);
+			fill(&model[to], to, round + 1, length);
+			REQUIRE(bt_mutation_rekey(mutation, &root, key(from), key(to),
+				    model[to].bytes, length) == BTRFS_OK);
+			model[from].present = 0;
+			verify(bt_mutation_view(mutation), root, model);
+			require_packed(mutation);
+		}
+		REQUIRE(bt_mutation_seal(mutation) == BTRFS_OK);
+		verify(&fixture.fs, fixture.root, original);
+		bt_mutation_destroy(mutation);
+		REQUIRE(fixture.live_bytes == 0 && fixture.reservations == held);
+		for (i = 0; i < 2; i++) {
+			root = fixture.root;
+			mutation = begin(&fixture, SLOTS / 2);
+			REQUIRE(bt_mutation_rekey(mutation, &root, key(i), key(2), NULL, 0) ==
+			    (i == 0 ? BTRFS_EXISTS : BTRFS_NOT_FOUND));
+			REQUIRE(bt_mutation_seal(mutation) ==
+			    (i == 0 ? BTRFS_EXISTS : BTRFS_NOT_FOUND));
+			bt_mutation_destroy(mutation);
+			REQUIRE(fixture.live_bytes == 0 && fixture.reservations == held);
+		}
+		free(original);
+		free(model);
+		free(fixture.medium);
+	}
+}
+
 int
 main(void)
 {
+	rekeys();
+	source_layout();
+	fst_batches();
 	three_way_split();
 	rebalance();
 	exercise(4096, 0);

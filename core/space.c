@@ -1321,7 +1321,7 @@ bt_space_log(struct bt_space *space, size_t chunk, uint64_t address, uint64_t si
 	size_t capacity;
 
 	if (space->change_count == space->change_capacity) {
-		if (space->change_capacity == BT_SPACE_MAX_GAPS) {
+		if (space->change_capacity == BT_SPACE_MAX_CHANGES) {
 			return BTRFS_UNSUPPORTED;
 		}
 		capacity = space->change_capacity == 0 ? 256 : space->change_capacity * 2;
@@ -1352,6 +1352,92 @@ const struct bt_space_change *
 bt_space_change(const struct bt_space *space, size_t index)
 {
 	return &space->changes[index];
+}
+
+static int
+bt_space_change_after(const struct bt_space_change *a, const struct bt_space_change *b)
+{
+	return a->chunk != b->chunk ? a->chunk > b->chunk
+	    : a->start != b->start  ? a->start > b->start
+				    : a->length > b->length;
+}
+
+static void
+bt_space_change_sift(struct bt_space_change *changes, size_t root, size_t count)
+{
+	struct bt_space_change swap;
+	size_t child;
+
+	for (;;) {
+		child = root * 2 + 1;
+		if (child >= count) {
+			return;
+		}
+		if (child + 1 < count &&
+		    bt_space_change_after(&changes[child + 1], &changes[child])) {
+			child++;
+		}
+		if (!bt_space_change_after(&changes[child], &changes[root])) {
+			return;
+		}
+		swap = changes[root];
+		changes[root] = changes[child];
+		changes[child] = swap;
+		root = child;
+	}
+}
+
+enum btrfs_result
+bt_space_coalesce(struct bt_space_change *changes, size_t *count)
+{
+	struct bt_space_change change;
+	struct bt_space_change previous = { 0 };
+	struct bt_space_change *last;
+	size_t i;
+	size_t kept = 0;
+	size_t total = *count;
+
+	if (total > BT_SPACE_MAX_CHANGES) {
+		return BTRFS_UNSUPPORTED;
+	}
+	/* Heap sort: O(n log n), constant extra storage, n bounded by the log. */
+	for (i = total / 2; i != 0; i--) {
+		bt_space_change_sift(changes, i - 1, total);
+	}
+	for (i = total; i > 1; i--) {
+		change = changes[0];
+		changes[0] = changes[i - 1];
+		changes[i - 1] = change;
+		bt_space_change_sift(changes, 0, i - 1);
+	}
+	for (i = 0; i < total; i++) {
+		change = changes[i];
+		if (change.length == 0 || change.length > UINT64_MAX - change.start ||
+		    (i != 0 && change.chunk == previous.chunk &&
+			change.start < previous.start + previous.length)) {
+			return BTRFS_CORRUPT;
+		}
+		previous = change;
+		if (i + 1 < total && change.chunk == changes[i + 1].chunk &&
+		    change.start == changes[i + 1].start &&
+		    change.length == changes[i + 1].length) {
+			if (!!change.allocate == !!changes[i + 1].allocate) {
+				return BTRFS_CORRUPT;
+			}
+			i++;
+			continue;
+		}
+		last = kept == 0 ? NULL : &changes[kept - 1];
+		if (last != NULL && last->chunk == change.chunk &&
+		    !!last->allocate == !!change.allocate &&
+		    last->start + last->length == change.start) {
+			last->length += change.length;
+		} else {
+			changes[kept++] = change;
+		}
+	}
+	*count = kept;
+	return BTRFS_OK;
 }
 
 enum btrfs_result

@@ -41,9 +41,9 @@ RECOVERY_REQUIRED; `tests/check_recovery.py` exercises it on a copy):
 ```
 
 `btrfs-bench IMAGE [--cache MiB] [--write [--durable]]` measures per-operation
-wall time, backend reads, read bytes and allocations for sequential and random
-reads, lookups, directory streams with and without inode attributes, and (on a
-copy, which it modifies) single-file commits, an 8 MiB write, and creates
+wall and process CPU time, backend reads, read bytes and allocations for
+sequential and random reads, lookups, directory streams with and without inode
+attributes, and (on a copy, which it modifies) single-file commits, an 8 MiB write, and creates
 committed one by one or grouped with one sync. Barriers are skipped unless
 `--durable` keeps the image's `F_FULLFSYNC`. Build it without sanitizers for
 meaningful times:
@@ -54,6 +54,13 @@ meson compile -C .build-release btrfs-bench
 cp artifacts/fixtures/transactions.raw /tmp/bench.raw
 .build-release/btrfs-bench /tmp/bench.raw --cache 64 --write
 ```
+
+`--volume-only --volume-files 2000` measures just the single-commit and grouped
+create series (1 through 100,000 files per series, default 200). It implies
+`--write` and does not require `/big` or `/many`. Use a fresh image copy for each
+trial, alternate the binaries at least seven times and report CPU time beside
+wall time: host file I/O can add large stalls even when barriers are skipped.
+Both are image-backend measurements, not native mounted or Linux comparisons.
 
 Useful inspection commands:
 

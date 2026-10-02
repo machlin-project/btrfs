@@ -103,11 +103,14 @@ bt_extent_search(struct bt_extent_copy *copy, const struct bt_backref *reference
 	struct bt_le64 value;
 	uint64_t existing;
 	uint64_t wanted = reference->parent != 0 ? reference->parent : reference->root;
-	uint64_t hash = bt_backref_data_hash(reference->root, reference->inode, reference->offset);
+	uint64_t hash = 0;
 	uint8_t type = bt_ref_type(reference);
 	uint8_t found;
 	size_t size;
 
+	if (type == BT_EXTENT_DATA_REF) {
+		hash = bt_backref_data_hash(reference->root, reference->inode, reference->offset);
+	}
 	copy->found = 0;
 	for (copy->position = copy->start; copy->position < copy->size; copy->position += size) {
 		found = copy->bytes[copy->position];
@@ -480,14 +483,61 @@ bt_backref_add(struct bt_mutation *mutation, struct bt_root *extents, struct bt_
 	return error;
 }
 
+/* Apply a drop to an item already loaded by either the general reference
+ * operation or the CoW accounting pass. */
+static enum btrfs_result
+bt_extent_drop(struct bt_mutation *mutation, struct bt_root *extents, struct bt_key extent,
+    const struct bt_backref *reference, uint32_t count, struct bt_extent_copy *copy, int *freed)
+{
+	const struct bt_disk_extent_item *item;
+	uint32_t remaining;
+	size_t size = bt_ref_size(bt_ref_type(reference));
+	enum btrfs_result error = BTRFS_OK;
+
+	if (error == BTRFS_OK &&
+	    bt_u64(((const struct bt_disk_extent_item *)copy->bytes)->refs) < count) {
+		error = BTRFS_CORRUPT;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_extent_search(copy, reference);
+	}
+	if (error == BTRFS_OK && copy->found) {
+		remaining = bt_inline_count(copy);
+		if (remaining < count) {
+			error = BTRFS_CORRUPT;
+		} else if (remaining == count) {
+			bt_move(copy->bytes + copy->position, copy->bytes + copy->position + size,
+			    copy->size - copy->position - size);
+			copy->size -= size;
+		} else {
+			bt_inline_set_count(copy, remaining - count);
+		}
+	} else if (error == BTRFS_OK) {
+		error =
+		    bt_keyed_change(mutation, extents, extent.objectid, reference, -(int64_t)count);
+	}
+	if (error == BTRFS_OK) {
+		bt_extent_add_refs(copy, -(int64_t)count);
+		item = (const void *)copy->bytes;
+		if (bt_u64(item->refs) != 0) {
+			error = bt_mutation_edit(
+			    mutation, extents, extent, copy->bytes, copy->size, BT_REPLACE);
+		} else if (copy->size != copy->start) {
+			/* A zero count with references still listed is inconsistent. */
+			error = BTRFS_CORRUPT;
+		} else {
+			error = bt_mutation_edit(mutation, extents, extent, NULL, 0, BT_DELETE);
+			*freed = error == BTRFS_OK;
+		}
+	}
+	return error;
+}
+
 enum btrfs_result
 bt_backref_drop(struct bt_mutation *mutation, struct bt_root *extents, struct bt_key extent,
     const struct bt_backref *reference, uint32_t count, int *freed)
 {
-	const struct bt_disk_extent_item *item;
 	struct bt_extent_copy copy;
-	uint32_t remaining;
-	size_t size = bt_ref_size(bt_ref_type(reference));
 	enum btrfs_result error;
 
 	*freed = 0;
@@ -498,40 +548,53 @@ bt_backref_drop(struct bt_mutation *mutation, struct bt_root *extents, struct bt
 	if (error == BTRFS_OK) {
 		error = bt_extent_load(mutation, *extents, extent, &copy);
 	}
-	if (error == BTRFS_OK &&
-	    bt_u64(((const struct bt_disk_extent_item *)copy.bytes)->refs) < count) {
-		error = BTRFS_CORRUPT;
+	if (error == BTRFS_OK) {
+		error = bt_extent_drop(mutation, extents, extent, reference, count, &copy, freed);
+	}
+	bt_extent_end(&copy);
+	return error;
+}
+
+enum btrfs_result
+bt_backref_release_tree(struct bt_mutation *mutation, struct bt_root *extents, struct bt_key extent,
+    uint64_t owner, const struct bt_root *replacement, uint64_t *refs, uint64_t *flags, int *freed,
+    int *replaced)
+{
+	struct bt_disk_extent_item *item;
+	struct bt_extent_copy copy;
+	struct bt_backref reference = { .root = owner };
+	struct bt_key target;
+	enum btrfs_result error;
+
+	*freed = 0;
+	*replaced = 0;
+	if (extent.type != BT_METADATA_ITEM) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_extent_begin(mutation, &copy);
+	if (error == BTRFS_OK) {
+		error = bt_extent_load(mutation, *extents, extent, &copy);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_extent_search(&copy, reference);
-	}
-	if (error == BTRFS_OK && copy.found) {
-		remaining = bt_inline_count(&copy);
-		if (remaining < count) {
-			error = BTRFS_CORRUPT;
-		} else if (remaining == count) {
-			bt_move(copy.bytes + copy.position, copy.bytes + copy.position + size,
-			    copy.size - copy.position - size);
-			copy.size -= size;
-		} else {
-			bt_inline_set_count(&copy, remaining - count);
-		}
-	} else if (error == BTRFS_OK) {
-		error =
-		    bt_keyed_change(mutation, extents, extent.objectid, reference, -(int64_t)count);
-	}
-	if (error == BTRFS_OK) {
-		bt_extent_add_refs(&copy, -(int64_t)count);
-		item = (const void *)copy.bytes;
-		if (bt_u64(item->refs) != 0) {
-			error = bt_mutation_edit(
-			    mutation, extents, extent, copy.bytes, copy.size, BT_REPLACE);
-		} else if (copy.size != copy.start) {
-			/* A zero count with references still listed is inconsistent. */
-			error = BTRFS_CORRUPT;
-		} else {
-			error = bt_mutation_edit(mutation, extents, extent, NULL, 0, BT_DELETE);
-			*freed = error == BTRFS_OK;
+		item = (void *)copy.bytes;
+		*refs = bt_u64(item->refs);
+		*flags = bt_u64(item->flags);
+		if (owner != 0 && *refs == 1 && !(*flags & BT_EXTENT_FLAG_FULL_BACKREF)) {
+			error = bt_extent_search(&copy, &reference);
+			if (error == BTRFS_OK && replacement != NULL && copy.found &&
+			    copy.size == copy.start + BT_TREE_REF_SIZE) {
+				target = (struct bt_key){ .objectid = replacement->address,
+					.type = BT_METADATA_ITEM,
+					.offset = replacement->level };
+				bt_put64(&item->generation, replacement->generation);
+				bt_put64(&item->flags, BT_EXTENT_FLAG_TREE);
+				error = bt_mutation_rekey(
+				    mutation, extents, extent, target, copy.bytes, copy.size);
+				*freed = *replaced = error == BTRFS_OK;
+			} else if (error == BTRFS_OK) {
+				error = bt_extent_drop(
+				    mutation, extents, extent, &reference, 1, &copy, freed);
+			}
 		}
 	}
 	bt_extent_end(&copy);

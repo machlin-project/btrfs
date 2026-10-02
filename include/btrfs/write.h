@@ -305,6 +305,13 @@ enum btrfs_result btrfs_transaction_evict(
 enum btrfs_result btrfs_transaction_clean_orphans(
     struct btrfs_transaction *transaction, uint64_t tree, size_t *cleaned);
 enum btrfs_result btrfs_transaction_commit(struct btrfs_transaction *transaction);
+/* Commits and returns an independently owned, immutable view of the published
+ * state, without mounting the device again. tree has btrfs_mount's meaning.
+ * All view storage and root validation are prepared before publication; *view
+ * stays NULL on failure or an unchanged transaction. Unmount a returned view
+ * after its readers retire; it does not borrow the transaction's storage. */
+enum btrfs_result btrfs_transaction_commit_view(
+    struct btrfs_transaction *transaction, uint64_t tree, struct btrfs_fs **view);
 void btrfs_transaction_destroy(struct btrfs_transaction *transaction);
 /* OK while the transaction can still commit; otherwise the error that made it
  * unusable (an operation failed after its first change) or READ_ONLY after

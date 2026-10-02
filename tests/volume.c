@@ -447,6 +447,19 @@ views_test(struct harness *harness)
 	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
 	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
 	REQUIRE(harness->overlay.writes == 0 && harness->overlay.flushes == 0);
+	/* A missing publication wrapper fails before any commit write and leaves
+	 * the last view usable; the uncommitted name never reaches readers. */
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_file(volume, transaction, "no-view-memory") == BTRFS_OK);
+	allocation_failure = 1;
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_NO_MEMORY);
+	allocation_failure = 0;
+	REQUIRE(harness->overlay.writes == 0 && harness->overlay.flushes == 0 &&
+	    btrfs_volume_failure(volume) == BTRFS_OK &&
+	    btrfs_volume_generation(volume) == generation);
+	new_fs = btrfs_volume_pin(volume, &new_view);
+	REQUIRE(!exists(new_fs, "/no-view-memory"));
+	btrfs_volume_unpin(volume, new_view);
 	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
 	REQUIRE(create_data_file(volume, transaction, "aborted") == BTRFS_OK);
 	REQUIRE(harness->overlay.writes != 0);

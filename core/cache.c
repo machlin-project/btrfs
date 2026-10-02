@@ -3,6 +3,9 @@
 
 /* Ways per set: a lookup compares at most this many entries. */
 #define BT_CACHE_WAYS 8U
+/* A set's worth of buffers can move from retired cache entries into the next
+ * private transaction. They are included in the configured node-byte budget. */
+#define BT_CACHE_SPARES BT_CACHE_WAYS
 /* Pin counters per entry. Every lookup pins the roots of the trees it walks,
  * so one shared counter per entry would bounce between processors; a lookup
  * uses the stripe its caller's stack address selects. */
@@ -22,6 +25,7 @@ struct bt_cache_entry {
 	uint64_t address;
 	uint64_t generation;
 	uint64_t owner;
+	uint8_t *bytes;
 	uint8_t replacing;
 	uint8_t level;
 	uint8_t used;
@@ -54,8 +58,11 @@ struct btrfs_cache {
 	/* Stripe-major: pins[stripe * entry count + entry]. */
 	uint32_t *pins;
 	struct bt_cache_hits *hits;
-	uint8_t *nodes;
 	uint8_t *hands;
+	uint8_t *spares[BT_CACHE_SPARES];
+	size_t spare_count;
+	size_t spare_limit;
+	size_t node_buffers;
 	/* Set (release) once the storage exists; lookups read it (acquire). */
 	int ready;
 	uint64_t misses;
@@ -103,8 +110,19 @@ bt_cache_release(struct btrfs_cache *cache)
 {
 	const struct btrfs_environment *env = &cache->environment;
 	size_t count = bt_cache_entry_count(cache);
+	size_t i;
 
+	while (cache->spare_count != 0) {
+		cache->spare_count--;
+		env->release(env->context, cache->spares[cache->spare_count], cache->node_size);
+	}
 	if (cache->entries != NULL) {
+		for (i = 0; i < count; i++) {
+			if (cache->entries[i].bytes != NULL) {
+				env->release(
+				    env->context, cache->entries[i].bytes, cache->node_size);
+			}
+		}
 		env->release(env->context, cache->entries, count * sizeof(*cache->entries));
 	}
 	if (cache->pins != NULL) {
@@ -114,16 +132,12 @@ bt_cache_release(struct btrfs_cache *cache)
 	if (cache->hits != NULL) {
 		env->release(env->context, cache->hits, BT_CACHE_STRIPES * sizeof(*cache->hits));
 	}
-	if (cache->nodes != NULL) {
-		env->release(env->context, cache->nodes, count * cache->node_size);
-	}
 	if (cache->hands != NULL) {
 		env->release(env->context, cache->hands, cache->sets);
 	}
 	cache->entries = NULL;
 	cache->pins = NULL;
 	cache->hits = NULL;
-	cache->nodes = NULL;
 	cache->hands = NULL;
 }
 
@@ -273,20 +287,22 @@ bt_cache_ready(struct btrfs_cache *cache, uint32_t node_size)
 	if (sets == 0) {
 		return 0;
 	}
+	cache->spare_limit = BT_CACHE_SPARES;
 	cache->node_size = node_size;
 	cache->sets = sets;
 	count = bt_cache_entry_count(cache);
 	cache->entries = env->allocate(env->context, count * sizeof(*cache->entries));
+	if (cache->entries != NULL) {
+		bt_zero(cache->entries, count * sizeof(*cache->entries));
+	}
 	cache->pins = env->allocate(env->context, BT_CACHE_STRIPES * count * sizeof(*cache->pins));
 	cache->hits = env->allocate(env->context, BT_CACHE_STRIPES * sizeof(*cache->hits));
-	cache->nodes = env->allocate(env->context, count * node_size);
 	cache->hands = env->allocate(env->context, sets);
 	if (cache->entries == NULL || cache->pins == NULL || cache->hits == NULL ||
-	    cache->nodes == NULL || cache->hands == NULL) {
+	    cache->hands == NULL) {
 		bt_cache_release(cache);
 		return 0;
 	}
-	bt_zero(cache->entries, count * sizeof(*cache->entries));
 	bt_zero(cache->pins, BT_CACHE_STRIPES * count * sizeof(*cache->pins));
 	bt_zero(cache->hits, BT_CACHE_STRIPES * sizeof(*cache->hits));
 	bt_zero(cache->hands, sets);
@@ -388,7 +404,7 @@ bt_cache_pin(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
 			__atomic_fetch_add(&cache->hits[stripe].count, 1, __ATOMIC_RELAXED);
 			*owner = __atomic_load_n(&entry->owner, __ATOMIC_RELAXED);
 			*handle = index * BT_CACHE_STRIPES + stripe;
-			return cache->nodes + index * node_size;
+			return entry->bytes;
 		}
 	}
 	__atomic_fetch_add(&cache->misses, 1, __ATOMIC_RELAXED);
@@ -437,9 +453,11 @@ bt_cache_claim(struct btrfs_cache *cache, size_t index)
 	return 1;
 }
 
-void
-bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, const void *node,
-    uint64_t owner)
+/* Takes a node buffer only from the cache's own allocator. A claimed entry
+ * has no readers; its bytes and ownership change before release publication. */
+static int
+bt_cache_store(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, const void *node,
+    uint64_t owner, int take)
 {
 	struct bt_cache_entry *entry = NULL;
 	struct bt_cache_entry *candidate;
@@ -447,18 +465,19 @@ bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
 	size_t index;
 	unsigned way;
 	unsigned step;
+	int stored = 0;
 
 	bt_cache_lock(cache);
 	if (!bt_cache_ready(cache, node_size)) {
 		bt_cache_unlock(cache);
-		return;
+		return 0;
 	}
 	set = bt_cache_set(cache, root.address);
 	/* Another reader may have stored the same node meanwhile. */
 	for (way = 0; way < BT_CACHE_WAYS; way++) {
 		if (bt_cache_matches(&cache->entries[set * BT_CACHE_WAYS + way], root)) {
 			bt_cache_unlock(cache);
-			return;
+			return 0;
 		}
 	}
 	/* CLOCK within the set: a free way, else the first unreferenced and
@@ -482,8 +501,43 @@ bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
 		}
 	}
 	if (entry != NULL) {
-		index = (size_t)(entry - cache->entries);
-		bt_copy(cache->nodes + index * node_size, node, node_size);
+		if (take) {
+			if (entry->bytes != NULL) {
+				if (cache->spare_count < cache->spare_limit &&
+				    cache->node_buffers < bt_cache_entry_count(cache)) {
+					cache->spares[cache->spare_count++] = entry->bytes;
+					cache->node_buffers++;
+				} else {
+					cache->environment.release(
+					    cache->environment.context, entry->bytes, node_size);
+				}
+			} else {
+				/* An empty entry can meet the byte limit only when a spare
+				 * holds its share of storage. Prefer this published node. */
+				if (cache->node_buffers == bt_cache_entry_count(cache)) {
+					cache->environment.release(cache->environment.context,
+					    cache->spares[--cache->spare_count], node_size);
+				} else {
+					cache->node_buffers++;
+				}
+			}
+			entry->bytes = (uint8_t *)node;
+		} else {
+			if (entry->bytes == NULL && cache->spare_count != 0) {
+				entry->bytes = cache->spares[--cache->spare_count];
+			}
+			if (entry->bytes == NULL) {
+				entry->bytes = cache->environment.allocate(
+				    cache->environment.context, node_size);
+				cache->node_buffers += entry->bytes != NULL;
+			}
+			if (entry->bytes == NULL) {
+				__atomic_store_n(&entry->replacing, 0, __ATOMIC_RELEASE);
+				bt_cache_unlock(cache);
+				return 0;
+			}
+			bt_copy(entry->bytes, node, node_size);
+		}
 		__atomic_store_n(&entry->address, root.address, __ATOMIC_RELAXED);
 		__atomic_store_n(&entry->generation, root.generation, __ATOMIC_RELAXED);
 		__atomic_store_n(&entry->level, root.level, __ATOMIC_RELAXED);
@@ -491,6 +545,48 @@ bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size,
 		__atomic_store_n(&entry->used, 1, __ATOMIC_RELAXED);
 		__atomic_store_n(&entry->referenced, 0, __ATOMIC_RELAXED);
 		__atomic_store_n(&entry->replacing, 0, __ATOMIC_RELEASE);
+		stored = 1;
 	}
 	bt_cache_unlock(cache);
+	return stored;
+}
+
+void
+bt_cache_put(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, const void *node,
+    uint64_t owner)
+{
+	(void)bt_cache_store(cache, root, node_size, node, owner, 0);
+}
+
+void
+bt_cache_take(struct btrfs_cache *cache, struct bt_root root, uint32_t node_size, uint8_t **node,
+    uint64_t owner, const struct btrfs_environment *source)
+{
+	if (source->context != cache->environment.context ||
+	    source->allocate != cache->environment.allocate ||
+	    source->release != cache->environment.release) {
+		bt_cache_put(cache, root, node_size, *node, owner);
+	} else if (bt_cache_store(cache, root, node_size, *node, owner, 1)) {
+		*node = NULL;
+	}
+}
+
+uint8_t *
+bt_cache_reuse(
+    struct btrfs_cache *cache, uint32_t node_size, const struct btrfs_environment *source)
+{
+	uint8_t *bytes = NULL;
+
+	if (source->context != cache->environment.context ||
+	    source->allocate != cache->environment.allocate ||
+	    source->release != cache->environment.release) {
+		return NULL;
+	}
+	bt_cache_lock(cache);
+	if (cache->node_size == node_size && cache->spare_count != 0) {
+		bytes = cache->spares[--cache->spare_count];
+		cache->node_buffers--;
+	}
+	bt_cache_unlock(cache);
+	return bytes;
 }

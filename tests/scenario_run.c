@@ -938,9 +938,11 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	struct bt_cursor cursor;
 	struct namespace_digest pending;
 	struct namespace_digest published;
+	struct namespace_digest promoted;
 	const struct btrfs_fs *reader;
 	struct btrfs_fs *fs;
 	struct btrfs_fs *after;
+	struct btrfs_fs *owned = NULL;
 	struct btrfs_transaction *transaction = NULL;
 	struct btrfs_time time = { 1700000000 + (int64_t)commit, 123456789 };
 	struct device *device = context->device;
@@ -1011,7 +1013,9 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	}
 	device->before_commit = device->count;
 	if (result == BTRFS_OK) {
-		result = btrfs_transaction_commit(transaction);
+		result = map == NULL
+		    ? btrfs_transaction_commit(transaction)
+		    : btrfs_transaction_commit_view(transaction, BTRFS_TOP_LEVEL_TREE, &owned);
 	}
 	totals->writes = device->issued;
 	totals->flushes = device->flushes;
@@ -1040,6 +1044,19 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 			    published.failure);
 			REQUIRE(0);
 		}
+		if (owned != NULL) {
+			/* The returned view survives both transaction and base destruction.
+			 * Compare with an independent mount, including chunk growth/removal
+			 * and feature flags changed by compression, then read its namespace. */
+			REQUIRE(memcmp(&owned->info, &after->info, sizeof(after->info)) == 0);
+			REQUIRE(owned->chunk_count == after->chunk_count &&
+			    memcmp(owned->chunks, after->chunks,
+				owned->chunk_count * sizeof(*owned->chunks)) == 0);
+			REQUIRE(namespace_digest(owned, &promoted) == 0);
+			REQUIRE(promoted.hash == published.hash &&
+			    promoted.objects == published.objects &&
+			    promoted.bytes == published.bytes);
+		}
 		btrfs_unmount(after);
 		if (published.hash != pending.hash || published.objects != pending.objects ||
 		    published.bytes != pending.bytes) {
@@ -1052,6 +1069,7 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 		}
 		context->reader_digests++;
 	}
+	btrfs_unmount(owned);
 	path_table_release(&table);
 	REQUIRE(context->image.live_allocations == 0);
 	return result;

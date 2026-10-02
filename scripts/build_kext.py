@@ -35,6 +35,10 @@ def main() -> None:
         "-Wall", "-Wextra", "-Werror", "-Werror=conditional-uninitialized",
         "-Wdeclaration-after-statement", "-Wframe-larger-than=2048",
     ]
+    # -mkernel alone permits compiler-generated NEON copies on arm64e.
+    # The adapter does not own SIMD state; CRC instructions use general registers.
+    if args.arch == "arm64e":
+        flags.append("-mgeneral-regs-only")
     sources = (sorted((ROOT / "core").glob("*.c")) +
                sorted((ROOT / "adapters/common").glob("*.c")) +
                sorted((ROOT / "adapters/xnu").glob("*.c")))
