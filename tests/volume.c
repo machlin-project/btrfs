@@ -616,6 +616,7 @@ grouped_test(struct harness *harness)
 	REQUIRE(newest_has(volume, "/grouped-b", &running) && !running);
 	REQUIRE(committed_has(volume, "/grouped-a") && committed_has(volume, "/grouped-b"));
 	REQUIRE(btrfs_volume_sync(volume, pending) == BTRFS_OK);
+	REQUIRE(btrfs_volume_sync(volume, btrfs_volume_pending(volume)) == BTRFS_OK);
 	REQUIRE(harness->overlay.flushes == flushes + 3);
 
 	/* A begin commits the running transaction before its own. */

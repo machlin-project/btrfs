@@ -558,6 +558,13 @@ btrfs_volume_sync(struct btrfs_volume *volume, uint64_t generation)
 		volume->locks.unlock(volume->locks.context);
 		return BTRFS_OK;
 	}
+	/* Nothing runs and no writer could be starting a transaction: the
+	 * changes of generation were published or discarded. */
+	if (volume->running == NULL && !volume->writer) {
+		error = volume->failure;
+		volume->locks.unlock(volume->locks.context);
+		return error;
+	}
 	volume_take_turn(volume);
 	volume->locks.unlock(volume->locks.context);
 	/* A sync that held the turn before this one may have committed it. */
