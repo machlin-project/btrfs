@@ -9,6 +9,66 @@ struct bt_key {
 	uint8_t type;
 };
 
+/* Wire decoding and key order sit on every tree search; defined here so each
+ * translation unit inlines them. */
+static inline uint16_t
+bt_u16(struct bt_le16 value)
+{
+	return (uint16_t)((uint16_t)value.bytes[0] | (uint16_t)value.bytes[1] << 8);
+}
+
+static inline uint32_t
+bt_u32(struct bt_le32 value)
+{
+	return (uint32_t)value.bytes[0] | (uint32_t)value.bytes[1] << 8 |
+	    (uint32_t)value.bytes[2] << 16 | (uint32_t)value.bytes[3] << 24;
+}
+
+static inline uint64_t
+bt_u64(struct bt_le64 value)
+{
+	uint64_t result = 0;
+	unsigned i;
+
+	for (i = 0; i < sizeof(value.bytes); i++) {
+		result |= (uint64_t)value.bytes[i] << (i * 8U);
+	}
+	return result;
+}
+
+static inline struct bt_key
+bt_key_decode(const struct bt_disk_key *key)
+{
+	struct bt_key result;
+
+	result.objectid = bt_u64(key->objectid);
+	result.type = key->type;
+	result.offset = bt_u64(key->offset);
+	return result;
+}
+
+static inline int
+bt_key_compare(struct bt_key a, struct bt_key b)
+{
+	if (a.objectid != b.objectid) {
+		return a.objectid < b.objectid ? -1 : 1;
+	}
+	if (a.type != b.type) {
+		return a.type < b.type ? -1 : 1;
+	}
+	if (a.offset != b.offset) {
+		return a.offset < b.offset ? -1 : 1;
+	}
+	return 0;
+}
+
+static inline int
+bt_file_tree(uint64_t tree)
+{
+	return tree == BTRFS_TOP_LEVEL_TREE ||
+	    (tree >= BTRFS_ROOT_INODE && tree <= BT_LAST_FREE_OBJECTID);
+}
+
 struct bt_root {
 	uint64_t address, generation, owner;
 	uint8_t level;
@@ -65,17 +125,11 @@ const uint8_t *bt_cache_pin(struct btrfs_cache *cache, struct bt_root root, uint
     uint64_t *owner, size_t *handle);
 void bt_cache_unpin(struct btrfs_cache *cache, size_t handle);
 
-uint16_t bt_u16(struct bt_le16 value);
-uint32_t bt_u32(struct bt_le32 value);
-uint64_t bt_u64(struct bt_le64 value);
 void bt_copy(void *destination, const void *source, size_t length);
 void bt_move(void *destination, const void *source, size_t length);
 void bt_zero(void *buffer, size_t length);
 int bt_equal(const void *a, const void *b, size_t length);
 uint32_t bt_crc32c(uint32_t seed, const void *buffer, size_t length);
-struct bt_key bt_key_decode(const struct bt_disk_key *key);
-int bt_key_compare(struct bt_key a, struct bt_key b);
-int bt_file_tree(uint64_t tree);
 int bt_name_valid(const void *name, size_t length);
 int bt_xattr_name_valid(const void *name, size_t length);
 enum btrfs_result bt_read_physical(

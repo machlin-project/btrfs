@@ -1,31 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "internal.h"
 
-uint16_t
-bt_u16(struct bt_le16 value)
-{
-	return (uint16_t)((uint16_t)value.bytes[0] | (uint16_t)value.bytes[1] << 8);
-}
-
-uint32_t
-bt_u32(struct bt_le32 value)
-{
-	return (uint32_t)value.bytes[0] | (uint32_t)value.bytes[1] << 8 |
-	    (uint32_t)value.bytes[2] << 16 | (uint32_t)value.bytes[3] << 24;
-}
-
-uint64_t
-bt_u64(struct bt_le64 value)
-{
-	uint64_t result = 0;
-	unsigned i;
-
-	for (i = 0; i < sizeof(value.bytes); i++) {
-		result |= (uint64_t)value.bytes[i] << (i * 8U);
-	}
-	return result;
-}
-
 /* A freestanding C implementation still provides memcpy, memmove, memset and
  * memcmp (and so does the kernel); the builtins let the compiler inline small
  * fixed sizes and call the platform's tuned routines otherwise. */
@@ -346,39 +321,6 @@ bt_crc32c(uint32_t seed, const void *buffer, size_t length)
 	}
 #endif
 	return seed;
-}
-
-struct bt_key
-bt_key_decode(const struct bt_disk_key *key)
-{
-	struct bt_key result;
-
-	result.objectid = bt_u64(key->objectid);
-	result.type = key->type;
-	result.offset = bt_u64(key->offset);
-	return result;
-}
-
-int
-bt_key_compare(struct bt_key a, struct bt_key b)
-{
-	if (a.objectid != b.objectid) {
-		return a.objectid < b.objectid ? -1 : 1;
-	}
-	if (a.type != b.type) {
-		return a.type < b.type ? -1 : 1;
-	}
-	if (a.offset != b.offset) {
-		return a.offset < b.offset ? -1 : 1;
-	}
-	return 0;
-}
-
-int
-bt_file_tree(uint64_t tree)
-{
-	return tree == BTRFS_TOP_LEVEL_TREE ||
-	    (tree >= BTRFS_ROOT_INODE && tree <= BT_LAST_FREE_OBJECTID);
 }
 
 static int
