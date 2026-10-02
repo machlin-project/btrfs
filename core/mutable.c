@@ -4,6 +4,18 @@
 
 #define BT_MUTATION_BUCKETS 1024U
 #define BT_MUTATION_MAX_NODES 65536U
+/* Node-size buffers the view keeps for reuse: cursors and extent copies of
+ * one operation allocate and release them in quick succession. */
+#define BT_MUTATION_SPARES 16U
+
+/* Sanitizer builds poison a kept buffer, so a use after release still fails. */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define BT_MUTATION_POISON 1
+void __asan_poison_memory_region(void const volatile *address, size_t size);
+void __asan_unpoison_memory_region(void const volatile *address, size_t size);
+#endif
+#endif
 
 struct bt_mutable_node;
 
@@ -53,6 +65,8 @@ struct bt_mutation {
 	uint8_t *merge_scratch;
 	size_t count;
 	size_t record_capacity;
+	void *spares[BT_MUTATION_SPARES];
+	size_t spare_count;
 	enum btrfs_result failure;
 	int sealed;
 	int accepted;
@@ -174,7 +188,15 @@ bt_mut_allocate(void *context, size_t size)
 {
 	struct bt_mutation *mutation = context;
 	const struct btrfs_environment *env = &mutation->base->env;
+	void *allocation;
 
+	if (size == mutation->view.info.node_size && mutation->spare_count != 0) {
+		allocation = mutation->spares[--mutation->spare_count];
+#ifdef BT_MUTATION_POISON
+		__asan_unpoison_memory_region(allocation, size);
+#endif
+		return allocation;
+	}
 	return env->allocate(env->context, size);
 }
 
@@ -184,6 +206,13 @@ bt_mut_release(void *context, void *allocation, size_t size)
 	struct bt_mutation *mutation = context;
 	const struct btrfs_environment *env = &mutation->base->env;
 
+	if (size == mutation->view.info.node_size && mutation->spare_count < BT_MUTATION_SPARES) {
+#ifdef BT_MUTATION_POISON
+		__asan_poison_memory_region(allocation, size);
+#endif
+		mutation->spares[mutation->spare_count++] = allocation;
+		return;
+	}
 	env->release(env->context, allocation, size);
 }
 
@@ -1065,6 +1094,15 @@ bt_mutation_destroy(struct bt_mutation *mutation)
 		return;
 	}
 	env = &mutation->base->env;
+	while (mutation->spare_count != 0) {
+		mutation->spare_count--;
+#ifdef BT_MUTATION_POISON
+		__asan_unpoison_memory_region(
+		    mutation->spares[mutation->spare_count], mutation->view.info.node_size);
+#endif
+		env->release(env->context, mutation->spares[mutation->spare_count],
+		    mutation->view.info.node_size);
+	}
 	for (i = 0; i < mutation->count; i++) {
 		node = mutation->nodes[i];
 		if (!mutation->accepted) {

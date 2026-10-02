@@ -44,13 +44,14 @@ fixtures a full load costs 18 to 39 reads and 72 to 588 KiB, which grows with
 the extent tree). Verified tree nodes can be cached across operations (below).
 Each commit still pays three barriers; grouping operations into one commit is
 designed in [group commit](GROUP_COMMIT.md). Each backreference edit copies its
-extent item into a fresh node-sized buffer and probes for keyed items with a new
-cursor, so a shared-subvolume commit costs several hundred allocations; the test
-output prints these counts per commit. New file data is written to the device
-as its extents are created, from rewrite pieces of at most 8 MiB; unaligned
-edges are read back through the private view. Compression costs one codec call
-per 128 KiB. Buffer reuse and extent-item caching are unmeasured follow-up
-work.
+extent item into a node-sized buffer and probes for keyed items with a new
+cursor; a transaction keeps up to 16 released node-sized buffers for reuse, so
+these cost allocations only when more are live at once (a create commit takes
+44 allocations instead of 97); the test output prints the counts per commit.
+New file data is written to the device as its extents are created, from rewrite
+pieces of at most 8 MiB; unaligned edges are read back through the private view.
+Compression costs one codec call per 128 KiB. Extent-item caching is unmeasured
+follow-up work.
 
 ## Measured implementation costs
 
