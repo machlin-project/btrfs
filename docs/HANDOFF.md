@@ -173,10 +173,13 @@ run in parallel CRC lanes, and aligned reads land in the caller's buffer. The
 volume groups operations into one running transaction
 ([group commit](GROUP_COMMIT.md)); a native adapter must use it to avoid three
 barriers per operation, and its acceptance needs mounted runs in both commit
-modes plus power-cut checks of `fsync` boundaries. Remaining measured costs:
-single-buffer node checksums, repeated subvolume-root resolution and
-attribute-rich enumeration. Optimize after measurement. Do not claim a speed win
-from a userspace image reader versus a mounted guest.
+modes plus power-cut checks of `fsync` boundaries. Writable admission loads
+block groups as allocation reaches them, and the chunk table follows the
+chunks present, so large volumes mount without a full extent-tree pass; no
+large Linux fixture measures that yet. Remaining measured costs: single-buffer
+node checksums, repeated subvolume-root resolution and attribute-rich
+enumeration. Optimize after measurement. Do not claim a speed win from a
+userspace image reader versus a mounted guest.
 
 At delivery, report portable contracts, actual loaded native mounts, FSKit,
 LXNU policy, recovery/durability and comparative performance separately. Preserve

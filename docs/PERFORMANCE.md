@@ -37,13 +37,16 @@ cache in the native adapters.
 The private editor reuses its dirty paths; repeated fixed-size replacement in an
 already modified path allocates nothing. It updates payloads and child pointers
 without repacking the whole node. The reservation gap vector begins at 4 KiB and
-grows only when needed. A volume keeps its allocation state across transactions:
-only the admission transaction loads the extent tree and verifies the free-space
-and device trees, and later begins copy the kept state (on the small Linux
-fixtures a full load costs 18 to 39 reads and 72 to 588 KiB, which grows with
-the extent tree). Verified tree nodes can be cached across operations (below).
-Each commit still pays three barriers; grouping operations into one commit is
-designed in [group commit](GROUP_COMMIT.md). Each backreference edit copies its
+grows only when needed. A writable transaction reads every block group's item
+and loads a block group's extents (verifying them and its free-space items)
+only when allocation reaches it or a change touches it, so admission costs a
+few node reads per block group instead of a pass over the whole extent tree
+(on the full-metadata fixture 20 node reads instead of 44; on the small
+fixtures about the same). A volume keeps the loaded state across transactions,
+and a transaction copies a class's free ranges only when it changes them.
+Verified tree nodes can be cached across operations (below). Each commit still
+pays three barriers; grouping operations into one commit is described in
+[group commit](GROUP_COMMIT.md). Each backreference edit copies its
 extent item into a node-sized buffer and probes for keyed items with a new
 cursor; a transaction keeps up to 16 released node-sized buffers for reuse, so
 these cost allocations only when more are live at once (a create commit takes
