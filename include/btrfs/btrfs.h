@@ -204,7 +204,8 @@ enum btrfs_result btrfs_directory_next(
     struct btrfs_directory *stream, struct btrfs_dir_entry *entry, uint64_t *next_cookie);
 void btrfs_directory_close(struct btrfs_directory *stream);
 /* completed is always initialized, including on error. Only the reported prefix
- * is valid. Regular extents verify complete sectors before copying any bytes. */
+ * is valid; bytes beyond it never hold unverified file data (a failed range
+ * read in place is zeroed). */
 enum btrfs_result btrfs_read(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
     uint64_t offset, void *buffer, size_t length, size_t *completed);
 /* A NULL buffer queries length. RANGE reports required size without partial data.

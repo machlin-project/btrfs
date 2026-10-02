@@ -61,11 +61,11 @@ nodes) in a release build, without and with a 64 MiB node cache:
 
 | Operation | Without cache | With cache |
 | --- | --- | --- |
-| 4 KiB random read of a 4 MiB file | 4.0 us, 5 reads | 1.0 us, 1 read |
+| 4 KiB random read of a 4 MiB file | 4.0 us, 5 reads | 1.0 us, 1 read, no allocations |
 | Path lookup in a 700-entry directory | 6.5 us, 8 reads | 0.6 us, no reads or allocations |
 | 700-entry directory stream | 24 us, 16 reads | 12 us, 0.1 reads |
 | 700-entry stream with each inode | 1,100 us, 1,416 reads | 90 us, 1 allocation |
-| 1 MiB sequential read | 140-160 us, 5.2 reads | 140-165 us, 1 read |
+| 1 MiB sequential read | 140-160 us, 5.2 reads | 60-95 us, 1 read, no allocations |
 | Mount, create one file, commit | 90-110 us, 61 reads | 55 us, 5 reads |
 | Create and write an 8 MiB file, commit | 1.8 ms, 71 reads | 1.7 ms, 5 reads |
 
@@ -74,7 +74,10 @@ Against the first cached measurement (lookup 1.2 us, stat during enumeration
 nodes in place, inlined key and integer decoding, a commit adding its published
 nodes to the cache, and a transaction reading its own nodes without checksumming
 them twice, and from reusing the primary superblock a transaction has just read
-instead of reading it again. The remaining reads are superblocks: the primary at
+instead of reading it again. Sequential reads gained from checksumming four data
+sectors in independent CRC instruction chains and from reading aligned sectors
+into the caller's buffer instead of copying them out of a window (the table's
+first sequential figures predate both). The remaining reads are superblocks: the primary at
 mount, and at both begin and commit the primary and each secondary copy present
 on the device. The written images are byte-identical to those before these
 changes. Writes in

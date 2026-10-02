@@ -98,11 +98,14 @@ bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t
 	struct bt_csum_item existing;
 	struct bt_le32 value;
 	struct bt_key key = { .objectid = BT_CSUM_OBJECTID, .type = BT_EXTENT_CSUM };
+	uint32_t sums[BT_CRC_BATCH];
 	uint8_t *buffer;
 	uint64_t done;
 	uint64_t sector;
 	size_t count;
+	size_t batch;
 	size_t i;
+	size_t j;
 	int found;
 	enum btrfs_result error;
 
@@ -126,9 +129,13 @@ bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t
 		count = (length - done) / sector < bt_csum_item_limit(view)
 		    ? (size_t)((length - done) / sector)
 		    : bt_csum_item_limit(view);
-		for (i = 0; i < count; i++) {
-			bt_put32(&value, ~bt_crc32c(UINT32_MAX, data + done + i * sector, sector));
-			bt_copy(buffer + i * BT_CSUM_BYTES, &value, sizeof(value));
+		for (i = 0; i < count; i += batch) {
+			batch = count - i < BT_CRC_BATCH ? count - i : BT_CRC_BATCH;
+			bt_crc32c_sectors(data + done + i * sector, sector, batch, sums);
+			for (j = 0; j < batch; j++) {
+				bt_put32(&value, sums[j]);
+				bt_copy(buffer + (i + j) * BT_CSUM_BYTES, &value, sizeof(value));
+			}
 		}
 		key.offset = logical + done;
 		error = bt_mutation_edit(

@@ -51,6 +51,12 @@ adversarial = executable('btrfs-adversarial', 'tests/adversarial.c', include_dir
 identity_test = executable('btrfs-identity-test', 'tests/identity.c', include_directories: inc,
   link_with: identity)
 test('native-object-identity', identity_test, suite: 'core')
+crc_test = executable('btrfs-crc-test', 'tests/crc.c', include_directories: inc,
+  link_with: core)
+test('crc32c', crc_test, suite: 'core')
+crc_portable_test = executable('btrfs-crc-portable-test', 'tests/crc.c', 'core/support.c',
+  include_directories: inc, c_args: ['-DBT_CRC_PORTABLE'])
+test('crc32c-portable', crc_portable_test, suite: 'core')
 native_test = executable('btrfs-native-policy', 'tests/native_policy.c', include_directories: inc,
   link_with: [native, core])
 test('native-xattr-policy', native_test, suite: 'core')

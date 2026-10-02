@@ -35,8 +35,44 @@ bt_equal(const void *a, const void *b, size_t length)
 	return length == 0 || __builtin_memcmp(a, b, length) == 0;
 }
 
-#if !defined(__clang__) || !defined(__aarch64__) || !defined(__ARM_FEATURE_CRC32)
-/* Byte remainders of the reflected Castagnoli polynomial 0x82f63b78. */
+/* Hardware CRC32C uses only general registers, so it is safe in the kernel
+ * without SIMD state ownership. Every Intel Mac able to run the supported
+ * macOS releases has the SSE4.2 CRC32 instruction. BT_CRC_PORTABLE selects
+ * the table implementation, which tests compare with the hardware one. */
+#if defined(BT_CRC_PORTABLE)
+#elif defined(__clang__) && defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#define BT_CRC_HARDWARE 1
+#define BT_CRC_TARGET
+
+static inline uint32_t
+bt_crc_word(uint32_t crc, uint64_t word)
+{
+	return __builtin_arm_crc32cd(crc, word);
+}
+
+static inline uint32_t
+bt_crc_byte(uint32_t crc, uint8_t byte)
+{
+	return __builtin_arm_crc32cb(crc, byte);
+}
+#elif defined(__clang__) && defined(__x86_64__) && (defined(__SSE4_2__) || defined(__APPLE__))
+#define BT_CRC_HARDWARE 1
+#define BT_CRC_TARGET __attribute__((target("crc32")))
+
+static inline BT_CRC_TARGET uint32_t
+bt_crc_word(uint32_t crc, uint64_t word)
+{
+	return (uint32_t)__builtin_ia32_crc32di(crc, word);
+}
+
+static inline BT_CRC_TARGET uint32_t
+bt_crc_byte(uint32_t crc, uint8_t byte)
+{
+	return __builtin_ia32_crc32qi(crc, byte);
+}
+#endif
+
+#ifndef BT_CRC_HARDWARE
 static const uint32_t bt_crc_table[256] = {
 	UINT32_C(0x00000000),
 	UINT32_C(0xf26b8303),
@@ -297,31 +333,89 @@ static const uint32_t bt_crc_table[256] = {
 };
 #endif
 
-uint32_t
+#ifdef BT_CRC_HARDWARE
+/* Little-endian 64-bit word at bytes, as the CRC instructions consume it. */
+static inline uint64_t
+bt_crc_load(const uint8_t *bytes)
+{
+	struct bt_le64 word;
+
+	bt_copy(&word, bytes, sizeof(word));
+	return bt_u64(word);
+}
+
+BT_CRC_TARGET uint32_t
 bt_crc32c(uint32_t seed, const void *buffer, size_t length)
 {
 	const uint8_t *bytes = buffer;
 	size_t i = 0;
-#if defined(__clang__) && defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
-	struct bt_le64 word;
-#endif
 
-#if defined(__clang__) && defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
-	/* Only general registers: safe in the kernel without SIMD ownership. */
-	for (; length - i >= sizeof(word); i += sizeof(word)) {
-		bt_copy(&word, bytes + i, sizeof(word));
-		seed = __builtin_arm_crc32cd(seed, bt_u64(word));
+	for (; length - i >= sizeof(uint64_t); i += sizeof(uint64_t)) {
+		seed = bt_crc_word(seed, bt_crc_load(bytes + i));
 	}
 	for (; i < length; i++) {
-		seed = __builtin_arm_crc32cb(seed, bytes[i]);
+		seed = bt_crc_byte(seed, bytes[i]);
 	}
-#else
-	for (; i < length; i++) {
-		seed = (seed >> 8) ^ bt_crc_table[(seed ^ bytes[i]) & 0xffU];
-	}
-#endif
 	return seed;
 }
+
+/* Four sectors at a time: independent CRC chains hide the instruction's
+ * latency, which bounds a single chain. */
+BT_CRC_TARGET void
+bt_crc32c_sectors(const void *data, size_t sector_size, size_t count, uint32_t *checksums)
+{
+	const uint8_t *bytes = data;
+	const uint8_t *lanes[BT_CRC_LANES];
+	uint32_t crcs[BT_CRC_LANES];
+	size_t sector = 0;
+	size_t i;
+	unsigned lane;
+
+	for (; count - sector >= BT_CRC_LANES; sector += BT_CRC_LANES) {
+		for (lane = 0; lane < BT_CRC_LANES; lane++) {
+			lanes[lane] = bytes + (sector + lane) * sector_size;
+			crcs[lane] = UINT32_MAX;
+		}
+		for (i = 0; sector_size - i >= sizeof(uint64_t); i += sizeof(uint64_t)) {
+			for (lane = 0; lane < BT_CRC_LANES; lane++) {
+				crcs[lane] = bt_crc_word(crcs[lane], bt_crc_load(lanes[lane] + i));
+			}
+		}
+		for (lane = 0; lane < BT_CRC_LANES; lane++) {
+			crcs[lane] = bt_crc32c(crcs[lane], lanes[lane] + i, sector_size - i);
+			checksums[sector + lane] = ~crcs[lane];
+		}
+	}
+	for (; sector < count; sector++) {
+		checksums[sector] =
+		    ~bt_crc32c(UINT32_MAX, bytes + sector * sector_size, sector_size);
+	}
+}
+#else
+uint32_t
+bt_crc32c(uint32_t seed, const void *buffer, size_t length)
+{
+	const uint8_t *bytes = buffer;
+	size_t i;
+
+	for (i = 0; i < length; i++) {
+		seed = (seed >> 8) ^ bt_crc_table[(seed ^ bytes[i]) & 0xffU];
+	}
+	return seed;
+}
+
+void
+bt_crc32c_sectors(const void *data, size_t sector_size, size_t count, uint32_t *checksums)
+{
+	const uint8_t *bytes = data;
+	size_t sector;
+
+	for (sector = 0; sector < count; sector++) {
+		checksums[sector] =
+		    ~bt_crc32c(UINT32_MAX, bytes + sector * sector_size, sector_size);
+	}
+}
+#endif
 
 static int
 bt_raw_name_valid(const void *name, size_t length, int xattr)

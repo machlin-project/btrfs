@@ -108,11 +108,14 @@ failure cannot publish an alias. Exhaustion is an explicit error.
 ## Data integrity and I/O cost
 
 Regular file reads reuse extent and checksum paths through an operation. Device
-I/O is coalesced into windows up to 1 MiB. Checksums consume full stored sectors,
-including edges outside a small requested byte range, before that window becomes
-visible to its caller. An I/O failure or checksum mismatch may retry a DUP copy
-with the same logical identity; no repair is written. A successful prefix before
-a later failure is reported explicitly; bytes beyond `completed` are invalid.
+I/O is coalesced into requests up to 1 MiB. Whole sectors at sector-aligned file
+positions are read into the caller's buffer and verified there; a range that
+fails is zeroed before the call returns. Unaligned edges are read into a window,
+where checksums consume full stored sectors before any byte is copied out. An
+I/O failure or checksum mismatch may retry a DUP copy with the same logical
+identity; no repair is written. A successful prefix before a later failure is
+reported explicitly; bytes beyond `completed` are invalid and never hold
+unverified file data.
 
 An owner may give its mounts one bounded cache of verified tree nodes
 (`btrfs_cache`, in the environment), shared across threads through its own lock
@@ -145,9 +148,13 @@ calling the adapter codec; input and decoded allocation are bounded independentl
 An absent codec returns unsupported. NODATASUM is honored as an explicit on-disk
 contract; it must not be confused with verified data.
 
-CRC32C uses ARM CRC instructions when the selected target guarantees them,
-otherwise an immutable table. Kernel acceleration uses general registers only.
-There is no CPU feature probe, lazy global initialization or kernel SIMD use.
+CRC32C uses ARM CRC instructions when the selected target guarantees them and the
+x86_64 CRC32 instruction (SSE4.2, present on every Intel Mac that runs the
+supported macOS releases) on Apple x86_64 targets or when the target enables
+SSE4.2; otherwise an immutable table. Data sectors are checksummed four at a
+time in independent instruction chains, which hide the instruction latency that
+bounds one chain. Kernel acceleration uses general registers only. There is no
+CPU feature probe, lazy global initialization or kernel SIMD use.
 
 FSKit inhibits offloaded I/O so data passes through the core. XNU retains UBC as
 the only native file-page cache. Its blockmap uses file-logical strategy addresses;

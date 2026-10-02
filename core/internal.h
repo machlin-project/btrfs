@@ -134,6 +134,12 @@ void bt_move(void *destination, const void *source, size_t length);
 void bt_zero(void *buffer, size_t length);
 int bt_equal(const void *a, const void *b, size_t length);
 uint32_t bt_crc32c(uint32_t seed, const void *buffer, size_t length);
+/* Lanes bt_crc32c_sectors interleaves, and the sectors its callers checksum
+ * per call (a stack array of results). */
+#define BT_CRC_LANES 4U
+#define BT_CRC_BATCH 64U
+/* checksums[i] = Btrfs CRC32C (~bt_crc32c(UINT32_MAX, ...)) of sector i. */
+void bt_crc32c_sectors(const void *data, size_t sector_size, size_t count, uint32_t *checksums);
 int bt_name_valid(const void *name, size_t length);
 int bt_xattr_name_valid(const void *name, size_t length);
 enum btrfs_result bt_read_physical(

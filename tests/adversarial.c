@@ -225,6 +225,57 @@ record_patch(struct fixture *fixture, struct btrfs_fs *fs, struct btrfs_object_i
 	return copy;
 }
 
+/* Sectors of "big" read at once, and the one among them corrupted. */
+#define UNVERIFIED_SECTORS 64U
+#define UNVERIFIED_BAD_SECTOR 2U
+#define UNVERIFIED_FILL 0xaaU
+
+/* An aligned read that fails verification leaves only verified file bytes in
+ * the reported prefix, and none at all beyond it: the device range read into
+ * the caller's buffer is zeroed. "big" holds byte (offset mod 256). */
+static void
+unverified_tests(struct fixture *fixture, struct btrfs_fs *fs, uint64_t logical)
+{
+	struct btrfs_environment environment = fixture->image.environment;
+	struct btrfs_fs *patched = NULL;
+	struct btrfs_inode inode;
+	uint8_t *sector;
+	uint8_t *buffer;
+	uint64_t physical;
+	size_t length = UNVERIFIED_SECTORS * fs->info.sector_size;
+	size_t completed;
+	size_t i;
+	unsigned copies = 1;
+
+	assert(bt_map(fs, logical + UNVERIFIED_BAD_SECTOR * fs->info.sector_size,
+		   fs->info.sector_size, BT_BLOCK_DATA, 0, &physical, &copies) == BTRFS_OK);
+	assert(copies == 1);
+	sector = malloc(fs->info.sector_size);
+	buffer = malloc(length);
+	assert(sector != NULL && buffer != NULL);
+	assert(fixture->image.environment.read(
+		   &fixture->image, physical, sector, fs->info.sector_size) == BTRFS_OK);
+	sector[0] ^= 1;
+	fixture->patches[0] = (struct patch){ physical, sector, fs->info.sector_size };
+	fixture->count = 1;
+	environment.context = fixture;
+	environment.read = patched_read;
+	assert(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &patched) == BTRFS_OK);
+	assert(btrfs_image_lookup(patched, "big", &inode) == BTRFS_OK);
+	memset(buffer, UNVERIFIED_FILL, length);
+	assert(btrfs_read(patched, &inode, 0, buffer, length, &completed) == BTRFS_CORRUPT);
+	assert(completed <= UNVERIFIED_BAD_SECTOR * fs->info.sector_size);
+	for (i = 0; i < length; i++) {
+		assert(i < completed ? buffer[i] == (uint8_t)i
+				     : buffer[i] == 0 || buffer[i] == UNVERIFIED_FILL);
+	}
+	btrfs_unmount(patched);
+	fixture->count = 0;
+	free(buffer);
+	free(sector);
+	puts("failed aligned data read leaves no unverified bytes: PASS");
+}
+
 static void
 tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 {
@@ -241,6 +292,7 @@ tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 	size_t size;
 	size_t mirrors;
 	uint64_t physical;
+	uint64_t logical;
 	unsigned copies;
 
 	assert(btrfs_root(fs, &root) == BTRFS_OK);
@@ -295,6 +347,9 @@ tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 	assert(size == sizeof(*extent) && extent->header.type == BT_EXTENT_REGULAR);
 	assert(bt_map(fs, bt_u64(extent->disk_bytenr), fs->info.sector_size, BT_BLOCK_DATA, 0,
 		   &physical, &copies) == BTRFS_OK);
+	assert(bt_u64(extent->offset) == 0 &&
+	    bt_u64(extent->length) >= UNVERIFIED_SECTORS * fs->info.sector_size);
+	logical = bt_u64(extent->disk_bytenr);
 	extent->header.compression = UINT8_MAX;
 	checksum(copy, fs->info.node_size);
 	expect(fixture, "unknown extent encoding", BTRFS_UNSUPPORTED, "big");
@@ -310,6 +365,7 @@ tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 	expect(fixture, "file data checksum before publication", BTRFS_CORRUPT, "big");
 	fixture->count = 0;
 	free(sector);
+	unverified_tests(fixture, fs, logical);
 }
 
 static void

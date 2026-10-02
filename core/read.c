@@ -43,6 +43,38 @@ bt_sector_checksum(struct bt_cursor *cursor, uint64_t logical, uint32_t *checksu
 	return BTRFS_OK;
 }
 
+/* Reads a sector whose checksum did not match from the other copies; no
+ * repair is written. */
+static enum btrfs_result
+bt_reread_sector(const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, unsigned mirrors,
+    unsigned selected, uint32_t checksum)
+{
+	uint64_t physical;
+	uint32_t sum;
+	unsigned mirror;
+	enum btrfs_result error = BTRFS_CORRUPT;
+
+	for (mirror = 0; mirror < mirrors; mirror++) {
+		if (mirror == selected) {
+			continue;
+		}
+		error = bt_map(
+		    fs, logical, fs->info.sector_size, BT_BLOCK_DATA, mirror, &physical, &mirrors);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		error = bt_read_physical(fs, physical, out, fs->info.sector_size);
+		if (error == BTRFS_OK) {
+			bt_crc32c_sectors(out, fs->info.sector_size, 1, &sum);
+			error = sum == checksum ? BTRFS_OK : BTRFS_CORRUPT;
+		}
+		if (error == BTRFS_OK || (error != BTRFS_CORRUPT && error != BTRFS_IO)) {
+			return error;
+		}
+	}
+	return error;
+}
+
 static enum btrfs_result
 bt_verified_read(
     struct bt_cursor *cursor, uint64_t logical, void *buffer, size_t length, int checksummed)
@@ -50,7 +82,11 @@ bt_verified_read(
 	const struct btrfs_fs *fs = cursor->fs;
 	uint8_t *out = buffer;
 	uint64_t physical;
+	uint32_t sums[BT_CRC_BATCH];
+	size_t sector = fs->info.sector_size;
 	size_t position;
+	size_t batch = 0;
+	size_t i;
 	unsigned mirror;
 	unsigned mirrors = 1;
 	unsigned selected = 0;
@@ -80,37 +116,17 @@ bt_verified_read(
 	if (error != BTRFS_OK || !checksummed) {
 		return error;
 	}
-	for (position = 0; position < length; position += fs->info.sector_size) {
-		error = bt_sector_checksum(cursor, logical + position, &checksum);
-		if (error != BTRFS_OK) {
-			break;
-		}
-		if (~bt_crc32c(UINT32_MAX, out + position, fs->info.sector_size) == checksum) {
-			continue;
-		}
-		error = BTRFS_CORRUPT;
-		for (mirror = 0; mirror < mirrors; mirror++) {
-			if (mirror == selected) {
-				continue;
-			}
-			error = bt_map(fs, logical + position, fs->info.sector_size, BT_BLOCK_DATA,
-			    mirror, &physical, &mirrors);
-			if (error != BTRFS_OK) {
-				break;
-			}
+	for (position = 0; error == BTRFS_OK && position < length; position += batch * sector) {
+		batch = (length - position) / sector < BT_CRC_BATCH ? (length - position) / sector
+								    : BT_CRC_BATCH;
+		bt_crc32c_sectors(out + position, sector, batch, sums);
+		for (i = 0; error == BTRFS_OK && i < batch; i++) {
 			error =
-			    bt_read_physical(fs, physical, out + position, fs->info.sector_size);
-			if (error == BTRFS_OK &&
-			    ~bt_crc32c(UINT32_MAX, out + position, fs->info.sector_size) !=
-				checksum) {
-				error = BTRFS_CORRUPT;
+			    bt_sector_checksum(cursor, logical + position + i * sector, &checksum);
+			if (error == BTRFS_OK && sums[i] != checksum) {
+				error = bt_reread_sector(fs, logical + position + i * sector,
+				    out + position + i * sector, mirrors, selected, checksum);
 			}
-			if (error == BTRFS_OK || (error != BTRFS_CORRUPT && error != BTRFS_IO)) {
-				break;
-			}
-		}
-		if (error != BTRFS_OK) {
-			break;
 		}
 	}
 	return error;
@@ -261,6 +277,7 @@ bt_read_extent(struct bt_read_session *session, const struct bt_record *record,
 	size_t skip;
 	size_t count;
 	size_t aligned;
+	int checksummed = (inode->flags & BT_INODE_NODATASUM) == 0;
 	enum btrfs_result error = BTRFS_OK;
 
 	*completed = 0;
@@ -282,22 +299,39 @@ bt_read_extent(struct bt_read_session *session, const struct bt_record *record,
 		return BTRFS_OK;
 	}
 	logical = bt_u64(extent->disk_bytenr) + bt_u64(extent->offset) + within;
-	if (session->window == NULL) {
-		session->window = fs->env.allocate(fs->env.context, session->window_size);
-		if (session->window == NULL) {
-			return BTRFS_NO_MEMORY;
-		}
-	}
 	while (*completed < length) {
 		skip = (size_t)(logical % fs->info.sector_size);
+		/* Whole sectors are read into the caller's buffer; a range that
+		 * fails verification is zeroed, so no unverified byte remains. */
+		if (skip == 0 && length - *completed >= fs->info.sector_size) {
+			count = (length - *completed) / fs->info.sector_size * fs->info.sector_size;
+			if (count > BT_READ_WINDOW) {
+				count = BT_READ_WINDOW;
+			}
+			error = bt_verified_read(&session->checksums, logical,
+			    (uint8_t *)output + *completed, count, checksummed);
+			if (error != BTRFS_OK) {
+				bt_zero((uint8_t *)output + *completed, count);
+				break;
+			}
+			logical += count;
+			*completed += count;
+			continue;
+		}
+		if (session->window == NULL) {
+			session->window = fs->env.allocate(fs->env.context, session->window_size);
+			if (session->window == NULL) {
+				return BTRFS_NO_MEMORY;
+			}
+		}
 		count = session->window_size - skip;
 		if (count > length - *completed) {
 			count = length - *completed;
 		}
 		aligned = ((count + skip + fs->info.sector_size - 1) / fs->info.sector_size) *
 		    fs->info.sector_size;
-		error = bt_verified_read(&session->checksums, logical - skip, session->window,
-		    aligned, (inode->flags & BT_INODE_NODATASUM) == 0);
+		error = bt_verified_read(
+		    &session->checksums, logical - skip, session->window, aligned, checksummed);
 		if (error != BTRFS_OK) {
 			break;
 		}
