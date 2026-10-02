@@ -49,6 +49,13 @@
 #define FILE_BYTES (300U * 1024U + 123U)
 #define WRITE_PIECE (64U * 1024U + 7U)
 #define TRUNCATED_BYTES (200U * 1024U + 1U)
+/* Every standard attribute FSKit may want; it faults on a reply missing one. */
+#define STANDARD_ATTRIBUTES                                                                        \
+	(FSItemAttributeType | FSItemAttributeMode | FSItemAttributeLinkCount |                    \
+	    FSItemAttributeUID | FSItemAttributeGID | FSItemAttributeFlags | FSItemAttributeSize | \
+	    FSItemAttributeAllocSize | FSItemAttributeFileID | FSItemAttributeParentID |           \
+	    FSItemAttributeAccessTime | FSItemAttributeModifyTime | FSItemAttributeChangeTime |    \
+	    FSItemAttributeBirthTime)
 
 @interface ImageReader : NSObject <BtrfsBlockWriter>
 @property(readonly) uint64_t blockSize;
@@ -159,6 +166,7 @@
 @property uint64_t itemID;
 @property uint64_t cookie;
 @property BOOL attributes;
+@property FSItemAttributes *values;
 @end
 
 @implementation TestEntry
@@ -188,6 +196,7 @@
 	entry.itemID = itemID;
 	entry.cookie = nextCookie;
 	entry.attributes = attributes != nil;
+	entry.values = attributes;
 	[self.entries addObject:entry];
 	return YES;
 }
@@ -304,17 +313,34 @@ lookup(BtrfsVolume *volume, BtrfsItem *directory, NSData *name, NSError **failur
 	return found;
 }
 
+static void
+require_complete(FSItemAttributes *attributes)
+{
+	unsigned bit;
+
+	REQUIRE(attributes != nil);
+	for (bit = 0; bit < 64; bit++) {
+		if ((STANDARD_ATTRIBUTES & (UINT64_C(1) << bit)) != 0) {
+			REQUIRE([attributes isValid:(FSItemAttribute)(UINT64_C(1) << bit)]);
+		}
+	}
+}
+
+/* The attributes FSKit would get when it wants every standard one. */
 static FSItemAttributes *
 attributes_of(BtrfsVolume *volume, BtrfsItem *item)
 {
+	FSItemGetAttributesRequest *request = [[FSItemGetAttributesRequest alloc] init];
 	__block FSItemAttributes *found = nil;
 
-	[volume getAttributes:[[FSItemGetAttributesRequest alloc] init]
+	request.wantedAttributes = STANDARD_ATTRIBUTES;
+	[volume getAttributes:request
 		       ofItem:item
 		 replyHandler:^(FSItemAttributes *attributes, NSError *error) {
 		   REQUIRE(error == nil);
 		   found = attributes;
 		 }];
+	require_complete(found);
 	return found;
 }
 
@@ -326,6 +352,8 @@ enumerate(BtrfsVolume *volume, BtrfsItem *directory, BOOL attributes, NSUInteger
 	NSMutableArray<TestEntry *> *all = [NSMutableArray array];
 	FSItemGetAttributesRequest *request =
 	    attributes ? [[FSItemGetAttributesRequest alloc] init] : nil;
+
+	request.wantedAttributes = STANDARD_ATTRIBUTES;
 	__block FSDirectoryVerifier verifier = FSDirectoryVerifierInitial;
 	__block NSError *error = nil;
 	FSDirectoryCookie cookie = FSDirectoryCookieInitial;
@@ -382,17 +410,25 @@ enumeration_tests(BtrfsVolume *volume, BtrfsItem *root)
 			[names addObject:entry.name];
 		}
 		REQUIRE(names.count == MANY_ENTRIES + 2);
-		/* With attributes: no dot entries, attributes for each. */
+		/* With attributes: no dot entries, complete attributes for each,
+		 * whose parent is the enumerated directory. */
 		entries = enumerate(volume, many, YES, pages[i]);
 		REQUIRE(entries.count == MANY_ENTRIES);
 		for (TestEntry *entry in entries) {
 			REQUIRE(entry.attributes && ((const char *)entry.name.bytes)[0] != '.');
+			require_complete(entry.values);
+			REQUIRE(entry.values.parentID == attributes_of(volume, many).fileID &&
+			    entry.values.fileID == entry.itemID);
 		}
 	}
-	/* The root's ".." is the root. */
+	/* The root's ".." is the root; its parent is FSKit's parent of the root,
+	 * and a directory's parent is the one holding it. */
 	entries = enumerate(volume, root, NO, 512);
 	REQUIRE(entries.count >= 2 && entries[0].itemID == FSItemIDRootDirectory &&
 	    entries[1].itemID == FSItemIDRootDirectory);
+	REQUIRE(attributes_of(volume, root).fileID == FSItemIDRootDirectory &&
+	    attributes_of(volume, root).parentID == FSItemIDParentOfRoot);
+	REQUIRE(attributes_of(volume, many).parentID == FSItemIDRootDirectory);
 }
 
 /* Reads item through the volume in uneven pieces and compares them with
@@ -827,6 +863,15 @@ write_tests(const char *fixture)
 	REQUIRE(error == nil && link != nil);
 	attributes = attributes_of(volume, file);
 	REQUIRE(attributes.linkCount == 2 && attributes.size == TRUNCATED_BYTES);
+	/* FSKit asks for the attributes of a rename's absent target. */
+	[volume getAttributes:[[FSItemGetAttributesRequest alloc] init]
+		       ofItem:(FSItem *_Nonnull)nil
+		 replyHandler:^(FSItemAttributes *nothing, NSError *replyError) {
+		   REQUIRE(nothing == nil && replyError.code == ESTALE);
+		 }];
+	/* A renamed file's parent is the directory it moved into. */
+	REQUIRE(attributes.parentID == attributes_of(volume, directory).fileID &&
+	    attributes_of(volume, directory).parentID == FSItemIDRootDirectory);
 	[volume createSymbolicLinkNamed:name_of("fskit-symlink")
 			    inDirectory:root
 			     attributes:owner_request(0777)

@@ -70,12 +70,17 @@ struct btrfs_fskit_locks;
 struct btrfs_fskit_cache *_Nullable btrfs_fskit_cache_create(void);
 void btrfs_fskit_cache_destroy(struct btrfs_fskit_cache *_Nullable owner);
 NSError *_Nullable btrfs_fskit_error(enum btrfs_result result);
+/* Linux inode flags with a Darwin equivalent, as the XNU adapter reports them. */
+uint32_t btrfs_fskit_flags(uint64_t flags);
 struct btrfs_time btrfs_fskit_now(void);
 
 @interface BtrfsItem : FSItem {
       @public
 	/* The inode as of the item's last read or change (itemLock). */
 	struct btrfs_inode inode;
+	/* The item number of the directory this item was last reached through:
+	 * a file's parent, as Darwin's vnode parent; 0 until known. */
+	uint64_t holder;
 	/* The generation that publishes the item's last change. */
 	uint64_t pending;
 	/* Open modes still in use, and whether its last name went while open. */
@@ -119,7 +124,16 @@ struct btrfs_time btrfs_fskit_now(void);
 /* For the adapter's files. */
 - (nullable NSNumber *)numberForIdentity:(struct btrfs_object_id)identity;
 - (nullable BtrfsItem *)itemForInode:(const struct btrfs_inode *)inode;
-- (nullable FSItemAttributes *)attributesForInode:(const struct btrfs_inode *)inode;
+/* Records that item was reached through directory. */
+- (void)setHolder:(BtrfsItem *)directory ofItem:(BtrfsItem *)item;
+/* Every standard attribute FSKit can ask for. parent is the item number of
+ * the directory holding the name; 0 resolves it (setting *result on failure). */
+- (nullable FSItemAttributes *)attributesForInode:(const struct btrfs_inode *)inode
+					   parent:(uint64_t)parent
+					   result:(enum btrfs_result *)result;
+/* The attributes of item's current inode. */
+- (nullable FSItemAttributes *)attributesForItem:(BtrfsItem *)item
+					  result:(enum btrfs_result *)result;
 /* Rereads item's inode from the newest state. */
 - (enum btrfs_result)refreshItem:(BtrfsItem *)item;
 /* Marks a directory's entries changed. */

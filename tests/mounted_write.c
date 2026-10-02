@@ -2,7 +2,10 @@
 /* Guest-only write acceptance on a disposable, mounted read-write fixture copy.
  * "write" runs the write contracts in MOUNT/native; after an unmount and a new
  * mount, "verify" checks that everything persisted and prints a manifest of the
- * final namespace for an independent Linux check of the same image. */
+ * final namespace for an independent Linux check of the same image.
+ * --skip-set-id leaves out the set-id group on a mount where it is a recorded
+ * failure (FSKit 26.x: no caller credentials, stale native mode cache); the
+ * verdict names the skip and the manifest omits those files. */
 #define _DARWIN_C_SOURCE
 #include <CommonCrypto/CommonDigest.h>
 #include <dirent.h>
@@ -44,6 +47,8 @@
 #define RENAMES 200U
 #define FILL_BYTES (4U * 1024U * 1024U)
 #define FILL_LIMIT 256U
+/* "suid" and "suid-root", the last names of the native listing. */
+#define SET_ID_FILES 2U
 #define OWNER_UID 1001U
 #define OWNER_GID 1002U
 #define WRITER_UID 1003U
@@ -348,6 +353,9 @@ write_as(int directory, const char *name, uid_t uid, gid_t gid)
 }
 
 /* The superuser's write keeps S_ISUID; another user's write removes it. */
+/* The set-id group is a recorded failure on this mount and is not run. */
+static bool skip_set_id;
+
 static void
 privilege_contracts(int directory)
 {
@@ -415,7 +423,11 @@ write_phase(int root)
 	big_contracts(directory);
 	append_rename_contracts(directory);
 	check_appended(directory);
-	privilege_contracts(directory);
+	if (skip_set_id) {
+		fprintf(stderr, "SKIP set-id contracts: recorded failure on this mount\n");
+	} else {
+		privilege_contracts(directory);
+	}
 	full_contracts(directory);
 	REQUIRE(close(directory) == 0);
 	sync();
@@ -531,7 +543,9 @@ verify_phase(int root)
 	free(bytes);
 	directory = openat(root, "native", O_RDONLY | O_DIRECTORY);
 	REQUIRE(directory >= 0 && fstat(directory, &native) == 0);
-	manifest_listing(directory, ".", listing, sizeof(listing) / sizeof(listing[0]));
+	/* The set-id files sort last. */
+	manifest_listing(directory, ".", listing,
+	    sizeof(listing) / sizeof(listing[0]) - (skip_set_id ? SET_ID_FILES : 0));
 	manifest_listing(directory, "child", children, 1);
 	expected = malloc(BIG_BYTES);
 	REQUIRE(expected != NULL);
@@ -560,10 +574,12 @@ verify_phase(int root)
 	manifest_file(directory, "big", expected, BIG_BYTES, 0644, 0, native.st_gid, 1);
 	check_appended(directory);
 	manifest_file(directory, "appended", NULL, 0, 0644, 0, native.st_gid, 1);
-	manifest_file(
-	    directory, "suid-root", (const uint8_t *)"root", 4, SUID_MODE, 0, native.st_gid, 1);
-	manifest_file(directory, "suid", (const uint8_t *)"x", 1, SHARED_MODE & ~(unsigned)S_ISUID,
-	    0, native.st_gid, 1);
+	if (!skip_set_id) {
+		manifest_file(directory, "suid-root", (const uint8_t *)"root", 4, SUID_MODE, 0,
+		    native.st_gid, 1);
+		manifest_file(directory, "suid", (const uint8_t *)"x", 1,
+		    SHARED_MODE & ~(unsigned)S_ISUID, 0, native.st_gid, 1);
+	}
 	manifest_file(directory, "after-full", (const uint8_t *)after_full, sizeof(after_full) - 1,
 	    0644, 0, native.st_gid, 1);
 	expect_error(fstatat(directory, "ghost", &status, 0), ENOENT);
@@ -579,10 +595,12 @@ main(int argc, char **argv)
 	struct statvfs filesystem;
 	int root;
 
-	if (argc != 3 || geteuid() != 0 ||
+	skip_set_id = argc == 4 && strcmp(argv[3], "--skip-set-id") == 0;
+	if ((argc != 3 && !skip_set_id) || geteuid() != 0 ||
 	    (strcmp(argv[1], "write") != 0 && strcmp(argv[1], "verify") != 0)) {
-		fprintf(
-		    stderr, "usage (guest root): btrfs-mounted-write-test write|verify MOUNT\n");
+		fprintf(stderr,
+		    "usage (guest root): btrfs-mounted-write-test write|verify MOUNT "
+		    "[--skip-set-id]\n");
 		return 2;
 	}
 	root = open(argv[2], O_RDONLY | O_DIRECTORY);
@@ -591,10 +609,12 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "write") == 0) {
 		REQUIRE((filesystem.f_flag & ST_RDONLY) == 0);
 		write_phase(root);
-		fprintf(stderr, "mounted Btrfs write contracts PASS\n");
+		fprintf(stderr, "mounted Btrfs write contracts PASS%s\n",
+		    skip_set_id ? " (set-id SKIPPED)" : "");
 	} else {
 		verify_phase(root);
-		fprintf(stderr, "mounted Btrfs persistence after remount PASS\n");
+		fprintf(stderr, "mounted Btrfs persistence after remount PASS%s\n",
+		    skip_set_id ? " (set-id SKIPPED)" : "");
 	}
 	REQUIRE(close(root) == 0);
 	return 0;

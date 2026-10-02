@@ -86,9 +86,9 @@ if fskit_available
     'adapters/fskit/BtrfsFileSystem.m', 'adapters/fskit/BtrfsVolumeMutation.m',
     'adapters/fskit/BtrfsDeviceBarrier.m', 'adapters/fskit/BtrfsPeerIdentity.m',
     'tests/namespace_audit.c', 'tests/references.c', include_directories: inc,
-    objc_args: ['-fobjc-arc', '-fblocks', '-mmacosx-version-min=26.5'],
+    objc_args: ['-fobjc-arc', '-fblocks', '-mmacosx-version-min=26.4'],
     link_args: ['-framework', 'Foundation', '-framework', 'FSKit', '-framework', 'Security',
-      '-mmacosx-version-min=26.5'],
+      '-mmacosx-version-min=26.4'],
     link_with: [posix, identity, native, volume, core], dependencies: [zlib, zstd])
 endif
 if get_option('fuzzer')

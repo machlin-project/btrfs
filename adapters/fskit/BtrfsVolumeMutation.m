@@ -159,6 +159,7 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 		[_itemLock lock];
 		item->pending = parent->pending;
 		[_itemLock unlock];
+		[self setHolder:parent ofItem:item];
 	}
 	reply(item, item != nil ? name : nil, btrfs_fskit_error(error));
 }
@@ -308,6 +309,7 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 		[_itemLock lock];
 		owned->pending = source->pending;
 		[_itemLock unlock];
+		[self setHolder:destination ofItem:owned];
 		(void)[self refreshItem:owned];
 		if (over != nil && over != owned) {
 			[self nameRemovedFrom:over];
@@ -349,8 +351,9 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 	inode = owned->inode;
 	[_itemLock unlock];
 	identity = inode.id;
-	/* Inode flags have no Darwin mapping beyond the absence of any. */
-	if ((supplied & FSItemAttributeFlags) != 0 && newAttributes.flags != 0) {
+	/* Inode flags have no Darwin mapping beyond their current value. */
+	if ((supplied & FSItemAttributeFlags) != 0 &&
+	    newAttributes.flags != btrfs_fskit_flags(inode.flags)) {
 		reply(nil, btrfs_fskit_error(BTRFS_UNSUPPORTED));
 		return;
 	}
@@ -422,11 +425,7 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 		error = [self refreshItem:owned];
 	}
 	if (error == BTRFS_OK) {
-		[_itemLock lock];
-		inode = owned->inode;
-		[_itemLock unlock];
-		attributes = [self attributesForInode:&inode];
-		error = attributes == nil ? BTRFS_NO_MEMORY : BTRFS_OK;
+		attributes = [self attributesForItem:owned result:&error];
 	}
 	reply(attributes, btrfs_fskit_error(error));
 }

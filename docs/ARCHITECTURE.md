@@ -668,6 +668,17 @@ for the caller's privilege. A name removed while its item is open leaves an
 orphan, evicted when FSKit reclaims the item or cleaned at the next writable
 load. Creation needs the kernel's mode and owner, refuses device nodes (their
 numbers do not reach the callback) and directories with a default POSIX ACL.
+FSKit faults, ending the extension and its volume, on an attribute reply that
+lacks any attribute it wants, so every reply carries all standard ones: flags as
+the XNU adapter maps them (immutable, append-only, nodump) and the parent ID.
+The mount root's parent is `FSItemIDParentOfRoot`, a directory's comes from its
+tree, and a file's is the directory it was last reached through, as Darwin's
+vnode parent; after a rename that replaced nothing FSKit asks for the absent
+target's attributes with a nil item, which gets ESTALE. On 26.x the kernel keeps
+its cached mode after a write that removed set-id bits: the bits are gone on
+disk and after a remount, but a live `stat` still shows them, as ext4 found on
+26.5.2 and 27. No public call refreshes that cache; the set-id group of the
+mounted write suite stays a recorded failure on FSKit.
 
 ## Superblock copies, publication and recovery
 

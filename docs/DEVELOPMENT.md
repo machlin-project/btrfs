@@ -257,8 +257,9 @@ crashing input; turn the cause into a deterministic regression before fixing it.
 
 ## Native builds and guest acceptance
 
-FSKit requires macOS 26.5 SDK or later and XcodeGen; the extension's deployment
-target is macOS 26.5. Kext builds use Kernel.framework
+FSKit requires macOS 26.5 SDK or later and XcodeGen; the deployment target is
+macOS 26.4, the release that added `requestedMountOptions`, which a read-only
+volume uses to ask FSKit for a read-only mount. Kext builds use Kernel.framework
 headers from the selected SDK and enforce the same core stack budget.
 
 ```sh
@@ -304,6 +305,12 @@ app='/Applications/Machlin btrfs.app/Contents/MacOS/Machlin btrfs'
 "$app" --control device-service
 ```
 
+Register the copy with `lsregister -f -R -trusted` and `pluginkit -a` on the
+extension. After replacing an installed bundle, restart the user's `fskit_agent`:
+it keeps the old extension identity, and every probe then fails with
+ExtensionKit error 2 until it restarts. Enabling the module takes the toggle in
+the category's info sheet; its state shows only in `--control modules`.
+
 `setup` opens the embedded setup utility (`Contents/Helpers/BtrfsDeviceSetup.app`),
 which registers the barrier daemon; approve it in System Settings. The utility also
 takes `--register`, `--unregister`, `--refresh` and `--status`, refuses to
@@ -312,6 +319,16 @@ unregister while a `machlinbtrfs` volume is mounted, and after a bundle update
 does not replace its code. Only the app's `device-service` query, which asks the
 daemon over its authenticated connection, shows a usable service; registration
 status alone does not.
+
+Attach a disposable copy as an ordinary user with
+`hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage IMAGE`
+(add `-readonly` for the read suite); Disk Arbitration mounts it through the
+module at `/Volumes/LABEL`. Run `btrfs-mounted-test MOUNT` and, as root,
+`btrfs-mounted-write-test write MOUNT --skip-set-id`, then detach, attach again
+and run `verify` with the same flag; the skip names the set-id group, a recorded
+failure on FSKit 26.x (see ARCHITECTURE.md), and the manifest omits its files.
+`diskutil unmount` is refused while Spotlight holds the volume root; `hdiutil
+detach` unmounts it. Check the written image with Linux as for the XNU runs.
 
 In an isolated guest with Python, mount a disposable copy of the plain fixture
 at its top-level subvolume, then run as root:

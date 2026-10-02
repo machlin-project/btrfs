@@ -25,6 +25,23 @@
 @implementation BtrfsDeviceBarrier (BtrfsDeviceFlusher)
 @end
 
+uint32_t
+btrfs_fskit_flags(uint64_t flags)
+{
+	uint32_t result = 0;
+
+	if (flags & BTRFS_INODE_FLAG_IMMUTABLE) {
+		result |= SF_IMMUTABLE;
+	}
+	if (flags & BTRFS_INODE_FLAG_APPEND) {
+		result |= SF_APPEND;
+	}
+	if (flags & BTRFS_INODE_FLAG_NODUMP) {
+		result |= UF_NODUMP;
+	}
+	return result;
+}
+
 NSError *
 btrfs_fskit_error(enum btrfs_result result)
 {
@@ -744,14 +761,95 @@ btrfs_timespec(struct btrfs_time time)
 	return result;
 }
 
+- (void)setHolder:(BtrfsItem *)directory ofItem:(BtrfsItem *)item
+{
+	NSNumber *number = [self numberForIdentity:[self identityOfItem:directory]];
+
+	if (number != nil) {
+		[_itemLock lock];
+		item->holder = number.unsignedLongLongValue;
+		[_itemLock unlock];
+	}
+}
+
+- (struct btrfs_object_id)identityOfItem:(BtrfsItem *)item
+{
+	struct btrfs_object_id identity;
+
+	[_itemLock lock];
+	identity = item->inode.id;
+	[_itemLock unlock];
+	return identity;
+}
+
+/* The mount root's parent is FSItemIDParentOfRoot; a directory has one parent
+ * in its tree. A file's parent is the holder its caller knows. */
+- (enum btrfs_result)parentOfInode:(const struct btrfs_inode *)inode number:(uint64_t *)number
+{
+	struct btrfs_volume_view *view;
+	struct btrfs_inode parent;
+	const struct btrfs_fs *fs;
+	NSNumber *found;
+	enum btrfs_result error;
+
+	if (inode->id.tree == _rootIdentity.tree && inode->id.inode == _rootIdentity.inode) {
+		*number = FSItemIDParentOfRoot;
+		return BTRFS_OK;
+	}
+	if ((inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_DIRECTORY) {
+		return BTRFS_NOT_FOUND;
+	}
+	fs = btrfs_volume_read(_volume, &view);
+	error = btrfs_parent(fs, inode, &parent);
+	btrfs_volume_unread(_volume, view);
+	if (error == BTRFS_OK) {
+		found = [self numberForIdentity:parent.id];
+		error = found == nil ? BTRFS_NO_MEMORY : BTRFS_OK;
+		*number = found.unsignedLongLongValue;
+	}
+	return error;
+}
+
+- (FSItemAttributes *)attributesForItem:(BtrfsItem *)item result:(enum btrfs_result *)result
+{
+	struct btrfs_inode inode;
+	uint64_t holder;
+	uint64_t parent = 0;
+
+	[_itemLock lock];
+	inode = item->inode;
+	holder = item->holder;
+	[_itemLock unlock];
+	*result = [self parentOfInode:&inode number:&parent];
+	/* A file, or a stub directory without a tree parent, keeps the directory
+	 * it was reached through. */
+	if (*result == BTRFS_NOT_FOUND && holder != 0) {
+		parent = holder;
+		*result = BTRFS_OK;
+	}
+	return *result == BTRFS_OK ? [self attributesForInode:&inode parent:parent result:result]
+				   : nil;
+}
+
 - (FSItemAttributes *)attributesForInode:(const struct btrfs_inode *)inode
+				  parent:(uint64_t)parent
+				  result:(enum btrfs_result *)result
 {
 	FSItemAttributes *attributes = [[FSItemAttributes alloc] init];
 	NSNumber *number = [self numberForIdentity:inode->id];
 
-	if (number == nil) {
+	*result = BTRFS_OK;
+	if (parent == 0) {
+		*result = [self parentOfInode:inode number:&parent];
+	}
+	if (*result == BTRFS_OK && number == nil) {
+		*result = BTRFS_NO_MEMORY;
+	}
+	if (*result != BTRFS_OK) {
 		return nil;
 	}
+	attributes.parentID = parent;
+	attributes.flags = btrfs_fskit_flags(inode->flags);
 	attributes.uid = inode->uid;
 	attributes.gid = inode->gid;
 	attributes.mode = inode->mode & ALLPERMS;
@@ -999,6 +1097,8 @@ btrfs_timespec(struct btrfs_time time)
 		item = [self itemForInode:&inode];
 		if (item == nil) {
 			error = BTRFS_NO_MEMORY;
+		} else {
+			[self setHolder:parent ofItem:item];
 		}
 	}
 	reply(item, error == BTRFS_OK ? name : nil, btrfs_fskit_error(error));
@@ -1010,11 +1110,17 @@ btrfs_timespec(struct btrfs_time time)
 {
 	BtrfsItem *owned = (BtrfsItem *)item;
 	FSItemAttributes *attributes = nil;
-	struct btrfs_inode inode;
 	BOOL orphan;
 	enum btrfs_result error = BTRFS_OK;
 
+	/* FSKit faults on a reply missing any attribute it wants: every standard
+	 * attribute is always supplied. After a rename that replaced nothing it
+	 * asks for the absent target's attributes with a nil item. */
 	(void)desiredAttributes;
+	if (![item isKindOfClass:BtrfsItem.class]) {
+		reply(nil, btrfs_fskit_error(BTRFS_STALE));
+		return;
+	}
 	[_itemLock lock];
 	orphan = owned->orphan;
 	[_itemLock unlock];
@@ -1023,11 +1129,7 @@ btrfs_timespec(struct btrfs_time time)
 		error = [self refreshItem:owned];
 	}
 	if (error == BTRFS_OK) {
-		[_itemLock lock];
-		inode = owned->inode;
-		[_itemLock unlock];
-		attributes = [self attributesForInode:&inode];
-		error = attributes == nil ? BTRFS_NO_MEMORY : BTRFS_OK;
+		attributes = [self attributesForItem:owned result:&error];
 	}
 	reply(attributes, btrfs_fskit_error(error));
 }
@@ -1086,6 +1188,7 @@ btrfs_timespec(struct btrfs_time time)
 	FSFileName *name;
 	NSNumber *number;
 	uint64_t next = cookie;
+	uint64_t holder;
 	FSDirectoryVerifier current;
 	enum btrfs_result error;
 
@@ -1093,6 +1196,14 @@ btrfs_timespec(struct btrfs_time time)
 	current = parent->version;
 	within = parent->inode;
 	[_itemLock unlock];
+	/* Every entry's parent is this directory, so attributes never resolve one
+	 * while this enumeration holds its view. */
+	number = [self numberForIdentity:within.id];
+	if (number == nil) {
+		reply(current, btrfs_fskit_error(BTRFS_NO_MEMORY));
+		return;
+	}
+	holder = number.unsignedLongLongValue;
 	if (verifier != FSDirectoryVerifierInitial && verifier != current) {
 		reply(
 		    current, [NSError errorWithDomain:NSPOSIXErrorDomain code:ESTALE userInfo:nil]);
@@ -1132,7 +1243,12 @@ btrfs_timespec(struct btrfs_time time)
 			error = BTRFS_NO_MEMORY;
 			break;
 		}
-		itemAttributes = attributes == nil ? nil : [self attributesForInode:&inode];
+		itemAttributes = attributes == nil
+		    ? nil
+		    : [self attributesForInode:&inode parent:holder result:&error];
+		if (attributes != nil && itemAttributes == nil) {
+			break;
+		}
 		if (![packer packEntryWithName:name
 				      itemType:btrfs_item_type(btrfs_mode_for_type(entry.type))
 					itemID:number.unsignedLongLongValue
