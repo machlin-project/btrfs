@@ -1075,11 +1075,30 @@ digest_inode(struct digest_state *state, const struct btrfs_inode *inode)
 }
 
 static int
+same_time(struct btrfs_time a, struct btrfs_time b)
+{
+	return a.seconds == b.seconds && a.nanoseconds == b.nanoseconds;
+}
+
+static int
+same_inode(const struct btrfs_inode *a, const struct btrfs_inode *b)
+{
+	return a->id.tree == b->id.tree && a->id.inode == b->id.inode &&
+	    a->generation == b->generation && a->size == b->size &&
+	    a->allocated_bytes == b->allocated_bytes && a->flags == b->flags &&
+	    a->device == b->device && a->mode == b->mode && a->uid == b->uid && a->gid == b->gid &&
+	    a->links == b->links && same_time(a->access_time, b->access_time) &&
+	    same_time(a->modify_time, b->modify_time) &&
+	    same_time(a->change_time, b->change_time) && same_time(a->birth_time, b->birth_time);
+}
+
+static int
 digest_directory(struct digest_state *state, const struct btrfs_inode *directory, unsigned depth)
 {
 	struct btrfs_directory *stream;
 	struct btrfs_dir_entry entry;
 	struct btrfs_inode child;
+	struct btrfs_inode alone;
 	uint64_t cookie;
 	enum btrfs_result result;
 
@@ -1094,7 +1113,14 @@ digest_directory(struct digest_state *state, const struct btrfs_inode *directory
 		digest_mix(state->digest, entry.name, entry.name_length);
 		digest_u64(state->digest, entry.type);
 		digest_u64(state->digest, cookie);
-		result = btrfs_get_inode(state->fs, entry.id, &child);
+		/* The stream's own inode path reads what a lookup alone reads. */
+		result = btrfs_directory_inode(stream, &entry, &child);
+		if (result == BTRFS_OK) {
+			result = btrfs_get_inode(state->fs, entry.id, &alone);
+		}
+		if (result == BTRFS_OK && !same_inode(&child, &alone)) {
+			result = BTRFS_CORRUPT;
+		}
 		if (result != BTRFS_OK) {
 			btrfs_directory_close(stream);
 			return digest_fail(state, "inode", result, entry.id);

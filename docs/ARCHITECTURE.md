@@ -89,8 +89,11 @@ namei.
 Lookup hashes raw names using Btrfs's CRC32C name hash, then compares full byte
 strings and validates collision records. Enumeration uses persistent DIR_INDEX
 keys as resumable cookies, never packed-buffer offsets. A failed operation leaves
-the caller's cookie unchanged. The streaming API retains its cursor across entries;
-adapters add any native dot entries themselves. Lookup handles `.` and `..`.
+the caller's cookie unchanged. The streaming API retains its cursor across entries,
+and a second one for the inodes its entries name in the directory's tree, which
+searches only its current leaf when that leaf spans the next inode; entries
+naming another subvolume's root read it directly. Adapters add any native dot
+entries themselves. Lookup handles `.` and `..`.
 Parent resolution uses inode references within a tree and root backreferences
 across subvolumes; the selected mount root remains its own parent. This does not
 implement Linux path-walk, symlink resolution or authorization policy.

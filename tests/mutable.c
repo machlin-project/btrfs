@@ -266,6 +266,40 @@ in_place(struct bt_mutation *mutation, struct bt_root root, struct bt_key wanted
 	return found;
 }
 
+/* A cursor seeking near its previous position finds what a fresh seek finds,
+ * for keys present, between present ones and beyond the last. */
+static void
+require_near(const struct btrfs_fs *fs, struct bt_root root)
+{
+	struct bt_cursor near;
+	struct bt_cursor fresh;
+	struct bt_record found;
+	struct bt_record expected;
+	struct bt_key wanted;
+	enum btrfs_result result;
+	unsigned i;
+
+	bt_cursor_init(&near, fs, root);
+	/* In order, each key and the absent one after it, then in a scattered
+	 * order. */
+	for (i = 0; i < 4 * KEYS; i++) {
+		wanted = key(i < 2 * KEYS ? i / 2 : i * 7919U % (KEYS + KEYS / 8));
+		wanted.offset += i < 2 * KEYS ? i % 2 : i % 3 == 0;
+		bt_cursor_init(&fresh, fs, root);
+		result = bt_cursor_seek(&fresh, wanted, 0);
+		REQUIRE(bt_cursor_seek_near(&near, wanted) == result);
+		if (result == BTRFS_OK) {
+			REQUIRE(bt_cursor_record(&fresh, &expected) == BTRFS_OK &&
+			    bt_cursor_record(&near, &found) == BTRFS_OK);
+			REQUIRE(bt_key_compare(found.key, expected.key) == 0 &&
+			    found.size == expected.size &&
+			    memcmp(found.data, expected.data, found.size) == 0);
+		}
+		bt_cursor_fini(&fresh);
+	}
+	bt_cursor_fini(&near);
+}
+
 static struct bt_mutation *
 begin(struct fixture *fixture, size_t limit)
 {
@@ -345,6 +379,7 @@ exercise(uint32_t node_size, int dup)
 	REQUIRE(node_size != 4096 || root.level >= 2);
 	verify(bt_mutation_view(mutation), root, model);
 	require_packed(mutation);
+	require_near(bt_mutation_view(mutation), root);
 	for (i = 0; i < KEYS; i += 7) {
 		REQUIRE(bt_mutation_find(mutation, root, key(i), value, sizeof(value), &length) ==
 		    BTRFS_OK);
@@ -376,7 +411,9 @@ exercise(uint32_t node_size, int dup)
 	}
 	verify(bt_mutation_view(mutation), root, model);
 	require_packed(mutation);
+	require_near(bt_mutation_view(mutation), root);
 	verify(&fixture.fs, snapshot, original);
+	require_near(&fixture.fs, snapshot);
 	REQUIRE(memcmp(before, fixture.medium, bytes) == 0);
 	allocations = fixture.allocations;
 	for (i = 0; i < 50; i++) {

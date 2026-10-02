@@ -44,6 +44,9 @@ next_held(struct btrfs_fs *fs, const struct btrfs_inode *directory, struct btrfs
 	assert(found.id.tree == entry.id.tree && found.id.inode == entry.id.inode);
 	assert(btrfs_get_inode(fs, entry.id, &child) == BTRFS_OK);
 	assert((child.mode & BTRFS_MODE_TYPE) == BTRFS_MODE_REGULAR);
+	assert(btrfs_directory_inode(*stream, &entry, &found) == BTRFS_OK);
+	assert(found.id.inode == child.id.inode && found.size == child.size &&
+	    found.mode == child.mode && found.links == child.links);
 }
 
 /* "many/entry-NNNN" holds "N\n" inline; spreads readers over every leaf. */

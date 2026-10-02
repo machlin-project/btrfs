@@ -211,6 +211,12 @@ enum btrfs_result btrfs_directory_open(const struct btrfs_fs *fs,
 enum btrfs_result btrfs_directory_next(
     struct btrfs_directory *stream, struct btrfs_dir_entry *entry, uint64_t *next_cookie);
 void btrfs_directory_close(struct btrfs_directory *stream);
+/* The inode an entry of this stream names, as btrfs_get_inode reads it. The
+ * stream keeps a second tree path for its directory's own inodes, so entries
+ * whose inodes are neighbors, as files created together are, cost one leaf
+ * search each. */
+enum btrfs_result btrfs_directory_inode(
+    struct btrfs_directory *stream, const struct btrfs_dir_entry *entry, struct btrfs_inode *inode);
 /* completed is always initialized, including on error. Only the reported prefix
  * is valid; bytes beyond it never hold unverified file data (a failed range
  * read in place is zeroed). */

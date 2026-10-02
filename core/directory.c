@@ -217,6 +217,10 @@ btrfs_lookup(const struct btrfs_fs *fs, const struct btrfs_inode *directory, con
 
 struct btrfs_directory {
 	struct bt_cursor cursor;
+	/* Reads the inodes of entries in the directory's own tree; set up on
+	 * first use. */
+	struct bt_cursor inodes;
+	int inodes_ready;
 	uint64_t inode;
 	int advance;
 	int end;
@@ -337,7 +341,28 @@ btrfs_directory_close(struct btrfs_directory *stream)
 	}
 	fs = stream->cursor.fs;
 	bt_cursor_fini(&stream->cursor);
+	if (stream->inodes_ready) {
+		bt_cursor_fini(&stream->inodes);
+	}
 	fs->env.release(fs->env.context, stream, sizeof(*stream));
+}
+
+enum btrfs_result
+btrfs_directory_inode(
+    struct btrfs_directory *stream, const struct btrfs_dir_entry *entry, struct btrfs_inode *inode)
+{
+	if (stream == NULL || entry == NULL || inode == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	/* A subvolume's root directory, or its empty stub, is in another tree. */
+	if (entry->id.tree != stream->cursor.root.owner || entry->id.inode < BTRFS_ROOT_INODE) {
+		return btrfs_get_inode(stream->cursor.fs, entry->id, inode);
+	}
+	if (!stream->inodes_ready) {
+		bt_cursor_init(&stream->inodes, stream->cursor.fs, stream->cursor.root);
+		stream->inodes_ready = 1;
+	}
+	return bt_inode_read(&stream->inodes, entry->id, 1, inode);
 }
 
 enum btrfs_result

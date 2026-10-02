@@ -76,7 +76,7 @@ nodes) in a release build, without and with a 64 MiB node cache:
 | 4 KiB random read of a 4 MiB file | 4.0 us, 5 reads | 1.0 us, 1 read, no allocations |
 | Path lookup in a 700-entry directory | 6.5 us, 8 reads | 0.6 us, no reads or allocations |
 | 700-entry directory stream | 24 us, 16 reads | 12 us, 0.1 reads |
-| 700-entry stream with each inode | 1,100 us, 1,416 reads | 90 us, 1 allocation |
+| 700-entry stream with each inode | 77 us, 77 reads | 40 us, 1 allocation |
 | 1 MiB sequential read | 140-160 us, 5.2 reads | 60-95 us, 1 read, no allocations |
 | Mount, create one file, commit | 90-110 us, 61 reads | 55 us, 5 reads |
 | Create and write an 8 MiB file, commit | 1.8 ms, 71 reads | 1.7 ms, 5 reads |
@@ -91,7 +91,10 @@ view, without copying them, and from reusing the primary superblock a transactio
 instead of reading it again. Sequential reads gained from checksumming four data
 sectors in independent CRC instruction chains and from reading aligned sectors
 into the caller's buffer instead of copying them out of a window (the table's
-first sequential figures predate both). Node checksums run in three such chains
+first sequential figures predate both). A directory stream reads the inodes its
+entries name through a second tree path it keeps, so an inode next to the
+previous one costs a search of the leaf already held and no device read (the
+row took 1,100 us and 1,416 reads before, and 90 us with the cache). Node checksums run in three such chains
 over thirds of the node, joined by an operator computed at mount that advances
 a CRC over a third of zero bytes: on the development host, 33 GB/s instead of 11
 for every node size. The remaining reads are superblocks: the primary at

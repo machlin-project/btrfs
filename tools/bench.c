@@ -124,7 +124,7 @@ read_series(struct btrfs_fs *fs)
 		while (btrfs_directory_next(stream, &entry, &cookie) == BTRFS_OK) {
 			struct btrfs_inode child;
 
-			(void)btrfs_get_inode(fs, entry.id, &child);
+			(void)btrfs_directory_inode(stream, &entry, &child);
 		}
 		btrfs_directory_close(stream);
 	}

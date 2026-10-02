@@ -431,6 +431,34 @@ bt_cursor_seek(struct bt_cursor *cursor, struct bt_key key, int predecessor)
 }
 
 enum btrfs_result
+bt_cursor_seek_near(struct bt_cursor *cursor, struct bt_key key)
+{
+	const uint8_t *leaf = cursor->blocks[0];
+	uint32_t base = 0;
+	uint32_t half;
+	uint32_t count;
+
+	if (!cursor->valid || leaf == NULL) {
+		return bt_cursor_seek(cursor, key, 0);
+	}
+	count = bt_count(leaf);
+	/* Keys are unique and ordered across leaves, so a key between a leaf's
+	 * first and last keys is in that leaf if anywhere. */
+	if (count == 0 || !bt_key_at_most(bt_node_key(leaf, 0, 0), key) ||
+	    !bt_key_at_most(key, bt_node_key(leaf, 0, count - 1))) {
+		return bt_cursor_seek(cursor, key, 0);
+	}
+	while (count > 1) {
+		half = count / 2;
+		base = bt_key_at_most(bt_node_key(leaf, 0, base + half), key) ? base + half : base;
+		count -= half;
+	}
+	/* The next key, when base's is below key, is still in this leaf. */
+	cursor->slots[0] = bt_key_compare(bt_node_key(leaf, 0, base), key) < 0 ? base + 1 : base;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
 bt_cursor_next(struct bt_cursor *cursor)
 {
 	return bt_cursor_step(cursor, 1);

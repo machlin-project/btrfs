@@ -14,14 +14,55 @@ bt_time_decode(struct bt_disk_time disk, struct btrfs_time *time)
 }
 
 enum btrfs_result
-btrfs_get_inode(const struct btrfs_fs *fs, struct btrfs_object_id id, struct btrfs_inode *inode)
+bt_inode_read(
+    struct bt_cursor *cursor, struct btrfs_object_id id, int near, struct btrfs_inode *inode)
 {
-	struct bt_root root;
-	struct bt_cursor cursor;
+	const struct btrfs_fs *fs = cursor->fs;
 	struct bt_record record;
 	struct btrfs_inode decoded;
 	const struct bt_disk_inode *disk;
 	struct bt_key key = { .objectid = id.inode, .type = BT_INODE_ITEM };
+	enum btrfs_result error;
+
+	error = near ? bt_cursor_seek_near(cursor, key) : bt_cursor_seek(cursor, key, 0);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	(void)bt_cursor_record(cursor, &record);
+	if (bt_key_compare(record.key, key) != 0) {
+		return BTRFS_NOT_FOUND;
+	}
+	if (record.size != sizeof(*disk)) {
+		return BTRFS_CORRUPT;
+	}
+	disk = (const void *)record.data;
+	bt_zero(&decoded, sizeof(decoded));
+	decoded.id = id;
+	decoded.generation = bt_u64(disk->generation);
+	decoded.size = bt_u64(disk->size);
+	decoded.allocated_bytes = bt_u64(disk->nbytes);
+	decoded.flags = bt_u64(disk->flags);
+	decoded.device = bt_u64(disk->device);
+	decoded.mode = bt_u32(disk->mode);
+	decoded.uid = bt_u32(disk->uid);
+	decoded.gid = bt_u32(disk->gid);
+	decoded.links = bt_u32(disk->links);
+	if (decoded.generation > fs->info.generation || decoded.size > INT64_MAX ||
+	    bt_time_decode(disk->atime, &decoded.access_time) != BTRFS_OK ||
+	    bt_time_decode(disk->mtime, &decoded.modify_time) != BTRFS_OK ||
+	    bt_time_decode(disk->ctime, &decoded.change_time) != BTRFS_OK ||
+	    bt_time_decode(disk->otime, &decoded.birth_time) != BTRFS_OK) {
+		return BTRFS_CORRUPT;
+	}
+	*inode = decoded;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+btrfs_get_inode(const struct btrfs_fs *fs, struct btrfs_object_id id, struct btrfs_inode *inode)
+{
+	struct bt_root root;
+	struct bt_cursor cursor;
 	enum btrfs_result error;
 
 	if (fs == NULL || inode == NULL || !bt_file_tree(id.tree) ||
@@ -41,37 +82,7 @@ btrfs_get_inode(const struct btrfs_fs *fs, struct btrfs_object_id id, struct btr
 		return BTRFS_OK;
 	}
 	bt_cursor_init(&cursor, fs, root);
-	error = bt_cursor_seek(&cursor, key, 0);
-	if (error == BTRFS_OK) {
-		(void)bt_cursor_record(&cursor, &record);
-		if (bt_key_compare(record.key, key) != 0) {
-			error = BTRFS_NOT_FOUND;
-		} else if (record.size != sizeof(*disk)) {
-			error = BTRFS_CORRUPT;
-		} else {
-			disk = (const void *)record.data;
-			bt_zero(&decoded, sizeof(decoded));
-			decoded.id = id;
-			decoded.generation = bt_u64(disk->generation);
-			decoded.size = bt_u64(disk->size);
-			decoded.allocated_bytes = bt_u64(disk->nbytes);
-			decoded.flags = bt_u64(disk->flags);
-			decoded.device = bt_u64(disk->device);
-			decoded.mode = bt_u32(disk->mode);
-			decoded.uid = bt_u32(disk->uid);
-			decoded.gid = bt_u32(disk->gid);
-			decoded.links = bt_u32(disk->links);
-			if (decoded.generation > fs->info.generation || decoded.size > INT64_MAX ||
-			    bt_time_decode(disk->atime, &decoded.access_time) != BTRFS_OK ||
-			    bt_time_decode(disk->mtime, &decoded.modify_time) != BTRFS_OK ||
-			    bt_time_decode(disk->ctime, &decoded.change_time) != BTRFS_OK ||
-			    bt_time_decode(disk->otime, &decoded.birth_time) != BTRFS_OK) {
-				error = BTRFS_CORRUPT;
-			} else {
-				*inode = decoded;
-			}
-		}
-	}
+	error = bt_inode_read(&cursor, id, 0, inode);
 	bt_cursor_fini(&cursor);
 	return error;
 }

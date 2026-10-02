@@ -237,6 +237,13 @@ enum btrfs_result bt_node_items(const struct btrfs_fs *fs, const uint8_t *block)
 void bt_cursor_init(struct bt_cursor *cursor, const struct btrfs_fs *fs, struct bt_root root);
 void bt_cursor_fini(struct bt_cursor *cursor);
 enum btrfs_result bt_cursor_seek(struct bt_cursor *cursor, struct bt_key key, int predecessor);
+/* bt_cursor_seek(cursor, key, 0) that searches only the current leaf when key
+ * lies between its first and last keys. */
+enum btrfs_result bt_cursor_seek_near(struct bt_cursor *cursor, struct bt_key key);
+/* The inode id names, from its INODE_ITEM through cursor on id's tree; near
+ * seeks with bt_cursor_seek_near. */
+enum btrfs_result bt_inode_read(
+    struct bt_cursor *cursor, struct btrfs_object_id id, int near, struct btrfs_inode *inode);
 enum btrfs_result bt_cursor_next(struct bt_cursor *cursor);
 enum btrfs_result bt_cursor_record(const struct bt_cursor *cursor, struct bt_record *record);
 enum btrfs_result bt_find_root(const struct btrfs_fs *fs, uint64_t tree, struct bt_root *root);
