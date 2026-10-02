@@ -51,6 +51,9 @@
 #define GROUPED_STAMP "grouped-stamp"
 /* Tree nodes a grouped stress operation declares. */
 #define GROUPED_STRESS_NODES 256U
+/* A compressible file of two compressed extents, read in three pieces. */
+#define COMPRESSED_BYTES (256U * 1024U)
+#define COMPRESSED_PIECE 100000U
 
 /* An allocation countdown for the writer thread only: readers never see
  * injected failures. */
@@ -571,6 +574,97 @@ committed_has(struct btrfs_volume *volume, const char *path)
 	present = exists(fs, path);
 	btrfs_volume_unpin(volume, view);
 	return present;
+}
+
+static void
+compressed_bytes(uint8_t *bytes, unsigned version)
+{
+	size_t i;
+
+	for (i = 0; i < COMPRESSED_BYTES; i++) {
+		bytes[i] = (uint8_t)(i / 64 + version * 37U);
+	}
+}
+
+static enum btrfs_result
+create_compressed(struct btrfs_transaction *transaction, struct btrfs_object_id root,
+    const char *name, unsigned version)
+{
+	static uint8_t bytes[COMPRESSED_BYTES];
+	struct btrfs_new_inode attributes;
+	struct btrfs_object_id id;
+	enum btrfs_result result;
+
+	memset(&attributes, 0, sizeof(attributes));
+	attributes.mode = BTRFS_MODE_REGULAR | 0644;
+	attributes.time.seconds = 1800000000;
+	compressed_bytes(bytes, version);
+	result = btrfs_transaction_create(transaction, root, name, strlen(name), &attributes, &id);
+	if (result == BTRFS_OK) {
+		result = btrfs_transaction_write(
+		    transaction, id, 0, bytes, sizeof(bytes), attributes.time);
+	}
+	return result;
+}
+
+/* Reads the file in pieces that end inside extents and compares each byte. */
+static void
+require_compressed(const struct btrfs_fs *fs, const char *path, unsigned version)
+{
+	static uint8_t expected[COMPRESSED_BYTES];
+	static uint8_t bytes[COMPRESSED_BYTES];
+	struct btrfs_inode inode;
+	size_t completed;
+	size_t offset;
+	size_t length;
+
+	compressed_bytes(expected, version);
+	REQUIRE(btrfs_image_lookup((struct btrfs_fs *)fs, path, &inode) == BTRFS_OK);
+	REQUIRE(inode.size == COMPRESSED_BYTES);
+	for (offset = 0; offset < COMPRESSED_BYTES; offset += length) {
+		length = COMPRESSED_BYTES - offset < COMPRESSED_PIECE ? COMPRESSED_BYTES - offset
+								      : COMPRESSED_PIECE;
+		REQUIRE(btrfs_read(fs, &inode, offset, bytes + offset, length, &completed) ==
+			BTRFS_OK &&
+		    completed == length);
+	}
+	REQUIRE(memcmp(bytes, expected, sizeof(bytes)) == 0);
+}
+
+static void
+require_committed_compressed(struct btrfs_volume *volume, const char *path, unsigned version)
+{
+	struct btrfs_volume_view *view;
+	const struct btrfs_fs *fs;
+
+	fs = btrfs_volume_pin(volume, &view);
+	require_compressed(fs, path, version);
+	btrfs_volume_unpin(volume, view);
+}
+
+/* A volume writes through the caller's compressor: a compressible file takes
+ * a fraction of its size on the device and reads back as written. */
+static void
+compression_test(struct harness *harness)
+{
+	struct btrfs_volume *volume;
+	struct btrfs_transaction *transaction;
+	size_t sectors;
+
+	harness->device.compress = btrfs_image_compress;
+	harness->device.compression = BTRFS_COMPRESSION_ZLIB;
+	REQUIRE(btrfs_volume_open(&harness->environment, &harness->device, &harness->callbacks,
+		    BTRFS_TOP_LEVEL_TREE, &volume) == BTRFS_OK);
+	sectors = harness->overlay.count;
+	REQUIRE(btrfs_volume_begin(volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_compressed(transaction, root_id(volume), "compressed", 1) == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(volume, transaction) == BTRFS_OK);
+	REQUIRE(harness->overlay.count - sectors < COMPRESSED_BYTES / SECTOR);
+	require_committed_compressed(volume, "/compressed", 1);
+	btrfs_volume_close(volume);
+	harness->device.compress = NULL;
+	harness->device.compression = BTRFS_COMPRESSION_NONE;
+	printf("compressed volume writes: stored in a fraction of their size, read back PASS\n");
 }
 
 /* Grouped operations: one running transaction, visible before it commits,
@@ -1352,6 +1446,9 @@ main(int argc, char **argv)
 	harness_close(&harness);
 	harness_open(&harness, argv[1]);
 	grouped_test(&harness);
+	harness_close(&harness);
+	harness_open(&harness, argv[1]);
+	compression_test(&harness);
 	harness_close(&harness);
 	return 0;
 }

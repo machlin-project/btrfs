@@ -79,6 +79,16 @@ volume_flush(void *context)
 }
 
 static enum btrfs_result
+volume_compress(void *context, enum btrfs_compression codec, const void *input, size_t input_size,
+    void *output, size_t capacity, size_t *size)
+{
+	struct btrfs_volume *volume = context;
+
+	return volume->device.compress(
+	    volume->device.context, codec, input, input_size, output, capacity, size);
+}
+
+static enum btrfs_result
 volume_view(struct btrfs_volume *volume, struct btrfs_volume_view **result)
 {
 	struct btrfs_volume_view *view;
@@ -195,6 +205,8 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 		volume->counted.context = volume;
 		volume->counted.write = volume_write;
 		volume->counted.flush = volume_flush;
+		volume->counted.compress = writer->compress != NULL ? volume_compress : NULL;
+		volume->counted.compression = writer->compression;
 	}
 	error = volume_view(volume, &volume->current);
 	if (error == BTRFS_OK && volume->writable) {
