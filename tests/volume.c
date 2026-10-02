@@ -1247,6 +1247,74 @@ grouped_stress_test(struct harness *harness, size_t iterations)
 	free(buffer);
 }
 
+#ifdef BTRFS_VOLUME_TEST_HOOKS
+extern void (*btrfs_volume_test_pin_hook)(void);
+
+/* Milliseconds a pinner stays between reading the current view and pinning
+ * it. */
+#define WINDOW_MILLISECONDS 100L
+
+static _Atomic int window_armed;
+
+static void
+window_pause(void)
+{
+	struct timespec delay = { 0, WINDOW_MILLISECONDS * 1000000L };
+
+	if (atomic_exchange(&window_armed, 0)) {
+		nanosleep(&delay, NULL);
+	}
+}
+
+struct window_reader {
+	struct btrfs_volume *volume;
+	struct btrfs_volume_view *view;
+	const struct btrfs_fs *fs;
+};
+
+static void *
+window_pin(void *context)
+{
+	struct window_reader *reader = context;
+
+	reader->fs = btrfs_volume_pin(reader->volume, &reader->view);
+	return NULL;
+}
+
+/* A pinner that read the current view just before a commit replaced it still
+ * pins that view: the commit's retirement waits for it and keeps the view. */
+static void
+window_test(struct harness *harness)
+{
+	struct window_reader reader;
+	struct btrfs_transaction *transaction;
+	struct timespec poll = { 0, 1000000L };
+	pthread_t thread;
+	uint64_t generation;
+
+	REQUIRE(btrfs_volume_open(&harness->environment, &harness->device, &harness->callbacks,
+		    BTRFS_TOP_LEVEL_TREE, &reader.volume) == BTRFS_OK);
+	generation = btrfs_volume_generation(reader.volume);
+	btrfs_volume_test_pin_hook = window_pause;
+	window_armed = 1;
+	REQUIRE(pthread_create(&thread, NULL, window_pin, &reader) == 0);
+	while (window_armed) {
+		nanosleep(&poll, NULL);
+	}
+	REQUIRE(btrfs_volume_begin(reader.volume, &transaction) == BTRFS_OK);
+	REQUIRE(create_file(reader.volume, transaction, "window") == BTRFS_OK);
+	REQUIRE(btrfs_volume_commit(reader.volume, transaction) == BTRFS_OK);
+	REQUIRE(pthread_join(thread, NULL) == 0);
+	btrfs_volume_test_pin_hook = NULL;
+	REQUIRE(btrfs_volume_generation(reader.volume) == generation + 1);
+	REQUIRE(exists(reader.fs, "/greeting") && !exists(reader.fs, "/window"));
+	btrfs_volume_unpin(reader.volume, reader.view);
+	btrfs_volume_close(reader.volume);
+	printf("native volume pin window: a view read before a commit replaced it stays pinned "
+	       "PASS\n");
+}
+#endif
+
 int
 main(int argc, char **argv)
 {
@@ -1254,6 +1322,14 @@ main(int argc, char **argv)
 	char *end;
 	unsigned long iterations;
 
+#ifdef BTRFS_VOLUME_TEST_HOOKS
+	if (argc == 3 && strcmp(argv[1], "--window") == 0) {
+		harness_open(&harness, argv[2]);
+		window_test(&harness);
+		harness_close(&harness);
+		return 0;
+	}
+#endif
 	if (argc == 4 && strcmp(argv[1], "--grouped") == 0) {
 		iterations = strtoul(argv[2], &end, 10);
 		REQUIRE(*end == '\0' && iterations != 0 && iterations < 1000000UL);

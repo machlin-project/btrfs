@@ -1,6 +1,24 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <btrfs/volume.h>
 
+/* Pinning the current view takes no lock: a pinner marks itself in one of
+ * these counters, chosen by its stack address, while it reads the current
+ * view and raises the view's pins. Freeing views waits for every counter to
+ * drain after publishing a new current view, so no pinner still holds an older
+ * one unpinned. */
+#define VOLUME_STRIPES 16U
+#define VOLUME_LINE 64U
+
+struct volume_active {
+	uint32_t count;
+	uint8_t padding[VOLUME_LINE - sizeof(uint32_t)];
+};
+
+#ifdef BTRFS_VOLUME_TEST_HOOKS
+/* Tests widen the window between reading the current view and pinning it. */
+void (*btrfs_volume_test_pin_hook)(void);
+#endif
+
 struct btrfs_volume_view {
 	struct btrfs_fs *fs;
 	uint64_t generation;
@@ -9,6 +27,7 @@ struct btrfs_volume_view {
 };
 
 struct btrfs_volume {
+	struct volume_active active[VOLUME_STRIPES];
 	struct btrfs_environment environment;
 	struct btrfs_write_environment device;
 	/* Counts what the open transaction issued, to tell an unchanged medium
@@ -70,7 +89,7 @@ volume_view(struct btrfs_volume *volume, struct btrfs_volume_view **result)
 	if (view == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
-	view->pins = 0;
+	__atomic_store_n(&view->pins, 0, __ATOMIC_RELAXED);
 	view->older = NULL;
 	error = btrfs_mount(&volume->environment, volume->tree, &view->fs);
 	if (error != BTRFS_OK) {
@@ -98,10 +117,17 @@ volume_retire(struct btrfs_volume *volume)
 	struct btrfs_volume_view **link = &volume->current->older;
 	struct btrfs_volume_view *retired = NULL;
 	struct btrfs_volume_view *view;
+	unsigned stripe;
 
+	/* A pinner that read an older current view has raised its pins once its
+	 * counter drains; one that starts later reads the current view. */
+	for (stripe = 0; stripe < VOLUME_STRIPES; stripe++) {
+		while (__atomic_load_n(&volume->active[stripe].count, __ATOMIC_SEQ_CST) != 0) {
+		}
+	}
 	while (*link != NULL) {
 		view = *link;
-		if (view->pins == 0) {
+		if (__atomic_load_n(&view->pins, __ATOMIC_ACQUIRE) == 0) {
 			*link = view->older;
 			view->older = retired;
 			retired = view;
@@ -131,6 +157,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 {
 	struct btrfs_volume *volume;
 	struct btrfs_transaction *transaction = NULL;
+	unsigned stripe;
 	enum btrfs_result error;
 
 	if (environment == NULL || locks == NULL || result == NULL ||
@@ -142,6 +169,9 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	if (volume == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
+	for (stripe = 0; stripe < VOLUME_STRIPES; stripe++) {
+		volume->active[stripe].count = 0;
+	}
 	volume->environment = *environment;
 	volume->locks = *locks;
 	volume->tree = tree;
@@ -149,7 +179,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	volume->counters = NULL;
 	volume->map = NULL;
 	volume->open = NULL;
-	volume->running = NULL;
+	__atomic_store_n(&volume->running, NULL, __ATOMIC_SEQ_CST);
 	volume->running_view = NULL;
 	volume->operations = 0;
 	volume->readers = 0;
@@ -243,27 +273,56 @@ btrfs_volume_failure(struct btrfs_volume *volume)
 	return failure;
 }
 
+static struct volume_active *
+volume_stripe(struct btrfs_volume *volume, const void *hint)
+{
+	uint64_t page = (uint64_t)(uintptr_t)hint >> 12;
+
+	return &volume->active[(page * UINT64_C(0x9E3779B97F4A7C15)) >> 60 & (VOLUME_STRIPES - 1)];
+}
+
+/* Pins the current view without the lock; NULL when unpinned is required
+ * (a running transaction's readers take the lock path). */
+static struct btrfs_volume_view *
+volume_pin_current(struct btrfs_volume *volume, int committed_only, const void *hint)
+{
+	struct volume_active *active = volume_stripe(volume, hint);
+	struct btrfs_volume_view *view = NULL;
+
+	__atomic_fetch_add(&active->count, 1, __ATOMIC_SEQ_CST);
+	if (committed_only || __atomic_load_n(&volume->running, __ATOMIC_SEQ_CST) == NULL) {
+		view = __atomic_load_n(&volume->current, __ATOMIC_SEQ_CST);
+#ifdef BTRFS_VOLUME_TEST_HOOKS
+		if (btrfs_volume_test_pin_hook != NULL) {
+			btrfs_volume_test_pin_hook();
+		}
+#endif
+		__atomic_fetch_add(&view->pins, 1, __ATOMIC_RELAXED);
+	}
+	__atomic_fetch_sub(&active->count, 1, __ATOMIC_RELEASE);
+	return view;
+}
+
 const struct btrfs_fs *
 btrfs_volume_pin(struct btrfs_volume *volume, struct btrfs_volume_view **view)
 {
-	volume->locks.lock(volume->locks.context);
-	*view = volume->current;
-	(*view)->pins++;
-	volume->locks.unlock(volume->locks.context);
+	*view = volume_pin_current(volume, 1, view);
 	return (*view)->fs;
 }
 
 void
 btrfs_volume_unpin(struct btrfs_volume *volume, struct btrfs_volume_view *view)
 {
-	struct btrfs_volume_view *retired = NULL;
+	struct btrfs_volume_view *retired;
 
-	volume->locks.lock(volume->locks.context);
-	view->pins--;
-	if (view != volume->current && view->pins == 0) {
-		retired = volume_retire(volume);
-		volume->locks.wake(volume->locks.context, &volume->current);
+	/* The view may be freed by others once its pins reach zero. */
+	if (__atomic_sub_fetch(&view->pins, 1, __ATOMIC_ACQ_REL) != 0 ||
+	    view == __atomic_load_n(&volume->current, __ATOMIC_ACQUIRE)) {
+		return;
 	}
+	volume->locks.lock(volume->locks.context);
+	retired = volume_retire(volume);
+	volume->locks.wake(volume->locks.context, &volume->current);
 	volume->locks.unlock(volume->locks.context);
 	volume_release_list(volume, retired);
 }
@@ -332,7 +391,7 @@ volume_publish(
 
 	if (view != NULL) {
 		view->older = volume->current;
-		volume->current = view;
+		__atomic_store_n(&volume->current, view, __ATOMIC_SEQ_CST);
 		retired = volume_retire(volume);
 	}
 	if (failure != BTRFS_OK && volume->failure == BTRFS_OK) {
@@ -357,7 +416,7 @@ volume_commit_running(struct btrfs_volume *volume)
 		return BTRFS_OK;
 	}
 	volume->locks.lock(volume->locks.context);
-	volume->running = NULL;
+	__atomic_store_n(&volume->running, NULL, __ATOMIC_SEQ_CST);
 	volume->running_view = NULL;
 	volume->operations = 0;
 	volume->locks.unlock(volume->locks.context);
@@ -479,7 +538,7 @@ btrfs_volume_join(struct btrfs_volume *volume, size_t nodes, struct btrfs_transa
 			btrfs_transaction_destroy(running);
 		} else {
 			volume->locks.lock(volume->locks.context);
-			volume->running = running;
+			__atomic_store_n(&volume->running, running, __ATOMIC_SEQ_CST);
 			volume->locks.unlock(volume->locks.context);
 		}
 	}
@@ -524,7 +583,7 @@ btrfs_volume_leave(struct btrfs_volume *volume, struct btrfs_transaction *transa
 	/* The operation failed after changing the transaction. */
 	btrfs_transaction_destroy(transaction);
 	volume->locks.lock(volume->locks.context);
-	volume->running = NULL;
+	__atomic_store_n(&volume->running, NULL, __ATOMIC_SEQ_CST);
 	volume->running_view = NULL;
 	if (volume->operations != 0 && volume->failure == BTRFS_OK) {
 		volume->failure = failure;
@@ -585,6 +644,11 @@ btrfs_volume_read(struct btrfs_volume *volume, struct btrfs_volume_view **view)
 {
 	const struct btrfs_fs *fs;
 
+	/* Without a running transaction the newest state is the current view. */
+	*view = volume_pin_current(volume, 0, view);
+	if (*view != NULL) {
+		return (*view)->fs;
+	}
 	volume->locks.lock(volume->locks.context);
 	volume->read_waiting++;
 	while (volume->running != NULL &&
@@ -605,7 +669,7 @@ btrfs_volume_read(struct btrfs_volume *volume, struct btrfs_volume_view **view)
 		fs = volume->running_view;
 	} else {
 		*view = volume->current;
-		(*view)->pins++;
+		__atomic_fetch_add(&(*view)->pins, 1, __ATOMIC_RELAXED);
 		fs = (*view)->fs;
 	}
 	volume->locks.unlock(volume->locks.context);

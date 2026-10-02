@@ -67,6 +67,9 @@ logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
   link_with: [posix, core], dependencies: [zlib, zstd])
 volume_test = executable('btrfs-volume-test', 'tests/volume.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
+volume_window_test = executable('btrfs-volume-window-test', 'tests/volume.c',
+  'adapters/common/volume.c', include_directories: inc, c_args: ['-DBTRFS_VOLUME_TEST_HOOKS'],
+  link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
 concurrent = executable('btrfs-concurrent', 'tests/concurrent.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
 if get_option('fuzzer')
@@ -151,6 +154,8 @@ if fixtures != ''
   test('native-volume-stress', volume_test,
     args: ['--stress', '1000', join_paths(fixtures, 'transactions.raw')], timeout: 300,
     suite: 'images')
+  test('native-volume-pin-window', volume_window_test,
+    args: ['--window', join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
   test('native-volume-grouped', volume_test,
     args: ['--grouped', '2000', join_paths(fixtures, 'transactions.raw')], timeout: 300,
     suite: 'images')

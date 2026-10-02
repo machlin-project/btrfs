@@ -113,8 +113,9 @@ Concurrent cached lookups of names in one directory, each walking the same
 tree roots, scale with lock-free hits and striped pin counters: on the
 `transactions` image, 1.6, 3.1, 4.9 and 5.1 million lookups per second with one,
 two, four and eight threads, where a cache lock gave 1.6, 1.0, 0.4 and 0.5
-million. Through the native volume, its lock on every read still limits eight
-threads to about 1.1 million.
+million. Reads through the native volume pin its current view without a lock
+as well: eight threads reach 5.1 million there, where the volume lock limited
+them to 1.1 million.
 
 ## Matched benchmark protocol
 
