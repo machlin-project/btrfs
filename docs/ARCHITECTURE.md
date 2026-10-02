@@ -176,9 +176,10 @@ CPU feature probe, lazy global initialization or kernel SIMD use.
 FSKit inhibits offloaded I/O so data passes through the core. The extension names
 its type `machlinbtrfs` with subtype zero: Disk Arbitration appends `_fskit` to a
 short name and cuts it at the first underscore. Probing returns `usable` for an
-admitted volume, since Disk Arbitration rejects `usableButLimited`; read-only
-access is the volume's mount policy, and an open for writing fails with EROFS
-before the kernel admits cached writes or writable mappings. Enumeration without
+admitted volume, since Disk Arbitration rejects `usableButLimited`; whether a
+volume accepts changes is decided when it loads, and on a read-only volume an
+open for writing fails with EROFS before the kernel admits cached writes or
+writable mappings. Enumeration without
 attributes starts with `.` and `..` at cookies 0 and 1, below the first directory
 index, and the mount root is its own parent; with attributes it has neither. An
 entry whose inode is missing fails the enumeration with EIO instead of ending it.
@@ -603,9 +604,21 @@ makes it read-only for the rest of the mount, since only explicit superblock
 recovery may decide what became durable. A read-write open admits a first
 transaction, so copies needing recovery fail the mount rather than a later write.
 
-The FSKit adapter stays read-only. Its block-device resource offers direct and
-buffered writes but no device cache flush or barrier, so it cannot meet the
-writer's flush contract; enabling writes there needs such an interface first.
+The FSKit volume runs on the shared volume layer: reads take the newest view and
+changes are operations of the running transaction, committed at least every
+five seconds, at synchronization and at unmount. FSKit's block resource offers
+direct writes but no device cache flush, so a volume accepts changes only with
+a device flusher that provides every barrier; a failed flush fails the commit
+and the volume, never acknowledging persistence. Without a flusher the volume
+is read-only, and until the privileged barrier service exists every installed
+volume is. Each write callback is one operation, applied completely or refused
+before its first change. The 26.x callbacks carry no caller credentials, so data
+writes, truncation and owner changes drop set-id bits and the file capability,
+as a writer without CAP_FSETID does; the extension's identity is never taken
+for the caller's privilege. A name removed while its item is open leaves an
+orphan, evicted when FSKit reclaims the item or cleaned at the next writable
+load. Creation needs the kernel's mode and owner, refuses device nodes (their
+numbers do not reach the callback) and directories with a default POSIX ACL.
 
 ## Superblock copies, publication and recovery
 

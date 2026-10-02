@@ -33,6 +33,7 @@ targets:
     sources:
       - BtrfsExtension.swift
       - BtrfsFileSystem.m
+      - BtrfsVolumeMutation.m
       - BtrfsFileSystem.h
       - BtrfsFileSystemInternal.h
       - BridgingHeader.h

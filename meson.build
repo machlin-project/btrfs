@@ -79,10 +79,11 @@ fskit_available = host_machine.system() == 'darwin' and add_languages('objc', re
   native: false)
 if fskit_available
   fskit_volume_test = executable('btrfs-fskit-volume-test', 'tests/fskit_volume.m',
-    'adapters/fskit/BtrfsFileSystem.m', include_directories: inc,
+    'adapters/fskit/BtrfsFileSystem.m', 'adapters/fskit/BtrfsVolumeMutation.m',
+    'tests/namespace_audit.c', 'tests/references.c', include_directories: inc,
     objc_args: ['-fobjc-arc', '-fblocks', '-mmacosx-version-min=26.5'],
     link_args: ['-framework', 'Foundation', '-framework', 'FSKit', '-mmacosx-version-min=26.5'],
-    link_with: [posix, identity, native, core], dependencies: [zlib, zstd])
+    link_with: [posix, identity, native, volume, core], dependencies: [zlib, zstd])
 endif
 if get_option('fuzzer')
   executable('btrfs-fuzz', 'tests/fuzz_metadata.c', include_directories: inc,
@@ -107,8 +108,8 @@ if fixtures != ''
   test('decompressed-extents', extents_test, args: [join_paths(fixtures, 'zstd.raw'),
     join_paths(fixtures, 'zlib.raw')], timeout: 180, suite: 'images')
   if fskit_available
-    test('fskit-volume', fskit_volume_test, args: [join_paths(fixtures, 'plain.raw')],
-      timeout: 180, suite: 'images')
+    test('fskit-volume', fskit_volume_test, args: [join_paths(fixtures, 'plain.raw'),
+      join_paths(fixtures, 'transactions.raw')], timeout: 180, suite: 'images')
   endif
   test('inline-transactions', transaction_test,
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 180, suite: 'images')
