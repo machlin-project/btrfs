@@ -139,10 +139,12 @@ wrote once its primary superblock is durable. A transaction's private view
 excludes its own generation; a refused or failed commit adds nothing, since the
 next commit may reuse that generation and those addresses; explicit recovery
 validates candidates without the cache, since a refused candidate's generation
-may be written again. Within a transaction, the private view copies its own
+may be written again. Within a transaction, the private view finds its own
 nodes by logical address and checks their identity and item count; the
-transaction checks each node's items once and computes its checksum when it
-seals the nodes it will write, refusing the commit if any is malformed. The cache is valid only
+transaction's point lookups read them in place, since they make no edit before
+copying the record out, and other cursors copy them. The transaction checks
+each node's items once and computes its checksum when it seals the nodes it
+will write, refusing the commit if any is malformed. The cache is valid only
 while the device changes through its owner's commits; it must be dropped when
 anything else changes the device.
 

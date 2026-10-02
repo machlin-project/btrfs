@@ -95,9 +95,10 @@ struct btrfs_fs {
 	/* Nodes of this generation and later are not committed in this view (a
 	 * transaction's private nodes) and never enter the shared node cache. */
 	uint64_t cache_limit;
-	/* A transaction's private view copies its own nodes by logical address,
-	 * with no device read or checksum; NOT_FOUND falls back to a read. */
-	enum btrfs_result (*private_read)(void *context, struct bt_root root, void *buffer);
+	/* A transaction's private view finds its own nodes by logical address,
+	 * with no device read or checksum; NOT_FOUND falls back to a read. The
+	 * node stays valid until the transaction's next edit. */
+	enum btrfs_result (*private_node)(void *context, struct bt_root root, const uint8_t **node);
 	void *private_context;
 	/* A transaction's reader view resolves the trees the transaction owns to
 	 * their private roots: nonzero with *result OK or NOT_FOUND (a deleted
@@ -107,8 +108,9 @@ struct btrfs_fs {
 	void *private_root_context;
 };
 
-/* blocks[level] is the cursor's own buffer (owned[level]) or a node read in
- * place from the shared cache, pinned while pins[level] (handle + 1) is set. */
+/* blocks[level] is the cursor's own buffer (owned[level]), a node read in
+ * place from the shared cache, pinned while pins[level] (handle + 1) is set,
+ * or, with borrow set, a transaction's own node read in place. */
 struct bt_cursor {
 	const struct btrfs_fs *fs;
 	struct bt_root root;
@@ -118,6 +120,9 @@ struct bt_cursor {
 	struct bt_root loaded[BT_MAX_LEVEL];
 	uint32_t slots[BT_MAX_LEVEL];
 	int valid;
+	/* Set by a transaction's own lookups, which make no edit before
+	 * bt_cursor_fini; other cursors copy the transaction's nodes. */
+	int borrow;
 };
 
 struct bt_record {

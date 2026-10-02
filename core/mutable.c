@@ -167,7 +167,7 @@ bt_mut_read(void *context, uint64_t offset, void *buffer, size_t length)
 }
 
 static enum btrfs_result
-bt_mut_private_read(void *context, struct bt_root root, void *buffer)
+bt_mut_private_node(void *context, struct bt_root root, const uint8_t **bytes)
 {
 	struct bt_mutation *mutation = context;
 	struct bt_mutable_node *node = bt_mut_find_node(mutation, root.address);
@@ -179,7 +179,7 @@ bt_mut_private_read(void *context, struct bt_root root, void *buffer)
 	if (node->discarded) {
 		return BTRFS_CORRUPT;
 	}
-	bt_copy(buffer, node->bytes, mutation->view.info.node_size);
+	*bytes = node->bytes;
 	return BTRFS_OK;
 }
 
@@ -891,7 +891,7 @@ bt_mutation_create(const struct btrfs_fs *base, const struct bt_mutation_allocat
 	mutation->view.env.read = bt_mut_read;
 	mutation->view.env.allocate = bt_mut_allocate;
 	mutation->view.env.release = bt_mut_release;
-	mutation->view.private_read = bt_mut_private_read;
+	mutation->view.private_node = bt_mut_private_node;
 	mutation->view.private_context = mutation;
 	/* This view supports private metadata traversal; file codec context stays with its adapter.
 	 */
@@ -977,6 +977,7 @@ bt_mutation_find(struct bt_mutation *mutation, struct bt_root root, struct bt_ke
 		return mutation->failure;
 	}
 	bt_cursor_init(&cursor, &mutation->view, root);
+	cursor.borrow = 1;
 	error = bt_cursor_seek(&cursor, key, 0);
 	if (error == BTRFS_OK) {
 		(void)bt_cursor_record(&cursor, &record);

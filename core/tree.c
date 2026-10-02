@@ -161,28 +161,32 @@ bt_tree_fetch(
 
 /* A transaction's own node, still checked for identity and item count. */
 static enum btrfs_result
-bt_tree_private(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
+bt_tree_private(const struct btrfs_fs *fs, struct bt_root root, const uint8_t **node)
 {
 	enum btrfs_result error;
 
-	if (fs->private_read == NULL || root.generation < fs->cache_limit) {
+	if (fs->private_node == NULL || root.generation < fs->cache_limit) {
 		return BTRFS_NOT_FOUND;
 	}
-	error = fs->private_read(fs->private_context, root, buffer);
-	return error == BTRFS_OK ? bt_validate_node(fs, root, buffer, 1) : error;
+	error = fs->private_node(fs->private_context, root, node);
+	return error == BTRFS_OK ? bt_validate_node(fs, root, *node, 1) : error;
 }
 
 enum btrfs_result
 bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer)
 {
 	struct btrfs_cache *cache = bt_tree_cache(fs, root);
+	const uint8_t *node;
 	uint64_t owner = 0;
 	enum btrfs_result error;
 
 	if (!bt_tree_address(fs, root)) {
 		return BTRFS_CORRUPT;
 	}
-	error = bt_tree_private(fs, root, buffer);
+	error = bt_tree_private(fs, root, &node);
+	if (error == BTRFS_OK) {
+		bt_copy(buffer, node, fs->info.node_size);
+	}
 	if (error != BTRFS_NOT_FOUND) {
 		return error;
 	}
@@ -219,6 +223,20 @@ bt_cursor_fini(struct bt_cursor *cursor)
 		cursor->blocks[i] = NULL;
 	}
 	cursor->valid = 0;
+}
+
+static enum btrfs_result
+bt_cursor_buffer(struct bt_cursor *cursor, uint8_t level)
+{
+	const struct btrfs_fs *fs = cursor->fs;
+
+	if (cursor->owned[level] == NULL) {
+		cursor->owned[level] = fs->env.allocate(fs->env.context, fs->info.node_size);
+		if (cursor->owned[level] == NULL) {
+			return BTRFS_NO_MEMORY;
+		}
+	}
+	return BTRFS_OK;
 }
 
 static enum btrfs_result
@@ -263,18 +281,24 @@ bt_cursor_load(struct bt_cursor *cursor, struct bt_root root)
 			return BTRFS_OK;
 		}
 	}
-	if (cursor->owned[root.level] == NULL) {
-		cursor->owned[root.level] = fs->env.allocate(fs->env.context, fs->info.node_size);
-		if (cursor->owned[root.level] == NULL) {
-			return BTRFS_NO_MEMORY;
+	error = bt_tree_private(fs, root, &node);
+	if (error == BTRFS_OK) {
+		if (!cursor->borrow) {
+			error = bt_cursor_buffer(cursor, root.level);
+		}
+		if (error == BTRFS_OK && !cursor->borrow) {
+			bt_copy(cursor->owned[root.level], node, fs->info.node_size);
+			node = cursor->owned[root.level];
+		}
+	} else if (error == BTRFS_NOT_FOUND) {
+		error = bt_cursor_buffer(cursor, root.level);
+		if (error == BTRFS_OK) {
+			error = bt_tree_fetch(fs, root, cursor->owned[root.level], cache);
+			node = cursor->owned[root.level];
 		}
 	}
-	error = bt_tree_private(fs, root, cursor->owned[root.level]);
-	if (error == BTRFS_NOT_FOUND) {
-		error = bt_tree_fetch(fs, root, cursor->owned[root.level], cache);
-	}
 	if (error == BTRFS_OK) {
-		cursor->blocks[root.level] = cursor->owned[root.level];
+		cursor->blocks[root.level] = node;
 		*loaded = root;
 	}
 	return error;
