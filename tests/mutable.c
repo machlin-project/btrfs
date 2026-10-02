@@ -201,6 +201,47 @@ verify(const struct btrfs_fs *fs, struct bt_root root, const struct model_value 
 	bt_cursor_fini(&cursor);
 }
 
+/* Every node of the mutation has the packed layout edits keep, in place or
+ * rebuilt: leaf data packed from the end in item order and every unused body
+ * byte zero. */
+static void
+require_packed(struct bt_mutation *mutation)
+{
+	struct bt_mutated_block block;
+	const struct bt_disk_header *header;
+	const struct bt_disk_item *items;
+	const uint8_t *body;
+	size_t end;
+	size_t used;
+	size_t count;
+	size_t i;
+	size_t j;
+
+	for (i = 0; i < bt_mutation_count(mutation); i++) {
+		REQUIRE(bt_mutation_block(mutation, i, &block) == BTRFS_OK);
+		if (block.discarded) {
+			continue;
+		}
+		header = block.bytes;
+		items = (const void *)(header + 1);
+		body = (const uint8_t *)(header + 1);
+		count = bt_u32(header->count);
+		end = block.size - sizeof(*header);
+		used = count * sizeof(struct bt_disk_pointer);
+		if (header->level == 0) {
+			for (j = 0; j < count; j++) {
+				REQUIRE(bt_u32(items[j].offset) + bt_u32(items[j].size) == end);
+				end = bt_u32(items[j].offset);
+			}
+			used = count * sizeof(*items);
+		}
+		REQUIRE(used <= end);
+		for (j = used; j < end; j++) {
+			REQUIRE(body[j] == 0);
+		}
+	}
+}
+
 static struct bt_mutation *
 begin(struct fixture *fixture, size_t limit)
 {
@@ -274,10 +315,12 @@ exercise(uint32_t node_size, int dup)
 			    model[index].length, BT_INSERT) == BTRFS_OK);
 		if (i % 100 == 0) {
 			verify(bt_mutation_view(mutation), root, model);
+			require_packed(mutation);
 		}
 	}
 	REQUIRE(node_size != 4096 || root.level >= 2);
 	verify(bt_mutation_view(mutation), root, model);
+	require_packed(mutation);
 	verify(&fixture.fs, fixture.root, original);
 	publish_tree(&fixture, mutation);
 	verify(&fixture.fs, root, model);
@@ -296,8 +339,12 @@ exercise(uint32_t node_size, int dup)
 		fill(&model[index], index, 1, index % 5 == 0 ? VALUE_MAX : index % 1700);
 		REQUIRE(bt_mutation_edit(mutation, &root, key(index), model[index].bytes,
 			    model[index].length, BT_REPLACE) == BTRFS_OK);
+		if (i % 100 == 0) {
+			require_packed(mutation);
+		}
 	}
 	verify(bt_mutation_view(mutation), root, model);
+	require_packed(mutation);
 	verify(&fixture.fs, snapshot, original);
 	REQUIRE(memcmp(before, fixture.medium, bytes) == 0);
 	allocations = fixture.allocations;
@@ -323,10 +370,12 @@ exercise(uint32_t node_size, int dup)
 		model[index].present = 0;
 		if (i % 100 == 0) {
 			verify(bt_mutation_view(mutation), root, model);
+			require_packed(mutation);
 		}
 	}
 	REQUIRE(root.level == 0);
 	verify(bt_mutation_view(mutation), root, model);
+	require_packed(mutation);
 	REQUIRE(bt_mutation_seal(mutation) == BTRFS_OK);
 	REQUIRE(bt_mutation_edit(mutation, &root, key(0), NULL, 0, BT_INSERT) == BTRFS_READ_ONLY);
 	bt_mutation_destroy(mutation);

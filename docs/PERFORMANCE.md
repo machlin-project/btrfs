@@ -36,7 +36,9 @@ cache in the native adapters.
 
 The private editor reuses its dirty paths; repeated fixed-size replacement in an
 already modified path allocates nothing. It updates payloads and child pointers
-without repacking the whole node. The reservation gap vector begins at 4 KiB and
+without repacking the whole node, and an insertion, resize or deletion that fits
+a leaf it has already packed moves only the item headers and data after the
+edited slot. The reservation gap vector begins at 4 KiB and
 grows only when needed. A writable transaction reads every block group's item
 and loads a block group's extents (verifying them and its free-space items)
 only when allocation reaches it or a change touches it, so admission costs a
@@ -104,8 +106,8 @@ image file's `F_FULLFSYNC` on the host SSD:
 
 | Create | Barriers skipped | `--durable` |
 | --- | --- | --- |
-| One transaction and commit each | 195 us, 5 reads, 51 allocations | 28.9 ms |
-| Grouped, one sync for all | 21 us, 3.7 allocations | 0.15 ms |
+| One transaction and commit each | 52 us, 5 reads, 51 allocations | 16 ms |
+| Grouped, one sync for all | 3.1 us, 3.7 allocations | 0.09 ms |
 
 A per-operation commit pays three barriers, which dominate durable latency;
 grouping amortizes them over the running transaction. A commit writes its node

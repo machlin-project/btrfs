@@ -160,8 +160,9 @@ The portable model covers every prefix, seeded reorder/tear states of the
 ## Performance work
 
 Preserve read budgets and the absence of a mount-wide read lock. Private fixed-size
-replacements update one payload/pointer without repacking the whole node; repeated
-edits reuse dirty paths. The allocator starts with 256 gap records and grows within
+replacements update one payload/pointer without repacking the whole node, and
+edits that fit an already packed leaf move only what follows the edited slot;
+repeated edits reuse dirty paths. The allocator starts with 256 gap records and grows within
 an explicit bound. Keep allocation and I/O counts visible in tests.
 
 Follow PERFORMANCE.md for matched Linux comparisons; `btrfs-bench` measures

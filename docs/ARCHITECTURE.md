@@ -201,8 +201,11 @@ path buffers. Variable-size insertion may produce two or three leaves; pointer
 splits propagate upward. Deletion removes empty children and collapses unary
 roots. An edited leaf below a third of its capacity, or node below a quarter of
 its pointers, merges with its right sibling, else its left one, when both fit in
-one node; the sibling is CoWed like any edited block and merges cascade upward. Fixed-size replacements avoid
-whole-node repacking. The original root and bytes remain immutable. A failed
+one node; the sibling is CoWed like any edited block and merges cascade upward.
+Fixed-size replacements write the payload alone. An insertion, resize or
+deletion that fits a leaf the transaction has already packed moves only the item
+headers and data after the edited slot, leaving the bytes a full repack writes.
+The original root and bytes remain immutable. A failed
 edit poisons the context; sealing computes checksums, and accepting transfers
 reservations only after the owning transaction's durable publication.
 

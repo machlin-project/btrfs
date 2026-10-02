@@ -37,6 +37,9 @@ struct bt_mutable_node {
 	uint8_t original_level;
 	int checksum_valid;
 	int discarded;
+	/* The node has bt_mut_pack's layout: leaf data packed from the end in
+	 * item order and every unused body byte zero. */
+	int packed;
 };
 
 struct bt_edit_record {
@@ -395,6 +398,7 @@ bt_mut_pack(struct bt_mutation *mutation, struct bt_mutable_node *node, size_t f
 	}
 	bt_put32(&header->count, (uint32_t)count);
 	node->checksum_valid = 0;
+	node->packed = 1;
 }
 
 static size_t
@@ -514,6 +518,57 @@ bt_mut_slot(struct bt_mutable_node *node, struct bt_key key, int predecessor)
 	return predecessor && low != 0 ? low - 1 : low;
 }
 
+/* Inserts, resizes or deletes the item at slot of a packed leaf in place when
+ * the result fits, leaving the bytes bt_mut_pack would write: only the item
+ * headers and data after slot move. Returns zero when the leaf must split. */
+static int
+bt_mut_leaf_in_place(struct bt_mutation *mutation, struct bt_mutable_node *node, uint32_t slot,
+    int present, struct bt_key key, const void *value, size_t length, enum bt_edit edit)
+{
+	struct bt_disk_header *header = bt_mut_header(node);
+	struct bt_disk_item *items = (void *)(header + 1);
+	uint8_t *body = (uint8_t *)(header + 1);
+	size_t body_size = mutation->view.info.node_size - sizeof(*header);
+	uint32_t count = bt_u32(header->count);
+	uint32_t total = edit == BT_DELETE ? count - 1 : present ? count : count + 1;
+	uint32_t i;
+	size_t data_end = count == 0 ? body_size : bt_u32(items[count - 1].offset);
+	size_t end = slot == 0 ? body_size : bt_u32(items[slot - 1].offset);
+	size_t old_length = present ? bt_u32(items[slot].size) : 0;
+	size_t new_length = edit == BT_DELETE ? 0 : length;
+	size_t tail_end = end - old_length;
+	size_t moved;
+
+	if (total * sizeof(*items) > data_end + old_length ||
+	    new_length > data_end + old_length - total * sizeof(*items)) {
+		return 0;
+	}
+	moved = data_end + old_length - new_length;
+	bt_move(body + moved, body + data_end, tail_end - data_end);
+	if (edit == BT_DELETE) {
+		bt_move(&items[slot], &items[slot + 1], (count - slot - 1) * sizeof(*items));
+		bt_zero(&items[count - 1], sizeof(*items));
+	} else if (!present) {
+		bt_move(&items[slot + 1], &items[slot], (count - slot) * sizeof(*items));
+		bt_key_encode(&items[slot].key, key);
+	}
+	if (edit != BT_DELETE) {
+		bt_put32(&items[slot].offset, (uint32_t)(end - new_length));
+		bt_put32(&items[slot].size, (uint32_t)new_length);
+		bt_copy(body + end - new_length, value, new_length);
+	}
+	for (i = edit == BT_DELETE ? slot : slot + 1; i < total; i++) {
+		bt_put32(&items[i].offset,
+		    (uint32_t)(bt_u32(items[i].offset) + old_length - new_length));
+	}
+	if (moved > data_end) {
+		bt_zero(body + data_end, moved - data_end);
+	}
+	bt_put32(&header->count, total);
+	node->checksum_valid = 0;
+	return 1;
+}
+
 static enum btrfs_result
 bt_mut_leaf(struct bt_mutation *mutation, struct bt_mutable_node *node, struct bt_key key,
     const void *value, size_t length, enum bt_edit edit, struct bt_mut_split *right)
@@ -537,6 +592,12 @@ bt_mut_leaf(struct bt_mutation *mutation, struct bt_mutable_node *node, struct b
 	if (present && edit != BT_DELETE && bt_u32(items[slot].size) == length) {
 		bt_copy((uint8_t *)items + bt_u32(items[slot].offset), value, length);
 		node->checksum_valid = 0;
+		right->count = 0;
+		return BTRFS_OK;
+	}
+	if (node->packed &&
+	    bt_mut_leaf_in_place(
+		mutation, node, (uint32_t)slot, present, key, value, length, edit)) {
 		right->count = 0;
 		return BTRFS_OK;
 	}
@@ -852,6 +913,7 @@ bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_k
 	if (bt_mut_count(node) == 0) {
 		bt_mut_header(node)->level = 0;
 		node->checksum_valid = 0;
+		node->packed = 0;
 	}
 	*root = bt_mut_root(node);
 	return BTRFS_OK;
