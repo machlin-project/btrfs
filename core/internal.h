@@ -129,9 +129,11 @@ struct btrfs_fs {
 	 * node stays valid until the transaction's next edit. */
 	enum btrfs_result (*private_node)(void *context, struct bt_root root, const uint8_t **node);
 	void *private_context;
-	/* Nonzero for a transaction's reader view, whose readers finish before
-	 * its next operation: every cursor reads its nodes in place. */
+	/* Nonzero for a transaction's views, whose cursors are closed before its
+	 * next edit: every cursor reads its nodes in place, counted in
+	 * private_holders while open; the transaction edits only when none is. */
 	int private_borrow;
+	uint32_t *private_holders;
 	/* A transaction's reader view resolves the trees the transaction owns to
 	 * their private roots: nonzero with *result OK or NOT_FOUND (a deleted
 	 * subvolume); zero to look the root item up. */
@@ -152,9 +154,11 @@ struct bt_cursor {
 	struct bt_root loaded[BT_MAX_LEVEL];
 	uint32_t slots[BT_MAX_LEVEL];
 	int valid;
-	/* Set by a transaction's own lookups and on its reader view, neither of
-	 * which edits before bt_cursor_fini; other cursors copy its nodes. */
+	/* Set on a transaction's views (private_borrow), which edit nothing before
+	 * bt_cursor_fini; other cursors copy the transaction's nodes. holding is
+	 * set while the cursor counts in the view's private_holders. */
 	int borrow;
+	int holding;
 };
 
 struct bt_record {

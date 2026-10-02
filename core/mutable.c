@@ -73,6 +73,8 @@ struct bt_mutation {
 	enum btrfs_result failure;
 	int sealed;
 	int accepted;
+	/* Cursors on the view reading its nodes in place. */
+	uint32_t holders;
 };
 
 static size_t
@@ -167,6 +169,18 @@ bt_mut_read(void *context, uint64_t offset, void *buffer, size_t length)
 		}
 	}
 	return env->read(env->context, offset, buffer, length);
+}
+
+/* A cursor still reading the nodes in place would see them change: the edit
+ * fails the mutation instead. */
+static enum btrfs_result
+bt_mut_unheld(struct bt_mutation *mutation)
+{
+	if (__atomic_load_n(&mutation->holders, __ATOMIC_RELAXED) != 0) {
+		mutation->failure = BTRFS_INVALID_ARGUMENT;
+		return mutation->failure;
+	}
+	return BTRFS_OK;
 }
 
 static enum btrfs_result
@@ -822,6 +836,10 @@ bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_k
 	if (mutation->sealed || mutation->failure != BTRFS_OK) {
 		return mutation->failure == BTRFS_OK ? BTRFS_READ_ONLY : mutation->failure;
 	}
+	error = bt_mut_unheld(mutation);
+	if (error != BTRFS_OK) {
+		return error;
+	}
 	current = *root;
 	top = current.level;
 	for (level = top;; level--) {
@@ -954,6 +972,8 @@ bt_mutation_create(const struct btrfs_fs *base, const struct bt_mutation_allocat
 	mutation->view.env.allocate = bt_mut_allocate;
 	mutation->view.env.release = bt_mut_release;
 	mutation->view.private_node = bt_mut_private_node;
+	mutation->view.private_borrow = 1;
+	mutation->view.private_holders = &mutation->holders;
 	mutation->view.private_context = mutation;
 	/* This view supports private metadata traversal; file codec context stays with its adapter.
 	 */
@@ -1039,7 +1059,6 @@ bt_mutation_find(struct bt_mutation *mutation, struct bt_root root, struct bt_ke
 		return mutation->failure;
 	}
 	bt_cursor_init(&cursor, &mutation->view, root);
-	cursor.borrow = 1;
 	error = bt_cursor_seek(&cursor, key, 0);
 	if (error == BTRFS_OK) {
 		(void)bt_cursor_record(&cursor, &record);
@@ -1116,6 +1135,10 @@ bt_mutation_seal(struct bt_mutation *mutation)
 	}
 	if (mutation->failure != BTRFS_OK) {
 		return mutation->failure;
+	}
+	error = bt_mut_unheld(mutation);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	/* Reads within the transaction trust its own nodes' items; every node it
 	 * will write is checked once here instead. */

@@ -682,6 +682,45 @@ malformed_seal(void)
 	}
 }
 
+/* An edit while a cursor still reads the mutation's nodes in place fails the
+ * mutation; a copying cursor does not hold them. */
+static void
+held_edit(void)
+{
+	struct fixture fixture;
+	struct bt_mutation *mutation;
+	struct bt_cursor cursor;
+	struct bt_root root;
+	uint8_t value[8] = { 0 };
+	unsigned i;
+
+	initialize(&fixture, 4096, 0);
+	root = fixture.root;
+	mutation = begin(&fixture, 8);
+	for (i = 0; i < 3; i++) {
+		REQUIRE(bt_mutation_edit(
+			    mutation, &root, key(i), value, sizeof(value), BT_INSERT) == BTRFS_OK);
+	}
+	bt_cursor_init(&cursor, bt_mutation_view(mutation), root);
+	cursor.borrow = 0;
+	REQUIRE(bt_cursor_seek(&cursor, key(1), 0) == BTRFS_OK);
+	REQUIRE(
+	    bt_mutation_edit(mutation, &root, key(3), value, sizeof(value), BT_INSERT) == BTRFS_OK);
+	bt_cursor_fini(&cursor);
+	bt_cursor_init(&cursor, bt_mutation_view(mutation), root);
+	REQUIRE(cursor.borrow && bt_cursor_seek(&cursor, key(1), 0) == BTRFS_OK);
+	REQUIRE(bt_mutation_edit(mutation, &root, key(4), value, sizeof(value), BT_INSERT) ==
+	    BTRFS_INVALID_ARGUMENT);
+	bt_cursor_fini(&cursor);
+	REQUIRE(bt_mutation_edit(mutation, &root, key(5), value, sizeof(value), BT_INSERT) ==
+	    BTRFS_INVALID_ARGUMENT);
+	REQUIRE(bt_mutation_seal(mutation) == BTRFS_INVALID_ARGUMENT);
+	REQUIRE(bt_mutation_view(mutation) == NULL);
+	bt_mutation_destroy(mutation);
+	REQUIRE(fixture.live_bytes == 0 && fixture.reservations == 0);
+	free(fixture.medium);
+}
+
 int
 main(void)
 {
@@ -692,6 +731,7 @@ main(void)
 	exercise(65536, 0);
 	failures();
 	malformed_seal();
+	held_edit();
 	puts("private CoW trees: model, split/grow/shrink/merge, snapshot isolation, abort/faults "
 	     "PASS");
 	return 0;

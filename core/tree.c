@@ -223,6 +223,10 @@ bt_cursor_fini(struct bt_cursor *cursor)
 		}
 		cursor->blocks[i] = NULL;
 	}
+	if (cursor->holding) {
+		__atomic_fetch_sub(cursor->fs->private_holders, 1, __ATOMIC_RELAXED);
+		cursor->holding = 0;
+	}
 	cursor->valid = 0;
 }
 
@@ -283,6 +287,11 @@ bt_cursor_load(struct bt_cursor *cursor, struct bt_root root)
 		}
 	}
 	error = bt_tree_private(fs, root, &node);
+	if (error == BTRFS_OK && cursor->borrow && !cursor->holding &&
+	    fs->private_holders != NULL) {
+		__atomic_fetch_add(fs->private_holders, 1, __ATOMIC_RELAXED);
+		cursor->holding = 1;
+	}
 	if (error == BTRFS_OK) {
 		if (!cursor->borrow) {
 			error = bt_cursor_buffer(cursor, root.level);

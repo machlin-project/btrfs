@@ -143,9 +143,10 @@ excludes its own generation; a refused or failed commit adds nothing, since the
 next commit may reuse that generation and those addresses; explicit recovery
 validates candidates without the cache, since a refused candidate's generation
 may be written again. Within a transaction, the private view finds its own
-nodes by logical address and checks their identity and item count; the
-transaction's point lookups and its reader view read them in place, since
-neither edits before closing its cursors, and other cursors copy them. The
+nodes by logical address and checks their identity and item count; cursors on
+the transaction's views read them in place, which holds because every such
+cursor is closed before the transaction's next edit: an edit or seal while one
+is open fails the transaction. Other cursors copy them. The
 transaction checks each node's items once and computes its checksum when it
 seals the nodes it will write, refusing the commit if any is malformed. The
 cache is valid only while the device changes through its owner's commits; it
