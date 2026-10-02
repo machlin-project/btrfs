@@ -1,18 +1,22 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-#import "BtrfsFileSystem.h"
+#import "BtrfsFileSystemInternal.h"
 #include <btrfs/btrfs.h>
 #include <btrfs/identity.h>
 #include <btrfs/native.h>
 #include <zlib.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 
-static NSError *
-btrfs_error(enum btrfs_result result)
+@implementation FSBlockDeviceResource (BtrfsBlockReader)
+@end
+
+NSError *
+btrfs_fskit_error(enum btrfs_result result)
 {
 	int error;
 
@@ -67,16 +71,43 @@ btrfs_error(enum btrfs_result result)
 			       }];
 }
 
+/* Reads exactly length bytes at an aligned offset, continuing after partial
+ * reads; a revoked resource or a read that makes no progress fails. */
+static enum btrfs_result
+btrfs_reader_exact(id<BtrfsBlockReader> reader, uint64_t offset, uint8_t *buffer, size_t length)
+{
+	NSError *error = nil;
+	size_t done = 0;
+	size_t completed;
+
+	while (done < length) {
+		if (reader.isRevoked) {
+			return BTRFS_IO;
+		}
+		completed = [reader readInto:buffer + done
+				  startingAt:(off_t)(offset + done)
+				      length:length - done
+				       error:&error];
+		if (error != nil || completed == 0 || completed > length - done) {
+			return BTRFS_IO;
+		}
+		done += completed;
+	}
+	return BTRFS_OK;
+}
+
+/* Aligned requests go straight into the caller's buffer; others read the
+ * covering sectors into a bounce buffer. A failed read leaves no partial
+ * data in the caller's buffer. */
 static enum btrfs_result
 btrfs_resource_read(void *context, uint64_t offset, void *buffer, size_t length)
 {
-	FSBlockDeviceResource *resource = (__bridge FSBlockDeviceResource *)context;
-	NSError *error = nil;
+	id<BtrfsBlockReader> reader = (__bridge id<BtrfsBlockReader>)context;
 	uint8_t *bounce;
-	uint64_t alignment = resource.physicalBlockSize;
+	uint64_t alignment = reader.physicalBlockSize;
 	uint64_t start;
 	uint64_t total;
-	size_t completed;
+	enum btrfs_result error;
 
 	if (alignment == 0 || alignment > SIZE_MAX || offset > INT64_MAX ||
 	    length > (uint64_t)INT64_MAX - offset) {
@@ -91,23 +122,27 @@ btrfs_resource_read(void *context, uint64_t offset, void *buffer, size_t length)
 		return BTRFS_RANGE;
 	}
 	total = ((total + alignment - 1) / alignment) * alignment;
-	if (start > resource.blockCount * resource.blockSize ||
-	    total > resource.blockCount * resource.blockSize - start) {
+	if (start > reader.blockCount * reader.blockSize ||
+	    total > reader.blockCount * reader.blockSize - start) {
 		return BTRFS_IO;
+	}
+	if (start == offset && total == length) {
+		error = btrfs_reader_exact(reader, offset, buffer, length);
+		if (error != BTRFS_OK) {
+			memset(buffer, 0, length);
+		}
+		return error;
 	}
 	bounce = malloc((size_t)total);
 	if (bounce == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
-	completed = [resource readInto:bounce
-			    startingAt:(off_t)start
-				length:(size_t)total
-				 error:&error];
-	if (error == nil && completed == total) {
+	error = btrfs_reader_exact(reader, start, bounce, (size_t)total);
+	if (error == BTRFS_OK) {
 		memcpy(buffer, bounce + (offset - start), length);
 	}
 	free(bounce);
-	return error == nil && completed == total ? BTRFS_OK : BTRFS_IO;
+	return error;
 }
 
 static void *
@@ -142,28 +177,98 @@ btrfs_resource_decompress(void *context, enum btrfs_compression codec, const voi
 	    : (result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT);
 }
 
-static enum btrfs_result
-btrfs_open_resource(FSResource *resource, struct btrfs_fs **fs)
+/* Verified tree nodes shared by a loaded volume's threads; the resource is
+ * read-only, so nothing else changes it while the volume is loaded. */
+#define BTRFS_FSKIT_CACHE_BYTES (32U * 1024U * 1024U)
+/* The first DIR_INDEX key: lower enumeration cookies name "." and "..". */
+#define BTRFS_FSKIT_FIRST_INDEX 2U
+
+struct btrfs_fskit_cache {
+	pthread_mutex_t mutex;
+	struct btrfs_cache *cache;
+};
+
+static void
+btrfs_fskit_cache_lock(void *context)
 {
-	FSBlockDeviceResource *block;
+	pthread_mutex_lock(context);
+}
+
+static void
+btrfs_fskit_cache_unlock(void *context)
+{
+	pthread_mutex_unlock(context);
+}
+
+void
+btrfs_fskit_cache_destroy(struct btrfs_fskit_cache *owner)
+{
+	if (owner == NULL) {
+		return;
+	}
+	btrfs_cache_destroy(owner->cache);
+	pthread_mutex_destroy(&owner->mutex);
+	free(owner);
+}
+
+/* NULL when the cache cannot be set up; the volume then reads uncached. */
+struct btrfs_fskit_cache *
+btrfs_fskit_cache_create(void)
+{
+	struct btrfs_environment environment = { 0 };
+	struct btrfs_cache_locks locks;
+	struct btrfs_fskit_cache *owner;
+
+	owner = calloc(1, sizeof(*owner));
+	if (owner == NULL) {
+		return NULL;
+	}
+	if (pthread_mutex_init(&owner->mutex, NULL) != 0) {
+		free(owner);
+		return NULL;
+	}
+	environment.allocate = btrfs_resource_allocate;
+	environment.release = btrfs_resource_release;
+	locks.context = &owner->mutex;
+	locks.lock = btrfs_fskit_cache_lock;
+	locks.unlock = btrfs_fskit_cache_unlock;
+	if (btrfs_cache_create(&environment, &locks, BTRFS_FSKIT_CACHE_BYTES, &owner->cache) !=
+	    BTRFS_OK) {
+		pthread_mutex_destroy(&owner->mutex);
+		free(owner);
+		return NULL;
+	}
+	return owner;
+}
+
+enum btrfs_result
+btrfs_fskit_open(id<BtrfsBlockReader> reader, struct btrfs_fskit_cache *cache, struct btrfs_fs **fs)
+{
 	struct btrfs_environment environment;
 
 	*fs = NULL;
-	if (![resource isKindOfClass:FSBlockDeviceResource.class]) {
-		return BTRFS_UNSUPPORTED;
-	}
-	block = (FSBlockDeviceResource *)resource;
-	if (block.blockSize == 0 || block.blockCount > UINT64_MAX / block.blockSize) {
+	if (reader.blockSize == 0 || reader.blockCount > UINT64_MAX / reader.blockSize) {
 		return BTRFS_CORRUPT;
 	}
 	memset(&environment, 0, sizeof(environment));
-	environment.context = (__bridge void *)block;
-	environment.size_bytes = block.blockCount * block.blockSize;
+	environment.context = (__bridge void *)reader;
+	environment.size_bytes = reader.blockCount * reader.blockSize;
 	environment.read = btrfs_resource_read;
 	environment.allocate = btrfs_resource_allocate;
 	environment.release = btrfs_resource_release;
 	environment.decompress = btrfs_resource_decompress;
+	environment.cache = cache == NULL ? NULL : cache->cache;
 	return btrfs_mount(&environment, 0, fs);
+}
+
+static enum btrfs_result
+btrfs_open_resource(FSResource *resource, struct btrfs_fskit_cache *cache, struct btrfs_fs **fs)
+{
+	*fs = NULL;
+	if (![resource isKindOfClass:FSBlockDeviceResource.class]) {
+		return BTRFS_UNSUPPORTED;
+	}
+	return btrfs_fskit_open((FSBlockDeviceResource *)resource, cache, fs);
 }
 
 static FSItemType
@@ -189,31 +294,22 @@ btrfs_item_type(uint16_t mode)
 	}
 }
 
-@interface BtrfsItem : FSItem {
-      @public
-	struct btrfs_inode inode;
-}
-@end
-
 @implementation BtrfsItem
 @end
 
-@interface BtrfsVolume
-    : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations, FSVolumeXattrOperations> {
+@implementation BtrfsVolume {
 	struct btrfs_fs *_fs;
+	struct btrfs_fskit_cache *_cache;
 	struct btrfs_info _info;
-	FSResource *_resource;
+	id<BtrfsBlockReader> _reader;
 	NSLock *_itemLock;
 	NSMapTable<NSNumber *, BtrfsItem *> *_items;
 	struct btrfs_identity_table *_identities;
 }
-- (instancetype)initWithResource:(FSResource *)resource filesystem:(struct btrfs_fs *)fs;
-- (NSError *)checkMountEligibility;
-@end
 
-@implementation BtrfsVolume
-
-- (instancetype)initWithResource:(FSResource *)resource filesystem:(struct btrfs_fs *)fs
+- (instancetype)initWithReader:(id<BtrfsBlockReader>)reader
+		    filesystem:(struct btrfs_fs *)fs
+			 cache:(struct btrfs_fskit_cache *)cache
 {
 	struct btrfs_info info;
 	struct btrfs_environment environment = { 0 };
@@ -236,8 +332,9 @@ btrfs_item_type(uint16_t mode)
 			return nil;
 		}
 		_fs = fs;
+		_cache = cache;
 		_info = info;
-		_resource = resource;
+		_reader = reader;
 		_itemLock = [[NSLock alloc] init];
 		_items = [NSMapTable strongToWeakObjectsMapTable];
 	}
@@ -248,6 +345,8 @@ btrfs_item_type(uint16_t mode)
 {
 	btrfs_identity_destroy(_identities);
 	btrfs_unmount(_fs);
+	/* After the mount: no view or stream uses the cache any more. */
+	btrfs_fskit_cache_destroy(_cache);
 }
 
 - (NSNumber *)numberForIdentity:(struct btrfs_object_id)identity
@@ -364,10 +463,12 @@ btrfs_item_type(uint16_t mode)
 - (FSStatFSResult *)volumeStatistics
 {
 	FSStatFSResult *statistics =
-	    [[FSStatFSResult alloc] initWithFileSystemTypeName:@"machlin_btrfs"];
+	    [[FSStatFSResult alloc] initWithFileSystemTypeName:BTRFS_FSKIT_TYPE_NAME];
 
 	statistics.blockSize = _info.sector_size;
-	statistics.ioSize = _info.sector_size;
+	/* Matches the personality's FSSubType in the extension's Info.plist. */
+	statistics.fileSystemSubType = 0;
+	statistics.ioSize = MAX(_info.sector_size, BTRFS_FSKIT_IO_SIZE);
 	statistics.totalBlocks = _info.total_bytes / _info.sector_size;
 	statistics.freeBlocks = (_info.total_bytes - _info.used_bytes) / _info.sector_size;
 	statistics.availableBlocks = 0;
@@ -413,7 +514,7 @@ btrfs_item_type(uint16_t mode)
 			error = BTRFS_NO_MEMORY;
 		}
 	}
-	reply(item, btrfs_error(error));
+	reply(item, btrfs_fskit_error(error));
 }
 
 - (void)deactivateWithOptions:(FSDeactivateOptions)options replyHandler:(void (^)(NSError *))reply
@@ -429,13 +530,37 @@ btrfs_item_type(uint16_t mode)
 	reply(nil);
 }
 
+- (BOOL)isOpenCloseInhibited
+{
+	return NO;
+}
+
+/* Write access is refused at open, before the kernel admits cached writes or
+ * shared writable mappings, whatever the exported mount flags say. */
+- (void)openItem:(FSItem *)item
+       withModes:(FSVolumeOpenModes)modes
+    replyHandler:(void (^)(NSError *))reply
+{
+	(void)item;
+	reply((modes & FSVolumeOpenModesWrite) != 0 ? btrfs_fskit_error(BTRFS_READ_ONLY) : nil);
+}
+
+- (void)closeItem:(FSItem *)item
+     keepingModes:(FSVolumeOpenModes)modes
+     replyHandler:(void (^)(NSError *))reply
+{
+	(void)item;
+	(void)modes;
+	reply(nil);
+}
+
 - (NSError *)checkMountEligibility
 {
 	struct btrfs_inode root;
 	enum btrfs_result error;
 
 	error = btrfs_root(_fs, &root);
-	return btrfs_error(error);
+	return btrfs_fskit_error(error);
 }
 
 - (void)lookupItemNamed:(FSFileName *)name
@@ -458,7 +583,7 @@ btrfs_item_type(uint16_t mode)
 			error = BTRFS_NO_MEMORY;
 		}
 	}
-	reply(item, error == BTRFS_OK ? name : nil, btrfs_error(error));
+	reply(item, error == BTRFS_OK ? name : nil, btrfs_fskit_error(error));
 }
 
 - (void)getAttributes:(FSItemGetAttributesRequest *)desiredAttributes
@@ -470,7 +595,42 @@ btrfs_item_type(uint16_t mode)
 
 	(void)desiredAttributes;
 	attributes = [self attributesForInode:&owned->inode];
-	reply(attributes, attributes == nil ? btrfs_error(BTRFS_NO_MEMORY) : nil);
+	reply(attributes, attributes == nil ? btrfs_fskit_error(BTRFS_NO_MEMORY) : nil);
+}
+
+/* Packs "." and ".." from cookie on; *packed is the cookie after the last
+ * packed one. The mount root is its own parent. */
+- (enum btrfs_result)packDots:(BtrfsItem *)directory
+			 from:(uint64_t)cookie
+		       packer:(FSDirectoryEntryPacker *)packer
+		       packed:(uint64_t *)packed
+{
+	struct btrfs_inode parent;
+	NSNumber *number;
+	enum btrfs_result error;
+
+	*packed = cookie;
+	for (; *packed < BTRFS_FSKIT_FIRST_INDEX; (*packed)++) {
+		parent = directory->inode;
+		if (*packed == 1) {
+			error = btrfs_parent(_fs, &directory->inode, &parent);
+			if (error != BTRFS_OK) {
+				return error;
+			}
+		}
+		number = [self numberForIdentity:parent.id];
+		if (number == nil) {
+			return BTRFS_NO_MEMORY;
+		}
+		if (![packer packEntryWithName:[FSFileName nameWithBytes:".." length:*packed + 1]
+				      itemType:FSItemTypeDirectory
+					itemID:number.unsignedLongLongValue
+				    nextCookie:*packed + 1
+				    attributes:nil]) {
+			break;
+		}
+	}
+	return BTRFS_OK;
 }
 
 - (void)enumerateDirectory:(FSItem *)directory
@@ -496,19 +656,28 @@ btrfs_item_type(uint16_t mode)
 		    current, [NSError errorWithDomain:NSPOSIXErrorDomain code:ESTALE userInfo:nil]);
 		return;
 	}
+	/* Without attributes FSKit expects "." and ".." first: cookies 0 and 1,
+	 * below the first DIR_INDEX key. */
+	if (attributes == nil && next < BTRFS_FSKIT_FIRST_INDEX) {
+		error = [self packDots:parent from:next packer:packer packed:&next];
+		if (error != BTRFS_OK || next < BTRFS_FSKIT_FIRST_INDEX) {
+			reply(current, btrfs_fskit_error(error));
+			return;
+		}
+	}
 	error = btrfs_directory_open(_fs, &parent->inode, next, &stream);
 	if (error != BTRFS_OK) {
-		reply(current, btrfs_error(error));
+		reply(current, btrfs_fskit_error(error));
 		return;
 	}
 	while ((error = btrfs_directory_next(stream, &entry, &next)) == BTRFS_OK) {
-		if (attributes != nil &&
-		    ((entry.name_length == 1 && entry.name[0] == '.') ||
-			(entry.name_length == 2 && entry.name[0] == '.' && entry.name[1] == '.'))) {
-			continue;
-		}
 		if (attributes != nil) {
-			error = btrfs_get_inode(_fs, entry.id, &inode);
+			error = btrfs_directory_inode(stream, &entry, &inode);
+			/* An entry naming a missing inode is damage: ending the
+			 * listing there would hide the remaining entries. */
+			if (error == BTRFS_NOT_FOUND) {
+				error = BTRFS_CORRUPT;
+			}
 			if (error != BTRFS_OK) {
 				break;
 			}
@@ -529,7 +698,7 @@ btrfs_item_type(uint16_t mode)
 		}
 	}
 	btrfs_directory_close(stream);
-	reply(current, error == BTRFS_NOT_FOUND ? nil : btrfs_error(error));
+	reply(current, error == BTRFS_NOT_FOUND ? nil : btrfs_fskit_error(error));
 }
 
 - (void)readFromFile:(FSItem *)item
@@ -543,16 +712,16 @@ btrfs_item_type(uint16_t mode)
 	enum btrfs_result error;
 
 	if (offset < 0 || length > buffer.length) {
-		reply(0, btrfs_error(BTRFS_INVALID_ARGUMENT));
+		reply(0, btrfs_fskit_error(BTRFS_INVALID_ARGUMENT));
 		return;
 	}
 	if ((owned->inode.mode & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR) {
-		reply(0, btrfs_error(BTRFS_INVALID_ARGUMENT));
+		reply(0, btrfs_fskit_error(BTRFS_INVALID_ARGUMENT));
 		return;
 	}
 	error = btrfs_read(
 	    _fs, &owned->inode, (uint64_t)offset, buffer.mutableBytes, length, &completed);
-	reply(completed, btrfs_error(error));
+	reply(completed, btrfs_fskit_error(error));
 }
 
 - (void)readSymbolicLink:(FSItem *)item replyHandler:(void (^)(FSFileName *, NSError *))reply
@@ -563,11 +732,11 @@ btrfs_item_type(uint16_t mode)
 	enum btrfs_result error;
 
 	if ((owned->inode.mode & BTRFS_MODE_TYPE) != BTRFS_MODE_SYMLINK) {
-		reply(nil, btrfs_error(BTRFS_INVALID_ARGUMENT));
+		reply(nil, btrfs_fskit_error(BTRFS_INVALID_ARGUMENT));
 		return;
 	}
 	if (owned->inode.size >= _info.sector_size) {
-		reply(nil, btrfs_error(BTRFS_UNSUPPORTED));
+		reply(nil, btrfs_fskit_error(BTRFS_UNSUPPORTED));
 		return;
 	}
 	bytes = [NSMutableData dataWithLength:(NSUInteger)owned->inode.size];
@@ -575,7 +744,7 @@ btrfs_item_type(uint16_t mode)
 	if (error == BTRFS_OK && completed != bytes.length) {
 		error = BTRFS_IO;
 	}
-	reply(error == BTRFS_OK ? [FSFileName nameWithData:bytes] : nil, btrfs_error(error));
+	reply(error == BTRFS_OK ? [FSFileName nameWithData:bytes] : nil, btrfs_fskit_error(error));
 }
 
 - (void)getXattrNamed:(FSFileName *)name
@@ -598,7 +767,7 @@ btrfs_item_type(uint16_t mode)
 		    result == BTRFS_NOT_FOUND ? [NSError errorWithDomain:NSPOSIXErrorDomain
 								    code:ENOATTR
 								userInfo:nil]
-					      : btrfs_error(result));
+					      : btrfs_fskit_error(result));
 		return;
 	}
 	if (length > BTRFS_NATIVE_XATTR_LIMIT) {
@@ -608,7 +777,7 @@ btrfs_item_type(uint16_t mode)
 	value = [NSMutableData dataWithLength:length];
 	result = btrfs_get_xattr(
 	    _fs, &owned->inode, key.bytes, key.length, value.mutableBytes, value.length, &length);
-	reply(result == BTRFS_OK ? value : nil, btrfs_error(result));
+	reply(result == BTRFS_OK ? value : nil, btrfs_fskit_error(result));
 }
 
 - (void)listXattrsOfItem:(FSItem *)item
@@ -626,7 +795,7 @@ btrfs_item_type(uint16_t mode)
 
 	result = btrfs_list_xattrs(_fs, &owned->inode, NULL, 0, &length);
 	if (result != BTRFS_OK) {
-		reply(nil, btrfs_error(result));
+		reply(nil, btrfs_fskit_error(result));
 		return;
 	}
 	if (length > BTRFS_NATIVE_XATTR_LIMIT) {
@@ -639,7 +808,7 @@ btrfs_item_type(uint16_t mode)
 		result = btrfs_native_filter_xattrs(buffer.mutableBytes, length, &filtered);
 	}
 	if (result != BTRFS_OK) {
-		reply(nil, btrfs_error(result));
+		reply(nil, btrfs_fskit_error(result));
 		return;
 	}
 	names = [NSMutableArray array];
@@ -661,7 +830,7 @@ btrfs_item_type(uint16_t mode)
 	(void)value;
 	(void)item;
 	(void)policy;
-	reply(btrfs_error(BTRFS_READ_ONLY));
+	reply(btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)createItemNamed:(FSFileName *)name
@@ -674,7 +843,7 @@ btrfs_item_type(uint16_t mode)
 	(void)type;
 	(void)directory;
 	(void)newAttributes;
-	reply(nil, nil, btrfs_error(BTRFS_READ_ONLY));
+	reply(nil, nil, btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)createSymbolicLinkNamed:(FSFileName *)name
@@ -687,7 +856,7 @@ btrfs_item_type(uint16_t mode)
 	(void)directory;
 	(void)newAttributes;
 	(void)contents;
-	reply(nil, nil, btrfs_error(BTRFS_READ_ONLY));
+	reply(nil, nil, btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)createLinkToItem:(FSItem *)item
@@ -698,7 +867,7 @@ btrfs_item_type(uint16_t mode)
 	(void)item;
 	(void)name;
 	(void)directory;
-	reply(nil, btrfs_error(BTRFS_READ_ONLY));
+	reply(nil, btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)renameItem:(FSItem *)item
@@ -715,7 +884,7 @@ btrfs_item_type(uint16_t mode)
 	(void)destinationName;
 	(void)destinationDirectory;
 	(void)overItem;
-	reply(nil, btrfs_error(BTRFS_READ_ONLY));
+	reply(nil, btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)removeItem:(FSItem *)item
@@ -726,7 +895,7 @@ btrfs_item_type(uint16_t mode)
 	(void)item;
 	(void)name;
 	(void)directory;
-	reply(btrfs_error(BTRFS_READ_ONLY));
+	reply(btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)setAttributes:(FSItemSetAttributesRequest *)newAttributes
@@ -735,7 +904,7 @@ btrfs_item_type(uint16_t mode)
 {
 	(void)newAttributes;
 	(void)item;
-	reply(nil, btrfs_error(BTRFS_READ_ONLY));
+	reply(nil, btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)writeContents:(NSData *)contents
@@ -746,10 +915,25 @@ btrfs_item_type(uint16_t mode)
 	(void)contents;
 	(void)item;
 	(void)offset;
-	reply(0, btrfs_error(BTRFS_READ_ONLY));
+	reply(0, btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 @end
+
+/* Completes a refused maintenance task through the task, asynchronously: a
+ * synchronous refusal crashes the system's check and format clients. */
+static NSProgress *
+btrfs_fskit_refusal(FSTask *task, NSError *error)
+{
+	NSProgress *progress = [NSProgress progressWithTotalUnitCount:1];
+
+	progress.cancellable = NO;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+	  progress.completedUnitCount = 1;
+	  [task didCompleteWithError:error];
+	});
+	return progress;
+}
 
 @implementation BtrfsFileSystem {
 	BtrfsVolume *_volume;
@@ -763,28 +947,22 @@ btrfs_item_type(uint16_t mode)
 	NSProgress *progress;
 
 	/* A quick check admits only clean read-only media; it is not an fsck repair. */
+	(void)error;
 	if (![options.taskOptions containsObject:@"-q"]) {
-		if (error != NULL) {
-			*error = [NSError
-			    errorWithDomain:NSPOSIXErrorDomain
-				       code:ENOTSUP
-				   userInfo:@{
-					   NSLocalizedDescriptionKey :
-					       @"Only a quick read-only check is supported."
-				   }];
-		}
-		return nil;
+		return btrfs_fskit_refusal(task,
+		    [NSError errorWithDomain:NSPOSIXErrorDomain
+					code:ENOTSUP
+				    userInfo:@{
+					    NSLocalizedDescriptionKey :
+						@"Only a quick read-only check is supported."
+				    }]);
 	}
 	@synchronized(self) {
 		volume = _volume;
 	}
 	if (volume == nil) {
-		if (error != NULL) {
-			*error = [NSError errorWithDomain:NSPOSIXErrorDomain
-						     code:ENXIO
-						 userInfo:nil];
-		}
-		return nil;
+		return btrfs_fskit_refusal(
+		    task, [NSError errorWithDomain:NSPOSIXErrorDomain code:ENXIO userInfo:nil]);
 	}
 	progress = [NSProgress progressWithTotalUnitCount:1];
 	progress.cancellable = NO;
@@ -802,12 +980,9 @@ btrfs_item_type(uint16_t mode)
 			    options:(FSTaskOptions *)options
 			      error:(NSError **)error
 {
-	(void)task;
 	(void)options;
-	if (error != NULL) {
-		*error = btrfs_error(BTRFS_READ_ONLY);
-	}
-	return nil;
+	(void)error;
+	return btrfs_fskit_refusal(task, btrfs_fskit_error(BTRFS_READ_ONLY));
 }
 
 - (void)probeResource:(FSResource *)resource
@@ -820,10 +995,10 @@ btrfs_item_type(uint16_t mode)
 	FSContainerIdentifier *identifier;
 	enum btrfs_result error;
 
-	error = btrfs_open_resource(resource, &fs);
+	error = btrfs_open_resource(resource, NULL, &fs);
 	if (error != BTRFS_OK) {
 		reply(error == BTRFS_NOT_BTRFS ? FSProbeResult.notRecognizedProbeResult : nil,
-		    btrfs_error(error == BTRFS_NOT_BTRFS ? BTRFS_OK : error));
+		    btrfs_fskit_error(error == BTRFS_NOT_BTRFS ? BTRFS_OK : error));
 		return;
 	}
 	btrfs_get_info(fs, &info);
@@ -836,7 +1011,9 @@ btrfs_item_type(uint16_t mode)
 	uuid = [[NSUUID alloc] initWithUUIDBytes:info.uuid];
 	identifier = [[FSContainerIdentifier alloc] initWithUUID:uuid];
 	btrfs_unmount(fs);
-	reply([FSProbeResult usableButLimitedProbeResultWithName:name containerID:identifier], nil);
+	/* Disk Arbitration rejects a usable-but-limited result; read-only access
+	 * is the mount policy, enforced by the volume. */
+	reply([FSProbeResult usableProbeResultWithName:name containerID:identifier], nil);
 }
 
 - (void)loadResource:(FSResource *)resource
@@ -844,6 +1021,7 @@ btrfs_item_type(uint16_t mode)
 	replyHandler:(void (^)(FSVolume *, NSError *))reply
 {
 	struct btrfs_fs *fs = NULL;
+	struct btrfs_fskit_cache *cache = NULL;
 	BtrfsVolume *volume = nil;
 	NSError *loadError = nil;
 	enum btrfs_result error;
@@ -855,16 +1033,22 @@ btrfs_item_type(uint16_t mode)
 							code:EBUSY
 						    userInfo:nil];
 		} else {
-			error = btrfs_open_resource(resource, &fs);
+			cache = btrfs_fskit_cache_create();
+			error = btrfs_open_resource(resource, cache, &fs);
 			if (error == BTRFS_OK) {
-				volume = [[BtrfsVolume alloc] initWithResource:resource
-								    filesystem:fs];
+				volume = [[BtrfsVolume alloc]
+				    initWithReader:(FSBlockDeviceResource *)resource
+					filesystem:fs
+					     cache:cache];
 				if (volume == nil) {
 					btrfs_unmount(fs);
 					error = BTRFS_NO_MEMORY;
 				}
 			}
-			loadError = btrfs_error(error);
+			if (volume == nil) {
+				btrfs_fskit_cache_destroy(cache);
+			}
+			loadError = btrfs_fskit_error(error);
 			_volume = volume;
 			self.containerStatus = loadError == nil
 			    ? FSContainerStatus.ready

@@ -12,7 +12,10 @@ Required: C11 compiler, Meson >= 1.3, Ninja, Python >= 3.11 and zlib. Install Zs
 development headers/libraries for full image acceptance. On macOS, use the selected
 Xcode command-line tools; `make` chooses `xcrun --sdk macosx clang` for new builds.
 Meson retains the compiler chosen at initial configuration, so select a fresh
-build directory when changing toolchains.
+build directory when changing toolchains. On macOS the suite also builds the
+Objective-C FSKit volume test; `make` sets `OBJC` to the C compiler, and a
+manual sanitizer build must do the same (for example `OBJC=/usr/bin/clang` beside
+Apple's C compiler), since both must link one sanitizer runtime.
 
 ```sh
 make build BUILD_JOBS=2
@@ -254,7 +257,8 @@ crashing input; turn the cause into a deterministic regression before fixing it.
 
 ## Native builds and guest acceptance
 
-FSKit requires macOS 26.4 SDK or later and XcodeGen. Kext builds use Kernel.framework
+FSKit requires macOS 26.5 SDK or later and XcodeGen; the extension's deployment
+target is macOS 26.5. Kext builds use Kernel.framework
 headers from the selected SDK and enforce the same core stack budget.
 
 ```sh

@@ -173,7 +173,23 @@ time in independent instruction chains, which hide the instruction latency that
 bounds one chain. Kernel acceleration uses general registers only. There is no
 CPU feature probe, lazy global initialization or kernel SIMD use.
 
-FSKit inhibits offloaded I/O so data passes through the core. XNU retains UBC as
+FSKit inhibits offloaded I/O so data passes through the core. The extension names
+its type `machlinbtrfs` with subtype zero: Disk Arbitration appends `_fskit` to a
+short name and cuts it at the first underscore. Probing returns `usable` for an
+admitted volume, since Disk Arbitration rejects `usableButLimited`; read-only
+access is the volume's mount policy, and an open for writing fails with EROFS
+before the kernel admits cached writes or writable mappings. Enumeration without
+attributes starts with `.` and `..` at cookies 0 and 1, below the first directory
+index, and the mount root is its own parent; with attributes it has neither. An
+entry whose inode is missing fails the enumeration with EIO instead of ending it.
+Device reads check the resource's revocation, continue after partial reads, read
+aligned ranges straight into the caller's buffer and bounce only unaligned ones.
+Refused check and format requests complete through their task, as the system
+clients expect. The preferred transfer size is 128 KiB. `tests/fskit_volume.m`
+checks this through stand-ins for the framework's resource, packer and buffer;
+it does not establish installed behavior.
+
+XNU retains UBC as
 the only native file-page cache. Its blockmap uses file-logical strategy addresses;
 strategy reads/verifies through the core before completing a buffer. It never
 passes those synthetic addresses to the device. The read-only guest suite verifies mmap, descriptor-close lifetime, EOF and

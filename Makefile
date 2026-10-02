@@ -10,6 +10,11 @@ ifeq ($(origin CC),default)
 CC := xcrun --sdk macosx clang
 endif
 export CC
+# The FSKit volume test is Objective-C and must share the C sanitizer runtime.
+ifeq ($(origin OBJC),undefined)
+OBJC := $(CC)
+endif
+export OBJC
 endif
 
 .PHONY: all configure build test format check-style fskit kext

@@ -1,7 +1,7 @@
 name: BtrfsFSKit
 options:
   deploymentTarget:
-    macOS: '26.4'
+    macOS: '26.5'
   xcodeVersion: '27.1'
 settings:
   base:
@@ -11,7 +11,7 @@ settings:
     GCC_C_LANGUAGE_STANDARD: c11
     GCC_TREAT_WARNINGS_AS_ERRORS: YES
     SWIFT_VERSION: '5.0'
-    MACOSX_DEPLOYMENT_TARGET: '26.4'
+    MACOSX_DEPLOYMENT_TARGET: '26.5'
     MARKETING_VERSION: '0.1.0'
     CURRENT_PROJECT_VERSION: '1'
 targets:
@@ -34,6 +34,7 @@ targets:
       - BtrfsExtension.swift
       - BtrfsFileSystem.m
       - BtrfsFileSystem.h
+      - BtrfsFileSystemInternal.h
       - BridgingHeader.h
     dependencies:
       - target: BtrfsCore

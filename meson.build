@@ -74,6 +74,16 @@ concurrent = executable('btrfs-concurrent', 'tests/concurrent.c', include_direct
   link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
 extents_test = executable('btrfs-extents-test', 'tests/extents.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
+# The FSKit volume against stand-ins for the framework's resource and packer.
+fskit_available = host_machine.system() == 'darwin' and add_languages('objc', required: false,
+  native: false)
+if fskit_available
+  fskit_volume_test = executable('btrfs-fskit-volume-test', 'tests/fskit_volume.m',
+    'adapters/fskit/BtrfsFileSystem.m', include_directories: inc,
+    objc_args: ['-fobjc-arc', '-fblocks', '-mmacosx-version-min=26.5'],
+    link_args: ['-framework', 'Foundation', '-framework', 'FSKit', '-mmacosx-version-min=26.5'],
+    link_with: [posix, identity, native, core], dependencies: [zlib, zstd])
+endif
 if get_option('fuzzer')
   executable('btrfs-fuzz', 'tests/fuzz_metadata.c', include_directories: inc,
     link_with: [posix, core], dependencies: [zlib, zstd],
@@ -96,6 +106,10 @@ if fixtures != ''
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   test('decompressed-extents', extents_test, args: [join_paths(fixtures, 'zstd.raw'),
     join_paths(fixtures, 'zlib.raw')], timeout: 180, suite: 'images')
+  if fskit_available
+    test('fskit-volume', fskit_volume_test, args: [join_paths(fixtures, 'plain.raw')],
+      timeout: 180, suite: 'images')
+  endif
   test('inline-transactions', transaction_test,
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 180, suite: 'images')
   test('inline-transactions-dup', transaction_test,

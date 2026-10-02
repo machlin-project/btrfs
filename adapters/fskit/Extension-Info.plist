@@ -53,12 +53,14 @@
                 <true/>
                 <key>FSName</key>
                 <string>Machlin btrfs</string>
+                <key>FSSubType</key>
+                <integer>0</integer>
             </dict>
         </dict>
         <key>FSRequiresSecurityScopedPathURLResources</key>
         <false/>
         <key>FSShortName</key>
-        <string>machlin_btrfs</string>
+        <string>machlinbtrfs</string>
         <key>FSSupportsBlockResources</key>
         <true/>
         <key>FSSupportsGenericURLResources</key>
