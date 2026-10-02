@@ -4,8 +4,11 @@ A standalone Btrfs filesystem for macOS and Machlin: one portable C core, an
 FSKit application extension, and an XNU filesystem extension. Linux ABI policy
 belongs to LXNU in the XNU fork, not to this repository.
 
-The current implementation has an accepted **read-only XNU mount** and an
-experimental portable CoW transaction writer.
+Both native adapters mount read-only by default and read-write on request, on a
+portable CoW transaction writer: the XNU mount (`mount_machlin_btrfs -w`) and
+the FSKit extension, behind a privileged device barrier, pass the mounted read
+and write suites, and Linux verifies the images they write. Native power-cut
+durability and FSKit set-id metadata are not accepted.
 It reads single-device CRC32C filesystems with SINGLE/DUP chunks, 4–64 KiB nodes,
 inodes, byte-exact names, directories, hard links, symlinks, inline and regular
 extents, sparse and preallocated data, raw xattrs, subvolumes and snapshots.
@@ -33,8 +36,10 @@ namespace audits check every committed state.
 Explicit superblock recovery resolves torn or disagreeing copies without rolling
 back an acknowledged generation. Linux agrees with the recorded outcome of
 reordered and torn crash states on twelve profiles, including namespace facts
-and its own cleanup of the orphans left. Native mounts remain read-only: native
-writeback and write coherence are remaining work. See
+and its own cleanup of the orphans left. The XNU adapter writes through the
+unified buffer cache with grouped or synchronous commits; FSKit's block resource
+has no device cache flush, so the extension writes only while a root service,
+approved by the administrator, flushes that one disk for each barrier. See
 [acceptance](docs/ACCEPTANCE.md) and [the concrete handoff](docs/HANDOFF.md).
 
 The performance goal is to outperform Linux Btrfs on matched filesystem
