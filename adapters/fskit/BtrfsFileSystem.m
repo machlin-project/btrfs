@@ -414,12 +414,41 @@ btrfs_fskit_locks_create(void)
 	return locks;
 }
 
-/* The writer's device: direct writes through the resource and the flusher's
+/* Device writes wait in memory until the writer's next barrier, merged where
+ * they continue one another, so a barrier issues a few large writes instead
+ * of one per block; staged bytes beyond these bounds are issued at once. Reads
+ * of the device see staged bytes. The writer issues every write and barrier
+ * with its turn held; reads run concurrently. */
+#define BTRFS_FSKIT_STAGED_BYTES (32U * 1024U * 1024U)
+#define BTRFS_FSKIT_STAGED_RUNS 4096U
+/* A run grows by appended writes up to this size. */
+#define BTRFS_FSKIT_RUN_BYTES (8U * 1024U * 1024U)
+
+struct btrfs_fskit_run {
+	uint64_t offset;
+	size_t length;
+	size_t capacity;
+	uint8_t *bytes;
+};
+
+/* Runs are sorted by offset and disjoint. A failed write is kept: every later
+ * write and barrier fails, so nothing written after it is acknowledged as
+ * durable. */
+struct btrfs_fskit_staged {
+	pthread_rwlock_t lock;
+	struct btrfs_fskit_run runs[BTRFS_FSKIT_STAGED_RUNS];
+	size_t count;
+	size_t bytes;
+	enum btrfs_result failure;
+};
+
+/* The writer's device: staged writes through the resource and the flusher's
  * cache flush as every barrier. A failed flush fails the commit; it never
  * acknowledges persistence. */
 @interface BtrfsDevice : NSObject
 @property(readonly) id<BtrfsBlockWriter> writer;
 @property(readonly) id<BtrfsDeviceFlusher> flusher;
+@property(readonly) struct btrfs_fskit_staged *staged;
 - (instancetype)initWithWriter:(id<BtrfsBlockWriter>)writer flusher:(id<BtrfsDeviceFlusher>)flusher;
 @end
 
@@ -429,29 +458,214 @@ btrfs_fskit_locks_create(void)
 {
 	self = [super init];
 	if (self != nil) {
+		_staged = calloc(1, sizeof(*_staged));
+		if (_staged == NULL || pthread_rwlock_init(&_staged->lock, NULL) != 0) {
+			free(_staged);
+			return nil;
+		}
 		_writer = writer;
 		_flusher = flusher;
 	}
 	return self;
 }
 
+- (void)dealloc
+{
+	size_t i;
+
+	/* Only a failed volume leaves staged writes; they are never issued. */
+	for (i = 0; i < _staged->count; i++) {
+		free(_staged->runs[i].bytes);
+	}
+	pthread_rwlock_destroy(&_staged->lock);
+	free(_staged);
+}
+
 @end
+
+/* Issues every staged run in offset order, with the lock held for writing. */
+static enum btrfs_result
+btrfs_staged_issue(struct btrfs_fskit_staged *staged, id<BtrfsBlockWriter> writer)
+{
+	enum btrfs_result error;
+	size_t i;
+
+	for (i = 0; i < staged->count; i++) {
+		if (staged->failure == BTRFS_OK) {
+			error = btrfs_resource_write((__bridge void *)writer,
+			    staged->runs[i].offset, staged->runs[i].bytes, staged->runs[i].length);
+			if (error != BTRFS_OK) {
+				staged->failure = error;
+			}
+		}
+		free(staged->runs[i].bytes);
+	}
+	staged->count = 0;
+	staged->bytes = 0;
+	return staged->failure;
+}
+
+/* The first run that does not end at or before offset. */
+static size_t
+btrfs_staged_find(const struct btrfs_fskit_staged *staged, uint64_t offset)
+{
+	size_t low = 0;
+	size_t high = staged->count;
+	size_t middle;
+
+	while (low < high) {
+		middle = low + (high - low) / 2;
+		if (staged->runs[middle].offset + staged->runs[middle].length <= offset) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low;
+}
+
+/* Stages one write, with the lock held for writing. A write inside a run
+ * replaces its bytes, one that continues the run before it extends that run,
+ * and one that overlaps runs otherwise first issues every staged run. */
+static enum btrfs_result
+btrfs_staged_add(struct btrfs_fskit_staged *staged, id<BtrfsBlockWriter> writer, uint64_t offset,
+    const void *bytes, size_t length)
+{
+	struct btrfs_fskit_run *run;
+	uint8_t *grown;
+	uint64_t end = offset + length;
+	size_t capacity;
+	size_t index = btrfs_staged_find(staged, offset);
+
+	if (index < staged->count && staged->runs[index].offset <= offset &&
+	    end <= staged->runs[index].offset + staged->runs[index].length) {
+		run = &staged->runs[index];
+		memcpy(run->bytes + (offset - run->offset), bytes, length);
+		return BTRFS_OK;
+	}
+	if (index < staged->count && staged->runs[index].offset < end) {
+		if (btrfs_staged_issue(staged, writer) != BTRFS_OK) {
+			return staged->failure;
+		}
+		index = 0;
+	}
+	if (index > 0 &&
+	    staged->runs[index - 1].offset + staged->runs[index - 1].length == offset &&
+	    staged->runs[index - 1].length + length <= BTRFS_FSKIT_RUN_BYTES) {
+		run = &staged->runs[index - 1];
+		if (run->length + length > run->capacity) {
+			capacity = MAX(run->capacity * 2U, run->length + length);
+			capacity = MIN(capacity, (size_t)BTRFS_FSKIT_RUN_BYTES);
+			grown = realloc(run->bytes, capacity);
+			if (grown == NULL) {
+				return BTRFS_NO_MEMORY;
+			}
+			run->bytes = grown;
+			run->capacity = capacity;
+		}
+		memcpy(run->bytes + run->length, bytes, length);
+		run->length += length;
+		staged->bytes += length;
+		return BTRFS_OK;
+	}
+	if (staged->count == BTRFS_FSKIT_STAGED_RUNS) {
+		if (btrfs_staged_issue(staged, writer) != BTRFS_OK) {
+			return staged->failure;
+		}
+		index = 0;
+	}
+	grown = malloc(length);
+	if (grown == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	memcpy(grown, bytes, length);
+	memmove(&staged->runs[index + 1], &staged->runs[index],
+	    (staged->count - index) * sizeof(staged->runs[0]));
+	staged->runs[index] = (struct btrfs_fskit_run){ offset, length, length, grown };
+	staged->count++;
+	staged->bytes += length;
+	return BTRFS_OK;
+}
 
 static enum btrfs_result
 btrfs_device_write(void *context, uint64_t offset, const void *bytes, size_t length)
 {
 	BtrfsDevice *device = (__bridge BtrfsDevice *)context;
+	struct btrfs_fskit_staged *staged = device.staged;
+	uint64_t alignment = device.writer.physicalBlockSize;
+	uint64_t size = device.writer.blockCount * device.writer.blockSize;
+	enum btrfs_result error;
 
-	return btrfs_resource_write((__bridge void *)device.writer, offset, bytes, length);
+	if (alignment == 0 || offset % alignment != 0 || length % alignment != 0 || offset > size ||
+	    length > size - offset) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (length == 0) {
+		return BTRFS_OK;
+	}
+	pthread_rwlock_wrlock(&staged->lock);
+	error = staged->failure;
+	if (error == BTRFS_OK) {
+		error = btrfs_staged_add(staged, device.writer, offset, bytes, length);
+	}
+	if (error == BTRFS_OK && staged->bytes > BTRFS_FSKIT_STAGED_BYTES) {
+		error = btrfs_staged_issue(staged, device.writer);
+	}
+	pthread_rwlock_unlock(&staged->lock);
+	return error;
+}
+
+/* Reads the device with the staged bytes of the range laid over it. */
+static enum btrfs_result
+btrfs_device_read(void *context, uint64_t offset, void *buffer, size_t length)
+{
+	BtrfsDevice *device = (__bridge BtrfsDevice *)context;
+	struct btrfs_fskit_staged *staged = device.staged;
+	struct btrfs_fskit_run *run;
+	uint64_t end = offset + length;
+	uint64_t from;
+	uint64_t to;
+	enum btrfs_result error;
+	size_t index;
+
+	if (length > UINT64_MAX - offset) {
+		return BTRFS_IO;
+	}
+	pthread_rwlock_rdlock(&staged->lock);
+	index = btrfs_staged_find(staged, offset);
+	run = index < staged->count ? &staged->runs[index] : NULL;
+	/* A range one run holds needs no device read. */
+	if (run != NULL && run->offset <= offset && end <= run->offset + run->length) {
+		memcpy(buffer, run->bytes + (offset - run->offset), length);
+		pthread_rwlock_unlock(&staged->lock);
+		return BTRFS_OK;
+	}
+	error = btrfs_resource_read((__bridge void *)device.writer, offset, buffer, length);
+	if (error == BTRFS_OK) {
+		for (; index < staged->count && staged->runs[index].offset < end; index++) {
+			run = &staged->runs[index];
+			from = MAX(run->offset, offset);
+			to = MIN(run->offset + run->length, end);
+			memcpy((uint8_t *)buffer + (from - offset),
+			    run->bytes + (from - run->offset), (size_t)(to - from));
+		}
+	}
+	pthread_rwlock_unlock(&staged->lock);
+	return error;
 }
 
 static enum btrfs_result
 btrfs_device_flush(void *context)
 {
 	BtrfsDevice *device = (__bridge BtrfsDevice *)context;
+	struct btrfs_fskit_staged *staged = device.staged;
 	NSError *error = nil;
+	enum btrfs_result issued;
 
-	if (device.writer.isRevoked) {
+	pthread_rwlock_wrlock(&staged->lock);
+	issued = btrfs_staged_issue(staged, device.writer);
+	pthread_rwlock_unlock(&staged->lock);
+	if (issued != BTRFS_OK || device.writer.isRevoked) {
 		return BTRFS_IO;
 	}
 	return [device.flusher synchronizeWithError:&error] && error == nil ? BTRFS_OK : BTRFS_IO;
@@ -537,6 +751,14 @@ btrfs_timespec(struct btrfs_time time)
 	    ((id<BtrfsBlockWriter>)reader).isWritable) {
 		device = [[BtrfsDevice alloc] initWithWriter:(id<BtrfsBlockWriter>)reader
 						     flusher:flusher];
+		if (device == nil) {
+			btrfs_fskit_locks_destroy(owned);
+			*result = BTRFS_NO_MEMORY;
+			return nil;
+		}
+		/* Reads see writes staged for the next barrier. */
+		environment.context = (__bridge void *)device;
+		environment.read = btrfs_device_read;
 		memset(&writer, 0, sizeof(writer));
 		writer.context = (__bridge void *)device;
 		writer.write = btrfs_device_write;

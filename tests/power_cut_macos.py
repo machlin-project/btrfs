@@ -34,6 +34,10 @@ import threading
 import time
 
 BOOT_SECONDS = 600
+# A start that has not failed within this many seconds is running.
+START_SECONDS = 15
+START_ATTEMPTS = 8
+LOCKED_STORAGE = "Failed to lock auxiliary storage"
 FIRST_ACK_SECONDS = 180
 MENU_TIMEOUT = 3
 
@@ -134,12 +138,25 @@ def main():
                               timeout=300).stdout
 
     def start_vm(index):
-        vm_log = (output / f"vm-{index:02d}.log").open("xb")
         shares = [f"--dir=lxnu-artifacts:{lab / 'artifacts'}:ro",
                   f"--dir=lxnu-kdk:{lab / '.cache/kdk'}:ro"] if xnu else []
-        return subprocess.Popen(
-            [tart, "run", args.vm, "--no-audio", "--no-clipboard", "--vnc-experimental", *shares,
-             f"--dir={args.share}:{products}"], cwd=lab, stdout=vm_log, stderr=subprocess.STDOUT)
+        # A killed machine's process may hold its auxiliary storage for a
+        # moment; a start that fails on that lock is retried.
+        for attempt in range(START_ATTEMPTS):
+            name = f"vm-{index:02d}.log" if attempt == 0 else f"vm-{index:02d}-{attempt}.log"
+            vm_log = (output / name).open("xb")
+            vm = subprocess.Popen(
+                [tart, "run", args.vm, "--no-audio", "--no-clipboard", "--vnc-experimental",
+                 *shares, f"--dir={args.share}:{products}"], cwd=lab, stdout=vm_log,
+                stderr=subprocess.STDOUT)
+            try:
+                vm.wait(timeout=START_SECONDS)
+            except subprocess.TimeoutExpired:
+                return vm
+            if LOCKED_STORAGE not in (output / name).read_text(errors="replace"):
+                raise RuntimeError(f"The virtual machine did not start; see {name}")
+            time.sleep(START_SECONDS)
+        raise RuntimeError("The virtual machine's storage stayed locked")
 
     def wait_boot():
         deadline = time.monotonic() + BOOT_SECONDS

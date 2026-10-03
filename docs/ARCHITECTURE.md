@@ -708,7 +708,14 @@ does not have (ENOTSUP).
 
 The FSKit volume runs on the shared volume layer: reads take the newest view and
 changes are operations of the running transaction, committed at least every
-five seconds, at synchronization and at unmount. FSKit's block resource offers
+five seconds, at synchronization and at unmount. The adapter keeps device
+writes in memory until the writer's next barrier (32 MiB at most, issued at once
+beyond that), merged where one write continues another, so a commit or a burst
+of new files reaches the device in a few large writes; a write overlapping
+staged runs other than within one issues them first. Reads of the device see
+the staged bytes. A staged write that fails is kept: the barrier and every later
+write fail, so the commit fails the volume and nothing after it is
+acknowledged. FSKit's block resource offers
 direct writes but no device cache flush, so a volume accepts changes only with
 a device flusher that provides every barrier; a failed flush fails the commit
 and the volume, never acknowledging persistence. Without a flusher the volume

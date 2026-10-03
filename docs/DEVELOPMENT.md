@@ -637,8 +637,9 @@ loaded module writes. It keeps the authoritative image on the host, selects the
 Btrfs slot with a short menu timeout (restoring the menu afterwards) and, per
 iteration, mounts a new guest copy read-write (grouped and `-s` alternate),
 verifies every file acknowledged so far, runs `btrfs-power-cut write`, kills the
-virtual machine process after a random delay, boots it again and copies the
-crash image back. The workload prints a manifest line only after a file and its
+virtual machine process after a random delay, boots it again (retrying a start
+that finds the killed process still holding the machine's auxiliary storage)
+and copies the crash image back. The workload prints a manifest line only after a file and its
 directory were synced, and churns unsynchronized renames, unlinks and open
 unlinked files around them. `btrfs-inspect IMAGE recover` (no writes) records
 whether a cut left disagreeing superblock copies; the next read-write mount must

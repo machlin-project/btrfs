@@ -235,13 +235,16 @@ lstat of each name) gives:
 | --- | --- | --- |
 | APFS (in-kernel) | 22 s | 92,780; 72,760; 56,213 |
 | exFAT (Apple's FSKit module) | 168 s | 3,692; 3,748; 3,749 |
-| Btrfs (FSKit build 8, 1 GiB image) | 843 s with the final sync | 7,665; 7,644; 7,648 |
+| Btrfs (FSKit build 9, 1 GiB image) | 110 s with the final sync | 7,670; 7,754; 7,696 |
+| Btrfs (FSKit build 8, writes issued at once) | 843 s with the final sync | 7,665; 7,644; 7,648 |
 
-Through FSKit, Btrfs walks twice as fast as Apple's exFAT module but creates
-five times slower; per-file creation cost through the extension (namespace
-operation, 4 KiB data write and its extent) is the next FSKit target. These
-are single-guest measurements; the loaded kernel module and Linux are not
-compared yet.
+Build 8 spent 84% of the extension's time during creation in one synchronous
+device write per file's data sector. Build 9 keeps device writes until the
+next barrier and merges adjacent ones (on the host, 64 one-sector files reach
+the device in 14 writes): creation became 7.7 times faster. Through FSKit,
+Btrfs now walks twice as fast and creates 1.5 times as fast as Apple's exFAT
+module. These are single-guest measurements; the loaded kernel module and
+Linux are not compared yet.
 
 ## Matched benchmark protocol
 

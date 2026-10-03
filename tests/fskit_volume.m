@@ -53,6 +53,10 @@
 #define FILE_BYTES (300U * 1024U + 123U)
 #define WRITE_PIECE (64U * 1024U + 7U)
 #define TRUNCATED_BYTES (200U * 1024U + 1U)
+/* Files of one data sector each that the staging test writes before one
+ * barrier; their extents adjoin, so far fewer device writes issue them. */
+#define STAGED_FILES 64U
+#define STAGED_FILE_BYTES 4096U
 /* One Btrfs superblock (BTRFS_SUPER_INFO_SIZE); recovery reports their offsets. */
 #define SUPERBLOCK_BYTES 4096U
 /* Every standard attribute FSKit may want; it faults on a reply missing one. */
@@ -71,6 +75,7 @@
 @property(readonly, getter=isWritable) BOOL writable;
 @property(readonly) NSString *BSDName;
 @property size_t partial;
+@property BOOL failWrites;
 @property uint64_t calls;
 @property uint64_t writes;
 - (instancetype)initWithPath:(const char *)path writable:(BOOL)writable;
@@ -132,6 +137,10 @@
 	REQUIRE(self.writable);
 	REQUIRE(offset % SECTOR_BYTES == 0 && length % SECTOR_BYTES == 0);
 	self.writes++;
+	if (self.failWrites) {
+		*error = [NSError errorWithDomain:NSPOSIXErrorDomain code:EIO userInfo:nil];
+		return 0;
+	}
 	if (self.partial != 0 && length > self.partial) {
 		length = self.partial;
 	}
@@ -788,7 +797,8 @@ write_tests(const char *fixture)
 			error = replyError;
 		      }];
 	REQUIRE(error.code == ESTALE);
-	/* Uneven writes through a device that moves partial pieces. */
+	/* Uneven writes, staged until the barrier, which issues them through a
+	 * device that moves partial pieces; reads see the staged bytes. */
 	reader.partial = PARTIAL_BYTES;
 	writes = reader.writes;
 	for (offset = 0; offset < FILE_BYTES; offset += length) {
@@ -796,6 +806,9 @@ write_tests(const char *fixture)
 		    FILE_BYTES - offset < WRITE_PIECE ? (size_t)(FILE_BYTES - offset) : WRITE_PIECE;
 		REQUIRE(write_data(volume, file, offset, expected + offset, length) == nil);
 	}
+	REQUIRE(reader.writes == writes);
+	compare_bytes(volume, file, expected, FILE_BYTES);
+	REQUIRE(synchronize(volume) == nil);
 	reader.partial = 0;
 	REQUIRE(reader.writes > writes);
 	compare_bytes(volume, file, expected, FILE_BYTES);
@@ -933,6 +946,87 @@ write_tests(const char *fixture)
 	volume = nil;
 	verify_written(path, expected);
 	free(expected);
+	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
+}
+
+/* Writes wait for the barrier and merge: files of one sector each, written
+ * together, reach the device in far fewer writes than files, and a fresh
+ * load reads them. */
+static void
+staging_test(const char *fixture)
+{
+	NSString *path = scratch_copy(fixture);
+	ImageReader *reader = [[ImageReader alloc] initWithPath:path.fileSystemRepresentation
+						       writable:YES];
+	TestFlusher *flusher = [TestFlusher new];
+	BtrfsVolume *volume = open_volume(reader, flusher);
+	BtrfsItem *root = root_item(volume);
+	BtrfsItem *files[STAGED_FILES];
+	uint8_t contents[STAGED_FILE_BYTES];
+	char name[32];
+	NSError *error = nil;
+	uint64_t writes;
+	uint64_t issued;
+	unsigned i;
+
+	REQUIRE(synchronize(volume) == nil);
+	writes = reader.writes;
+	for (i = 0; i < STAGED_FILES; i++) {
+		snprintf(name, sizeof(name), "staged-%02u", i);
+		memset(contents, (int)(i + 1U), sizeof(contents));
+		files[i] = create(volume, root, name, FSItemTypeFile, 0644, &error);
+		REQUIRE(files[i] != nil && error == nil);
+		REQUIRE(write_data(volume, files[i], 0, contents, sizeof(contents)) == nil);
+		compare_bytes(volume, files[i], contents, sizeof(contents));
+	}
+	REQUIRE(reader.writes == writes);
+	REQUIRE(synchronize(volume) == nil);
+	issued = reader.writes - writes;
+	REQUIRE(issued != 0 && issued < STAGED_FILES / 4U);
+	volume = nil;
+	volume = open_volume(reader, flusher);
+	root = root_item(volume);
+	for (i = 0; i < STAGED_FILES; i++) {
+		snprintf(name, sizeof(name), "staged-%02u", i);
+		memset(contents, (int)(i + 1U), sizeof(contents));
+		files[i] =
+		    lookup(volume, root, [NSData dataWithBytes:name length:strlen(name)], &error);
+		REQUIRE(files[i] != nil);
+		compare_bytes(volume, files[i], contents, sizeof(contents));
+	}
+	volume = nil;
+	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
+	printf("FSKit staging: %u files of one sector in %llu device writes at the barrier\n",
+	    STAGED_FILES, (unsigned long long)issued);
+}
+
+/* A staged write that fails at the barrier fails synchronization, and the
+ * volume refuses every later change instead of acknowledging lost ones. */
+static void
+staged_failure_test(const char *fixture)
+{
+	NSString *path = scratch_copy(fixture);
+	ImageReader *reader = [[ImageReader alloc] initWithPath:path.fileSystemRepresentation
+						       writable:YES];
+	TestFlusher *flusher = [TestFlusher new];
+	BtrfsVolume *volume = open_volume(reader, flusher);
+	BtrfsItem *root = root_item(volume);
+	BtrfsItem *file;
+	uint8_t contents[STAGED_FILE_BYTES];
+	NSError *error = nil;
+	uint64_t flushes;
+
+	memset(contents, 0x5a, sizeof(contents));
+	file = create(volume, root, "unissued", FSItemTypeFile, 0644, &error);
+	REQUIRE(file != nil && write_data(volume, file, 0, contents, sizeof(contents)) == nil);
+	reader.failWrites = YES;
+	flushes = flusher.flushes;
+	error = synchronize(volume);
+	REQUIRE(error != nil && error.code == EIO && flusher.flushes == flushes);
+	reader.failWrites = NO;
+	REQUIRE(create(volume, root, "after-failure", FSItemTypeFile, 0644, &error) == nil &&
+	    error != nil);
+	volume = nil;
 	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
 }
 
@@ -1110,6 +1204,8 @@ main(int argc, char **argv)
 		btrfs_image_close(&image);
 		write_tests(argv[2]);
 		barrier_failure_test(argv[2]);
+		staging_test(argv[2]);
+		staged_failure_test(argv[2]);
 		admission_test(argv[2]);
 		recovery_test(argv[2]);
 		printf(
@@ -1117,8 +1213,9 @@ main(int argc, char **argv)
 		    "only without attributes across pages, read-only refusals, revocation, "
 		    "maintenance refusals, Disk Arbitration type; writable creation, writes, "
 		    "truncation, attributes, xattrs, links, renames, removal and eviction "
-		    "durable through the barrier and audited, barrier failure fails the "
-		    "volume, no barrier for --rdonly, read-only devices or an unsigned "
+		    "durable through the barrier and audited, writes staged and merged until "
+		    "the barrier, barrier and staged write failures fail the volume, no barrier "
+		    "for --rdonly, read-only devices or an unsigned "
 		    "process, recovery only for a writable volume PASS\n");
 	}
 	return 0;
