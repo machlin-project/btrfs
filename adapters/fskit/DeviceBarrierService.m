@@ -3,6 +3,7 @@
  * block device after checking its name, type and geometry, and can then only
  * synchronize that device's cache. Peers must be this team's extension or app. */
 #import "BtrfsDeviceBarrier.h"
+#include "IOProfile.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/disk.h>
@@ -96,10 +97,12 @@ barrier_error(int code)
 {
 	@synchronized(self) {
 		int error = _device < 0 ? ENXIO : 0;
+		uint64_t start = btrfs_io_profile_start();
 
 		if (error == 0 && ioctl(_device, DKIOCSYNCHRONIZECACHE) != 0) {
 			error = errno;
 		}
+		btrfs_io_profile_end("barrier_ioctl", start, 0, 0, error);
 		reply(barrier_error(error));
 	}
 }

@@ -693,6 +693,32 @@ and inode generation, so an inode number reused after deletion gets a new vnode;
 unlinking a name that is still open keeps an orphan item until `VNOP_INACTIVE`
 evicts it, and a read-write mount cleans orphans of its tree as Linux does.
 
+Below UBC and the transaction engine, the XNU adapter combines device writes in
+`btrfs_staging`. Up to 32 MiB of payload forms at most 4,096 disjoint runs, each
+at most 8 MiB. Adjacent writes append; an overwrite wholly inside a run replaces
+its bytes. Other overlaps or capacity limits drain the pending writes before
+staging more. Runs reach the device in physical order, through private I/O
+buffers split at `MAXPHYS`. Device reads overlay staged bytes, with a shared
+lock for reads and an exclusive lock for writes and drains. Every persistence
+barrier drains first, then performs the original device cache flush; any failed
+write or barrier permanently fails the staging owner. Destruction drops buffers
+without I/O, including after an aborted mount. Read-only mounts allocate no
+staging owner. Sync propagates page-push errors, and a normal unmount refuses to
+discard a failed flush; forced unmount may still tear down a failed owner.
+Volume sync first drains each vnode's cluster-write queue and then its dirty
+UBC pages, without a per-vnode commit. Only after the pass does it commit the
+running transaction. Write strategy maps the outgoing UPL range read-only:
+an arm64 writable kernel mapping marks the physical pages modified even if the
+adapter only reads their bytes. Such a mapping dirties each page again during
+its own writeback, so subsequent fsync and reclaim repeat the writes and commits.
+Incoming reads retain writable mappings. File fsync uses the same data-push
+helper and still commits the generation that contains that file's last change
+before returning.
+Payload limits exclude geometric buffer capacity: allocation is
+less than twice the payload limit, plus one run during growth and the fixed run
+table. This changes request sizes and timing within an epoch, not the ordering
+of publication or the meaning of fsync.
+
 Authorization stays with XNU's VFS, which checks the caller's credential against
 the attributes the adapter reports, including immutable and append-only flags.
 New objects take the caller's uid and the directory's group (BSD creation);
@@ -715,7 +741,16 @@ of new files reaches the device in a few large writes; a write overlapping
 staged runs other than within one issues them first. Reads of the device see
 the staged bytes. A staged write that fails is kept: the barrier and every later
 write fail, so the commit fails the volume and nothing after it is
-acknowledged. FSKit's block resource offers
+acknowledged. A writable FSKit mount also retains the three fixed superblock
+copies (12 KiB) it reads at admission. Only that mount may change the resource:
+successful staging updates its cached bytes, and every core validation still
+runs. Admission and commit can therefore check the copies without repeated
+raw-device reads. A failed write or barrier invalidates the cache; even a cache
+hit checks resource revocation. The next load starts with an empty cache and
+reads the physical copies before admission or recovery. Read-only resources
+and probes use direct reads. External writes during a writable mount violate
+its exclusive-resource contract; this cache is not a foreign-writer detector.
+FSKit's block resource offers
 direct writes but no device cache flush, so a volume accepts changes only with
 a device flusher that provides every barrier; a failed flush fails the commit
 and the volume, never acknowledging persistence. Without a flusher the volume
@@ -776,6 +811,13 @@ names the acknowledged generation or the new one, and every intact copy names a
 complete durable tree. Exact write/flush callbacks are explicit capabilities.
 Failure or uncertain persistence makes the transaction terminal. Pre-write
 failures and destruction discard private state without changing media.
+
+Putting primary and secondary writes in the same unbarriered epoch would permit
+one crash to tear every copy: the current device contract allows sector tears
+of every issued write. Two barriers alone therefore do not preserve this
+publication invariant. A reduced-barrier design needs an additional, explicit
+device persistence/atomicity guarantee and its own recovery oracle; ordinary
+completion of a write callback supplies neither.
 
 Mount reads only the primary, so a torn primary fails as CORRUPT and an older
 mirror is never silently chosen. `btrfs_recover_supers` is the explicit,

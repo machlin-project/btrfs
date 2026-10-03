@@ -21,6 +21,11 @@ core = static_library('btrfs_core', sources, include_directories: inc,
 identity = static_library('btrfs_identity', 'adapters/common/identity.c', include_directories: inc)
 native = static_library('btrfs_native', 'adapters/common/native.c', include_directories: inc)
 volume = static_library('btrfs_volume', 'adapters/common/volume.c', include_directories: inc)
+staging = static_library('btrfs_staging', 'adapters/common/staging.c', include_directories: inc,
+  c_args: ['-ffreestanding', '-fno-builtin'])
+staging_test = executable('btrfs-staging-test', 'tests/staging.c', include_directories: inc,
+  link_with: staging)
+test('device-write-staging', staging_test, suite: 'core')
 static_library('btrfs_freestanding', sources, include_directories: inc,
   override_options: ['b_sanitize=none', 'optimization=2'],
   c_args: ['-ffreestanding', '-fno-builtin', '-Wframe-larger-than=2048'])
@@ -33,6 +38,8 @@ inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: in
   link_with: [posix, core], dependencies: [zlib, zstd])
 executable('btrfs-bench', 'tools/bench.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
+executable('btrfs-fsync-bench', 'tools/fsync_bench.c',
+  override_options: ['b_sanitize=none'])
 transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',

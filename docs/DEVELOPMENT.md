@@ -62,6 +62,44 @@ trial, alternate the binaries at least seven times and report CPU time beside
 wall time: host file I/O can add large stalls even when barriers are skipped.
 Both are image-backend measurements, not native mounted or Linux comparisons.
 
+`btrfs-fsync-bench DIRECTORY FILES BYTES [--samples]` is a separate mounted
+POSIX workload, built on both Linux and macOS. Use an existing empty directory
+on a disposable filesystem. It exclusively creates each file, writes deterministic
+contents, fsyncs the file, closes it and fsyncs its directory. It reports JSON
+with each stage's mean/p50/p95/p99, wall time and caller CPU time, then checks
+every file's size and contents outside the measured interval. `--samples` adds
+per-file timings and monotonic timestamps. Bounds are 100,000 files and 4 MiB
+per file. It leaves its files for remount or independent verification; a repeat
+in the same directory fails instead of replacing them. Caller CPU excludes the
+filesystem extension, daemon and kernel. This workload alone is not a crash
+oracle or the complete matched workload matrix.
+
+```sh
+meson compile -C .build-release btrfs-fsync-bench
+.build-release/btrfs-fsync-bench /Volumes/disposable/fsync-run 64 4096 --samples > run.jsonl
+```
+
+For FSKit attribution, `scripts/build_fskit.py --profile-io` adds diagnostic
+logging to the extension and its device-barrier daemon. Install both in the
+dedicated guest, capture `log stream --style ndjson --predicate 'eventMessage
+CONTAINS "btrfs-io "'` during the workload, then run:
+
+```sh
+python3 tools/analyze_fskit_io.py trace.jsonl --benchmark run.jsonl --output attribution.json
+```
+
+The trace records resource reads/writes, staged drains, XPC barriers, the daemon's
+flush ioctl and volume-sync callbacks. Monotonic timestamps select the workload's
+window and relate callbacks to file/directory fsync. Intervals nest: do not add
+drain and resource-write time, or XPC and ioctl time. Unattributed time includes
+locking and logging as well as CPU work. Concurrent calls overlap:
+`wall_coverage_ns` measures the union of their intervals, while `sum_ns` adds
+their individual durations. Profile only one mounted test volume;
+diagnostic logging perturbs timing, so performance comparisons use ordinary
+builds. Restore the ordinary signed guest build afterwards. Without the flag,
+the release extension contains neither the trace strings nor clock calls from
+this instrumentation.
+
 Useful inspection commands:
 
 ```sh
@@ -268,6 +306,8 @@ FSKit requires macOS 26.5 SDK or later and XcodeGen; the deployment target is
 macOS 26.4, the release that added `requestedMountOptions`, which a read-only
 volume uses to ask FSKit for a read-only mount. Kext builds use Kernel.framework
 headers from the selected SDK and enforce the same core stack budget.
+The adapter uses the public `page_size` KPI: the SDK 27 `PAGE_SIZE` macro instead
+imports `PAGE_SHIFT_CONST`, which the supported 26.5 kernel does not export.
 
 ```sh
 python3 scripts/build_fskit.py
@@ -671,3 +711,16 @@ the runner refuses a read-only mount, and root commands read the guest's sudo
 password from `--sudo-password-file` through stdin, never from arguments or
 logs. It takes no mount helper or kernel identities, and every iteration uses
 grouped commits.
+
+For a durability-only run without guest administrator credentials, use
+`--adapter fskit --unprivileged` instead of the password option. The runner
+attaches its disposable copies with `-owners off` and runs the same workload as
+the logged-in user. Acknowledgements still require both fsyncs; the manifest
+still records and verifies contents, mode, owner, group and link count in the
+guest and Linux. This mode does not test ownership enforcement or set-id
+semantics. The guest must still have its signed module and device service
+installed and enabled.
+
+Each crash image remains in the host output directory. After its hash matches
+the guest file, the runner removes that redundant guest copy before the next
+iteration, keeping guest disk use bounded.

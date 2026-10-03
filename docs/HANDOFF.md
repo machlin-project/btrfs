@@ -20,7 +20,7 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require thirty-six passing test processes on macOS (thirty-five elsewhere) and
+Require thirty-seven passing test processes on macOS (thirty-six elsewhere) and
 all seven reader profiles (367 contracts). Thirteen writable images are required
 by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
@@ -212,10 +212,24 @@ Accepted editors now transfer buffers into the cache at destruction and reuse
 retired buffers. Sole-owner metadata CoW moves its inline extent record directly
 to the replacement block. A volume prepares the next immutable view before
 publication and receives it from commit without mounting again, saving one
-superblock read per commit. General extent-reference accounting, free-space
-fixed-point rounds and begin/commit superblock rereads remain candidates.
-Do not cancel reference
-additions/drops without preserving snapshot and FULL_BACKREF transitions.
+superblock read per commit. General extent-reference accounting and free-space
+fixed-point rounds remain candidates. Writable FSKit mounts now cache their
+own superblock copies under exclusive device ownership, eliminating repeated
+device reads at begin/commit while retaining the core checks. The mounted
+file+directory-fsync workload improves by 22–24% across seven paired trials.
+XNU now combines adjacent device writes before each barrier, and volume sync
+drains both the cluster-write queue and UBC pages before a group commit. Write
+strategy maps outgoing UPL ranges read-only: writable kernel mappings on arm64
+mark pages modified during writeback itself, causing repeated writes and full
+commits at later fsync and reclaim. Creating 1,000 files and unmounting normally
+now takes a median 0.676 s instead of 30.520 s across three runs per build;
+100,000 files take 13.314 s in one verified run. Single-file fsync throughput
+in XNU is essentially unchanged; barriers still dominate. Preserve all three
+publication barriers;
+the current sector-tear model permits every superblock copy to tear if their
+writes share one unbarriered epoch.
+Do not cancel reference additions/drops without preserving snapshot and
+FULL_BACKREF transitions.
 Tree-log fsync needs a separate replay and power-cut design. Hardware CRC uses
 general registers; arm64e kernel builds enforce `-mgeneral-regs-only`, since
 the adapter does not own SIMD state even for compiler-generated copies.

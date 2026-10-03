@@ -77,6 +77,7 @@
 @property size_t partial;
 @property BOOL failWrites;
 @property uint64_t calls;
+@property uint64_t superReads;
 @property uint64_t writes;
 - (instancetype)initWithPath:(const char *)path writable:(BOOL)writable;
 @end
@@ -115,6 +116,10 @@
 	ssize_t done;
 
 	self.calls++;
+	if (offset == 64U * 1024U || offset == 64U * 1024U * 1024U ||
+	    offset == UINT64_C(256) * 1024U * 1024U * 1024U) {
+		self.superReads++;
+	}
 	REQUIRE(offset % SECTOR_BYTES == 0 && length % SECTOR_BYTES == 0);
 	if (self.partial != 0 && length > self.partial) {
 		length = self.partial;
@@ -1000,6 +1005,45 @@ staging_test(const char *fixture)
 	    STAGED_FILES, (unsigned long long)issued);
 }
 
+/* Superblock copies are read on each writable load, then follow only that
+ * mount's writes. Repeated admissions and commits need no device rereads;
+ * revocation still refuses a writer whose copies would all be cache hits. */
+static void
+super_cache_test(const char *fixture)
+{
+	NSString *path = scratch_copy(fixture);
+	ImageReader *reader = [[ImageReader alloc] initWithPath:path.fileSystemRepresentation
+						       writable:YES];
+	TestFlusher *flusher = [TestFlusher new];
+	BtrfsVolume *volume = open_volume(reader, flusher);
+	BtrfsItem *root = root_item(volume);
+	NSError *error = nil;
+	uint64_t reads = reader.superReads;
+	char name[32];
+	unsigned i;
+
+	REQUIRE(reads >= 2 && reads <= BTRFS_SUPER_COPIES);
+	for (i = 0; i < 8; i++) {
+		snprintf(name, sizeof(name), "super-cache-%u", i);
+		REQUIRE(create(volume, root, name, FSItemTypeFile, 0644, &error) != nil);
+		REQUIRE(synchronize(volume) == nil && reader.superReads == reads);
+	}
+	REQUIRE([volume shutdown] == BTRFS_OK);
+	volume = nil;
+	volume = open_volume(reader, flusher);
+	root = root_item(volume);
+	REQUIRE(reader.superReads == reads * 2U);
+	for (i = 0; i < 8; i++) {
+		snprintf(name, sizeof(name), "super-cache-%u", i);
+		REQUIRE(lookup(volume, root, bytes_of(name), &error) != nil);
+	}
+	reader.revoked = YES;
+	REQUIRE(create(volume, root, "revoked-cache", FSItemTypeFile, 0644, &error) == nil);
+	REQUIRE(error.code == EIO);
+	volume = nil;
+	REQUIRE([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
+}
+
 /* A staged write that fails at the barrier fails synchronization, and the
  * volume refuses every later change instead of acknowledging lost ones. */
 static void
@@ -1205,6 +1249,7 @@ main(int argc, char **argv)
 		write_tests(argv[2]);
 		barrier_failure_test(argv[2]);
 		staging_test(argv[2]);
+		super_cache_test(argv[2]);
 		staged_failure_test(argv[2]);
 		admission_test(argv[2]);
 		recovery_test(argv[2]);

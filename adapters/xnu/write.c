@@ -11,6 +11,7 @@
  * data that is not applied yet. */
 #include "btrfs_xnu.h"
 
+#include <mach/vm_prot.h>
 #include <sys/buf.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
@@ -194,14 +195,14 @@ btrfs_xnu_commit_data(struct btrfs_xnu_node *node, uint64_t offset, const void *
 	return btrfs_xnu_stop(node->mount, 0, transaction, result, node, NULL);
 }
 
-/* Pushes cached data, including pages dirtied through a mapping, then commits
- * the generation that publishes the object's last change (nothing to do once
- * it is durable). cluster_push_err returns how many clusters it pushed and
- * reports a failure through its last argument. */
-static int
-btrfs_xnu_sync_node(struct btrfs_xnu_node *node, vnode_t vnode, int wait)
+/* Drain both the cluster-write queue and pages dirtied through a mapping.
+ * The volume sync uses this data-only phase for every vnode before committing
+ * the whole group.
+ * cluster_push_err returns a count and reports errors through its last arg. */
+int
+btrfs_xnu_push_data(vnode_t vnode, int wait)
 {
-	uint64_t pending;
+	struct btrfs_xnu_node *node = vnode_fsnode(vnode);
 	int error = 0;
 
 	if (vnode_vtype(vnode) == VREG && btrfs_volume_writable(node->mount->volume)) {
@@ -218,6 +219,18 @@ btrfs_xnu_sync_node(struct btrfs_xnu_node *node, vnode_t vnode, int wait)
 		node->write_error = 0;
 		lck_mtx_unlock(node->mount->nodes_lock);
 	}
+	return error != 0 ? error : btrfs_xnu_error(btrfs_volume_failure(node->mount->volume));
+}
+
+/* Commit the generation that publishes the object's last change after its
+ * data is applied; nothing is left to do when that generation is durable. */
+static int
+btrfs_xnu_sync_node(struct btrfs_xnu_node *node, vnode_t vnode, int wait)
+{
+	uint64_t pending;
+	int error;
+
+	error = btrfs_xnu_push_data(vnode, wait);
 	if (error == 0 && btrfs_volume_writable(node->mount->volume)) {
 		lck_mtx_lock(node->mount->nodes_lock);
 		pending = node->pending;
@@ -253,11 +266,15 @@ btrfs_xnu_strategy_write(struct btrfs_xnu_node *node, buf_t buffer)
 		amount = offset >= size
 		    ? 0
 		    : (size - offset < length ? (size_t)(size - offset) : length);
-		error = amount == 0 ? 0 : buf_map(buffer, &address);
+		/* A writable kernel mapping marks the physical pages modified on
+		 * arm64, even when we only read them. It would dirty the pages again
+		 * during every push and force another write/commit at the next fsync.
+		 * Only the incoming read path needs a writable mapping. */
+		error = amount == 0 ? 0 : buf_map_range_with_prot(buffer, &address, VM_PROT_READ);
 		if (error == 0 && amount != 0) {
 			error =
 			    btrfs_xnu_error(btrfs_xnu_commit_data(node, offset, address, amount));
-			buf_unmap(buffer);
+			buf_unmap_range(buffer);
 		}
 	}
 	if (error != 0) {

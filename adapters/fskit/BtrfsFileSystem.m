@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #import "BtrfsDeviceBarrier.h"
 #import "BtrfsFileSystemInternal.h"
+#include "IOProfile.h"
 #include <btrfs/btrfs.h>
 #include <btrfs/identity.h>
 #include <btrfs/native.h>
@@ -154,15 +155,19 @@ btrfs_reader_exact(id<BtrfsBlockReader> reader, uint64_t offset, uint8_t *buffer
 	NSError *error = nil;
 	size_t done = 0;
 	size_t completed;
+	uint64_t start;
 
 	while (done < length) {
 		if (reader.isRevoked) {
 			return BTRFS_IO;
 		}
+		start = btrfs_io_profile_start();
 		completed = [reader readInto:buffer + done
 				  startingAt:(off_t)(offset + done)
 				      length:length - done
 				       error:&error];
+		btrfs_io_profile_end("resource_read", start, offset + done, completed,
+		    error == nil && completed != 0 && completed <= length - done ? 0 : EIO);
 		if (error != nil || completed == 0 || completed > length - done) {
 			return BTRFS_IO;
 		}
@@ -230,6 +235,7 @@ btrfs_resource_write(void *context, uint64_t offset, const void *bytes, size_t l
 	uint64_t alignment = writer.physicalBlockSize;
 	size_t done = 0;
 	size_t completed;
+	uint64_t start;
 
 	if (alignment == 0 || offset % alignment != 0 || length % alignment != 0 ||
 	    offset > writer.blockCount * writer.blockSize ||
@@ -240,10 +246,13 @@ btrfs_resource_write(void *context, uint64_t offset, const void *bytes, size_t l
 		if (writer.isRevoked) {
 			return BTRFS_IO;
 		}
+		start = btrfs_io_profile_start();
 		completed = [writer writeFrom:(uint8_t *)(uintptr_t)bytes + done
 				   startingAt:(off_t)(offset + done)
 				       length:length - done
 					error:&error];
+		btrfs_io_profile_end("resource_write", start, offset + done, completed,
+		    error == nil && completed != 0 && completed <= length - done ? 0 : EIO);
 		if (error != nil || completed == 0 || completed > length - done) {
 			return BTRFS_IO;
 		}
@@ -423,6 +432,11 @@ btrfs_fskit_locks_create(void)
 #define BTRFS_FSKIT_STAGED_RUNS 4096U
 /* A run grows by appended writes up to this size. */
 #define BTRFS_FSKIT_RUN_BYTES (8U * 1024U * 1024U)
+/* Fixed Btrfs superblock locations; these bytes are still checked by the core
+ * on every admission. Only this writable mount may change its resource. */
+#define BTRFS_FSKIT_SUPER_BYTES 4096U
+static const uint64_t btrfs_fskit_super_offsets[BTRFS_SUPER_COPIES] = { UINT64_C(64) * 1024U,
+	UINT64_C(64) * 1024U * 1024U, UINT64_C(256) * 1024U * 1024U * 1024U };
 
 struct btrfs_fskit_run {
 	uint64_t offset;
@@ -437,10 +451,54 @@ struct btrfs_fskit_run {
 struct btrfs_fskit_staged {
 	pthread_rwlock_t lock;
 	struct btrfs_fskit_run runs[BTRFS_FSKIT_STAGED_RUNS];
+	uint8_t supers[BTRFS_SUPER_COPIES][BTRFS_FSKIT_SUPER_BYTES];
+	unsigned super_valid;
 	size_t count;
 	size_t bytes;
 	enum btrfs_result failure;
 };
+
+static int
+btrfs_staged_super(uint64_t offset, size_t length)
+{
+	unsigned i;
+
+	for (i = 0; length == BTRFS_FSKIT_SUPER_BYTES && i < BTRFS_SUPER_COPIES; i++) {
+		if (offset == btrfs_fskit_super_offsets[i]) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+/* Keep the exact view of our writes, including a partial overlap. This is not
+ * a persistence acknowledgement: a failed write/barrier makes these copies
+ * unusable and the volume terminal. A new mount always rereads the device. */
+static void
+btrfs_staged_update_supers(
+    struct btrfs_fskit_staged *staged, uint64_t offset, const void *bytes, size_t length)
+{
+	uint64_t from;
+	uint64_t to;
+	uint64_t start;
+	unsigned i;
+
+	for (i = 0; i < BTRFS_SUPER_COPIES; i++) {
+		start = btrfs_fskit_super_offsets[i];
+		from = MAX(offset, start);
+		to = MIN(offset + length, start + BTRFS_FSKIT_SUPER_BYTES);
+		if (from >= to) {
+			continue;
+		}
+		if (from == start && to == start + BTRFS_FSKIT_SUPER_BYTES) {
+			staged->super_valid |= 1U << i;
+		}
+		if (staged->super_valid & (1U << i)) {
+			memcpy(staged->supers[i] + (from - start),
+			    (const uint8_t *)bytes + (from - offset), (size_t)(to - from));
+		}
+	}
+}
 
 /* The writer's device: staged writes through the resource and the flusher's
  * cache flush as every barrier. A failed flush fails the commit; it never
@@ -502,6 +560,9 @@ btrfs_staged_issue(struct btrfs_fskit_staged *staged, id<BtrfsBlockWriter> write
 	}
 	staged->count = 0;
 	staged->bytes = 0;
+	if (staged->failure != BTRFS_OK) {
+		staged->super_valid = 0;
+	}
 	return staged->failure;
 }
 
@@ -604,12 +665,19 @@ btrfs_device_write(void *context, uint64_t offset, const void *bytes, size_t len
 		return BTRFS_OK;
 	}
 	pthread_rwlock_wrlock(&staged->lock);
+	if (device.writer.isRevoked) {
+		staged->failure = BTRFS_IO;
+		staged->super_valid = 0;
+	}
 	error = staged->failure;
 	if (error == BTRFS_OK) {
 		error = btrfs_staged_add(staged, device.writer, offset, bytes, length);
 	}
 	if (error == BTRFS_OK && staged->bytes > BTRFS_FSKIT_STAGED_BYTES) {
 		error = btrfs_staged_issue(staged, device.writer);
+	}
+	if (error == BTRFS_OK) {
+		btrfs_staged_update_supers(staged, offset, bytes, length);
 	}
 	pthread_rwlock_unlock(&staged->lock);
 	return error;
@@ -627,18 +695,32 @@ btrfs_device_read(void *context, uint64_t offset, void *buffer, size_t length)
 	uint64_t to;
 	enum btrfs_result error;
 	size_t index;
+	int copy = btrfs_staged_super(offset, length);
 
 	if (length > UINT64_MAX - offset) {
 		return BTRFS_IO;
 	}
-	pthread_rwlock_rdlock(&staged->lock);
+	if (copy >= 0) {
+		pthread_rwlock_wrlock(&staged->lock);
+	} else {
+		pthread_rwlock_rdlock(&staged->lock);
+	}
+	if (device.writer.isRevoked || (copy >= 0 && staged->failure != BTRFS_OK)) {
+		pthread_rwlock_unlock(&staged->lock);
+		return BTRFS_IO;
+	}
+	if (copy >= 0 && (staged->super_valid & (1U << copy))) {
+		memcpy(buffer, staged->supers[copy], length);
+		pthread_rwlock_unlock(&staged->lock);
+		return BTRFS_OK;
+	}
 	index = btrfs_staged_find(staged, offset);
 	run = index < staged->count ? &staged->runs[index] : NULL;
 	/* A range one run holds needs no device read. */
 	if (run != NULL && run->offset <= offset && end <= run->offset + run->length) {
 		memcpy(buffer, run->bytes + (offset - run->offset), length);
-		pthread_rwlock_unlock(&staged->lock);
-		return BTRFS_OK;
+		error = BTRFS_OK;
+		goto remember;
 	}
 	error = btrfs_resource_read((__bridge void *)device.writer, offset, buffer, length);
 	if (error == BTRFS_OK) {
@@ -649,6 +731,11 @@ btrfs_device_read(void *context, uint64_t offset, void *buffer, size_t length)
 			memcpy((uint8_t *)buffer + (from - offset),
 			    run->bytes + (from - run->offset), (size_t)(to - from));
 		}
+	}
+remember:
+	if (error == BTRFS_OK && copy >= 0) {
+		memcpy(staged->supers[copy], buffer, length);
+		staged->super_valid |= 1U << copy;
 	}
 	pthread_rwlock_unlock(&staged->lock);
 	return error;
@@ -661,14 +748,29 @@ btrfs_device_flush(void *context)
 	struct btrfs_fskit_staged *staged = device.staged;
 	NSError *error = nil;
 	enum btrfs_result issued;
+	uint64_t start;
+	size_t bytes;
+	BOOL synchronized;
 
+	start = btrfs_io_profile_start();
 	pthread_rwlock_wrlock(&staged->lock);
+	bytes = staged->bytes;
 	issued = btrfs_staged_issue(staged, device.writer);
 	pthread_rwlock_unlock(&staged->lock);
+	btrfs_io_profile_end("staged_drain", start, 0, bytes, issued);
 	if (issued != BTRFS_OK || device.writer.isRevoked) {
 		return BTRFS_IO;
 	}
-	return [device.flusher synchronizeWithError:&error] && error == nil ? BTRFS_OK : BTRFS_IO;
+	start = btrfs_io_profile_start();
+	synchronized = [device.flusher synchronizeWithError:&error] && error == nil;
+	btrfs_io_profile_end("barrier_xpc", start, 0, 0, synchronized ? 0 : EIO);
+	if (!synchronized) {
+		pthread_rwlock_wrlock(&staged->lock);
+		staged->failure = BTRFS_IO;
+		staged->super_valid = 0;
+		pthread_rwlock_unlock(&staged->lock);
+	}
+	return synchronized ? BTRFS_OK : BTRFS_IO;
 }
 
 static FSItemType
@@ -1201,11 +1303,13 @@ btrfs_timespec(struct btrfs_time time)
 - (void)synchronizeWithFlags:(FSSyncFlags)flags replyHandler:(void (^)(NSError *))reply
 {
 	enum btrfs_result error = BTRFS_OK;
+	uint64_t start = btrfs_io_profile_start();
 
 	(void)flags;
 	if (_writable) {
 		error = btrfs_volume_sync(_volume, btrfs_volume_pending(_volume));
 	}
+	btrfs_io_profile_end("volume_sync", start, 0, 0, error);
 	reply(btrfs_fskit_error(error));
 }
 

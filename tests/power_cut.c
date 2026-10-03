@@ -275,10 +275,9 @@ main(int argc, char **argv)
 	unsigned long run;
 	int root;
 
-	if (argc != 4 || geteuid() != 0 ||
-	    (strcmp(argv[1], "write") != 0 && strcmp(argv[1], "verify") != 0)) {
+	if (argc != 4 || (strcmp(argv[1], "write") != 0 && strcmp(argv[1], "verify") != 0)) {
 		fprintf(stderr,
-		    "usage (guest root): btrfs-power-cut write MOUNT RUN | "
+		    "usage: btrfs-power-cut write MOUNT RUN | "
 		    "verify MOUNT ACKS\n");
 		return 2;
 	}

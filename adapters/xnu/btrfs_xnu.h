@@ -5,6 +5,7 @@
 #include <btrfs/btrfs.h>
 #include <btrfs/identity.h>
 #include <btrfs/native.h>
+#include <btrfs/staging.h>
 #include <btrfs/volume.h>
 #include <kern/locks.h>
 #include <kern/thread_call.h>
@@ -61,6 +62,10 @@ struct btrfs_xnu_mount {
 	 * device while it is mounted. */
 	struct btrfs_cache *cache;
 	lck_mtx_t *cache_lock;
+	/* Device write combining, below the core and UBC. Shared for reads;
+	 * exclusive for staging and a complete drain/device barrier. */
+	struct btrfs_staging *staging;
+	lck_rw_t *staging_lock;
 	/* Nodes by native number (nodes_lock); hashinit sizes it. */
 	struct btrfs_xnu_node_head *nodes;
 	u_long nodes_mask;
@@ -121,6 +126,7 @@ uint32_t btrfs_xnu_inode_flags(uint64_t flags);
 int btrfs_xnu_sync_all(mount_t mount, int wait);
 /* Makes generation durable (grouped mounts). */
 int btrfs_xnu_commit(struct btrfs_xnu_mount *mount, uint64_t generation);
+int btrfs_xnu_push_data(vnode_t vnode, int wait);
 
 /* Write operations (write.c). */
 int btrfs_xnu_create(void *arguments);

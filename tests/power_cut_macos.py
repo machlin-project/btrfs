@@ -5,6 +5,8 @@
 fskit lets Disk Arbitration mount the image through the installed FSKit module
 (enabled, with its device barrier approved), runs root commands with a sudo
 password read from a file (never logged) and needs automatic login in the guest.
+With --unprivileged, FSKit uses an ownership-disabled disposable mount and the
+logged-in user instead. That mode checks durability, not ownership enforcement.
 
 The host keeps the authoritative image. Each iteration copies it into the
 guest, mounts it read-write (grouped and synchronous commits alternate),
@@ -67,6 +69,8 @@ def main():
     parser.add_argument("--kernel-uuid")
     parser.add_argument("--module-uuid")
     parser.add_argument("--sudo-password-file", type=Path)
+    parser.add_argument("--unprivileged", action="store_true",
+                        help="FSKit only: use the guest user and an ownership-disabled mount")
     parser.add_argument("--app", default="/Applications/Machlin btrfs.app")
     parser.add_argument("--iterations", type=int, default=6)
     parser.add_argument("--seed", type=int, default=1)
@@ -86,15 +90,18 @@ def main():
     xnu = args.adapter == "xnu"
     if xnu and not (args.mount_helper and args.kernel_uuid and args.module_uuid):
         parser.error("--adapter xnu needs --mount-helper, --kernel-uuid and --module-uuid")
-    if not xnu and args.sudo_password_file is None:
-        parser.error("--adapter fskit needs --sudo-password-file")
+    if args.unprivileged and (xnu or args.sudo_password_file is not None):
+        parser.error("--unprivileged requires --adapter fskit and no password file")
+    if not xnu and not args.unprivileged and args.sudo_password_file is None:
+        parser.error("--adapter fskit needs --sudo-password-file or --unprivileged")
     output.mkdir()
     tart = str(lab / "scripts/tart.sh")
     share = f"/Volumes/My Shared Files/{args.share}/{output.name}"
     guest_dir = args.guest_directory.rstrip("/") + "/" + output.name
     mountpoint = guest_dir + "/mount"
     mounted = {"path": mountpoint, "device": None}
-    record = {"vm": args.vm, "adapter": args.adapter, "image": str(args.image),
+    record = {"vm": args.vm, "adapter": args.adapter, "unprivileged": args.unprivileged,
+              "image": str(args.image),
               "image_sha256": digest(args.image), "seed": args.seed, "iterations": [],
               "commands": []}
     password = args.sudo_password_file.read_bytes() if args.sudo_password_file else None
@@ -116,20 +123,23 @@ def main():
             raise RuntimeError(f"Guest command failed: {command!r}: {entry['stderr']}")
         return result.stdout if stdout is None else b""
 
-    def root_argv(*command):
+    def owner_argv(*command):
+        if args.unprivileged:
+            return [tart, "exec", args.vm, *command]
         if password is None:
             return [tart, "exec", args.vm, "/usr/bin/sudo", "-n", *command]
         return [tart, "exec", "-i", args.vm, "/usr/bin/sudo", "-S", "-p", "", "--", *command]
 
-    def root(*command, timeout=120):
-        result = subprocess.run(root_argv(*command), cwd=lab, timeout=timeout, input=password,
+    def owner(*command, timeout=120):
+        result = subprocess.run(owner_argv(*command), cwd=lab, timeout=timeout, input=password,
                                 capture_output=True)
-        entry = {"command": ["sudo", *command], "status": result.returncode,
+        entry = {"command": list(command) if args.unprivileged else ["sudo", *command],
+                 "status": result.returncode,
                  "stdout": result.stdout.decode(errors="backslashreplace")[-2000:],
                  "stderr": result.stderr.decode(errors="backslashreplace")[-2000:]}
         record["commands"].append(entry)
         if result.returncode != 0:
-            raise RuntimeError(f"Guest root command failed: {command!r}: {entry['stderr']}")
+            raise RuntimeError(f"Guest owner command failed: {command!r}: {entry['stderr']}")
         return entry
 
     def bootctl(*command):
@@ -194,13 +204,13 @@ def main():
                  timeout=600).decode().split()[0] != digest(output / name):
             raise RuntimeError("Guest image copy differs")
         attach = ["/usr/bin/hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage"]
-        attach += ["-nomount"] if xnu else ["-owners", "on"]
+        attach += ["-nomount"] if xnu else ["-owners", "off" if args.unprivileged else "on"]
         device = guest(*attach, f"{guest_dir}/{local}").decode().split()[0]
         if not device.startswith("/dev/disk"):
             raise RuntimeError(f"Unexpected device {device}")
         mounted["device"] = device
         if xnu:
-            root(f"{guest_dir}/{args.mount_helper.name}", *flags, device, mountpoint)
+            owner(f"{guest_dir}/{args.mount_helper.name}", *flags, device, mountpoint)
             return device
         # Disk Arbitration mounts through the FSKit module; writable needs the barrier.
         deadline = time.monotonic() + 60
@@ -216,12 +226,12 @@ def main():
 
     def unmount():
         if xnu:
-            root("/sbin/umount", mounted["path"])
+            owner("/sbin/umount", mounted["path"])
         else:
             guest("/usr/bin/hdiutil", "detach", mounted["device"])
 
     def verify(manifest):
-        return root(f"{guest_dir}/{args.workload.name}", "verify", mounted["path"],
+        return owner(f"{guest_dir}/{args.workload.name}", "verify", mounted["path"],
                     f"{share}/{manifest}", timeout=900)["stderr"].strip()
 
     # Unattended boots take the btrfs slot; the confirmed fallback slot stays.
@@ -257,7 +267,7 @@ def main():
             if acks:
                 item["verified_before"] = verify(f"acks-{index - 1:02d}.tsv")
             stream = subprocess.Popen(
-                root_argv(f"{guest_dir}/{args.workload.name}", "write", mounted["path"],
+                owner_argv(f"{guest_dir}/{args.workload.name}", "write", mounted["path"],
                           str(index)),
                 cwd=lab, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=(output / f"workload-{index:02d}.log").open("xb"))
@@ -309,6 +319,15 @@ def main():
             if probe.returncode not in (0, 3):
                 raise RuntimeError(f"Recovery check failed: {probe.stdout}{probe.stderr}")
             item["needs_recovery"] = probe.returncode == 3
+            # The next iteration copies the retained host crash image. Drop
+            # the redundant guest file only after verifying the capture,
+            # keeping bounded guest disk use across all cuts.
+            crashed_guest = f"{guest_dir}/run-{index:02d}.raw"
+            captured = guest("/usr/bin/shasum", "-a", "256", crashed_guest,
+                             timeout=600).decode().split()[0]
+            if captured != item["crash_sha256"]:
+                raise RuntimeError("Captured crash image differs from the guest file")
+            guest("/bin/rm", crashed_guest)
             current = crash
             save()
         mount_image(current, "final.raw", ["-w"])

@@ -14,11 +14,29 @@ Evidence below records completed runs. After the commit-cost changes
 profiles, the loaded XNU read and write suites with Linux checks of the written
 images, and installed FSKit on stock macOS 26.5.2 were rerun and pass.
 
+The subsequent native I/O batch passes all thirty-seven portable processes and
+both arm64e and x86_64 module builds (public imports resolved, no emitted SIMD/FP
+instructions). The loaded arm64e module passes the plain read-only contracts
+with unchanged media and the grouped/synchronous write suites with remount and
+whole-volume walks. Installed FSKit passes six further power cuts (254
+acknowledged files); the XNU module passes six alternating grouped/synchronous
+cuts (797 acknowledged files), including two cuts requiring superblock recovery.
+FSKit's new series runs without root on disposable ownership-disabled mounts;
+it checks durability and recorded inode facts, not ownership enforcement.
+Linux 6.12.94 independently accepts all sixteen retained images: the twelve
+crashes, two write-suite results, the 100,000-file benchmark and its 1,000-file
+old-build control. All 105,234 expected facts, read-only fsck checks and Linux
+read-write continuations pass. These reports are under lab
+`artifacts/btrfs-kext/{fsync-profile-20261003,native-io-final3-20261003,powercut-native-io-*}`
+and `logs/native-io-final-20261003/`. Performance results and their limits are
+in PERFORMANCE.md; no matched Linux performance or LXNU ABI acceptance is claimed.
+
 | Layer | Result | Reproduction / generated evidence |
 | --- | --- | --- |
 | Linux fixtures | Nineteen independently created images and one Linux workload recorded with dm-log-writes; Linux contents and read-only fsck pass | `tests/prepare_linux.py`; `logs/linux-reference-*.log` |
 | Portable reader | 367 contracts across the six read profiles and the holes profile, whose split hole items Linux wrote with nonzero offsets; image hashes unchanged | `tests/check_images.py`; `logs/acceptance-tests.log` |
-| Portable acceptance | Thirty-six Meson test processes pass under ASan/UBSan on macOS (thirty-five elsewhere, without the FSKit volume test) | `make test -Dfixtures=...` via DEVELOPMENT.md |
+| Portable acceptance | Thirty-seven Meson test processes pass under ASan/UBSan on macOS; thirty-six are configured elsewhere, without the FSKit volume test. The native I/O batch reruns all thirty-seven | `make test -Dfixtures=...` via DEVELOPMENT.md; `logs/fsync-profile-20261003/final-portable-test.log` |
+| Adapter device-write staging | 10,000 writes compared with an independent byte-array model; adjacent runs, contained/partial overlaps, covered reads, capacity and oversized writes; allocation failures with exact-size release, partial device-write failures and failed barriers. Failed persistence is terminal. All pass under ASan/UBSan. The FSKit volume test also verifies cached superblock admission across eight commits, device rereads on a new load and revocation even on cache hits | `tests/staging.c`, `tests/fskit_volume.m` |
 | Private CoW editor | Independent ordered model; 4/16/64 KiB nodes; root growth/collapse; three-way variable-item split; snapshot isolation; reservation/allocation/read failures; exact private-path lookups, parent generation/level refusals and snapshot owner semantics; packed and gapped source leaves with nonzero unused bytes preserve values and committed sources; 350 modeled key moves per node size cover both directions, equal/zero/changed payload sizes, cross-leaf moves, duplicate/missing keys and canonical packed bytes | `tests/mutable.c` |
 | Batched free-space accounting | A sector model checks allocation-log permutation, exact cancellation, adjacent merging within groups, overlap/overflow/limit refusals; a separate free-sector model checks extent/bitmap batches, bitmap boundaries, short last items, neighbouring runs and malformed range/flag refusals | `tests/unit.c`, `tests/mutable.c` |
 | Cache buffer ownership | Same-allocator donation, pinned entries refusing replacement, foreign-allocator copy fallback, bounded reuse through repeated generations and balanced allocation/release counts; focused volume stress and grouped commits pass under ASan/UBSan and TSan | `tests/unit.c`, `tests/volume.c`; `logs/perf-commit-20261002/v8-focused-tests-r2.log`, `logs/perf-commit-20261002/v8-tsan-r2.log` |
@@ -83,7 +101,8 @@ stress remain open.
 `include/btrfs/write.h` grants write authority separately from the immutable read
 environment. The caller owns exclusive resource access and drains readers before
 commit. The base mount must be retired after successful or uncertain persistence.
-Neither native adapter supplies write callbacks yet.
+Both native adapters supply write and persistence callbacks on admitted writable
+mounts; their ownership and barrier contracts are described in ARCHITECTURE.md.
 
 Admission requires skinny metadata and at least two superblock copies that agree
 with the mounted primary. It accepts a valid free-space tree that agrees with

@@ -29,6 +29,8 @@ def main() -> None:
     parser.add_argument("--configuration", choices=("Debug", "Release"),
                         help="Defaults to Release for archives, Debug for builds")
     parser.add_argument("--build-number", type=int, help="Positive bundle build number for every bundle")
+    parser.add_argument("--profile-io", action="store_true",
+                        help="Diagnostic build: log timed device I/O, barriers and volume syncs")
     parser.add_argument("--derived-data", type=Path, default=ROOT / "artifacts/fskit/DerivedData")
     parser.add_argument("--archive-path", type=Path, help="Create a new Xcode archive instead of a build")
     args = parser.parse_args()
@@ -64,6 +66,8 @@ def main() -> None:
     ]
     if args.build_number is not None:
         command.append(f"CURRENT_PROJECT_VERSION={args.build_number}")
+    if args.profile_io:
+        command.append("GCC_PREPROCESSOR_DEFINITIONS=$(inherited) BTRFS_PROFILE_IO=1")
     if args.team:
         command.extend([
             f"CODE_SIGN_STYLE={'Manual' if manual else 'Automatic'}",

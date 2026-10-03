@@ -205,8 +205,8 @@ suites (ACCEPTANCE.md). Raw trials, sampling profiles and binary identities
 live under the ignored `logs/perf-commit-20261002/` and
 `artifacts/perf-commit-20261002/` directories.
 These results do not establish a 2–4 times faster full commit or a win over
-Linux. Tree-log fsync and avoiding mounted-volume superblock rereads are
-separate changes with separate durability contracts.
+Linux. Tree-log fsync remains separate work. The later mounted FSKit change
+below avoids superblock device rereads under its exclusive-resource contract.
 
 ### Native numbering and whole-volume walks
 
@@ -245,6 +245,74 @@ the device in 14 writes): creation became 7.7 times faster. Through FSKit,
 Btrfs now walks twice as fast and creates 1.5 times as fast as Apple's exFAT
 module. These are single-guest measurements; the loaded kernel module and
 Linux are not compared yet.
+
+### XNU writeback and normal unmount
+
+Outgoing cluster buffers now use `buf_map_range_with_prot(..., VM_PROT_READ)`.
+The previous `buf_map` creates a writable kernel mapping: on arm64, XNU marks
+its physical pages modified even when the adapter only reads them. Each push
+therefore dirtied its own pages again. Reclaim's later fsync wrote the data
+again and published a separate transaction for each file.
+
+Three fresh-image runs before and three after on the same 8-vCPU, 16-GiB
+macOS guest give these create-plus-normal-unmount times for 1,000 files of
+4 KiB, including both guest command round trips:
+
+| Build | Individual durations | Median |
+| --- | --- | --- |
+| Before this native I/O batch | 33.274, 30.520, 30.344 s | 30.520 s |
+| With write combining and read-only outgoing mappings | 0.676, 0.375, 0.697 s | 0.676 s |
+
+The median improves by 45.1 times. Every run remounts read-only and verifies
+every byte. One 100,000-file run completes creation and normal unmount in
+13.314 s, then verifies every file on a fresh read-only mount. The old
+100,000-file unmount was interrupted after exceeding its time bound and is
+not a completed baseline; no speed ratio is claimed at that size. Runs are
+sequential before/after, not alternating, and no samples are discarded.
+
+A separate DTrace comparison isolates the mapping fix after write combining
+was already present. For 1,000 bulk files plus 96 individually synced files,
+strategy writes fall from 4,772 to 1,129 and commits from 1,196 to 97; all
+three volume-sync calls succeed. The timing table uses uninstrumented runs.
+Single-file durability remains barrier-bound: median throughput is 39.341
+versus 38.988 files/s at 4 KiB and 38.105 versus 38.248 at 128 KiB. This batch
+does not establish a single-fsync improvement in XNU or a win over Linux.
+
+### Mounted FSKit superblock reads
+
+An exclusive writable mount now retains the superblock copies it reads and
+updates them with its own writes. The core still checks every checksum,
+generation and identity on admission and commit. A new load reads the device
+again; failed writes/barriers invalidate the copies and resource revocation is
+checked even on hits. The cache occupies 12 KiB and changes none of the three
+persistence barriers.
+
+Seven alternating pairs of ordinary signed builds on the same stock macOS
+26.5.2 guest compare build 9 with build 17. Each run starts with a fresh clone
+of the same Linux-authored 1 GiB image, creates 64 files of 4 KiB and 32 files
+of 128 KiB in separate directories, and verifies all contents. Every operation
+includes create, write, file fsync, close and directory fsync. These are mounted
+end-to-end latencies, not the portable core's CPU cost.
+
+| File size | Median throughput before / after | Median paired throughput gain | Median mean file-fsync latency before / after |
+| --- | --- | --- | --- |
+| 4 KiB | 6.823 / 8.443 files/s | 23.7% | 128.23 / 114.20 ms |
+| 128 KiB | 6.036 / 7.344 files/s | 21.7% | 146.27 / 132.15 ms |
+
+The gain is the median of each pair's ratio, not a ratio of the two medians.
+All seven pairs and their tails are retained. File fsync alone improves by
+about 11%; eliminating the admission reads also makes create much cheaper,
+which contributes to the larger gain for the whole operation.
+
+A separate diagnostic build attributes roughly 27 ms per 4 KiB operation to
+four superblock reads, 66 ms to device writes and 41 ms to the three device
+flush ioctls. XPC overhead outside those ioctls is under 1 ms in that sample.
+The resource already uses a raw character device. Concurrent resource writes
+did not give a repeatable improvement and are not part of the implementation.
+The ordinary builds used for comparison contain no diagnostic logging.
+Raw trials and identities are in the lab's ignored
+`artifacts/btrfs-kext/fsync-profile-20261003/` directory. This is a comparison
+between two versions of the same FSKit driver; Linux remains unmeasured.
 
 ## Matched benchmark protocol
 
