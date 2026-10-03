@@ -1,9 +1,11 @@
 # Handoff for continued implementation
 
-Continue this repository on `development`. The portable reader and read-only XNU
-mount work; a real CoW transaction implementation can replace inline files and
-produce images independently accepted by Linux. Preserve these implementations
-and extend their contracts. Native writable mounts are deliberately still disabled.
+Continue this repository on `development`. The portable reader and CoW writer,
+installed FSKit and loaded XNU mounts have read/write acceptance, including
+grouped commits and native power cuts independently checked by Linux. Both
+adapters mount read-only by default and enable writes explicitly. Preserve
+these implementations and extend their contracts; see ACCEPTANCE.md for the
+remaining limitations and PERFORMANCE.md for measured costs and next targets.
 
 Read AGENTS.md, ARCHITECTURE.md, ACCEPTANCE.md and DEVELOPMENT.md. The main agent
 owns design, implementation, tests and diagnosis; GPT-6 Luna executes prepared
@@ -61,11 +63,12 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Persistence model / Linux oracle | Source-controlled scenarios; fault sweeps; prefix, reorder and sector-tear epochs; recovery of every state; exported cases checked by Linux fsck, mount and `btrfs rescue super-recover` | `tests/transaction.c`, `tests/scenario_*.c`, `tests/prepare_transactions_linux.py`, `tests/transaction_oracle.sh` |
 | Native boundary | Stable `(tree,inode)` identities, user xattrs, ACL rejection, XNU UBC/strategy, zlib and range device I/O | `adapters/common`, `adapters/xnu`, `adapters/fskit` |
 
-The mutation view supports metadata traversal; it does not magically update all
-cached root descriptors or provide a live native read/write mount. Reservations
+The volume publishes each completed operation's private view to live mount
+readers under its reader/writer protocol. Stable committed-view consumers retain
+their own immutable roots; never redirect them into private trees. Reservations
 are fresh for the transaction, and released slots stay pinned until its allocator
-is destroyed. Never route committed readers into private trees. `accept` is legal
-only after successful durable publication; `seal` alone is not a commit.
+is destroyed. `accept` is legal only after successful durable publication;
+`seal` alone is not a commit.
 
 ## Next changes, in dependency order
 

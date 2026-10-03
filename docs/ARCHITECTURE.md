@@ -649,10 +649,12 @@ cleaner thread does.
 ## Native writers
 
 `adapters/common/volume.c` (`include/btrfs/volume.h`) owns a mounted volume's
-versioned views. Each committed root set is one immutable `btrfs_fs`; readers
-pin the current view for one operation and never see a private tree. One writer
-at a time runs a transaction on the current view. `btrfs_transaction_commit_view`
-prepares the next view from the sealed private roots before commit writes: it
+versioned views. Each committed root set is one immutable `btrfs_fs`. Live mount
+readers use the running transaction's view between operations, or pin the
+committed view when no transaction runs; stable-view consumers pin immutable
+committed roots explicitly. One writer at a time updates the running
+transaction. `btrfs_transaction_commit_view` prepares the next view from the
+sealed private roots before commit writes: it
 owns a copy of the surviving chunk mappings and validates the selected tree and
 root inode. The volume also allocates the version wrapper before committing.
 Successful publication detaches every private-node hook and returns this

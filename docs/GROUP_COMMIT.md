@@ -1,12 +1,12 @@
 # Group commit design
 
-Status: the portable volume groups operations (below, "Implemented in the
-volume"); no native adapter uses it yet. The XNU adapter commits each namespace
-and attribute operation in its own transaction, and every commit pays three
-device barriers (metadata, secondary superblocks, primary). Durable throughput
-is therefore bounded by barrier latency, about one operation per three flushes.
-Linux amortizes the same barriers over every change of a running transaction.
-This document fixes the contracts a grouped commit must keep.
+Status: the portable volume and both native adapters group operations. Mounted
+write suites and native power cuts pass for XNU and FSKit; see ACCEPTANCE.md.
+Every full commit still pays three device barriers (metadata, secondary
+superblocks, primary). Grouping amortizes that cost over a running transaction;
+fsync of a pending change still waits for its full publication. XNU's `-o sync`
+mode commits each namespace and attribute operation before returning. This
+document records the contracts, implementation and remaining reservation proof.
 
 ## What Linux does
 
@@ -54,10 +54,11 @@ read-only.
    the editor's limits (4,096 dirty nodes, 16 file trees, the reference queue,
    the per-transaction directory bound) instead of refusing an operation. An
    operation that would cross a limit first waits for that commit.
-6. **Data pages.** UBC/FSKit dirty pages keep their current ownership: pageout,
-   `fsync`, `sync` and unmount push ranges into the running transaction; data
-   writes already reach the device as their extents are created. A commit
-   includes every range pushed before it starts.
+6. **Data pages.** Native caches keep their current ownership: XNU pageout,
+   `fsync`, `sync` and unmount push ranges into the running transaction; FSKit
+   write callbacks apply their ranges there. Core data writes go to the adapter
+   as their extents are created; device staging drains them before the next
+   barrier. A commit includes every range pushed before it starts.
 
 ## Proposed structure
 
@@ -124,25 +125,28 @@ acknowledged before the read began, under ASan and TSan. Letting readers in
 during an operation makes them see torn state; letting them read the committed
 view during a commit makes them see an operation disappear (both fail).
 
-## Order of work
+## Implementation status and remaining work
 
 1. Metadata reservations per operation and a commit reserve, with tests that
    accepted batches never fail at commit for space (extending the exhaustion
-   bisection), and that refusals leave the running transaction usable. Done as
-   the room check above; operation bounds per adapter call remain to be set.
+   bisection), and that refusals leave the running transaction usable. The room
+   check and adapter call budgets exist. The accounting allowance remains a
+   measured margin rather than a proven bound for every supported topology.
 2. Read paths over the running transaction's view with a reader/writer lock,
-   and TSan stress of concurrent readers against a running writer. The core
-   part exists: `btrfs_transaction_reader` resolves the transaction's own trees
-   to their private roots, copies private nodes by logical address and reads
-   unchanged nodes from the device and cache with the base allocator. The
+   and TSan stress of concurrent readers against a running writer. Implemented
+   in the volume and adapters: `btrfs_transaction_reader` resolves the
+   transaction's own trees to their private roots, copies private nodes by
+   logical address and reads unchanged nodes from the device and cache with the
+   base allocator. The
    scenario harness requires every transaction's view, read through the public
    interface before commit, to equal the published view.
 3. Durability waits: per-object last-changing generation, `fsync`/`sync`
    semantics, failure propagation to waiters. The volume provides
-   `btrfs_volume_pending` and `btrfs_volume_sync`; adapters must record the
-   generation per object and call sync from `fsync`, `sync` and unmount.
+   `btrfs_volume_pending` and `btrfs_volume_sync`; both adapters record changing
+   generations and sync from their durability and unmount paths.
 4. Commit triggers and limits, then adapter integration and the mounted write
    suite, including power-cut checks of every acknowledged `fsync` boundary.
+   Implemented and accepted on the native guests; see ACCEPTANCE.md.
 5. Measurements per PERFORMANCE.md: operations per barrier, fsync latency and
    throughput against Linux on matched workloads.
 

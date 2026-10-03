@@ -30,9 +30,9 @@ each convenience read creates a new operation context. The XNU adapter now
 coalesces aligned device requests through private I/O buffers, with one-block
 bounce storage only at unaligned edges.
 Do not conceal these costs behind hot-cache numbers. A bounded,
-generation-aware node cache exists (see ARCHITECTURE.md); reusable read sessions
-and native I/O instrumentation are explicit follow-up work, as is enabling the
-cache in the native adapters.
+generation-aware node cache exists and both native adapters enable it (see
+ARCHITECTURE.md). Reusable read sessions remain follow-up work; optional native
+I/O instrumentation is available for attributing device and barrier costs.
 
 The private editor reuses its dirty paths; repeated fixed-size replacement in an
 already modified path allocates nothing. It updates payloads and child pointers
@@ -313,6 +313,108 @@ The ordinary builds used for comparison contain no diagnostic logging.
 Raw trials and identities are in the lab's ignored
 `artifacts/btrfs-kext/fsync-profile-20261003/` directory. This is a comparison
 between two versions of the same FSKit driver; Linux remains unmeasured.
+
+## Remaining opportunities after the native I/O changes
+
+The following findings come from inspecting the current implementation. Their
+speedups have not been measured. The next two local core changes should target
+block-group accounting and checksum-item packing; the larger adapter and
+durability changes follow separately.
+
+### Update only changed block groups
+
+`bt_tx_prepare` in `core/transaction.c` replaces every active block group's item
+in every accounting round, even when its used-byte count did not change.
+`bt_tx_edit` forwards directly to the private editor; `bt_mutation_apply` copies
+the path before `bt_mut_leaf` replaces the payload, with no equality check.
+Consequently a small transaction can CoW extent-tree leaves for untouched
+groups, adding allocations, reference updates, free-space edits and writes to
+its own fixed point. Already-private paths avoid another copy, but still pay
+the traversal and replacement in subsequent rounds.
+
+This is a dependency on the number of block groups, which a benchmark varying
+only files per directory does not isolate. First retain each group's last
+published used-byte count and skip unchanged replacements. Then let allocator
+accounting enqueue changed groups, including changes caused by the commit
+itself, and maintain the total used count incrementally. New and removed groups
+must participate, and convergence must include changes made while processing
+that queue. Chunk-map copies and admission still depend on group count; this
+does not make the entire transaction constant-time.
+
+Measure one create/commit on Linux-authored images with increasing group counts
+and comparable occupancy, recording unique CoW nodes, accounting rounds and
+metadata bytes as well as CPU time. Keep the reference/free-space audits and
+growth, removal and exhausted-metadata cases when implementing the change.
+
+### Pack adjacent checksums before adding delayed allocation
+
+`bt_csum_insert` in `core/csum.c` creates new items for each call and never
+extends an adjacent item. For 32 consecutive checksummed 4 KiB allocations it
+therefore creates 32 items. If the logical device ranges are contiguous, one
+item can hold all 32 checksums: 153 bytes of item header plus payload instead
+of 928 bytes, excluding the leaf header and unused space. This is an on-disk
+representation calculation, not a sixfold throughput prediction. Append and
+merge paths should respect the existing per-item limit, reject overlaps and
+retain correct partial deletion and shared-extent behavior. Reusing checksum
+scratch storage can also remove a node-sized allocation from each insert.
+
+Separately, each FSKit write callback calls `btrfs_transaction_write`, which
+creates file extent and extent-reference items for its new allocations. Device
+write staging combines I/O only after those records exist. Buffering adjacent
+file ranges before allocation could reduce all three trees' item counts; it
+requires bounded memory and space reservations, coherent reads and correct
+truncate, fsync and failure handling. Measure callback sizes and resulting
+extent counts first. XNU already combines file writes through UBC.
+
+### Reduce repeated FSKit metadata work and callbacks
+
+On the current adapter, lookup reads the inode and saves it in `BtrfsItem`, but
+the following `getAttributes` calls `refreshItem`, which reads it again.
+Mutation callbacks also refresh records after updating them. A coherent inode
+cache can remove repeated traversals on macOS 26. Its validity must follow
+operation publication, not only committed generation: many mutations share a
+running transaction. Preserve `(tree,inode)`, orphan lifetime, parent changes
+and ordering between concurrent readers and writers.
+
+The selected macOS 27 SDK exposes `FSVolumeHandler` and result objects carrying
+attributes with lookup, create and rename. `FSVolumeHandlerResult` specifies
+which attributes to populate and cache; create results can also supply free
+space, avoiding the fallback statistics query documented by the SDK. Adopting
+these protocols is a separate way to reduce FSKit callbacks, with a macOS 26
+fallback. It needs a macOS 27 guest for mounted acceptance; compiling against
+that SDK or timing the existing 26.5.2 guest cannot establish the gain.
+
+### Let reads progress while a sealed transaction persists
+
+`volume_commit_running` in `adapters/common/volume.c` holds the writer turn
+across persistence, and `btrfs_volume_read` waits for it. Consequently metadata
+and data reads that reach the volume can wait through all three barriers.
+This affects mixed-workload latency even when their data is already in the
+core cache; reads satisfied entirely by the native page cache need not enter
+the volume.
+
+A possible design exposes a pinned, immutable view of the sealed transaction
+while it persists. It must retain visibility of previously acknowledged
+operations, prevent block reuse underneath readers and define failure
+behavior. Returning the old committed view would restore the stale-read bug
+covered by the volume stress test. Measure read p95/p99 during concurrent fsync;
+this change targets stalls, not the cost of an individual durable commit.
+
+### Treat durable fsync as a separate architecture project
+
+The measured core CPU times above are tens to hundreds of microseconds, while
+mounted fsync takes tens to hundreds of milliseconds. Faster CRC or another
+private-tree micro-optimization cannot remove the measured device and barrier
+latency. Hardware CRC and independent instruction chains are already present;
+the arm64e kernel build deliberately emits no SIMD/FP instructions.
+
+A tree log can reduce the work persisted by a single-object fsync, but needs
+its own writer, mount replay, full-commit fallback and power-cut/Linux oracle.
+That scope remains separate from the local changes above. Three barriers are
+still the accepted publication protocol; a two-barrier design requires its own
+crash analysis and acceptance. Caching exclusive-mount superblocks in XNU is
+also possible, but the FSKit cache's measured gain cannot be transferred to
+XNU's cheaper in-kernel read path without a new measurement.
 
 ## Matched benchmark protocol
 
