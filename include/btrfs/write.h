@@ -57,8 +57,9 @@ enum btrfs_result btrfs_recover_supers(const struct btrfs_environment *environme
     const struct btrfs_write_environment *writer, uint64_t acknowledged,
     struct btrfs_recovery_report *report);
 
-/* Current admission: CRC32C, skinny metadata, SINGLE/DUP, no free-space cache
- * tree, quotas or mixed groups. At least two superblock copies must exist and
+/* Current admission: any of Linux's four checksum algorithms, skinny metadata,
+ * SINGLE/DUP, no free-space cache tree, quotas or mixed groups. At least two
+ * superblock copies must exist and
  * agree with the mounted primary; otherwise begin returns RECOVERY_REQUIRED.
  * Changes are confined to unshared top-level tree paths. Unsupported layouts
  * return before any media write. Native adapters open read-write only on

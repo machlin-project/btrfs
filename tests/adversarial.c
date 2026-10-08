@@ -77,13 +77,13 @@ set_le(void *field, uint64_t value, size_t size)
 
 #define SET(object, field, value) set_le(&(object)->field, (value), sizeof((object)->field))
 
+/* The fixture's checksum algorithm, which edited blocks are sealed with. */
+static unsigned fixture_checksum;
+
 static void
 checksum(void *block, size_t size)
 {
-	uint32_t crc;
-
-	crc = ~bt_crc32c(UINT32_MAX, (uint8_t *)block + BT_CSUM_SIZE, size - BT_CSUM_SIZE);
-	set_le(block, crc, sizeof(crc));
+	bt_checksum(fixture_checksum, (uint8_t *)block + BT_CSUM_SIZE, size - BT_CSUM_SIZE, block);
 }
 
 static void
@@ -141,9 +141,13 @@ super_tests(struct fixture *fixture)
 	copy->csum[0] ^= 1;
 	expect(fixture, "super checksum", BTRFS_CORRUPT, NULL);
 	*copy = *original;
-	SET(copy, checksum_type, 1);
+	SET(copy, checksum_type, BT_CHECKSUM_BLAKE2 + 1U);
 	checksum(copy, sizeof(*copy));
-	expect(fixture, "unsupported checksum is not CRC32C", BTRFS_UNSUPPORTED, NULL);
+	expect(fixture, "unknown checksum algorithm", BTRFS_UNSUPPORTED, NULL);
+	*copy = *original;
+	SET(copy, checksum_type, (fixture_checksum + 1U) % (BT_CHECKSUM_BLAKE2 + 1U));
+	checksum(copy, sizeof(*copy));
+	expect(fixture, "checksum under another algorithm", BTRFS_CORRUPT, NULL);
 	*copy = *original;
 	SET(copy, incompat, bt_u64(copy->incompat) | (UINT64_C(1) << 63));
 	checksum(copy, sizeof(*copy));
@@ -248,18 +252,25 @@ unverified_tests(struct fixture *fixture, struct btrfs_fs *fs, uint64_t logical)
 	size_t completed;
 	size_t i;
 	unsigned copies = 1;
+	unsigned copy;
 
-	assert(bt_map(fs, logical + UNVERIFIED_BAD_SECTOR * fs->info.sector_size,
-		   fs->info.sector_size, BT_BLOCK_DATA, 0, &physical, &copies) == BTRFS_OK);
-	assert(copies == 1);
 	sector = malloc(fs->info.sector_size);
 	buffer = malloc(length);
 	assert(sector != NULL && buffer != NULL);
-	assert(fixture->image.environment.read(
-		   &fixture->image, physical, sector, fs->info.sector_size) == BTRFS_OK);
-	sector[0] ^= 1;
-	fixture->patches[0] = (struct patch){ physical, sector, fs->info.sector_size };
-	fixture->count = 1;
+	/* Every copy of the sector holds the same corruption. */
+	for (copy = 0; copy < copies; copy++) {
+		assert(
+		    bt_map(fs, logical + UNVERIFIED_BAD_SECTOR * fs->info.sector_size,
+			fs->info.sector_size, BT_BLOCK_DATA, copy, &physical, &copies) == BTRFS_OK);
+		assert(copies <= sizeof(fixture->patches) / sizeof(fixture->patches[0]));
+		if (copy == 0) {
+			assert(fixture->image.environment.read(&fixture->image, physical, sector,
+				   fs->info.sector_size) == BTRFS_OK);
+			sector[0] ^= 1;
+		}
+		fixture->patches[copy] = (struct patch){ physical, sector, fs->info.sector_size };
+	}
+	fixture->count = copies;
 	environment.context = fixture;
 	environment.read = patched_read;
 	assert(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &patched) == BTRFS_OK);
@@ -364,6 +375,13 @@ tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 	sector[0] ^= 1;
 	fixture->patches[0] = (struct patch){ physical, sector, fs->info.sector_size };
 	fixture->count = 1;
+	if (copies > 1) {
+		expect(fixture, "file data checksum fallback to the second copy", BTRFS_OK, "big");
+		assert(bt_map(fs, logical, fs->info.sector_size, BT_BLOCK_DATA, 1, &physical,
+			   &copies) == BTRFS_OK);
+		fixture->patches[1] = (struct patch){ physical, sector, fs->info.sector_size };
+		fixture->count = 2;
+	}
 	expect(fixture, "file data checksum before publication", BTRFS_CORRUPT, "big");
 	fixture->count = 0;
 	free(sector);
@@ -583,15 +601,23 @@ main(int argc, char **argv)
 {
 	struct fixture fixture = { 0 };
 	struct btrfs_fs *fs;
+	struct btrfs_info info;
 
 	assert(argc == 2);
 	assert(btrfs_image_open(argv[1], &fixture.image) == 0);
+	assert(btrfs_mount(&fixture.image.environment, 5, &fs) == BTRFS_OK);
+	btrfs_get_info(fs, &info);
+	fixture_checksum = info.checksum_type;
+	btrfs_unmount(fs);
 	super_tests(&fixture);
 	assert(btrfs_mount(&fixture.image.environment, 5, &fs) == BTRFS_OK);
 	tree_tests(&fixture, fs);
 	btrfs_unmount(fs);
 	fault_tests(&fixture);
-	free_space_tests(&fixture);
+	/* Images made without a free-space tree have none to contradict. */
+	if ((info.readonly_features & BT_COMPAT_RO_FREE_SPACE_TREE) != 0) {
+		free_space_tests(&fixture);
+	}
 	stream_tests(&fixture);
 	btrfs_image_close(&fixture.image);
 	puts("adversarial contracts: PASS");

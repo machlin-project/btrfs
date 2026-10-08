@@ -23,6 +23,12 @@ struct bt_le64 {
 #define BT_SUPER_MIRROR_BASE UINT64_C(16384)
 #define BT_SUPER_MIRROR_SHIFT 12U
 #define BT_CSUM_SIZE 32U
+/* Algorithms of the superblock's checksum_type; each checksum occupies the
+ * first bytes of a BT_CSUM_SIZE field. */
+#define BT_CHECKSUM_CRC32C 0U
+#define BT_CHECKSUM_XXHASH 1U
+#define BT_CHECKSUM_SHA256 2U
+#define BT_CHECKSUM_BLAKE2 3U
 #define BT_SYSTEM_ARRAY_SIZE 2048U
 #define BT_MAX_LEVEL 8U
 #define BT_MAX_NODE_SIZE 65536U

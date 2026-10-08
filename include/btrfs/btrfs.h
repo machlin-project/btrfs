@@ -183,6 +183,9 @@ struct btrfs_info {
 	uint64_t default_tree;
 	uint32_t sector_size;
 	uint32_t node_size;
+	/* Linux's checksum algorithm number: 0 CRC32C, 1 XXH64, 2 SHA-256,
+	 * 3 BLAKE2b-256. */
+	uint16_t checksum_type;
 };
 
 struct btrfs_dir_entry {

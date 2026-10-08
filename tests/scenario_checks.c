@@ -247,15 +247,11 @@ static void
 replace_leaf(struct context *context, const struct btrfs_fs *fs, uint8_t *leaf, uint64_t logical,
     uint64_t kind)
 {
-	struct bt_le32 checksum;
 	uint64_t physical;
 	unsigned mirrors = 1;
 	unsigned mirror;
 
-	bt_put32(&checksum,
-	    ~bt_crc32c(UINT32_MAX, leaf + BT_CSUM_SIZE, fs->info.node_size - BT_CSUM_SIZE));
-	memset(leaf, 0, BT_CSUM_SIZE);
-	memcpy(leaf, &checksum, sizeof(checksum));
+	bt_checksum_node(fs, leaf, leaf);
 	for (mirror = 0; mirror < mirrors; mirror++) {
 		REQUIRE(bt_map(fs, logical, fs->info.node_size, kind, mirror, &physical,
 			    &mirrors) == BTRFS_OK);

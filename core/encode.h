@@ -42,18 +42,14 @@ bt_key_encode(struct bt_disk_key *wire, struct bt_key key)
 	bt_put64(&wire->offset, key.offset);
 }
 
-/* Each copy records its own byte offset and checksum; all other bytes are shared. */
+/* Each copy records its own byte offset and checksum; all other bytes are
+ * shared. The superblock names its checksum algorithm. */
 static inline void
 bt_super_seal(struct bt_disk_super *super, uint64_t offset)
 {
-	struct bt_le32 checksum;
-
 	bt_put64(&super->bytenr, offset);
-	bt_zero(super->csum, sizeof(super->csum));
-	bt_put32(&checksum,
-	    ~bt_crc32c(
-		UINT32_MAX, (const uint8_t *)super + BT_CSUM_SIZE, sizeof(*super) - BT_CSUM_SIZE));
-	bt_copy(super->csum, &checksum, sizeof(checksum));
+	bt_checksum(bt_u16(super->checksum_type), (const uint8_t *)super + BT_CSUM_SIZE,
+	    sizeof(*super) - BT_CSUM_SIZE, super->csum);
 }
 
 #endif

@@ -20,17 +20,25 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-holes": (4096, "dup", ""),
             "transactions-convert": (4096, "single", ""),
             "transactions-copies": (4096, "single", ""),
-            "transactions-scale": (4096, "single", "")}
+            "transactions-scale": (4096, "single", ""),
+            "checksums-xxhash": (16384, "dup", ""), "checksums-sha256": (4096, "single", ""),
+            "checksums-blake2": (65536, "dup", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
             "transactions-shared", "transactions-keyed", "transactions-data",
-            "transactions-holes", "transactions-copies"}
+            "transactions-holes", "transactions-copies", "checksums-xxhash",
+            "checksums-sha256", "checksums-blake2"}
 # The holes profile repeats the data payload without NO_HOLES, so Linux writes
 # explicit hole items, and with DUP data, so every data sector has two copies;
 # it adds a file grown by truncation alone and a NODATACOW directory.
-DATA_PROFILES = {"transactions-holes": "dup"}
+DATA_PROFILES = {"transactions-holes": "dup", "checksums-blake2": "dup"}
 MKFS_FEATURES = {"transactions-holes": "-O ^no-holes"}
+# The checksum profiles repeat the data payload under each algorithm other than
+# CRC32C, with 16, 4 and 64 KiB nodes; Linux also verifies every data checksum.
+CHECKSUMS = {"checksums-xxhash": "xxhash", "checksums-sha256": "sha256",
+             "checksums-blake2": "blake2"}
+DATA_PAYLOAD = ("transactions-data", "transactions-fst", "transactions-holes", *CHECKSUMS)
 HOLES_GROWN_BYTES = 1048576
 # The convert profile keeps mkfs defaults (a free-space tree) on 1 GiB, so data
 # block groups span enough bitmaps for both of Linux's conversion thresholds.
@@ -94,6 +102,7 @@ COPIES_DEVICE_BYTES = 257 * 1024 * 1024 * 1024
 THIRD_SUPER_OFFSET = 256 * 1024 * 1024 * 1024
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
                 "transactions-holes": 512 * 1024 * 1024,
+                "checksums-blake2": 512 * 1024 * 1024,
                 "transactions-convert": 1024 * 1024 * 1024,
                 "transactions-copies": COPIES_DEVICE_BYTES,
                 "transactions-scale": SCALE_DEVICE_BYTES}
@@ -127,7 +136,10 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
         f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in contents.items()))
     options = f"compress-force={compression}" if compression else "compress=no"
     features = " ".join(part for part in ("-R ^free-space-tree" if profile in WRITABLE else "",
-                                          MKFS_FEATURES.get(profile, "")) if part)
+                                          MKFS_FEATURES.get(profile, ""),
+                                          f"--csum {CHECKSUMS[profile]}"
+                                          if profile in CHECKSUMS else "") if part)
+    check_data = "--check-data-csum" if profile in CHECKSUMS else ""
     data_profile = DATA_PROFILES.get(profile, "single")
     if profile in WRITABLE:
         options += ",nospace_cache"
@@ -260,7 +272,7 @@ btrfs filesystem sync /mnt
 cmp /mnt/keyed-29/r29 /mnt/keyed/origin
 btrfs inspect-internal dump-tree -t extent /dev/vda > /tmp/extent.txt
 echo BTRFS_REFERENCE_KEYED_REFS:$(grep -cE 'key \\([0-9]+ (TREE_BLOCK_REF|EXTENT_DATA_REF|SHARED_BLOCK_REF|SHARED_DATA_REF) ' /tmp/extent.txt || true)'''
-    if profile in ("transactions-data", "transactions-fst", "transactions-holes"):
+    if profile in DATA_PAYLOAD:
         fill = f'''btrfs subvolume create /mnt/data
 head -c {DATA_BIG_BYTES} /input/big > /mnt/data/big
 head -c {DATA_SMALL_BYTES} /input/random > /mnt/data/small
@@ -468,7 +480,7 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 trap 'echo BTRFS_REFERENCE_FAIL; dmesg | tail -60; sync; poweroff -f' EXIT
-for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c btrfs; do
+for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c xxhash_generic blake2b_generic btrfs; do
     insmod /modules/$module.ko
 done
 uname -r
@@ -510,7 +522,8 @@ getfattr -d greeting
 btrfs filesystem sync /mnt
 cd /
 umount /mnt
-btrfs check --readonly /dev/vda
+btrfs check --readonly {check_data} /dev/vda
+btrfs inspect-internal dump-super /dev/vda | grep '^csum_type'
 btrfs inspect-internal dump-tree -t fs /dev/vda > /tmp/tree.txt
 grep 'compression' /tmp/tree.txt | sort | uniq -c
 echo BTRFS_REFERENCE_PASS:{profile}
@@ -525,7 +538,7 @@ poweroff -f
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root,
                        input=paths, stdout=output, check=True)
     manifest = {"profile": profile, "node_size": node_size, "metadata": metadata,
-                "data": data_profile,
+                "data": data_profile, "checksum": CHECKSUMS.get(profile, "crc32c"),
                 "compression": compression, "device_bytes": device_bytes, "files": {
                     name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                     for name, data in {**contents, **extra}.items()}}

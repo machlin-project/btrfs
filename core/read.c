@@ -7,22 +7,22 @@ struct bt_read_session {
 	size_t window_size;
 };
 
+/* Copies the stored checksum of the sector at logical into checksum. */
 static enum btrfs_result
-bt_sector_checksum(struct bt_cursor *cursor, uint64_t logical, uint32_t *checksum)
+bt_sector_checksum(struct bt_cursor *cursor, uint64_t logical, uint8_t *checksum)
 {
 	struct bt_key key = {
 		.objectid = BT_CSUM_OBJECTID, .type = BT_EXTENT_CSUM, .offset = logical
 	};
 	struct bt_record record;
-	struct bt_le32 disk;
+	size_t size = bt_checksum_size(cursor->fs->info.checksum_type);
 	uint64_t index;
 	enum btrfs_result error;
 
 	error = bt_cursor_record(cursor, &record);
 	if (error != BTRFS_OK || record.key.objectid != key.objectid ||
 	    record.key.type != key.type || logical < record.key.offset ||
-	    (logical - record.key.offset) / cursor->fs->info.sector_size >=
-		record.size / sizeof(disk)) {
+	    (logical - record.key.offset) / cursor->fs->info.sector_size >= record.size / size) {
 		error = bt_cursor_seek(cursor, key, 1);
 	}
 	if (error != BTRFS_OK) {
@@ -30,16 +30,14 @@ bt_sector_checksum(struct bt_cursor *cursor, uint64_t logical, uint32_t *checksu
 	}
 	(void)bt_cursor_record(cursor, &record);
 	if (record.key.objectid != key.objectid || record.key.type != key.type ||
-	    record.key.offset % cursor->fs->info.sector_size != 0 ||
-	    record.size % sizeof(disk) != 0) {
+	    record.key.offset % cursor->fs->info.sector_size != 0 || record.size % size != 0) {
 		return BTRFS_CORRUPT;
 	}
 	index = (logical - record.key.offset) / cursor->fs->info.sector_size;
-	if (index >= record.size / sizeof(disk)) {
+	if (index >= record.size / size) {
 		return BTRFS_CORRUPT;
 	}
-	bt_copy(&disk, record.data + (size_t)index * sizeof(disk), sizeof(disk));
-	*checksum = bt_u32(disk);
+	bt_copy(checksum, record.data + (size_t)index * size, size);
 	return BTRFS_OK;
 }
 
@@ -47,10 +45,10 @@ bt_sector_checksum(struct bt_cursor *cursor, uint64_t logical, uint32_t *checksu
  * repair is written. */
 static enum btrfs_result
 bt_reread_sector(const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, unsigned mirrors,
-    unsigned selected, uint32_t checksum)
+    unsigned selected, const uint8_t *checksum)
 {
+	uint8_t sum[BT_CSUM_SIZE];
 	uint64_t physical;
-	uint32_t sum;
 	unsigned mirror;
 	enum btrfs_result error = BTRFS_CORRUPT;
 
@@ -65,8 +63,10 @@ bt_reread_sector(const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, unsi
 		}
 		error = bt_read_physical(fs, physical, out, fs->info.sector_size);
 		if (error == BTRFS_OK) {
-			bt_crc32c_sectors(out, fs->info.sector_size, 1, &sum);
-			error = sum == checksum ? BTRFS_OK : BTRFS_CORRUPT;
+			bt_checksum_sectors(fs, out, 1, sum);
+			error = bt_equal(sum, checksum, bt_checksum_size(fs->info.checksum_type))
+			    ? BTRFS_OK
+			    : BTRFS_CORRUPT;
 		}
 		if (error == BTRFS_OK || (error != BTRFS_CORRUPT && error != BTRFS_IO)) {
 			return error;
@@ -81,16 +81,18 @@ bt_verified_read(
 {
 	const struct btrfs_fs *fs = cursor->fs;
 	uint8_t *out = buffer;
+	uint8_t sums[BT_CHECKSUM_BATCH_BYTES];
+	uint8_t checksum[BT_CSUM_SIZE];
 	uint64_t physical;
-	uint32_t sums[BT_CRC_BATCH];
 	size_t sector = fs->info.sector_size;
+	size_t size = bt_checksum_size(fs->info.checksum_type);
+	size_t limit = bt_checksum_batch(fs);
 	size_t position;
 	size_t batch = 0;
 	size_t i;
 	unsigned mirror;
 	unsigned mirrors = 1;
 	unsigned selected = 0;
-	uint32_t checksum = 0;
 	enum btrfs_result error = BTRFS_OK;
 
 	if (logical % fs->info.sector_size != 0 || length % fs->info.sector_size != 0 ||
@@ -117,13 +119,12 @@ bt_verified_read(
 		return error;
 	}
 	for (position = 0; error == BTRFS_OK && position < length; position += batch * sector) {
-		batch = (length - position) / sector < BT_CRC_BATCH ? (length - position) / sector
-								    : BT_CRC_BATCH;
-		bt_crc32c_sectors(out + position, sector, batch, sums);
+		batch = (length - position) / sector < limit ? (length - position) / sector : limit;
+		bt_checksum_sectors(fs, out + position, batch, sums);
 		for (i = 0; error == BTRFS_OK && i < batch; i++) {
 			error =
-			    bt_sector_checksum(cursor, logical + position + i * sector, &checksum);
-			if (error == BTRFS_OK && sums[i] != checksum) {
+			    bt_sector_checksum(cursor, logical + position + i * sector, checksum);
+			if (error == BTRFS_OK && !bt_equal(sums + i * size, checksum, size)) {
 				error = bt_reread_sector(fs, logical + position + i * sector,
 				    out + position + i * sector, mirrors, selected, checksum);
 			}

@@ -666,8 +666,9 @@ audit_checksums(struct audit_state *state)
 	struct bt_cursor cursor;
 	struct bt_record record;
 	struct bt_key first = { .objectid = BT_CSUM_OBJECTID, .type = BT_EXTENT_CSUM };
-	struct bt_le32 stored;
+	uint8_t sum[BT_CSUM_SIZE];
 	uint8_t *sector;
+	size_t size = bt_checksum_size(fs->info.checksum_type);
 	uint64_t physical;
 	uint64_t length;
 	uint64_t position;
@@ -688,8 +689,8 @@ audit_checksums(struct audit_state *state)
 		if (record.key.objectid != BT_CSUM_OBJECTID || record.key.type != BT_EXTENT_CSUM) {
 			break;
 		}
-		length = (uint64_t)(record.size / sizeof(stored)) * fs->info.sector_size;
-		if (record.size == 0 || record.size % sizeof(stored) != 0) {
+		length = (uint64_t)(record.size / size) * fs->info.sector_size;
+		if (record.size == 0 || record.size % size != 0) {
 			fail(state, "malformed checksum item at %llu",
 			    (unsigned long long)record.key.offset);
 			break;
@@ -709,10 +710,9 @@ audit_checksums(struct audit_state *state)
 			    : record.key.offset + length;
 		}
 		add_range(&state->checksummed, record.key.offset, record.key.offset + length);
-		state->audit->checksums += record.size / sizeof(stored);
+		state->audit->checksums += record.size / size;
 		/* Every copy of a DUP data chunk holds the checksummed bytes. */
-		for (i = 0; i < record.size / sizeof(stored) && !state->failed; i++) {
-			memcpy(&stored, record.data + i * sizeof(stored), sizeof(stored));
+		for (i = 0; i < record.size / size && !state->failed; i++) {
 			mirrors = 1;
 			for (mirror = 0; mirror < mirrors && !state->failed; mirror++) {
 				if (bt_map(fs, record.key.offset + i * fs->info.sector_size,
@@ -724,8 +724,11 @@ audit_checksums(struct audit_state *state)
 					    (unsigned long long)(record.key.offset +
 						i * fs->info.sector_size),
 					    mirror);
-				} else if (bt_u32(stored) !=
-				    ~bt_crc32c(UINT32_MAX, sector, fs->info.sector_size)) {
+					continue;
+				}
+				bt_checksum(
+				    fs->info.checksum_type, sector, fs->info.sector_size, sum);
+				if (memcmp(record.data + i * size, sum, size) != 0) {
 					fail(state, "checksum mismatch at %llu copy %u",
 					    (unsigned long long)(record.key.offset +
 						i * fs->info.sector_size),

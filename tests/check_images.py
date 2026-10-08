@@ -8,6 +8,21 @@ import os
 from pathlib import Path
 import subprocess
 
+# Linux's checksum algorithm numbers by mkfs.btrfs name.
+CHECKSUM_TYPES = {"crc32c": 0, "xxhash": 1, "sha256": 2, "blake2": 3}
+# The data payload of tests/prepare_linux.py: prefixes of its inputs, a sparse
+# file, a preallocation, a zlib property file, a NODATACOW file without
+# checksums, an inline file, a reflink and two snapshots.
+DATA_PAYLOAD_PROFILES = {"checksums-xxhash", "checksums-sha256", "checksums-blake2"}
+DATA_BIG_BYTES = 1048576
+DATA_SMALL_BYTES = 10000
+DATA_SPARSE_BYTES = 4194304
+DATA_HOLE_A = 1048576
+DATA_HOLE_B = 3145728
+DATA_PREALLOC_BYTES = 262144
+DATA_ZLIB_BYTES = 262144
+DATA_NODATASUM_BYTES = 65536
+
 
 def check(tool: Path, image: Path, manifest: dict) -> int:
     cases = 0
@@ -26,6 +41,7 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
 
     info = json.loads(run("info"))
     assert info["node_size"] == manifest["node_size"] and info["sector_size"] == 4096
+    assert info["checksum_type"] == CHECKSUM_TYPES[manifest.get("checksum", "crc32c")]
     cases += 1
     for name, expected in manifest["files"].items():
         data = run("cat", "/" + name)
@@ -78,6 +94,22 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
         assert stat(path)["tree"] == 5 and stat(path)["inode"] == 256
     assert run("cat", "../value", tree=sub["tree"]) == b"subvolume changed\n"
     cases += 6
+    if manifest["profile"] in DATA_PAYLOAD_PROFILES:
+        big = run("cat", "big")
+        random = run("cat", "random")
+        sparse = bytearray(DATA_SPARSE_BYTES)
+        sparse[DATA_HOLE_A:DATA_HOLE_A + 6] = b"HOLE-A"
+        sparse[DATA_HOLE_B:DATA_HOLE_B + 6] = b"HOLE-B"
+        expected = {"big": big[:DATA_BIG_BYTES], "small": random[:DATA_SMALL_BYTES],
+                    "sparse": bytes(sparse), "prealloc": bytes(DATA_PREALLOC_BYTES),
+                    "zlib": big[:DATA_ZLIB_BYTES], "nodatasum": random[:DATA_NODATASUM_BYTES],
+                    "inline": b"inline data\n", "big-clone": big[:DATA_BIG_BYTES]}
+        for directory in ("data", "data-snap", "data-ro"):
+            for name, data in expected.items():
+                assert run("cat", f"{directory}/{name}") == data, (directory, name)
+                cases += 1
+        assert run("cat", "data/big", "4093", "8199") == big[4093:12292]
+        cases += 1
     if manifest["profile"] == "transactions-holes":
         # Without NO_HOLES Linux splits hole items around written sectors and
         # keeps their offsets; a file grown by truncation is one hole item.
@@ -97,7 +129,7 @@ def main() -> None:
     parser.add_argument("--fixtures", type=Path, required=True)
     args = parser.parse_args()
     profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "codecs",
-                "default-subvolume", "transactions-holes"]
+                "default-subvolume", "transactions-holes", *sorted(DATA_PAYLOAD_PROFILES)]
     total = 0
     for profile in profiles:
         image = args.fixtures / f"{profile}.raw"

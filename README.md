@@ -10,11 +10,12 @@ the FSKit extension, behind a privileged device barrier, pass the mounted read
 and write suites, and Linux verifies the images they write. Both keep every
 acknowledged fsync through power cuts of their guest; FSKit set-id metadata is
 not accepted.
-It reads single-device CRC32C filesystems with SINGLE/DUP chunks, 4–64 KiB nodes,
-inodes, byte-exact names, directories, hard links, symlinks, inline and regular
-extents, sparse and preallocated data, raw xattrs, subvolumes and snapshots.
-The POSIX image adapter provides zlib and optional Zstd decoding. FSKit supplies
-zlib; the XNU adapter also supplies a bounded kernel zlib decoder.
+It reads single-device filesystems with CRC32C, XXH64, SHA-256 or BLAKE2b
+checksums, SINGLE/DUP chunks, 4–64 KiB nodes, inodes, byte-exact names,
+directories, hard links, symlinks, inline and regular extents, sparse and
+preallocated data, raw xattrs, subvolumes and snapshots. Every adapter reads
+zlib, LZO and Zstd extents: the platform's zlib (a bounded kernel decoder in the
+XNU adapter) and the shared freestanding LZO and Zstd decoders.
 
 Independent Linux-created images are compared byte-for-byte under ASan/UBSan.
 The tests also exercise checksum-correct malformed metadata, allocation/I/O

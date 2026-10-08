@@ -2,13 +2,18 @@
 #include "csum.h"
 #include "encode.h"
 
-#define BT_CSUM_BYTES 4U
-
 struct bt_csum_item {
 	struct bt_key key;
 	uint64_t end;
 	size_t size;
 };
+
+/* Bytes of one sector's checksum in an item. */
+static size_t
+bt_csum_bytes(const struct btrfs_fs *view)
+{
+	return bt_checksum_size(view->info.checksum_type);
+}
 
 /* Linux's per-item limit leaves room for two item headers in a leaf. */
 static size_t
@@ -16,7 +21,7 @@ bt_csum_item_limit(const struct btrfs_fs *view)
 {
 	return (view->info.node_size - sizeof(struct bt_disk_header) -
 		   2 * sizeof(struct bt_disk_item)) /
-	    BT_CSUM_BYTES -
+	    bt_csum_bytes(view) -
 	    1;
 }
 
@@ -24,7 +29,7 @@ static int
 bt_csum_decode(const struct btrfs_fs *view, const struct bt_record *record, uint64_t end,
     struct bt_csum_item *item)
 {
-	uint64_t sectors = record->size / BT_CSUM_BYTES;
+	uint64_t sectors = record->size / bt_csum_bytes(view);
 
 	if (record->key.objectid != BT_CSUM_OBJECTID || record->key.type != BT_EXTENT_CSUM ||
 	    record->key.offset >= end) {
@@ -63,7 +68,7 @@ bt_csum_find(struct bt_mutation *mutation, struct bt_root root, uint64_t logical
 			(void)bt_cursor_record(&cursor, &record);
 			if (record.key.objectid == BT_CSUM_OBJECTID &&
 			    record.key.type == BT_EXTENT_CSUM &&
-			    (record.size == 0 || record.size % BT_CSUM_BYTES != 0 ||
+			    (record.size == 0 || record.size % bt_csum_bytes(view) != 0 ||
 				record.key.offset % view->info.sector_size != 0)) {
 				error = BTRFS_CORRUPT;
 			} else if (bt_csum_decode(view, &record, end, item) &&
@@ -96,16 +101,15 @@ bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t
 {
 	const struct btrfs_fs *view = bt_mutation_view(mutation);
 	struct bt_csum_item existing;
-	struct bt_le32 value;
 	struct bt_key key = { .objectid = BT_CSUM_OBJECTID, .type = BT_EXTENT_CSUM };
-	uint32_t sums[BT_CRC_BATCH];
 	uint8_t *buffer;
 	uint64_t done;
 	uint64_t sector;
+	size_t size;
+	size_t limit;
 	size_t count;
 	size_t batch;
 	size_t i;
-	size_t j;
 	int found;
 	enum btrfs_result error;
 
@@ -113,6 +117,8 @@ bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	sector = view->info.sector_size;
+	size = bt_csum_bytes(view);
+	limit = bt_checksum_batch(view);
 	if (length == 0 || logical % sector != 0 || length % sector != 0 ||
 	    length > UINT64_MAX - logical) {
 		return BTRFS_INVALID_ARGUMENT;
@@ -130,16 +136,12 @@ bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t
 		    ? (size_t)((length - done) / sector)
 		    : bt_csum_item_limit(view);
 		for (i = 0; i < count; i += batch) {
-			batch = count - i < BT_CRC_BATCH ? count - i : BT_CRC_BATCH;
-			bt_crc32c_sectors(data + done + i * sector, sector, batch, sums);
-			for (j = 0; j < batch; j++) {
-				bt_put32(&value, sums[j]);
-				bt_copy(buffer + (i + j) * BT_CSUM_BYTES, &value, sizeof(value));
-			}
+			batch = count - i < limit ? count - i : limit;
+			bt_checksum_sectors(
+			    view, data + done + i * sector, batch, buffer + i * size);
 		}
 		key.offset = logical + done;
-		error = bt_mutation_edit(
-		    mutation, checksums, key, buffer, count * BT_CSUM_BYTES, BT_INSERT);
+		error = bt_mutation_edit(mutation, checksums, key, buffer, count * size, BT_INSERT);
 	}
 	view->env.release(view->env.context, buffer, view->info.node_size);
 	return error;
@@ -196,13 +198,14 @@ bt_csum_delete(
 			error = bt_mutation_edit(mutation, checksums, item.key, NULL, 0, BT_DELETE);
 		} else {
 			error = bt_mutation_edit(mutation, checksums, item.key, buffer,
-			    (size_t)((first - item.key.offset) / sector) * BT_CSUM_BYTES,
+			    (size_t)((first - item.key.offset) / sector) * bt_csum_bytes(view),
 			    BT_REPLACE);
 		}
 		if (error == BTRFS_OK && last < item.end) {
 			error = bt_mutation_edit(mutation, checksums, tail,
-			    buffer + (size_t)((last - item.key.offset) / sector) * BT_CSUM_BYTES,
-			    (size_t)((item.end - last) / sector) * BT_CSUM_BYTES, BT_INSERT);
+			    buffer +
+				(size_t)((last - item.key.offset) / sector) * bt_csum_bytes(view),
+			    (size_t)((item.end - last) / sector) * bt_csum_bytes(view), BT_INSERT);
 		}
 	}
 	view->env.release(view->env.context, buffer, view->info.node_size);

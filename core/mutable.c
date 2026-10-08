@@ -138,14 +138,9 @@ static void
 bt_mut_checksum(struct bt_mutation *mutation, struct bt_mutable_node *node)
 {
 	struct bt_disk_header *header = bt_mut_header(node);
-	struct bt_le32 checksum;
 
 	if (!node->checksum_valid) {
-		bt_zero(header->csum, sizeof(header->csum));
-		bt_put32(&checksum,
-		    ~bt_crc32c_block(&mutation->view.node_crc, UINT32_MAX,
-			node->bytes + BT_CSUM_SIZE, mutation->view.info.node_size - BT_CSUM_SIZE));
-		bt_copy(header->csum, &checksum, sizeof(checksum));
+		bt_checksum_node(&mutation->view, node->bytes, header->csum);
 		node->checksum_valid = 1;
 	}
 }

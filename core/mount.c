@@ -52,6 +52,7 @@ bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t
 	    bt_u32(super->system_array_size) == 0) {
 		return BTRFS_CORRUPT;
 	}
+	fs->info.checksum_type = bt_u16(super->checksum_type);
 	bt_crc_shift_init(&fs->node_crc, fs->info.node_size - BT_CSUM_SIZE);
 	bt_copy(fs->info.uuid, super->fsid, BTRFS_UUID_SIZE);
 	bt_copy(fs->info.label, super->label, BTRFS_LABEL_SIZE);

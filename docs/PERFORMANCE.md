@@ -416,6 +416,19 @@ crash analysis and acceptance. Caching exclusive-mount superblocks in XNU is
 also possible, but the FSKit cache's measured gain cannot be transferred to
 XNU's cheaper in-kernel read path without a new measurement.
 
+### Accelerate SHA-256 checksums in the adapters
+
+The core's checksum algorithms use general registers only. Measured on the
+development host (arm64, optimized freestanding core, 4 KiB sectors), CRC32C
+runs at about 30 GB/s and XXH64 at 24 GB/s, but SHA-256 at 0.4 GB/s and BLAKE2b
+at 0.5 GB/s: a SHA-256 filesystem's data reads and writes are bounded by
+hashing. Linux uses the ARMv8 SHA-2 instructions; its BLAKE2b on arm64 is the
+generic code. The platform libraries can use those instructions with proper
+SIMD state ownership (CommonCrypto in FSKit, corecrypto through libkern's
+SHA-256 KPI in the kext), so an optional environment hash callback, like the
+decompression callback, would let adapters supply them while the core keeps its
+own implementation as the default and as the test reference.
+
 ## Matched benchmark protocol
 
 1. Freeze binaries, fixture images and mount options in generated reports. Record

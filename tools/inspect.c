@@ -25,8 +25,10 @@ inspect(struct btrfs_fs *fs, int argc, char **argv)
 	if (strcmp(argv[0], "info") == 0) {
 		btrfs_get_info(fs, &info);
 		printf("{\"generation\":%" PRIu64
-		       ",\"sector_size\":%u,\"node_size\":%u,\"tree\":%" PRIu64 "}\n",
-		    info.generation, info.sector_size, info.node_size, info.default_tree);
+		       ",\"sector_size\":%u,\"node_size\":%u,\"checksum_type\":%u"
+		       ",\"tree\":%" PRIu64 "}\n",
+		    info.generation, info.sector_size, info.node_size, info.checksum_type,
+		    info.default_tree);
 		return BTRFS_OK;
 	}
 	if (argc < 2) {

@@ -71,18 +71,18 @@ static enum btrfs_result
 bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *block, int built)
 {
 	const struct bt_disk_header *header = (const void *)block;
-	struct bt_le32 checksum;
+	uint8_t checksum[BT_CSUM_SIZE];
 	uint64_t owner;
 	uint32_t count;
 	size_t body_size = fs->info.node_size - sizeof(*header);
 	size_t stride =
 	    root.level == 0 ? sizeof(struct bt_disk_item) : sizeof(struct bt_disk_pointer);
 
-	bt_copy(&checksum, header->csum, sizeof(checksum));
+	if (!built) {
+		bt_checksum_node(fs, block, checksum);
+	}
 	if ((!built &&
-		bt_u32(checksum) !=
-		    ~bt_crc32c_block(&fs->node_crc, UINT32_MAX, block + BT_CSUM_SIZE,
-			fs->info.node_size - BT_CSUM_SIZE)) ||
+		!bt_equal(header->csum, checksum, bt_checksum_size(fs->info.checksum_type))) ||
 	    !bt_equal(header->fsid, fs->metadata_uuid, BTRFS_UUID_SIZE) ||
 	    bt_u64(header->bytenr) != root.address || header->level != root.level ||
 	    bt_u64(header->generation) != root.generation || root.generation == 0 ||

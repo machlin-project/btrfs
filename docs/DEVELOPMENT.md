@@ -41,6 +41,13 @@ decode to the input, and mutated streams must agree with the references'
 oracles. Without a library it prints a SKIP line for that codec and runs only
 hand-written streams; acceptance needs both libraries.
 
+`checksum-algorithms` (`tests/checksum.c`) compares the core's XXH64, SHA-256 and
+BLAKE2b-256 with published digests and with libxxhash, CommonCrypto and libb2
+(`libxxhash` and `libb2` through pkg-config; Homebrew `xxhash` and `libb2`)
+over every short length, alignments and sector and node sizes. Without a
+library its comparisons are not made and the printed count drops; acceptance
+needs all three.
+
 Explicit superblock recovery of an image (dry run unless `--apply`; exit 3 means
 RECOVERY_REQUIRED; `tests/check_recovery.py` exercises it on a copy):
 
@@ -167,6 +174,11 @@ The holes profile repeats the data payload without NO_HOLES, so Linux writes
 explicit hole items (split around the sparse file's sectors, with their
 offsets) and every data sector has two copies; it adds a 1 MiB file grown by
 truncation alone and a NODATACOW directory.
+The checksum profiles repeat the data payload without a free-space tree under
+`mkfs.btrfs --csum`: `checksums-xxhash` (16 KiB nodes, DUP metadata),
+`checksums-sha256` (4 KiB nodes, single metadata) and `checksums-blake2` (64 KiB
+nodes, DUP metadata and data, 512 MiB); Linux also runs `btrfs check
+--check-data-csum` and prints the superblock's `csum_type`.
 The convert profile writes an 8 MiB filler and 480 one-sector files into a
 112 MiB data block group, removes every other file, then the rest in order,
 syncing after each removal, and requires Linux to convert the group to bitmaps
@@ -200,7 +212,8 @@ tracked driver sources. Standard `unsquashfs` or the sibling ext4 test extractor
 can extract the matching module archive. Put these modules in `root/modules/`:
 
 ```text
-virtio_blk.ko xor-neon.ko xor.ko raid6_pq.ko crc32c_generic.ko libcrc32c.ko btrfs.ko
+virtio_blk.ko xor-neon.ko xor.ko raid6_pq.ko crc32c_generic.ko libcrc32c.ko
+xxhash_generic.ko blake2b_generic.ko btrfs.ko
 ```
 
 The Linux crash-state recording also needs `dm-mod.ko` and `dm-log-writes.ko` in
@@ -230,13 +243,14 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all twenty-one
-profiles (512 MiB for `transactions-holes`, 1 GiB for `transactions-convert`,
+Linux checks and a completed VM exit before consuming the image. Repeat all twenty-four
+profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for `transactions-convert`,
 2 GiB for `transactions-scale`, 257 GiB for `transactions-copies`, created with
 `truncate` so they stay sparse and never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
-verifies 1,571 contracts (the seven reader profiles and `transactions-holes`,
-whose split hole items it reads), and fails if any byte changed. The `codecs`
+verifies 1,802 contracts (the seven reader profiles, `transactions-holes`,
+whose split hole items it reads, and the checksum profiles, whose data payload
+it reads in the subvolume and both snapshots), and fails if any byte changed. The `codecs`
 profile mounts with `compress-force=lzo` and writes the same 64 files of an
 incompressible head and a compressible tail into `lzo`, and, through the
 `btrfs.compression` property, `zlib` and `zstd` directories; Linux must report

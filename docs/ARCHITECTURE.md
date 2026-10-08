@@ -44,7 +44,7 @@ cannot repair media or replay a pending tree log.
 
 Only the primary superblock is admitted. Automatic selection of an older mirror
 could silently roll back acknowledged data and is not a mount fallback. Unknown
-incompatible features, alternate checksum algorithms, seeding/metadump formats,
+incompatible features and checksum algorithms, seeding/metadump formats,
 multiple devices and pending logs have explicit results. Unknown read-only
 compatible bits are admissible to the immutable reader only; transaction admission
 rejects them until their write semantics are implemented.
@@ -200,6 +200,17 @@ SSE4.2; otherwise an immutable table. Data sectors are checksummed four at a
 time in independent instruction chains, which hide the instruction latency that
 bounds one chain. Kernel acceleration uses general registers only. There is no
 CPU feature probe, lazy global initialization or kernel SIMD use.
+
+The superblock's `checksum_type` selects one algorithm for the superblock, every
+node and every data sector, as on Linux: CRC32C (4 bytes), XXH64 with seed zero
+(8 bytes, little-endian), SHA-256 or unkeyed BLAKE2b-256 (32 bytes); an unknown
+number is unsupported. `core/checksum.c` implements all four in general
+registers. The checksum occupies the first bytes of a 32-byte field, the rest
+zero when written and ignored when verified, as Linux compares only the
+algorithm's length; checksum items hold one checksum of that length per sector,
+and the per-item limit follows from it. The writer seals superblocks, nodes and
+data checksums with the filesystem's algorithm, so every writer feature applies
+to all four.
 The arm64e kernel build uses `-mgeneral-regs-only`: `-mkernel` alone permits
 compiler-generated NEON for copies and zeroing. A core header rejects ARM
 kernel compilation with NEON enabled, including for inline memory primitives.

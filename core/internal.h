@@ -119,7 +119,7 @@ struct btrfs_fs {
 	struct btrfs_inode root_inode;
 	uint8_t metadata_uuid[BTRFS_UUID_SIZE], device_uuid[BTRFS_UUID_SIZE];
 	uint64_t device_id, device_size;
-	/* Joins the lanes of a node checksum (node_size - BT_CSUM_SIZE bytes). */
+	/* Joins the lanes of a node CRC32C (node_size - BT_CSUM_SIZE bytes). */
 	struct bt_crc_shift node_crc;
 	/* Sorted by logical address; chunk_capacity entries are allocated. */
 	struct bt_chunk *chunks;
@@ -260,6 +260,20 @@ void bt_crc_shift_init(struct bt_crc_shift *shift, size_t length);
  * length; otherwise a single chain. */
 uint32_t bt_crc32c_block(
     const struct bt_crc_shift *shift, uint32_t seed, const void *buffer, size_t length);
+/* Bytes of sector checksums one bt_checksum_sectors call computes. */
+#define BT_CHECKSUM_BATCH_BYTES (BT_CRC_BATCH * sizeof(uint32_t))
+/* Bytes of a checksum of the type; zero for an unknown type. */
+size_t bt_checksum_size(unsigned type);
+/* The checksum occupies the first bt_checksum_size(type) bytes of sum; the
+ * rest are zero. */
+void bt_checksum(unsigned type, const void *data, size_t length, uint8_t sum[BT_CSUM_SIZE]);
+/* The checksum of a node's bytes after its checksum field. */
+void bt_checksum_node(const struct btrfs_fs *fs, const uint8_t *node, uint8_t sum[BT_CSUM_SIZE]);
+/* Sectors one bt_checksum_sectors call covers at most. */
+size_t bt_checksum_batch(const struct btrfs_fs *fs);
+/* The checksums of count sectors, bt_checksum_size bytes each and packed as in
+ * a checksum item, into sums. */
+void bt_checksum_sectors(const struct btrfs_fs *fs, const void *data, size_t count, uint8_t *sums);
 int bt_name_valid(const void *name, size_t length);
 int bt_xattr_name_valid(const void *name, size_t length);
 enum btrfs_result bt_read_physical(

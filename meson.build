@@ -11,7 +11,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c',
-  'core/group.c', 'core/cache.c')
+  'core/group.c', 'core/cache.c', 'core/checksum.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -70,8 +70,16 @@ crc_test = executable('btrfs-crc-test', 'tests/crc.c', include_directories: inc,
   link_with: core)
 test('crc32c', crc_test, suite: 'core')
 crc_portable_test = executable('btrfs-crc-portable-test', 'tests/crc.c', 'core/support.c',
+  'core/checksum.c',
   include_directories: inc, c_args: ['-DBT_CRC_PORTABLE'])
 test('crc32c-portable', crc_portable_test, suite: 'core')
+xxhash = dependency('libxxhash', required: false)
+b2 = dependency('libb2', required: false)
+checksum_test = executable('btrfs-checksum-test', 'tests/checksum.c', include_directories: inc,
+  link_with: core, dependencies: [xxhash, b2],
+  c_args: (xxhash.found() ? ['-DBTRFS_HAVE_XXHASH=1'] : []) +
+    (b2.found() ? ['-DBTRFS_HAVE_B2=1'] : []))
+test('checksum-algorithms', checksum_test, suite: 'core')
 native_test = executable('btrfs-native-policy', 'tests/native_policy.c', include_directories: inc,
   link_with: [native, core])
 test('native-xattr-policy', native_test, suite: 'core')
@@ -132,6 +140,11 @@ if fixtures != ''
     join_paths(fixtures, 'logwrites-data.raw')], timeout: 600, suite: 'images')
   test('malformed-faults-and-io-budgets', adversarial,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
+  foreach algorithm : ['xxhash', 'blake2']
+    test('malformed-faults-' + algorithm, adversarial,
+      args: [join_paths(fixtures, 'checksums-' + algorithm + '.raw')], timeout: 180,
+      suite: 'images')
+  endforeach
   test('concurrent-readers', concurrent,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   test('decompressed-extents', extents_test, args: [join_paths(fixtures, 'zstd.raw'),
@@ -152,6 +165,11 @@ if fixtures != ''
     args: ['--shared', join_paths(fixtures, 'transactions-shared.raw')], timeout: 300, suite: 'images')
   test('data-extents', transaction_test,
     args: ['--data', join_paths(fixtures, 'transactions-data.raw')], timeout: 300, suite: 'images')
+  foreach algorithm : ['xxhash', 'sha256', 'blake2']
+    test('data-extents-' + algorithm, transaction_test,
+      args: ['--data', join_paths(fixtures, 'checksums-' + algorithm + '.raw')], timeout: 600,
+      suite: 'images')
+  endforeach
   test('holes-and-dup-data', transaction_test,
     args: ['--data', '--holes', join_paths(fixtures, 'transactions-holes.raw')], timeout: 600,
     suite: 'images')
@@ -183,7 +201,9 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-namespace.raw'),
     join_paths(fixtures, 'transactions-holes.raw'),
     join_paths(fixtures, 'transactions-convert.raw'),
-    join_paths(fixtures, 'transactions-copies.raw')],
+    join_paths(fixtures, 'transactions-copies.raw'),
+    join_paths(fixtures, 'checksums-xxhash.raw'), join_paths(fixtures, 'checksums-sha256.raw'),
+    join_paths(fixtures, 'checksums-blake2.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

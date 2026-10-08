@@ -518,18 +518,19 @@ bt_super_present(uint64_t device_size, unsigned mirror)
 enum btrfs_result
 bt_super_check(const struct bt_disk_super *super, uint64_t offset)
 {
-	struct bt_le32 checksum;
+	uint8_t checksum[BT_CSUM_SIZE];
+	unsigned type = bt_u16(super->checksum_type);
 
 	if (!bt_equal(super->magic, BT_MAGIC, sizeof(super->magic))) {
 		return BTRFS_NOT_BTRFS;
 	}
-	if (bt_u16(super->checksum_type) != 0) {
+	if (bt_checksum_size(type) == 0) {
 		return BTRFS_UNSUPPORTED;
 	}
-	bt_copy(&checksum, super->csum, sizeof(checksum));
-	if (bt_u32(checksum) !=
-		~bt_crc32c(UINT32_MAX, (const uint8_t *)super + BT_CSUM_SIZE,
-		    BT_SUPER_SIZE - BT_CSUM_SIZE) ||
+	/* As Linux, only the algorithm's own bytes of the field are compared. */
+	bt_checksum(
+	    type, (const uint8_t *)super + BT_CSUM_SIZE, BT_SUPER_SIZE - BT_CSUM_SIZE, checksum);
+	if (!bt_equal(super->csum, checksum, bt_checksum_size(type)) ||
 	    bt_u64(super->bytenr) != offset) {
 		return BTRFS_CORRUPT;
 	}

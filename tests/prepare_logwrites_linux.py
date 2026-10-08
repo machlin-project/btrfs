@@ -49,7 +49,7 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 trap 'echo BTRFS_LOGWRITES_FAIL; dmesg | tail -60; sync; poweroff -f' EXIT
-for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c btrfs dm-mod dm-log-writes; do
+for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c xxhash_generic blake2b_generic btrfs dm-mod dm-log-writes; do
     insmod /modules/$module.ko
 done
 uname -r
