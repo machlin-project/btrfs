@@ -73,12 +73,12 @@ read_device(void *context, uint64_t offset, void *bytes, size_t size)
 
 enum btrfs_result
 decompress_device(void *context, enum btrfs_compression codec, const void *input, size_t input_size,
-    void *output, size_t output_size)
+    void *output, size_t capacity, size_t *produced)
 {
 	struct device *device = context;
 
-	return device->image->environment.decompress(
-	    device->image->environment.context, codec, input, input_size, output, output_size);
+	return device->image->environment.decompress(device->image->environment.context, codec,
+	    input, input_size, output, capacity, produced);
 }
 
 void *

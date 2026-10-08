@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build or archive the macOS FSKit app, unsigned unless a personal signing team is supplied."""
+"""Build or archive the macOS FSKit app, unsigned unless a personal signing team is
+supplied, with an optional Xcode distribution export of the archive."""
 
 import argparse
 import os
@@ -33,7 +34,16 @@ def main() -> None:
                         help="Diagnostic build: log timed device I/O, barriers and volume syncs")
     parser.add_argument("--derived-data", type=Path, default=ROOT / "artifacts/fskit/DerivedData")
     parser.add_argument("--archive-path", type=Path, help="Create a new Xcode archive instead of a build")
+    parser.add_argument("--export-path", type=Path,
+                        help="Export the archive to a new distribution directory")
+    parser.add_argument("--export-options", type=Path,
+                        help="Xcode ExportOptions.plist for --export-path")
     args = parser.parse_args()
+    if args.export_path or args.export_options:
+        if not (args.archive_path and args.export_path and args.export_options and args.team):
+            parser.error("export requires --archive-path, --export-path, --export-options and --team")
+        if not args.export_options.is_file():
+            parser.error("--export-options must name an existing plist file")
     if args.build_number is not None and args.build_number <= 0:
         parser.error("--build-number must be positive")
     if args.provision and not args.team:
@@ -42,8 +52,10 @@ def main() -> None:
     if manual and not (args.team and args.app_profile and args.extension_profile):
         parser.error("manual signing requires --team, --app-profile and --extension-profile")
     archive_path = args.archive_path.resolve() if args.archive_path else None
-    if archive_path and archive_path.exists():
-        parser.error(f"output already exists: {archive_path}")
+    export_path = args.export_path.resolve() if args.export_path else None
+    for output in (archive_path, export_path):
+        if output and output.exists():
+            parser.error(f"output already exists: {output}")
     configuration = args.configuration or ("Release" if archive_path else "Debug")
     derived_data = args.derived_data.resolve()
     project = ROOT / "adapters/fskit"
@@ -93,6 +105,19 @@ def main() -> None:
         app = (archive_path / "Products/Applications" / APP_NAME if archive_path else
                derived_data / "Build/Products" / configuration / APP_NAME)
         verify_app(app, environment)
+    if export_path:
+        # Export selects the distribution identity and profiles, including those
+        # for the extension's restricted entitlements.
+        command = [
+            "xcodebuild", "-exportArchive", "-archivePath", str(archive_path),
+            "-exportPath", str(export_path), "-exportOptionsPlist",
+            str(args.export_options.resolve()),
+        ]
+        if args.provision:
+            command.append("-allowProvisioningUpdates")
+        subprocess.run(command, check=True, cwd=ROOT, env=environment)
+        if (export_path / APP_NAME).is_dir():
+            verify_app(export_path / APP_NAME, environment)
 
 
 if __name__ == "__main__":

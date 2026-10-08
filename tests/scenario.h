@@ -385,7 +385,7 @@ size_t sectors(const struct saved_write *write);
 void show(struct saved_write *write, int visible);
 enum btrfs_result read_device(void *context, uint64_t offset, void *bytes, size_t size);
 enum btrfs_result decompress_device(void *context, enum btrfs_compression codec, const void *input,
-    size_t input_size, void *output, size_t output_size);
+    size_t input_size, void *output, size_t capacity, size_t *produced);
 void *allocate(void *context, size_t size);
 void release(void *context, void *bytes, size_t size);
 struct saved_write *record(struct device *device, uint64_t offset, const void *bytes, size_t size);

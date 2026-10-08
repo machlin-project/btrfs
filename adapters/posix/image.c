@@ -5,6 +5,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "image.h"
+#include <btrfs/codec.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -77,45 +78,42 @@ image_release(void *context, void *allocation, size_t size)
 
 static enum btrfs_result
 image_decompress(void *context, enum btrfs_compression codec, const void *input, size_t input_size,
-    void *output, size_t output_size)
+    void *output, size_t capacity, size_t *produced)
 {
+	/* The Zstandard decoder's tables, one set per thread. */
+	static _Thread_local _Alignas(16) uint8_t workspace[BTRFS_ZSTD_WORKSPACE_BYTES];
 	z_stream stream;
 	int result;
-#ifdef BTRFS_HAVE_ZSTD
-	size_t frame;
-	size_t decoded;
-#endif
 
 	(void)context;
+	if (codec == BTRFS_COMPRESSION_LZO) {
+		return btrfs_lzo1x_decompress(input, input_size, output, capacity, produced);
+	}
+	if (codec == BTRFS_COMPRESSION_ZSTD) {
+		return btrfs_zstd_decompress(
+		    workspace, input, input_size, output, capacity, produced);
+	}
 	if (codec == BTRFS_COMPRESSION_ZLIB) {
-		if (input_size > UINT_MAX || output_size > UINT_MAX) {
+		if (input_size > UINT_MAX || capacity > UINT_MAX) {
 			return BTRFS_RANGE;
 		}
 		memset(&stream, 0, sizeof(stream));
 		stream.next_in = (Bytef *)input;
 		stream.avail_in = (uInt)input_size;
 		stream.next_out = output;
-		stream.avail_out = (uInt)output_size;
+		stream.avail_out = (uInt)capacity;
 		result = inflateInit(&stream);
 		if (result != Z_OK) {
 			return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT;
 		}
 		result = inflate(&stream, Z_FINISH);
 		(void)inflateEnd(&stream);
-		return result == Z_STREAM_END && stream.total_out == output_size
-		    ? BTRFS_OK
-		    : (result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT);
-	}
-#ifdef BTRFS_HAVE_ZSTD
-	if (codec == BTRFS_COMPRESSION_ZSTD) {
-		frame = ZSTD_findFrameCompressedSize(input, input_size);
-		if (ZSTD_isError(frame)) {
-			return BTRFS_CORRUPT;
+		if (result != Z_STREAM_END) {
+			return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT;
 		}
-		decoded = ZSTD_decompress(output, output_size, input, frame);
-		return !ZSTD_isError(decoded) && decoded == output_size ? BTRFS_OK : BTRFS_CORRUPT;
+		*produced = stream.total_out;
+		return BTRFS_OK;
 	}
-#endif
 	return BTRFS_UNSUPPORTED;
 }
 

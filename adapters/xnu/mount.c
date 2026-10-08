@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "btrfs_xnu.h"
+#include <btrfs/codec.h>
 
 #include <libkern/zlib.h>
 #include <mach/vm_param.h>
@@ -93,16 +94,31 @@ btrfs_xnu_zfree(voidpf context, voidpf allocation)
 
 static enum btrfs_result
 btrfs_xnu_decompress(void *context, enum btrfs_compression codec, const void *input,
-    size_t input_size, void *output, size_t output_size)
+    size_t input_size, void *output, size_t capacity, size_t *produced)
 {
 	z_stream stream;
+	void *workspace;
+	enum btrfs_result decoded;
 	int result;
 
 	(void)context;
+	if (codec == BTRFS_COMPRESSION_LZO) {
+		return btrfs_lzo1x_decompress(input, input_size, output, capacity, produced);
+	}
+	if (codec == BTRFS_COMPRESSION_ZSTD) {
+		workspace = _MALLOC(BTRFS_ZSTD_WORKSPACE_BYTES, M_TEMP, M_WAITOK | M_NULL);
+		if (workspace == NULL) {
+			return BTRFS_NO_MEMORY;
+		}
+		decoded =
+		    btrfs_zstd_decompress(workspace, input, input_size, output, capacity, produced);
+		_FREE(workspace, M_TEMP);
+		return decoded;
+	}
 	if (codec != BTRFS_COMPRESSION_ZLIB) {
 		return BTRFS_UNSUPPORTED;
 	}
-	if (input_size > UINT32_MAX || output_size > UINT32_MAX) {
+	if (input_size > UINT32_MAX || capacity > UINT32_MAX) {
 		return BTRFS_RANGE;
 	}
 	bzero(&stream, sizeof(stream));
@@ -111,16 +127,18 @@ btrfs_xnu_decompress(void *context, enum btrfs_compression codec, const void *in
 	stream.next_in = (Bytef *)input;
 	stream.avail_in = (uInt)input_size;
 	stream.next_out = output;
-	stream.avail_out = (uInt)output_size;
+	stream.avail_out = (uInt)capacity;
 	result = inflateInit(&stream);
 	if (result != Z_OK) {
 		return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT;
 	}
 	result = inflate(&stream, Z_FINISH);
 	(void)inflateEnd(&stream);
-	return result == Z_STREAM_END && stream.total_out == output_size
-	    ? BTRFS_OK
-	    : (result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT);
+	if (result != Z_STREAM_END) {
+		return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT;
+	}
+	*produced = stream.total_out;
+	return BTRFS_OK;
 }
 
 static enum btrfs_result

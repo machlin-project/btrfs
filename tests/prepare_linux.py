@@ -9,7 +9,8 @@ import subprocess
 
 PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "large-nodes": (65536, "dup", ""), "zlib": (16384, "dup", "zlib"),
-            "zstd": (16384, "dup", "zstd"), "default-subvolume": (16384, "dup", ""),
+            "zstd": (16384, "dup", "zstd"), "codecs": (16384, "dup", "lzo"),
+            "default-subvolume": (16384, "dup", ""),
             "transactions": (4096, "single", ""), "transactions-dup": (16384, "dup", ""),
             "transactions-large": (65536, "dup", ""), "transactions-full": (4096, "single", ""),
             "transactions-shared": (4096, "single", ""), "transactions-keyed": (4096, "single", ""),
@@ -97,6 +98,16 @@ DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
                 "transactions-copies": COPIES_DEVICE_BYTES,
                 "transactions-scale": SCALE_DEVICE_BYTES}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
+# The codecs profile adds files of an incompressible head and a compressible
+# tail in many sizes, under the mount's LZO and, by property, zlib and Zstd: LZO
+# segments of varied lengths with headers at many offsets within a sector,
+# inline extents, and regular extents whose stream ends with an unaligned file.
+CODEC_DIRECTORIES = ("lzo", "zlib", "zstd")
+LZO_FILES = 64
+LZO_HEAD_STEP = 37
+LZO_HEAD_BASE = 50
+LZO_TAIL_STEP = 1531
+LZO_TAIL_BASE = 100
 FILL_XATTR_BYTES = 3800
 FILL_REMOVE_STRIDE = 7
 
@@ -123,7 +134,32 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
     set_default = "btrfs subvolume set-default /mnt/subvol" if profile == "default-subvolume" else ":"
     device_bytes = DEVICE_BYTES.get(profile, 256 * 1024 * 1024)
     len_random = len(contents["random"])
+    extra = {}
     fill = ":"
+    if profile == "codecs":
+        for directory in CODEC_DIRECTORIES:
+            for i in range(LZO_FILES):
+                extra[f"{directory}/f{i}"] = (
+                    contents["random"][:i * LZO_HEAD_STEP + LZO_HEAD_BASE] +
+                    contents["big"][:i * LZO_TAIL_STEP + LZO_TAIL_BASE])
+        fill = f'''mkdir /mnt/lzo /mnt/zlib /mnt/zstd
+btrfs property set /mnt/zlib compression zlib
+btrfs property set /mnt/zstd compression zstd
+for directory in {" ".join(CODEC_DIRECTORIES)}; do
+    i=0
+    while [ "$i" -lt {LZO_FILES} ]; do
+        {{ head -c $((i * {LZO_HEAD_STEP} + {LZO_HEAD_BASE})) /input/random
+           head -c $((i * {LZO_TAIL_STEP} + {LZO_TAIL_BASE})) /input/big; }} > /mnt/$directory/f$i
+        i=$((i + 1))
+    done
+done
+btrfs filesystem sync /mnt
+btrfs inspect-internal dump-tree -t 5 /dev/vda > /tmp/codecs.txt
+for codec in '1 (zlib)' '2 (lzo)' '3 (zstd)'; do
+    count=$(grep -c "extent compression $codec" /tmp/codecs.txt || true)
+    echo "BTRFS_REFERENCE_REGULAR_EXTENTS:$codec:$count"
+    test "$count" -ge {LZO_FILES // 2}
+done'''
     if profile == "transactions-full":
         # Exhaust unallocated space with data, then metadata with inline files,
         # then free every seventh filler so the remaining free space is scattered.
@@ -492,7 +528,7 @@ poweroff -f
                 "data": data_profile,
                 "compression": compression, "device_bytes": device_bytes, "files": {
                     name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-                    for name, data in contents.items()}}
+                    for name, data in {**contents, **extra}.items()}}
     archive.with_suffix(".json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 

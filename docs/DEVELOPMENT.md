@@ -32,6 +32,15 @@ private CoW editor tests run;
 that is not complete acceptance. With fixtures, every image is required and an
 unavailable codec causes the image test to fail, not silently skip.
 
+`extent-codecs` (`tests/codec.c`) runs the freestanding LZO1X and Zstandard
+decoders of `adapters/common/codec.c` against liblzo2 and libzstd when Meson
+finds them (`lzo2` and `libzstd` through pkg-config; Homebrew provides both):
+streams from lzo1x_1, lzo1x_999 and many libzstd settings (levels, windows,
+block sizes, literal modes, checksums, with and without content sizes) must
+decode to the input, and mutated streams must agree with the references'
+oracles. Without a library it prints a SKIP line for that codec and runs only
+hand-written streams; acceptance needs both libraries.
+
 Explicit superblock recovery of an image (dry run unless `--apply`; exit 3 means
 RECOVERY_REQUIRED; `tests/check_recovery.py` exercises it on a copy):
 
@@ -221,13 +230,17 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all twenty
+Linux checks and a completed VM exit before consuming the image. Repeat all twenty-one
 profiles (512 MiB for `transactions-holes`, 1 GiB for `transactions-convert`,
 2 GiB for `transactions-scale`, 257 GiB for `transactions-copies`, created with
 `truncate` so they stay sparse and never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
-verifies 367 contracts (the six reader profiles and `transactions-holes`, whose
-split hole items it reads), and fails if any byte changed.
+verifies 1,571 contracts (the seven reader profiles and `transactions-holes`,
+whose split hole items it reads), and fails if any byte changed. The `codecs`
+profile mounts with `compress-force=lzo` and writes the same 64 files of an
+incompressible head and a compressible tail into `lzo`, and, through the
+`btrfs.compression` property, `zlib` and `zstd` directories; Linux must report
+at least 32 regular extents of each codec.
 
 ## Linux-written crash states
 
@@ -297,6 +310,18 @@ serving the published view, and a reopened volume must find that generation.
 Its allocation map must have been loaded once, at admission, and reused by
 every later transaction, aborted and failed ones included.
 
+`btrfs-fuzz-codec` drives the same decoders: an input's first byte selects the
+codec, the next two the output capacity. Seed it with compressed streams of
+both codecs (any generator works; libzstd and liblzo2 output in that framing),
+keep every finding under `artifacts/fuzz-corpus-codec/regression-*`, and run
+it with an RSS limit, since the reference decoders allocate windows:
+
+```sh
+.build-fuzz-llvm/btrfs-fuzz-codec -max_total_time=1200 -timeout=5 -rss_limit_mb=4096 \
+  -max_len=65536 -jobs=6 -workers=6 -artifact_prefix=artifacts/fuzz-findings-codec/ \
+  artifacts/fuzz-corpus-codec
+```
+
 A bounded smoke campaign is not exhaustive fuzzing. Preserve and minimize every
 crashing input; turn the cause into a deterministic regression before fixing it.
 
@@ -340,6 +365,28 @@ device barrier use hardened runtime; the app and extension share the App Group
 `group.org.machlin.btrfs`, which prefixes the barrier's Mach service. No signing
 or installation acceptance has been established for this project. Do not use a
 different entitlement to pretend filesystem-module authorization exists.
+
+A development profile authorizes only the devices it lists, by Provisioning
+UDID (`system_profiler SPHardwareDataType`), and a guest can acquire a new one
+while keeping its Tart configuration; AMFI then refuses to launch the app and
+extension ("No matching profile found"), and FSKit reports no mountable file
+system. A Developer ID export runs on any Mac: archive, then export with an
+`ExportOptions.plist` whose `method` is `developer-id`, `teamID` the personal
+team and `signingStyle` `automatic`; Xcode selects the Developer ID identity
+and all-device profiles, including the extension's FSKit entitlement:
+
+```sh
+python3 scripts/build_fskit.py --team TEAM --provision --configuration Release \
+  --build-number N --derived-data artifacts/fskit-distribution/DerivedData \
+  --archive-path artifacts/fskit-distribution/Machlin-btrfs-N.xcarchive \
+  --export-path artifacts/fskit-distribution/export-N \
+  --export-options artifacts/fskit-distribution/ExportOptions.plist
+```
+
+The export is not notarized; Gatekeeper rejects it after a download, but copies
+made with `tart exec` carry no quarantine and run. A replaced barrier daemon
+needs `BtrfsDeviceSetup --refresh` and, after a change of signing identity, the
+administrator's approval again before writable loads.
 
 Install into `/Applications` of a dedicated guest, enable the module in System
 Settings → General → Login Items & Extensions → **By Category → File System

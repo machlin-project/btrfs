@@ -177,6 +177,14 @@ unwritten preallocation return zeroes; a hole item may carry the nonzero offset
 Linux leaves when it splits or trims one. Shared regular extents honor the recorded extent
 offset, not just disk_bytenr. Compressed extents verify their stored bytes before
 calling the adapter codec; input and decoded allocation are bounded independently.
+zlib and Zstd extents reach the codec as one stream; the core cuts Btrfs's LZO
+framing itself (a total length, then one LZO1X segment per sector, whose
+32-bit header never crosses a sector boundary, as Linux's `fs/btrfs/lzo.c`
+writes and checks it) and passes each segment on. A codec reports how many
+bytes a stream decodes. An inline extent must decode to its recorded length
+exactly; a regular extent's stream ends with the file's data, so a file whose
+size is not a multiple of the sector size decodes short, and the rest of the
+extent reads as zeros, as on Linux.
 A shared cache with locks keeps up to sixteen decompressed extents, keyed by
 stored range, codec, decoded size and the naming item's generation, so reads
 within one extent decompress it once. Only committed generations are kept,
@@ -220,7 +228,14 @@ passes those synthetic addresses to the device. The read-only guest suite verifi
 concurrent reads. Failed pagein and forced reclaim/unmount remain separate gates.
 XNU device requests use private synchronous buffers and coalesced aligned ranges;
 only unaligned edges need a one-block bounce buffer. A bounded kernel zlib provider
-uses exported inflate APIs and paired kernel allocation callbacks.
+uses exported inflate APIs and paired kernel allocation callbacks. LZO1X and
+Zstandard come from `adapters/common/codec.c`, freestanding decoders that every
+adapter shares: they allocate nothing, take a 16 KiB table workspace for
+Zstandard (a kernel allocation per call, per-thread storage in user space)
+and decode Zstandard literals into the end of the output instead of a block
+buffer. A frame is accepted only as libzstd, which Linux shares, accepts it
+both as one buffer and as a stream; LZO1X follows Linux's decoder, which also
+requires the three-byte end instruction.
 
 ## Bounds
 

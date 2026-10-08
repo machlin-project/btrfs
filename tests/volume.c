@@ -115,12 +115,12 @@ overlay_release(void *context, void *bytes, size_t size)
 
 static enum btrfs_result
 overlay_decompress(void *context, enum btrfs_compression codec, const void *input,
-    size_t input_size, void *output, size_t output_size)
+    size_t input_size, void *output, size_t capacity, size_t *produced)
 {
 	struct overlay *overlay = context;
 
 	return overlay->image->environment.decompress(
-	    overlay->image, codec, input, input_size, output, output_size);
+	    overlay->image, codec, input, input_size, output, capacity, produced);
 }
 
 static enum btrfs_result

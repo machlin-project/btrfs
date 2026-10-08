@@ -32,8 +32,16 @@ static_library('btrfs_freestanding', sources, include_directories: inc,
 zlib = dependency('zlib')
 zstd = dependency('libzstd', required: false)
 codec_flags = zstd.found() ? ['-DBTRFS_HAVE_ZSTD=1'] : []
+codec = static_library('btrfs_codec', 'adapters/common/codec.c', include_directories: inc,
+  c_args: ['-ffreestanding', '-fno-builtin'])
+lzo = dependency('lzo2', required: false, include_type: 'system')
+codec_test = executable('btrfs-codec-test', 'tests/codec.c', include_directories: inc,
+  link_with: codec, dependencies: [zstd, lzo],
+  c_args: codec_flags + (lzo.found()
+    ? ['-DBTRFS_HAVE_LZO=1', '-isystem', lzo.get_variable(pkgconfig: 'includedir')] : []))
+test('extent-codecs', codec_test, suite: 'core', timeout: 600)
 posix = static_library('btrfs_posix', 'adapters/posix/image.c',
-  include_directories: inc, dependencies: [zlib, zstd], c_args: codec_flags)
+  include_directories: inc, dependencies: [zlib, zstd], c_args: codec_flags, link_with: codec)
 inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 executable('btrfs-bench', 'tools/bench.c', include_directories: inc,
@@ -102,6 +110,11 @@ if fskit_available
     link_with: [posix, identity, native, volume, core], dependencies: [zlib, zstd])
 endif
 if get_option('fuzzer')
+  executable('btrfs-fuzz-codec', 'tests/fuzz_codec.c', include_directories: inc,
+    link_with: codec, dependencies: [zstd, lzo],
+    c_args: ['-fsanitize=fuzzer'] + codec_flags + (lzo.found()
+      ? ['-DBTRFS_HAVE_LZO=1', '-isystem', lzo.get_variable(pkgconfig: 'includedir')] : []),
+    link_args: ['-fsanitize=fuzzer'])
   executable('btrfs-fuzz', 'tests/fuzz_metadata.c', include_directories: inc,
     link_with: [posix, core], dependencies: [zlib, zstd],
     c_args: ['-fsanitize=fuzzer'], link_args: ['-fsanitize=fuzzer'])

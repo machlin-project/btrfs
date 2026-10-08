@@ -3,6 +3,7 @@
 #import "BtrfsFileSystemInternal.h"
 #include "IOProfile.h"
 #include <btrfs/btrfs.h>
+#include <btrfs/codec.h>
 #include <btrfs/identity.h>
 #include <btrfs/native.h>
 #include <btrfs/volume.h>
@@ -278,19 +279,30 @@ btrfs_resource_release(void *context, void *allocation, size_t size)
 
 static enum btrfs_result
 btrfs_resource_decompress(void *context, enum btrfs_compression codec, const void *input,
-    size_t input_size, void *output, size_t output_size)
+    size_t input_size, void *output, size_t capacity, size_t *produced)
 {
-	uLongf actual = output_size;
+	/* The Zstandard decoder's tables, one set per thread. */
+	static _Thread_local _Alignas(16) uint8_t workspace[BTRFS_ZSTD_WORKSPACE_BYTES];
+	uLongf actual = capacity;
 	int result;
 
 	(void)context;
+	if (codec == BTRFS_COMPRESSION_LZO) {
+		return btrfs_lzo1x_decompress(input, input_size, output, capacity, produced);
+	}
+	if (codec == BTRFS_COMPRESSION_ZSTD) {
+		return btrfs_zstd_decompress(
+		    workspace, input, input_size, output, capacity, produced);
+	}
 	if (codec != BTRFS_COMPRESSION_ZLIB) {
 		return BTRFS_UNSUPPORTED;
 	}
 	result = uncompress(output, &actual, input, input_size);
-	return result == Z_OK && actual == output_size
-	    ? BTRFS_OK
-	    : (result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT);
+	if (result != Z_OK) {
+		return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_CORRUPT;
+	}
+	*produced = actual;
+	return BTRFS_OK;
 }
 
 /* Verified tree nodes shared by a loaded volume's threads; only the volume's

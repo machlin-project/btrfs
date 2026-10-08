@@ -211,6 +211,85 @@ bt_extent_length(const struct btrfs_fs *fs, const struct bt_record *record,
 	return BTRFS_OK;
 }
 
+/* Btrfs's LZO format, as Linux writes and checks it (fs/btrfs/lzo.c): a 32-bit
+ * total length, which counts itself, then segments of a 32-bit length and an
+ * LZO1X stream, each the compression of one sector of the extent, the last
+ * ending with the file's data. A segment header never crosses a sector
+ * boundary of the stored extent: fewer than four bytes left in a sector are
+ * padding. An inline extent is the length and one segment, exactly. Each
+ * segment goes to the environment's codec on its own. */
+#define BT_LZO_LENGTH_BYTES 4U
+/* lzo1x_worst_compress: the largest stream of one sector. */
+#define BT_LZO_SEGMENT_MAX(sector) ((sector) + (sector) / 16U + 64U + 3U)
+
+static uint32_t
+bt_lzo_length(const uint8_t *bytes)
+{
+	struct bt_le32 value;
+
+	bt_copy(&value, bytes, sizeof(value));
+	return bt_u32(value);
+}
+
+static enum btrfs_result
+bt_lzo_decode(const struct btrfs_fs *fs, const uint8_t *input, size_t input_size, int inline_data,
+    uint8_t *output, size_t output_size, size_t *decoded)
+{
+	size_t sector = fs->info.sector_size;
+	size_t position = BT_LZO_LENGTH_BYTES;
+	size_t produced = 0;
+	size_t total;
+	size_t segment;
+	size_t capacity;
+	size_t written;
+	enum btrfs_result error;
+
+	if (input_size < 2U * BT_LZO_LENGTH_BYTES) {
+		return BTRFS_CORRUPT;
+	}
+	total = bt_lzo_length(input);
+	if (inline_data
+		? total != input_size
+		: total > input_size || (total + sector - 1U) / sector * sector < input_size) {
+		return BTRFS_CORRUPT;
+	}
+	while (produced < output_size) {
+		if (sector - position % sector < BT_LZO_LENGTH_BYTES) {
+			position += sector - position % sector;
+		}
+		if (position >= total || total - position < BT_LZO_LENGTH_BYTES) {
+			return BTRFS_CORRUPT;
+		}
+		segment = bt_lzo_length(input + position);
+		position += BT_LZO_LENGTH_BYTES;
+		capacity = output_size - produced < sector ? output_size - produced : sector;
+		if (segment == 0 || segment > BT_LZO_SEGMENT_MAX(sector) ||
+		    segment > input_size - position ||
+		    (inline_data && position + segment != total)) {
+			return BTRFS_CORRUPT;
+		}
+		error = fs->env.decompress(fs->env.context, BTRFS_COMPRESSION_LZO, input + position,
+		    segment, output + produced, capacity, &written);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		if (written > capacity) {
+			return BTRFS_CORRUPT;
+		}
+		position += segment;
+		produced += written;
+		/* Only the last segment, which ends the data, is short. */
+		if (written < capacity) {
+			if (position != total) {
+				return BTRFS_CORRUPT;
+			}
+			break;
+		}
+	}
+	*decoded = produced;
+	return BTRFS_OK;
+}
+
 static enum btrfs_result
 bt_compressed_read(struct bt_read_session *session, const struct bt_record *record,
     const struct btrfs_inode *inode, uint64_t within, void *output, size_t length)
@@ -225,6 +304,7 @@ bt_compressed_read(struct bt_read_session *session, const struct bt_record *reco
 	uint8_t *decoded;
 	size_t stored_size;
 	size_t decoded_size = (size_t)bt_u64(header->ram_bytes);
+	size_t produced = 0;
 	uint64_t offset = within;
 	int verified = (inode->flags & BT_INODE_NODATASUM) == 0;
 	enum btrfs_result error;
@@ -265,10 +345,21 @@ bt_compressed_read(struct bt_read_session *session, const struct bt_record *reco
 	if (decoded == NULL) {
 		error = BTRFS_NO_MEMORY;
 	} else {
-		error =
-		    fs->env.decompress(fs->env.context, (enum btrfs_compression)header->compression,
-			input, stored_size, decoded, decoded_size);
+		error = header->compression == BTRFS_COMPRESSION_LZO
+		    ? bt_lzo_decode(fs, input, stored_size, header->type == BT_EXTENT_INLINE,
+			  decoded, decoded_size, &produced)
+		    : fs->env.decompress(fs->env.context,
+			  (enum btrfs_compression)header->compression, input, stored_size, decoded,
+			  decoded_size, &produced);
+		/* An inline extent decodes exactly; a regular extent's stream ends
+		 * with the file's data, and Linux reads zeros after it. */
+		if (error == BTRFS_OK &&
+		    (header->type == BT_EXTENT_INLINE ? produced != decoded_size
+						      : produced > decoded_size)) {
+			error = BTRFS_CORRUPT;
+		}
 		if (error == BTRFS_OK) {
+			bt_zero(decoded + produced, decoded_size - produced);
 			bt_copy(output, decoded + offset, length);
 			if (cache != NULL) {
 				bt_cache_extent_put(cache, &key, verified, decoded);

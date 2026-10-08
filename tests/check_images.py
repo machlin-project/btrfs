@@ -96,8 +96,8 @@ def main() -> None:
     parser.add_argument("--tool", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path, required=True)
     args = parser.parse_args()
-    profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "default-subvolume",
-                "transactions-holes"]
+    profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "codecs",
+                "default-subvolume", "transactions-holes"]
     total = 0
     for profile in profiles:
         image = args.fixtures / f"{profile}.raw"

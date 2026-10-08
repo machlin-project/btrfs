@@ -130,14 +130,14 @@ bt_view_release(void *context, void *allocation, size_t size)
 
 static enum btrfs_result
 bt_view_decompress(void *context, enum btrfs_compression codec, const void *input,
-    size_t input_size, void *output, size_t output_size)
+    size_t input_size, void *output, size_t capacity, size_t *produced)
 {
 	struct btrfs_transaction *transaction = context;
 	const struct btrfs_environment *env = &transaction->base->env;
 
 	return env->decompress == NULL
 	    ? BTRFS_UNSUPPORTED
-	    : env->decompress(env->context, codec, input, input_size, output, output_size);
+	    : env->decompress(env->context, codec, input, input_size, output, capacity, produced);
 }
 
 static enum btrfs_result

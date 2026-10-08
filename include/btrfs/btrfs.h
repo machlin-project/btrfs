@@ -85,11 +85,16 @@ struct btrfs_environment {
 	enum btrfs_result (*read)(void *context, uint64_t offset, void *buffer, size_t length);
 	void *(*allocate)(void *context, size_t size);
 	void (*release)(void *context, void *allocation, size_t size);
-	/* Optional codec service. Produce exactly output_size bytes from one bounded
-	 * stream; reject malformed/truncated input. Sector padding may follow it.
-	 * The core checks stored data before invoking the codec. */
+	/* Optional codec service. Decode one bounded stream into at most capacity
+	 * bytes and store its decoded length in *produced; reject malformed or
+	 * truncated input and a stream longer than capacity. Sector padding may
+	 * follow a zlib or Zstandard stream; an LZO call is one LZO1X segment, which
+	 * the core cuts from Btrfs's LZO framing. The core checks stored data before
+	 * invoking the codec, and as Linux reads zeros after a regular extent's
+	 * stream, which ends with the file. btrfs/codec.h has freestanding LZO1X and
+	 * Zstandard decoders. */
 	enum btrfs_result (*decompress)(void *context, enum btrfs_compression codec,
-	    const void *input, size_t input_size, void *output, size_t output_size);
+	    const void *input, size_t input_size, void *output, size_t capacity, size_t *produced);
 	/* Optional verified tree-node cache shared by the owner's mounts of this
 	 * device (btrfs_cache_create). */
 	struct btrfs_cache *cache;
