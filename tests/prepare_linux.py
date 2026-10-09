@@ -30,7 +30,12 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-space-cache": (4096, "single", ""),
             "transactions-quota": (16384, "dup", ""),
             "transactions-squota": (16384, "dup", ""),
-            "transactions-verity": (16384, "dup", "")}
+            "transactions-verity": (16384, "dup", ""),
+            "sectors-16k": (16384, "dup", ""), "transactions-16k": (16384, "dup", "")}
+# Profiles with sectors above 4 KiB, which only a kernel whose pages are at
+# least as large mounts: the staged 16 KiB-page root and kernel build them
+# (docs/DEVELOPMENT.md).
+SECTOR_SIZES = {"sectors-16k": 16384, "transactions-16k": 16384}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -69,7 +74,7 @@ QUOTA_GROUP_LIMIT_BYTES = 160 * 1024 * 1024
 CHECKSUMS = {"checksums-xxhash": "xxhash", "checksums-sha256": "sha256",
              "checksums-blake2": "blake2"}
 DATA_PAYLOAD = ("transactions-data", "transactions-fst", "transactions-holes", *CHECKSUMS,
-                *FEATURE_PROFILES)
+                *FEATURE_PROFILES, "transactions-16k")
 HOLES_GROWN_BYTES = 1048576
 # The convert profile keeps mkfs defaults (a free-space tree) on 1 GiB, so data
 # block groups span enough bitmaps for both of Linux's conversion thresholds.
@@ -233,6 +238,7 @@ def verity_files(contents: dict) -> dict:
 
 def prepare(root: Path, profile: str, archive: Path) -> None:
     node_size, metadata, compression = PROFILES[profile]
+    sector_size = SECTOR_SIZES.get(profile, 4096)
     inputs = root / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     contents = {
@@ -687,12 +693,15 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 trap 'echo BTRFS_REFERENCE_FAIL; dmesg | tail -60; sync; poweroff -f' EXIT
-for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c xxhash_generic blake2b_generic btrfs; do
+# The staged root lists its kernel's modules in load order; a console that is
+# a module opens once loaded.
+for module in $(cat /modules/order); do
     insmod /modules/$module.ko
 done
+exec < /dev/hvc0 > /dev/hvc0 2>&1
 uname -r
 mkfs.btrfs --version
-mkfs.btrfs -f -s 4096 -n {node_size} -m {metadata} -d {data_profile} {features} -L machlin-btrfs /dev/vda
+mkfs.btrfs -f -s {sector_size} -n {node_size} -m {metadata} -d {data_profile} {features} -L machlin-btrfs /dev/vda
 mount -t btrfs -o {options} /dev/vda /mnt
 cp /input/greeting /input/big /input/random /mnt/
 chmod 0640 /mnt/greeting
@@ -745,7 +754,8 @@ poweroff -f
     with archive.open("wb") as output:
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root,
                        input=paths, stdout=output, check=True)
-    manifest = {"profile": profile, "node_size": node_size, "metadata": metadata,
+    manifest = {"profile": profile, "node_size": node_size, "sector_size": sector_size,
+                "metadata": metadata,
                 "data": data_profile, "checksum": CHECKSUMS.get(profile, "crc32c"),
                 "compression": compression, "device_bytes": device_bytes, "files": {
                     name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}

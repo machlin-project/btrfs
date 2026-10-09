@@ -25,8 +25,6 @@ import subprocess
 
 # Linux keeps the transaction open this long, so only fsync writes durably.
 COMMIT_SECONDS = 3600
-MODULES = ("virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c xxhash_generic "
-           "blake2b_generic btrfs")
 PROFILES = {
     # 16 KiB nodes, DUP metadata, mkfs defaults (no-holes, free-space tree).
     "logs": {"node_size": 16384, "metadata": "dup", "device_bytes": 256 << 20},
@@ -56,9 +54,10 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 trap 'echo BTRFS_LOG_FAIL; dmesg | tail -60; sync; poweroff -f' EXIT
-for module in {MODULES}; do
+for module in $(cat /modules/order); do
     insmod /modules/$module.ko
 done
+exec < /dev/hvc0 > /dev/hvc0 2>&1
 uname -r
 """
 

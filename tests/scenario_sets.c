@@ -404,17 +404,29 @@ data_compress_plan(struct context *context)
 
 	/* 128 KiB, 128 KiB and the rest, each compressed. */
 	expect_compressed(&plan, 1, 1, "/data/zlib", BTRFS_COMPRESSION_ZLIB, 3, 0);
-	/* The patch splits the second extent around a new compressed one. */
-	expect_compressed(&plan, 2, 2, "/data/zlib", BTRFS_COMPRESSION_ZLIB, 5, 0);
-	/* The truncated tail drops the third extent; the new EOF sector does not
-	 * compress to less than itself. */
-	expect_compressed(&plan, 3, LAST_STAGE, "/data/zlib", BTRFS_COMPRESSION_ZLIB, 4, 0);
+	/* The patch splits the second extent around a new compressed one; with
+	 * 16 KiB sectors its range starts with that extent, which keeps only
+	 * its tail. */
+	expect_compressed(&plan, 2, 2, "/data/zlib", BTRFS_COMPRESSION_ZLIB,
+	    context->sector_size == 4096 ? 5 : 4, 0);
+	/* The truncated tail drops the third extent; the new EOF sector, one
+	 * sector after the file's start, is never compressed. */
+	expect_compressed(&plan, 3, LAST_STAGE, "/data/zlib", BTRFS_COMPRESSION_ZLIB,
+	    context->sector_size == 4096 ? 4 : 3, 0);
 	expect_compressed(&plan, 1, LAST_STAGE, "/data/noise", BTRFS_COMPRESSION_ZLIB, 0, 0);
 	expect_file(&plan, 1, LAST_STAGE, "/data/noise", noise, sizeof(noise));
 	expect_compressed(&plan, 1, 1, "/data/zsmall", BTRFS_COMPRESSION_ZLIB, 0, 1);
 	expect_file(&plan, 1, 1, "/data/zsmall", small, sizeof(small));
-	/* Grown past one sector, the inline extent becomes a compressed one. */
-	expect_compressed(&plan, 2, LAST_STAGE, "/data/zsmall", BTRFS_COMPRESSION_ZLIB, 1, 0);
+	/* Grown past one 4 KiB sector, the inline extent becomes a compressed
+	 * one; within one 16 KiB sector it stays inline, as Linux keeps data
+	 * inline that fits a sector and compresses below max_inline. */
+	if (context->sector_size == 4096) {
+		expect_compressed(
+		    &plan, 2, LAST_STAGE, "/data/zsmall", BTRFS_COMPRESSION_ZLIB, 1, 0);
+	} else {
+		expect_compressed(
+		    &plan, 2, LAST_STAGE, "/data/zsmall", BTRFS_COMPRESSION_ZLIB, 0, 1);
+	}
 	expect_file(&plan, 2, LAST_STAGE, "/data/zsmall", grown, sizeof(grown));
 	expect_compressed(&plan, 1, LAST_STAGE, "/data/ztiny", BTRFS_COMPRESSION_ZLIB, 0, 0);
 	expect_file(&plan, 1, LAST_STAGE, "/data/ztiny", tiny, sizeof(tiny));
@@ -498,7 +510,11 @@ fallocate_plans(struct context *context)
 	plan_fallocate(context, &plan, 1, "/data/big",
 	    BTRFS_FALLOCATE_ZERO_RANGE | BTRFS_FALLOCATE_KEEP_SIZE,
 	    FALLOCATE_BIG_BYTES + FALLOCATE_BEYOND_GAP, FALLOCATE_BEYOND_BYTES);
-	expect_extents(&plan, 1, LAST_STAGE, "/data/big", 4, 2, 5);
+	/* btrfs_zero_range rewrites the partial sectors at both ends; with 16 KiB
+	 * sectors the first one starts the file, so no piece of the original
+	 * extent stays before it. */
+	expect_extents(
+	    &plan, 1, LAST_STAGE, "/data/big", context->sector_size == 4096 ? 4 : 3, 2, 5);
 	expect_flags(&plan, 1, LAST_STAGE, "/data/big", BT_INODE_PREALLOC, BT_INODE_PREALLOC);
 	run_plan(context, &plan);
 
@@ -508,8 +524,16 @@ fallocate_plans(struct context *context)
 	plan_fallocate(context, &plan, 1, "/data/small", BTRFS_FALLOCATE_KEEP_SIZE,
 	    FALLOCATE_SMALL_BYTES, FALLOCATE_KEEP_BYTES);
 	plan_write(context, &plan, 2, "/data/small", FALLOCATE_INSIDE_OFFSET, data, sizeof(data));
-	expect_extents(&plan, 1, 1, "/data/small", 2, 1, 3);
-	expect_extents(&plan, 2, LAST_STAGE, "/data/small", 3, 2, 3);
+	/* Linux rewrites the sector holding EOF before it preallocates past it:
+	 * one 16 KiB sector holds all of /data/small, so nothing of its extent
+	 * stays, and the write fills one whole preallocated sector. */
+	if (context->sector_size == 4096) {
+		expect_extents(&plan, 1, 1, "/data/small", 2, 1, 3);
+		expect_extents(&plan, 2, LAST_STAGE, "/data/small", 3, 2, 3);
+	} else {
+		expect_extents(&plan, 1, 1, "/data/small", 1, 1, 2);
+		expect_extents(&plan, 2, LAST_STAGE, "/data/small", 2, 1, 2);
+	}
 	expect_flags(&plan, 1, LAST_STAGE, "/data/small", BT_INODE_PREALLOC, BT_INODE_PREALLOC);
 	run_plan(context, &plan);
 
@@ -519,8 +543,15 @@ fallocate_plans(struct context *context)
 	plan_fallocate(
 	    context, &plan, 1, "/data/small", 0, FALLOCATE_GROW_OFFSET, FALLOCATE_GROW_BYTES);
 	plan_write(context, &plan, 2, "/data/small", FALLOCATE_WRITE_OFFSET, data, sizeof(data));
-	expect_extents(&plan, 1, 1, "/data/small", 2, 1, 3);
-	expect_extents(&plan, 2, LAST_STAGE, "/data/small", 3, 1, 3);
+	/* With 16 KiB sectors the preallocation is one sector, which the write
+	 * turns into data. */
+	if (context->sector_size == 4096) {
+		expect_extents(&plan, 1, 1, "/data/small", 2, 1, 3);
+		expect_extents(&plan, 2, LAST_STAGE, "/data/small", 3, 1, 3);
+	} else {
+		expect_extents(&plan, 1, 1, "/data/small", 1, 1, 2);
+		expect_extents(&plan, 2, LAST_STAGE, "/data/small", 2, 0, 2);
+	}
 	run_plan(context, &plan);
 }
 

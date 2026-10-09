@@ -269,9 +269,32 @@ The Linux crash-state recording also needs `dm-mod.ko` and `dm-log-writes.ko` in
 `root/modules/` and a static `dmsetup` at `root/sbin/dmsetup` (from the
 device-mapper-static APK, `usr/sbin/dmsetup.static`).
 
-The payload loads them in dependency order. Modules and the running guest kernel
-must match. A fresh checkout requires staging these external tools; the fixture
-preparer does not silently download or substitute them.
+Every guest init loads the modules `root/modules/order` names, in that order
+(`virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c xxhash_generic
+blake2b_generic btrfs` here), then reopens its console on `/dev/hvc0`; the
+crash-state recording adds `dm-mod dm-log-writes`. Modules and the running guest
+kernel must match. A fresh checkout requires staging these external tools; the
+fixture preparer does not silently download or substitute them.
+
+Sectors above 4 KiB need a kernel whose pages are at least as large. The 16 KiB
+profiles (`sectors-16k`, `transactions-16k`) run on CentOS Stream 10's
+Hyperscale SIG `kernel-16k` 6.16.4 for Asahi (`6.16.4-0.hs100.hs+asahi.el10`),
+which builds in btrfs, fs-verity, SHA-512, xxhash and BLAKE2b and boots in the
+Virtualization.framework runner. Fetch its `packages-asahi` repository's
+`repomd.xml` with `repomd.xml.asc`, check the signature with the SIG key from
+`https://www.centos.org/keys/RPM-GPG-KEY-CentOS-SIG-HyperScale` (fingerprint
+`9B04 530E 0ED6 ABC4 B2C3 58DD 2A01 FA2A EB3D AC40`, in a scratch keyring), then
+`primary.xml.gz` against `repomd.xml` and the `kernel-16k-core` and
+`kernel-16k-modules-core` RPMs against `primary.xml.gz`. Their payloads are
+zstd-compressed `newc` archives. `.cache/linux-reference-16k/Image` is the zstd
+payload of the core package's EFI zboot `vmlinuz`. `root-16k` beside `root` is
+a copy of it whose `modules/` holds `virtio_console.ko`, `virtio_blk.ko`,
+`dm-mod.ko` and `dm-log-writes.ko`, decompressed from the modules package's
+`.ko.xz` files, with `modules/order` naming `virtio_console virtio_blk`: this
+kernel's console is a module, so a guest sees no output before init loads it.
+Build those profiles with `--root artifacts/btrfs-reference/root-16k` and the
+16 KiB `Image`; `mkfs.btrfs` there formats with `-s 16384`. Apple CPUs implement
+no 64 KiB translation granule, so no 64 KiB-sector fixture can be made here.
 
 For each profile, run the following **from the absolute lab directory**, replacing
 `plain` consistently and using 128 MiB for `transactions-full`. The image creation
@@ -292,18 +315,19 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all thirty-one
+Linux checks and a completed VM exit before consuming the image. Repeat all thirty-three
 profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for
 `transactions-convert` and `transactions-space-cache`, whose data groups must reach the
 100 MiB Linux needs before it writes a v1 cache,
 2 GiB for `transactions-scale`, 257 GiB for `transactions-copies`, created with
 `truncate` so they stay sparse and never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
-verifies 2,477 contracts (the seven reader profiles; `transactions-holes`,
-whose split hole items it reads; the checksum profiles and the metadata-UUID,
-mixed, space-cache, quota, simple-quota and fs-verity profiles, whose data payload it reads in the
-subvolume and both snapshots; and the block-group-tree profile), and fails if any
-byte changed. The `transactions-verity` profile enables fs-verity on fourteen
+verifies 2,950 contracts (the seven reader profiles and `sectors-16k`;
+`transactions-holes`, whose split hole items it reads; the checksum profiles and
+the metadata-UUID, mixed, space-cache, quota, simple-quota, fs-verity and
+`transactions-16k` profiles, whose data payload it reads in the subvolume and
+both snapshots; and the block-group-tree profile), and fails if any byte
+changed. The `transactions-verity` profile enables fs-verity on fourteen
 files in a subvolume, then snapshots it read-only; Linux's `fsverity measure`
 must print the digest the preparer's independent model computes for each, and
 appending, truncating and preallocating must fail. The reader must read both

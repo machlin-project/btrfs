@@ -16,7 +16,7 @@ CHECKSUM_TYPES = {"crc32c": 0, "xxhash": 1, "sha256": 2, "blake2": 3}
 DATA_PAYLOAD_PROFILES = {"checksums-xxhash", "checksums-sha256", "checksums-blake2",
                          "transactions-metadata-uuid", "transactions-mixed",
                          "transactions-space-cache", "transactions-quota",
-                         "transactions-squota", "transactions-verity"}
+                         "transactions-squota", "transactions-verity", "transactions-16k"}
 DATA_BIG_BYTES = 1048576
 DATA_SMALL_BYTES = 10000
 DATA_SPARSE_BYTES = 4194304
@@ -55,7 +55,8 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
         return int(result.stdout)
 
     info = json.loads(run("info"))
-    assert info["node_size"] == manifest["node_size"] and info["sector_size"] == 4096
+    sector = manifest.get("sector_size", 4096)
+    assert info["node_size"] == manifest["node_size"] and info["sector_size"] == sector
     assert info["checksum_type"] == CHECKSUM_TYPES[manifest.get("checksum", "crc32c")]
     cases += 1
     for name, expected in manifest["files"].items():
@@ -97,11 +98,12 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
     cases += 6
     # lseek's SEEK_DATA and SEEK_HOLE as Linux answers them: the sectors Linux
     # wrote are data, never-written and preallocated ranges holes, the end of
-    # the file the last hole; at or past the size there is nothing.
+    # the file the last hole; at or past the size there is nothing. "RIGHT" is
+    # written at 7340035, in the sector from 7340032 for every sector size.
     for path, whence, offset, expected in [
-            ("sparse", "data", 0, 0), ("sparse", "hole", 0, 4096),
-            ("sparse", "data", 4096, 7340032), ("sparse", "hole", 7340032, 7344128),
-            ("sparse", "data", 7344128, None), ("sparse", "hole", 8388607, 8388607),
+            ("sparse", "data", 0, 0), ("sparse", "hole", 0, sector),
+            ("sparse", "data", sector, 7340032), ("sparse", "hole", 7340032, 7340032 + sector),
+            ("sparse", "data", 7340032 + sector, None), ("sparse", "hole", 8388607, 8388607),
             ("sparse", "hole", 8388608, None), ("preallocated", "data", 0, None),
             ("preallocated", "hole", 0, 0), ("huge", "data", 0, None),
             ("huge", "hole", 17179869190, 17179869190), ("greeting", "data", 0, 0),
@@ -168,7 +170,7 @@ def main() -> None:
     parser.add_argument("--tool", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path, required=True)
     args = parser.parse_args()
-    profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "codecs",
+    profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "codecs", "sectors-16k",
                 "default-subvolume", "transactions-holes", "transactions-block-group-tree",
                 *sorted(DATA_PAYLOAD_PROFILES)]
     total = 0

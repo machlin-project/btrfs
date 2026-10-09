@@ -127,8 +127,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    space cache is left stale for Linux to rebuild (ARCHITECTURE.md, Format
    features), and qgroups are accounted as Linux's full mode accounts them
    (`core/qgroup.c`, ARCHITECTURE.md, Quotas), including rescans, Linux's
-   metadata reservations against limits and simple quotas. Remaining:
-   fixtures with sectors above 4 KiB.
+   metadata reservations against limits and simple quotas. 16 KiB sectors
+   are read and written against fixtures a 16 KiB-page Linux wrote.
+   Remaining: 64 KiB sectors, whose fixtures need a 64 KiB-page kernel that
+   no Apple CPU runs.
 5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
    orphan items for open inodes, eviction and orphan cleanup, atomic rename
    (replacement, cross-directory, between names of one inode), xattrs and the

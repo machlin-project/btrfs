@@ -156,6 +156,8 @@ if fixtures != ''
     timeout: 300, suite: 'images')
   test('malformed-faults-and-io-budgets', adversarial,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
+  test('malformed-faults-16k', adversarial, args: [join_paths(fixtures, 'sectors-16k.raw')],
+    timeout: 180, suite: 'images')
   foreach algorithm : ['xxhash', 'blake2']
     test('malformed-faults-' + algorithm, adversarial,
       args: [join_paths(fixtures, 'checksums-' + algorithm + '.raw')], timeout: 180,
@@ -182,8 +184,10 @@ if fixtures != ''
   test('data-extents', transaction_test,
     args: ['--data', join_paths(fixtures, 'transactions-data.raw')], timeout: 300, suite: 'images')
   foreach algorithm : ['xxhash', 'sha256', 'blake2']
+    # BLAKE2b with 64 KiB nodes and DUP data takes about ten minutes, more under
+    # load.
     test('data-extents-' + algorithm, transaction_test,
-      args: ['--data', join_paths(fixtures, 'checksums-' + algorithm + '.raw')], timeout: 600,
+      args: ['--data', join_paths(fixtures, 'checksums-' + algorithm + '.raw')], timeout: 1200,
       suite: 'images')
   endforeach
   # The kernel adapter's encoders write the compressed extents.
@@ -252,6 +256,13 @@ if fixtures != ''
   test('verity-feature', transaction_test,
     args: ['--verity', join_paths(fixtures, 'transactions.raw')], timeout: 300,
     suite: 'images')
+  # 16 KiB sectors, written by a 16 KiB-page Linux kernel: Linux's sector
+  # rounding decides the zeroed, preallocated and compressed ranges.
+  test('inline-transactions-16k', transaction_test,
+    args: [join_paths(fixtures, 'transactions-16k.raw')], timeout: 300, suite: 'images')
+  test('data-extents-16k', transaction_test,
+    args: ['--data', join_paths(fixtures, 'transactions-16k.raw')], timeout: 900,
+    suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
     suite: 'images')
@@ -279,7 +290,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-space-cache.raw'),
     join_paths(fixtures, 'transactions-quota.raw'),
     join_paths(fixtures, 'transactions-squota.raw'),
-    join_paths(fixtures, 'transactions-verity.raw')],
+    join_paths(fixtures, 'transactions-verity.raw'),
+    join_paths(fixtures, 'sectors-16k.raw'), join_paths(fixtures, 'transactions-16k.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

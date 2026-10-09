@@ -11,9 +11,10 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 trap 'echo BTRFS_TRANSACTION_FAIL; dmesg | tail -60; sync; poweroff -f' EXIT
-for module in virtio_blk xor-neon xor raid6_pq crc32c_generic libcrc32c xxhash_generic blake2b_generic btrfs; do
+for module in $(cat /modules/order); do
     insmod /modules/$module.ko
 done
+exec < /dev/hvc0 > /dev/hvc0 2>&1
 uname -r
 btrfs --version
 test "$(blockdev --getsize64 /dev/vda)" = @DEVICE_BYTES@
@@ -339,7 +340,7 @@ check_namespace() {
 verify() {
     btrfs check --readonly /dev/vda < /dev/null
     test "$(primary_generation)" = "$(generation "$1" "$2")"
-    mount -t btrfs -o ro,nologreplay /dev/vda /mnt
+    mount -t btrfs -o ro,rescue=nologreplay /dev/vda /mnt
     while IFS="$(printf '\t')" read -r stage generation path expected; do
         if [ "$stage" = "$2" ]; then
             cmp "/mnt$path" "$1/$expected"
@@ -367,7 +368,7 @@ for scenario in /transaction/*; do
         apply "$scenario" "case-$case.tsv"
         echo "BTRFS_TRANSACTION_CASE:$name:$case:$kind:$mounted:$resolved:$recovered"
         if [ "$mounted" = - ]; then
-            if mount -t btrfs -o ro,nologreplay /dev/vda /mnt 2>/dev/null; then
+            if mount -t btrfs -o ro,rescue=nologreplay /dev/vda /mnt 2>/dev/null; then
                 umount /mnt
                 echo "Linux mounted a primary superblock this implementation rejects"
                 exit 1
