@@ -498,8 +498,62 @@ cache (`btrfs_read_block_groups`). A zero `cache_generation`, which names no
 v1 cache, stays zero. Cache inodes and their extents in the root tree are
 ordinary references to the writer, and a group that has one is not removed.
 
-Quotas stay refused: a filesystem with a quota tree is not admitted for
-writing.
+## Quotas
+
+`core/qgroup.c` keeps Linux's full qgroup accounting. Admission loads the
+quota tree whole (at most 65,536 qgroups and relations) and refuses simple
+quotas, a rescan in progress and disabled quotas. A status generation other
+than the base's, or a qgroup without both its info and limit items, makes
+quotas inconsistent and stops accounting, as Linux's mount does; numbers are
+then kept, the status item still follows every commit, and limits still apply.
+
+The mutation reports every extent whose references change: the backref
+layer's additions, drops and replacements, new data extents and new or
+discarded tree blocks, as Linux records qgroup extents from delayed
+references. After the commit's last subvolume and reference change, each one
+is accounted once from two root sets: the subvolume trees reaching it in the
+committed base and in the transaction's view. Both are found as
+`btrfs_find_all_roots` finds them: a tree or data reference names its root,
+resolved through the tree (the node above a block on its first key's search
+path; the leaves of that root holding the file extent items of a data
+reference, skipping leaves another root owns and shared parents); shared
+references lead to their parent's roots; a block at its tree's root level, a
+subvolume being dropped (in the view) and a search without a result leave the
+root itself. Parents lie one level up, so a walk ends within the tree height,
+and each block's root set is remembered for the pass; the searches run out of
+line so that no cursor stays on the recursion's stack.
+`btrfs_qgroup_account_extent` then counts each root's qgroup and every qgroup
+above it once per root and updates referenced and exclusive bytes; a count
+that would go below zero makes quotas inconsistent. Changed qgroups store
+their info and limit items with the new generation, and the status item takes
+it as well.
+
+A new subvolume gets zeroed info and limit items. A snapshot must be its
+transaction's first change, and its source is unchanged (as every snapshot
+here), so the state it copies is the base with the copy's root added. Linux's
+`btrfs_qgroup_inherit` applies first: the copy references what the source
+references, takes its limits, and each holds only its root node exclusively; a
+source in a higher qgroup leaves quotas inconsistent, as Linux leaves them
+without an inherit request. The single accounting pass then takes old roots at
+the snapshot point: the copy's root belongs to the copy alone, and everything
+the source reaches below its root node the copy reaches too. This gives
+Linux's numbers without its intermediate commit. Subvolume ids skip every
+level-0 qgroup, which may outlive its subvolume.
+
+Dropping a deleted subvolume traces the extents below each shared block it
+leaves (`btrfs_qgroup_trace_subtree`), whose root sets lose the subvolume; a
+shared subtree at level 3 or above makes quotas inconsistent, Linux's default
+`drop_subtree_threshold`. When the drop ends, the subvolume's qgroup goes with
+its relations at commit (`btrfs_remove_qgroup`); a parent loses its exclusive
+bytes when they are all it referenced, otherwise, and when numbers remain on a
+consistent qgroup, quotas become inconsistent.
+
+Limits are checked before any change as Linux's `qgroup_reserve`: a write
+admits its sector-aligned range and a preallocation or zeroing its new
+extents against the subvolume's qgroup and every qgroup above it; passing a
+referenced or exclusive limit returns QUOTA_EXCEEDED (EDQUOT natively).
+Metadata growth is accounted at commit but not reserved beforehand, as
+Linux's per-item metadata reservation would.
 
 ## Free-space tree
 

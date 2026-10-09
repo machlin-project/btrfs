@@ -75,6 +75,7 @@ struct bt_mutation {
 	int accepted;
 	/* Cursors on the view reading its nodes in place. */
 	uint32_t holders;
+	struct bt_mutation_observer observer;
 };
 
 static size_t
@@ -1331,6 +1332,30 @@ const struct btrfs_fs *
 bt_mutation_view(const struct bt_mutation *mutation)
 {
 	return mutation == NULL || mutation->failure != BTRFS_OK ? NULL : &mutation->view;
+}
+
+void
+bt_mutation_observe(struct bt_mutation *mutation, const struct bt_mutation_observer *observer)
+{
+	mutation->observer = *observer;
+}
+
+enum btrfs_result
+bt_mutation_note_extent(struct bt_mutation *mutation, struct bt_key extent)
+{
+	enum btrfs_result error;
+
+	if (mutation->failure != BTRFS_OK) {
+		return mutation->failure;
+	}
+	if (mutation->observer.extent == NULL) {
+		return BTRFS_OK;
+	}
+	error = mutation->observer.extent(mutation->observer.context, extent);
+	if (error != BTRFS_OK) {
+		mutation->failure = error;
+	}
+	return error;
 }
 
 size_t

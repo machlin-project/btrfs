@@ -140,7 +140,8 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 {
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
 		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
-		"subvolumes", "deleted", "compressed", "extents", "holes", "bitmaps", "groups" };
+		"subvolumes", "deleted", "compressed", "extents", "holes", "bitmaps", "groups",
+		"quota" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[64];
@@ -149,7 +150,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	size_t stage;
 	size_t i;
 
-	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_GROUPS + 1, "expectation kinds");
+	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_QUOTA + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
@@ -202,6 +203,12 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 			REQUIRE(snprintf(argument, sizeof(argument), "%s:%u:%u",
 				    e->value == BTRFS_COMPRESSION_ZLIB ? "zlib" : "zstd", e->links,
 				    e->mode) < (int)sizeof(argument));
+			detail = argument;
+		} else if (e->kind == EXPECT_QUOTA) {
+			/* consistent or inconsistent:qgroups */
+			REQUIRE(snprintf(argument, sizeof(argument), "%s:%llu",
+				    e->links != 0 ? "inconsistent" : "consistent",
+				    (unsigned long long)e->value) < (int)sizeof(argument));
 			detail = argument;
 		} else if (e->kind == EXPECT_GROUPS) {
 			/* block groups:system array entries */
@@ -1325,6 +1332,7 @@ audit_state(struct context *context, const char *name)
 {
 	struct reference_audit audit;
 	struct namespace_audit names;
+	struct qgroup_audit qgroups;
 	struct btrfs_fs *fs;
 
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
@@ -1336,6 +1344,11 @@ audit_state(struct context *context, const char *name)
 		fprintf(stderr, "%s: namespace audit: %s\n", name, names.failure);
 		exit(1);
 	}
+	if (qgroup_audit(fs, &qgroups) != 0) {
+		fprintf(stderr, "%s: qgroup audit: %s\n", name, qgroups.failure);
+		exit(1);
+	}
+	context->qgroup_audits += qgroups.quotas && !qgroups.skipped;
 	btrfs_unmount(fs);
 	REQUIRE(context->image.live_allocations == 0);
 	printf("%s references: %zu blocks, tree %zu, shared block %zu, data %zu, shared data %zu, "

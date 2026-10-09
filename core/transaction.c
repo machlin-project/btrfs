@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "transaction.h"
+#include "qgroup.h"
 
 static enum btrfs_result
 bt_tx_root(const struct btrfs_fs *fs, uint64_t owner, struct bt_owned_root *root)
@@ -98,7 +99,7 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 {
 	struct btrfs_transaction *transaction;
 	struct bt_mutation_allocator allocator;
-	struct bt_root quota;
+	struct bt_owned_root quota;
 	int mapped;
 	enum btrfs_result error;
 	uint64_t free_space = BT_COMPAT_RO_FREE_SPACE_TREE | BT_COMPAT_RO_FREE_SPACE_TREE_VALID;
@@ -128,9 +129,11 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	    base->info.generation == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
 	}
-	error = bt_find_root(base, BT_QUOTA_TREE, &quota);
-	if (error != BTRFS_NOT_FOUND) {
-		return error == BTRFS_OK ? BTRFS_UNSUPPORTED : error;
+	/* Quotas are accounted (core/qgroup.c) once the mutation exists. */
+	bt_zero(&quota, sizeof(quota));
+	error = bt_tx_root(base, BT_QUOTA_TREE, &quota);
+	if (error != BTRFS_OK && error != BTRFS_NOT_FOUND) {
+		return error;
 	}
 	transaction = base->env.allocate(base->env.context, sizeof(*transaction));
 	if (transaction == NULL) {
@@ -227,6 +230,10 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	if (error == BTRFS_OK) {
 		bt_space_allocator(transaction->space, &allocator);
 		error = bt_mutation_create(&transaction->fs, &allocator, &transaction->mutation);
+	}
+	if (error == BTRFS_OK && quota.root.owner == BT_QUOTA_TREE) {
+		transaction->quota = quota;
+		error = bt_qgroup_begin(transaction);
 	}
 	if (error != BTRFS_OK) {
 		btrfs_transaction_destroy(transaction);
@@ -375,6 +382,10 @@ bt_tx_root_id(struct btrfs_transaction *transaction, uint64_t *result)
 	}
 	if (error != BTRFS_OK) {
 		return error;
+	}
+	/* A qgroup that outlived its subvolume keeps its id (btrfs_read_qgroup_config). */
+	if (bt_qgroup_next_id(transaction) > next) {
+		next = bt_qgroup_next_id(transaction);
 	}
 	if (next >= BT_ROOT_ID_LIMIT) {
 		return BTRFS_NO_SPACE;
@@ -724,6 +735,9 @@ bt_tx_account(struct btrfs_transaction *transaction)
 			error = bt_tx_edit(transaction, &transaction->extents.root, key, &item,
 			    sizeof(item), BT_INSERT);
 			if (error == BTRFS_OK) {
+				error = bt_mutation_note_extent(transaction->mutation, key);
+			}
+			if (error == BTRFS_OK) {
 				error = bt_space_change_used(transaction->space, block.address,
 				    transaction->base->info.node_size, 1);
 			}
@@ -734,6 +748,9 @@ bt_tx_account(struct btrfs_transaction *transaction)
 		} else if (block.discarded && (transaction->accounted[i] & BT_ACCOUNT_NEW)) {
 			error = bt_tx_edit(
 			    transaction, &transaction->extents.root, key, NULL, 0, BT_DELETE);
+			if (error == BTRFS_OK) {
+				error = bt_mutation_note_extent(transaction->mutation, key);
+			}
 			if (error == BTRFS_OK) {
 				error = bt_space_change_used(transaction->space, block.address,
 				    transaction->base->info.node_size, 0);
@@ -1045,6 +1062,10 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 	if (error == BTRFS_OK) {
 		error = bt_tx_remove_groups(transaction);
 	}
+	/* Every subvolume tree and reference is final: account qgroups once. */
+	if (error == BTRFS_OK) {
+		error = bt_qgroup_commit(transaction);
+	}
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -1092,6 +1113,11 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 		    transaction->groups.root.address !=
 			bt_u64(transaction->groups.item.legacy.bytenr)) {
 			error = bt_tx_update_root(transaction, &transaction->groups);
+		}
+		if (error == BTRFS_OK && transaction->qgroups != NULL &&
+		    transaction->quota.root.address !=
+			bt_u64(transaction->quota.item.legacy.bytenr)) {
+			error = bt_tx_update_root(transaction, &transaction->quota);
 		}
 		if (error != BTRFS_OK) {
 			return error;
@@ -1493,6 +1519,7 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 	}
 	env = &transaction->base->env;
 	bt_tx_release_data(transaction);
+	bt_qgroup_end(transaction);
 	bt_mutation_destroy(transaction->mutation);
 	bt_space_destroy(transaction->space);
 	if (transaction->scratch != NULL) {

@@ -32,6 +32,10 @@ PROFILES = {
     "logs": {"node_size": 16384, "metadata": "dup", "device_bytes": 256 << 20},
     # 4 KiB nodes: the log of one directory spans a multi-level log tree.
     "logs-many": {"node_size": 4096, "metadata": "single", "device_bytes": 256 << 20},
+    # The logs workload with quotas enabled before its base: replay accounts
+    # the extents it adds and drops, and btrfs check verifies the numbers.
+    "logs-quota": {"node_size": 16384, "metadata": "dup", "device_bytes": 256 << 20,
+                   "quota": True},
 }
 MANY_FILES = 2000
 INPUTS = {
@@ -180,7 +184,9 @@ mkfs.btrfs --version
 mkfs.btrfs -f -s 4096 -n {settings["node_size"]} -m {settings["metadata"]} -d single \\
     -L machlin-btrfs /dev/vda
 mount -t btrfs -o noatime,commit={COMMIT_SECONDS} /dev/vda /mnt
+{"btrfs quota enable /mnt" if settings.get("quota") else ":"}
 {BASE}
+{"btrfs quota rescan -w /mnt && btrfs qgroup show --raw /mnt" if settings.get("quota") else ":"}
 {logged}
 echo BTRFS_LOG_CREATED:{profile}
 trap - EXIT

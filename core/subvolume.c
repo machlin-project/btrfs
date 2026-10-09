@@ -2,6 +2,7 @@
 /* Subvolume and snapshot creation, following Linux's create_subvol and
  * create_pending_snapshot. */
 #include "namespace.h"
+#include "qgroup.h"
 
 /* Linux's placeholder inode inside a new root item. */
 #define BT_ROOT_ITEM_INODE_SIZE 3U
@@ -232,6 +233,9 @@ btrfs_transaction_create_subvolume(struct btrfs_transaction *transaction,
 	transid = bt_ns_transid(transaction);
 	bt_zero(&owned, sizeof(owned));
 	error = bt_mutation_new_root(transaction->mutation, transaction->roots, id, 0, &owned.root);
+	if (error == BTRFS_OK) {
+		error = bt_qgroup_create(transaction, id);
+	}
 	bt_put64(&item->legacy.inode.generation, 1);
 	bt_put64(&item->legacy.inode.size, BT_ROOT_ITEM_INODE_SIZE);
 	bt_put32(&item->legacy.inode.links, 1);
@@ -335,6 +339,12 @@ btrfs_transaction_snapshot(struct btrfs_transaction *transaction, uint64_t sourc
 	if (error == BTRFS_OK && changed) {
 		error = BTRFS_UNSUPPORTED;
 	}
+	/* With quotas the snapshot is the transaction's first change: its
+	 * accounting starts from the base with only the copy added. */
+	if (error == BTRFS_OK && transaction->qgroups != NULL &&
+	    (transaction->changed || bt_mutation_count(transaction->mutation) != 0)) {
+		error = BTRFS_UNSUPPORTED;
+	}
 	if (error == BTRFS_OK &&
 	    bt_u64(origin->item.legacy.used_bytes) < transaction->base->info.node_size) {
 		error = BTRFS_CORRUPT;
@@ -355,6 +365,13 @@ btrfs_transaction_snapshot(struct btrfs_transaction *transaction, uint64_t sourc
 	bt_zero(&owned, sizeof(owned));
 	owned.item = origin->item;
 	error = bt_mutation_new_root(transaction->mutation, origin->root, id, 1, &owned.root);
+	if (error == BTRFS_OK) {
+		error = bt_qgroup_create(transaction, id);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_qgroup_snapshot(
+		    transaction, source, id, origin->root.address, owned.root.address);
+	}
 	if (error == BTRFS_OK) {
 		error = bt_tree_read(
 		    bt_mutation_view(transaction->mutation), owned.root, transaction->original);

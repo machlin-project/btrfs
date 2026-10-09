@@ -479,6 +479,9 @@ bt_backref_add(struct bt_mutation *mutation, struct bt_root *extents, struct bt_
 		error =
 		    bt_mutation_edit(mutation, extents, extent, copy.bytes, copy.size, BT_REPLACE);
 	}
+	if (error == BTRFS_OK) {
+		error = bt_mutation_note_extent(mutation, extent);
+	}
 	bt_extent_end(&copy);
 	return error;
 }
@@ -529,6 +532,9 @@ bt_extent_drop(struct bt_mutation *mutation, struct bt_root *extents, struct bt_
 			error = bt_mutation_edit(mutation, extents, extent, NULL, 0, BT_DELETE);
 			*freed = error == BTRFS_OK;
 		}
+	}
+	if (error == BTRFS_OK) {
+		error = bt_mutation_note_extent(mutation, extent);
 	}
 	return error;
 }
@@ -591,6 +597,13 @@ bt_backref_release_tree(struct bt_mutation *mutation, struct bt_root *extents, s
 				error = bt_mutation_rekey(
 				    mutation, extents, extent, target, copy.bytes, copy.size);
 				*freed = *replaced = error == BTRFS_OK;
+				/* The old block leaves its tree as the new one enters. */
+				if (error == BTRFS_OK) {
+					error = bt_mutation_note_extent(mutation, extent);
+				}
+				if (error == BTRFS_OK) {
+					error = bt_mutation_note_extent(mutation, target);
+				}
 			} else if (error == BTRFS_OK) {
 				error = bt_extent_drop(
 				    mutation, extents, extent, &reference, 1, &copy, freed);

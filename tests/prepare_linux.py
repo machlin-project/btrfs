@@ -54,11 +54,12 @@ MOUNT_OPTIONS = {"transactions-space-cache": "space_cache=v1"}
 # Linux writes no v1 cache for a block group below 100 MiB (cache_save_setup);
 # on 1 GiB its data groups are 112 MiB.
 SPACE_CACHE_DEVICE_BYTES = 1024 * 1024 * 1024
-QUOTA_LIMIT_BYTES = 64 * 1024 * 1024
+# Above the 80 MiB the data scenarios write in one transaction.
+QUOTA_LIMIT_BYTES = 128 * 1024 * 1024
 # A level-1 qgroup holding the data subvolume and its writable snapshot, with an
 # exclusive limit of its own.
 QUOTA_GROUP = "1/100"
-QUOTA_GROUP_LIMIT_BYTES = 96 * 1024 * 1024
+QUOTA_GROUP_LIMIT_BYTES = 160 * 1024 * 1024
 # The checksum profiles repeat the data payload under each algorithm other than
 # CRC32C, with 16, 4 and 64 KiB nodes; Linux also verifies every data checksum.
 CHECKSUMS = {"checksums-xxhash": "xxhash", "checksums-sha256": "sha256",

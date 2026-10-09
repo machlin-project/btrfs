@@ -143,6 +143,9 @@ btrfs_fskit_error(enum btrfs_result result)
 	case BTRFS_NOT_PERMITTED:
 		error = EPERM;
 		break;
+	case BTRFS_QUOTA_EXCEEDED:
+		error = EDQUOT;
+		break;
 	case BTRFS_NAME_TOO_LONG:
 		error = ENAMETOOLONG;
 		break;

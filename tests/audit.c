@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../adapters/posix/image.h"
 #include "namespace_audit.h"
+#include "qgroup_audit.h"
 #include "references.h"
 #include <stdio.h>
 
@@ -12,6 +13,7 @@ main(int argc, char **argv)
 {
 	struct reference_audit audit;
 	struct namespace_audit names;
+	struct qgroup_audit qgroups;
 	struct btrfs_image image;
 	struct btrfs_fs *fs;
 	int i;
@@ -50,6 +52,14 @@ main(int argc, char **argv)
 			    argv[i], names.trees, names.dead_trees, names.inodes, names.names,
 			    names.extended_names, names.subvolume_entries, names.subvolume_refs,
 			    names.collisions, names.xattrs, names.orphans, names.hole_items);
+		}
+		if (qgroup_audit(fs, &qgroups) != 0) {
+			fprintf(stderr, "%s: qgroups: %s\n", argv[i], qgroups.failure);
+			failures++;
+		} else if (qgroups.quotas) {
+			printf("%s: %zu qgroups over %zu extents (%zu implied references)%s PASS\n",
+			    argv[i], qgroups.qgroups, qgroups.extents, qgroups.implied,
+			    qgroups.skipped ? ", numbers not checked" : "");
 		}
 		btrfs_unmount(fs);
 		btrfs_image_close(&image);

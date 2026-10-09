@@ -21,6 +21,14 @@ struct bt_mutation_allocator {
 	size_t node_limit;
 };
 
+/* Observes every extent whose references change, as Linux's qgroup extent
+ * records do: the backref layer and extent creation report each one. The
+ * callback records and must not edit trees. */
+struct bt_mutation_observer {
+	void *context;
+	enum btrfs_result (*extent)(void *context, struct bt_key extent);
+};
+
 struct bt_mutated_block {
 	uint64_t address;
 	uint64_t original_address;
@@ -57,6 +65,10 @@ enum btrfs_result bt_mutation_new_root(struct bt_mutation *mutation, struct bt_r
 enum btrfs_result bt_mutation_find(struct bt_mutation *mutation, struct bt_root root,
     struct bt_key key, void *value, size_t capacity, size_t *length);
 const struct btrfs_fs *bt_mutation_view(const struct bt_mutation *mutation);
+void bt_mutation_observe(struct bt_mutation *mutation, const struct bt_mutation_observer *observer);
+/* Reports an extent (EXTENT_ITEM or METADATA_ITEM key) whose references
+ * changed; a failed report poisons the mutation. */
+enum btrfs_result bt_mutation_note_extent(struct bt_mutation *mutation, struct bt_key extent);
 size_t bt_mutation_count(const struct bt_mutation *mutation);
 /* Describes changed node index; its bytes carry their checksum once the
  * mutation is sealed. */

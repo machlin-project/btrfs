@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "namespace.h"
+#include "qgroup.h"
 
 /* Largest single data write issued to the device. */
 #define BT_DATA_WRITE (1024U * 1024U)
@@ -613,6 +614,9 @@ bt_tx_extent_item(struct btrfs_transaction *transaction, const struct bt_owned_r
 		error = bt_tx_edit(
 		    transaction, &transaction->extents.root, key, &wire, sizeof(wire), BT_INSERT);
 	}
+	if (error == BTRFS_OK) {
+		error = bt_mutation_note_extent(transaction->mutation, key);
+	}
 	return error;
 }
 
@@ -1210,6 +1214,13 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	if (!bt_space_data_available(
 		transaction->space, size + 2 * sector - (uint64_t)size % sector)) {
 		return BTRFS_NO_SPACE;
+	}
+	/* btrfs_qgroup_reserve_data: the written sectors count against the
+	 * subvolume's qgroups and every qgroup above them. */
+	error = bt_qgroup_reserve(transaction, id.tree,
+	    (offset + size + sector - 1) / sector * sector - (offset - offset % sector));
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	/* A file that fits its first sector may become one inline extent. */
 	if (final <= sector) {
@@ -1820,6 +1831,14 @@ btrfs_transaction_fallocate(struct btrfs_transaction *transaction, struct btrfs_
 	bt_tx_hold_metadata(transaction);
 	if (!bt_space_data_available(transaction->space, need)) {
 		return BTRFS_NO_SPACE;
+	}
+	/* Allocation and zeroing reserve their sectors as btrfs_fallocate does;
+	 * a punch adds nothing. */
+	if ((mode & BTRFS_FALLOCATE_PUNCH_HOLE) == 0) {
+		error = bt_qgroup_reserve(transaction, id.tree, need);
+		if (error != BTRFS_OK) {
+			return error;
+		}
 	}
 	env = &transaction->base->env;
 	zeros = env->allocate(env->context, (size_t)sector);

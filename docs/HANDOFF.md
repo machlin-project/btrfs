@@ -118,10 +118,12 @@ is destroyed. `accept` is legal only after successful durable publication;
    commit that released space. Admission keeps metadata for the commit, for
    data written afterwards and, as Linux's global reserve, for deletions;
    truncation, eviction and orphan cleanup run in bounded steps.
-   Mixed groups, the block-group tree and a metadata UUID are written, and a
-   v1 space cache is left stale for Linux to rebuild (ARCHITECTURE.md, Format
-   features). Remaining: quotas, which stay rejected until implemented and
-   tested, and fixtures with sectors above 4 KiB.
+   Mixed groups, the block-group tree and a metadata UUID are written, a v1
+   space cache is left stale for Linux to rebuild (ARCHITECTURE.md, Format
+   features), and qgroups are accounted as Linux's full mode accounts them
+   (`core/qgroup.c`, ARCHITECTURE.md, Quotas). Remaining: simple quotas, quota
+   rescans, metadata reservation against qgroup limits, and fixtures with
+   sectors above 4 KiB.
 5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
    orphan items for open inodes, eviction and orphan cleanup, atomic rename
    (replacement, cross-directory, between names of one inode), xattrs and the

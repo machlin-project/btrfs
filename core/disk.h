@@ -122,6 +122,15 @@ struct bt_le64 {
 #define BT_COMPAT_RO_FREE_SPACE_TREE (UINT64_C(1) << 0)
 #define BT_COMPAT_RO_FREE_SPACE_TREE_VALID (UINT64_C(1) << 1)
 #define BT_COMPAT_RO_BLOCK_GROUP_TREE (UINT64_C(1) << 3)
+#define BT_QGROUP_STATUS_VERSION UINT64_C(1)
+#define BT_QGROUP_STATUS_ON (UINT64_C(1) << 0)
+#define BT_QGROUP_STATUS_RESCAN (UINT64_C(1) << 1)
+#define BT_QGROUP_STATUS_INCONSISTENT (UINT64_C(1) << 2)
+#define BT_QGROUP_STATUS_SIMPLE (UINT64_C(1) << 3)
+#define BT_QGROUP_LIMIT_MAX_REFERENCED (UINT64_C(1) << 0)
+#define BT_QGROUP_LIMIT_MAX_EXCLUSIVE (UINT64_C(1) << 1)
+/* A qgroup id: level in the top 16 bits, the subvolume (level 0) below. */
+#define BT_QGROUP_LEVEL_SHIFT 48U
 #define BT_FREE_SPACE_USING_BITMAPS UINT32_C(1)
 #define BT_FREE_SPACE_BITMAP_BYTES 256U
 
@@ -153,6 +162,10 @@ enum bt_item_type {
 	BT_DEV_EXTENT = 204,
 	BT_DEV_ITEM = 216,
 	BT_CHUNK_ITEM = 228,
+	BT_QGROUP_STATUS = 240,
+	BT_QGROUP_INFO = 242,
+	BT_QGROUP_LIMIT = 244,
+	BT_QGROUP_RELATION = 246,
 	BT_UUID_SUBVOL = 251,
 	BT_UUID_RECEIVED_SUBVOL = 252
 };
@@ -297,6 +310,24 @@ struct bt_disk_tree_block_info {
 	uint8_t level;
 };
 
+/* The quota tree's (0, QGROUP_STATUS, 0) item; enable_gen follows only in
+ * newer items and only simple quotas use it. */
+struct bt_disk_qgroup_status {
+	struct bt_le64 version, generation, flags, rescan;
+};
+
+/* (0, QGROUP_INFO, qgroup): the bytes a qgroup references and holds alone. */
+struct bt_disk_qgroup_info {
+	struct bt_le64 generation, referenced, referenced_compressed, exclusive,
+	    exclusive_compressed;
+};
+
+/* (0, QGROUP_LIMIT, qgroup): limits on those numbers. */
+struct bt_disk_qgroup_limit {
+	struct bt_le64 flags, max_referenced, max_exclusive, reserved_referenced,
+	    reserved_exclusive;
+};
+
 struct bt_disk_free_space_info {
 	struct bt_le32 extent_count, flags;
 };
@@ -366,5 +397,8 @@ _Static_assert(sizeof(struct bt_disk_extent_header) == 21, "inline extent layout
 _Static_assert(sizeof(struct bt_disk_extent) == 53, "file extent layout");
 _Static_assert(sizeof(struct bt_disk_data_ref) == 28, "data reference layout");
 _Static_assert(sizeof(struct bt_disk_tree_block_info) == 18, "tree block info layout");
+_Static_assert(sizeof(struct bt_disk_qgroup_status) == 32, "qgroup status layout");
+_Static_assert(sizeof(struct bt_disk_qgroup_info) == 40, "qgroup info layout");
+_Static_assert(sizeof(struct bt_disk_qgroup_limit) == 40, "qgroup limit layout");
 
 #endif

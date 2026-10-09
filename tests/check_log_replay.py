@@ -16,7 +16,7 @@ import struct
 import subprocess
 import tempfile
 
-PROFILES = ("logs", "logs-many")
+PROFILES = ("logs", "logs-many", "logs-quota")
 SUPER_OFFSET = 65536
 SECONDARY_OFFSET = 64 * 1024 * 1024
 SUPER_SIZE = 4096

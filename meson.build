@@ -11,7 +11,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c',
-  'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c')
+  'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -51,11 +51,12 @@ executable('btrfs-fsync-bench', 'tools/fsync_bench.c',
 transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
-  'tests/scenario_random.c', 'tests/scenario_subvolume.c',
-  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
-  link_with: [volume, posix, core], dependencies: [zlib, zstd])
+  'tests/scenario_random.c', 'tests/scenario_subvolume.c', 'tests/scenario_quota.c',
+  'tests/references.c', 'tests/namespace_audit.c', 'tests/qgroup_audit.c',
+  include_directories: inc, link_with: [volume, posix, core], dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
-  'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core], dependencies: [zlib, zstd])
+  'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
 unit = executable('btrfs-unit', 'tests/unit.c', include_directories: inc, link_with: core)
 test('wire-and-api', unit, suite: 'core')
 mutable_test = executable('btrfs-mutable-test', 'tests/mutable.c', include_directories: inc,
@@ -209,6 +210,15 @@ if fixtures != ''
       args: ['--data', join_paths(fixtures, 'transactions-' + profile + '.raw')], timeout: 900,
       suite: 'images')
   endforeach
+  # Quotas: every audited state's qgroup numbers equal an independent count.
+  test('inline-transactions-quota', transaction_test,
+    args: [join_paths(fixtures, 'transactions-quota.raw')], timeout: 300, suite: 'images')
+  test('data-extents-quota', transaction_test,
+    args: ['--data', join_paths(fixtures, 'transactions-quota.raw')], timeout: 900,
+    suite: 'images')
+  test('quota-transactions', transaction_test,
+    args: ['--quota', join_paths(fixtures, 'transactions-quota.raw')], timeout: 600,
+    suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
     suite: 'images')

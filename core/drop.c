@@ -8,6 +8,7 @@
  * file extents of a leaf. Progress is the key of the next child at a level:
  * the root item keeps it between transactions. */
 #include "transaction.h"
+#include "qgroup.h"
 
 #define BT_DROP_REFERENCE 0
 #define BT_DROP_UPDATE_BACKREF 1
@@ -278,7 +279,14 @@ bt_drop_down(struct bt_drop *drop, int *skip)
 		drop->refs[level - 1] = 0;
 		drop->flags[level - 1] = 0;
 		if (drop->stage == BT_DROP_REFERENCE) {
-			error = bt_drop_parent(drop, level, &parent);
+			/* The subtree stays with its other trees: its extents leave this
+			 * tree's qgroup (do_walk_down's btrfs_qgroup_trace_subtree). */
+			error = bt_qgroup_trace_subtree(drop->transaction,
+			    (struct bt_root){
+				address, generation, drop->dead.root.owner, (uint8_t)(level - 1) });
+			if (error == BTRFS_OK) {
+				error = bt_drop_parent(drop, level, &parent);
+			}
 			if (error == BTRFS_OK) {
 				error = bt_drop_block(drop, address, level - 1, parent, 0);
 			}
@@ -567,6 +575,10 @@ bt_drop_tree(struct bt_drop *drop, size_t budget, int *finished)
 		if (error == BTRFS_OK) {
 			error = bt_tx_edit(
 			    transaction, &transaction->roots, orphan, NULL, 0, BT_DELETE);
+		}
+		/* btrfs_qgroup_cleanup_dropped_subvolume: the qgroup goes too. */
+		if (error == BTRFS_OK) {
+			error = bt_qgroup_dropped(transaction, drop->dead.root.owner);
 		}
 	} else {
 		error = bt_tx_edit(transaction, &transaction->roots, drop->dead.key,

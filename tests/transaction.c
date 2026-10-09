@@ -22,6 +22,7 @@ main(int argc, char **argv)
 	int grow = 0;
 	int names = 0;
 	int subvolumes = 0;
+	int quotas = 0;
 	uint32_t random_first = 0;
 	uint32_t random_count = 0;
 	int random_quick = 0;
@@ -54,6 +55,8 @@ main(int argc, char **argv)
 			names = 1;
 		} else if (strcmp(argv[i], "--subvolume") == 0) {
 			subvolumes = 1;
+		} else if (strcmp(argv[i], "--quota") == 0) {
+			quotas = 1;
 		} else if ((strcmp(argv[i], "--random") == 0 ||
 			       strcmp(argv[i], "--random-quick") == 0) &&
 		    i + 2 < argc) {
@@ -124,6 +127,9 @@ main(int argc, char **argv)
 	if (subvolumes) {
 		subvolume_scenarios(context);
 	}
+	if (quotas) {
+		quota_scenarios(context);
+	}
 	if (random_count != 0) {
 		random_scenarios(context, random_first, random_count, random_quick);
 	}
@@ -131,6 +137,10 @@ main(int argc, char **argv)
 	btrfs_image_close(&context->image);
 	free(context->device->writes);
 	free(context->device);
+	if (context->qgroup_audits != 0) {
+		printf("qgroups: %zu audited states agree with the stored qgroup items\n",
+		    context->qgroup_audits);
+	}
 	printf("transactions (%u-byte nodes): %zu crash states, %zu explicit recoveries, %zu "
 	       "transaction views read as published; fault sweeps, stale copies and allocation "
 	       "maps PASS\n",

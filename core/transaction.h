@@ -36,6 +36,8 @@
 #define BT_ACCOUNT_NEW 2U
 #define BT_INODE_NODATASUM_FLAG (UINT64_C(1) << 0)
 
+struct bt_qgroups;
+
 struct bt_owned_root {
 	struct bt_root root;
 	struct bt_key key;
@@ -116,6 +118,9 @@ struct btrfs_transaction {
 	/* Block-group items, when the filesystem keeps them in their own tree. */
 	struct bt_owned_root groups;
 	int has_group_tree;
+	/* The quota tree and its qgroups (core/qgroup.c), when quotas are on. */
+	struct bt_owned_root quota;
+	struct bt_qgroups *qgroups;
 	/* Subvolume UUIDs, when the filesystem has the tree. */
 	struct bt_owned_root uuids;
 	int has_uuids;

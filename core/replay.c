@@ -1473,6 +1473,9 @@ bt_rp_reference(struct bt_replay *rp, struct bt_owned_root *tree,
 		    transaction, &transaction->extents.root, key, &wire, sizeof(wire), BT_INSERT);
 	}
 	if (error == BTRFS_OK) {
+		error = bt_mutation_note_extent(transaction->mutation, key);
+	}
+	if (error == BTRFS_OK) {
 		rp->report->allocated++;
 	}
 	return error;

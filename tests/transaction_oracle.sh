@@ -221,6 +221,23 @@ check_groups() {
         { echo "groups: $chunks chunks, $groups block groups, $system system entries" >&2; return 1; }
 }
 
+# CONSISTENT:QGROUPS: the quota status item (inconsistent or not, stamped with
+# the primary's generation, which Linux requires to keep counting) and the
+# number of qgroup info items; btrfs check verifies the numbers themselves.
+check_quota() {
+    btrfs inspect-internal dump-tree -t quota /dev/vda > /tmp/quota.txt
+    status=$(grep -A1 'key (0 QGROUP_STATUS 0)' /tmp/quota.txt | tail -1)
+    flags=$(echo "$status" | awk '{ print $6 }')
+    test "$(echo "$status" | awk '{ print $4 }')" = "$(primary_generation)" &&
+        case "${1%%:*}" in
+        consistent) test "${flags#*INCONSISTENT}" = "$flags" ;;
+        inconsistent) test "${flags#*INCONSISTENT}" != "$flags" ;;
+        *) false ;;
+        esac &&
+        test "$(grep -c 'item [0-9]* key (0 QGROUP_INFO' /tmp/quota.txt || true)" = "${1#*:}" ||
+        { echo "quota: $status, $(grep -c 'item [0-9]* key (0 QGROUP_INFO' /tmp/quota.txt || true) qgroups" >&2; return 1; }
+}
+
 # A NODATACOW overwrite reaches the disk before its commit: a state of commit
 # $commit resolving to the previous stage may hold, device sector by sector, the
 # old or the new bytes inside the scenario's volatile ranges (volatile.tsv).
@@ -280,6 +297,7 @@ check_namespace() {
         holes) check_holes "$target" "$arg" ;;
         bitmaps) check_bitmaps "$target" "$arg" ;;
         groups) check_groups "$arg" ;;
+        quota) check_quota "$arg" ;;
         *) false ;;
         esac || { echo "Namespace check failed: $kind $path"; exit 1; }
     done < "$1/namespace.tsv"

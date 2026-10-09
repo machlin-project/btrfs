@@ -628,6 +628,42 @@ check_groups(
 	}
 }
 
+/* The quota tree's status item, stamped with the stage's generation, and its
+ * qgroup info items. */
+static void
+check_quota(struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e)
+{
+	const struct bt_disk_qgroup_status *status = NULL;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	uint64_t qgroups = 0;
+	int inconsistent = 0;
+	enum btrfs_result result;
+
+	REQUIRE(bt_find_root(fs, BT_QUOTA_TREE, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, (struct bt_key){ 0 }, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.type == BT_QGROUP_STATUS) {
+			REQUIRE(record.size >= sizeof(*status));
+			status = (const void *)record.data;
+			inconsistent = (bt_u64(status->flags) & BT_QGROUP_STATUS_INCONSISTENT) != 0;
+			REQUIRE(bt_u64(status->generation) == fs->info.generation);
+		}
+		qgroups += record.key.type == BT_QGROUP_INFO;
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	REQUIRE(result == BTRFS_NOT_FOUND && status != NULL);
+	if (inconsistent != (e->links != 0) || qgroups != e->value) {
+		fprintf(stderr, "%s stage %zu: quotas %s with %llu qgroups\n", plan->name, stage,
+		    inconsistent ? "inconsistent" : "consistent", (unsigned long long)qgroups);
+		exit(1);
+	}
+}
+
 static void
 check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, size_t crash_commit,
     const struct expectation *e)
@@ -747,6 +783,9 @@ check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, si
 		return;
 	case EXPECT_GROUPS:
 		check_groups(fs, plan, stage, e);
+		return;
+	case EXPECT_QUOTA:
+		check_quota(fs, plan, stage, e);
 		return;
 	default:
 		REQUIRE(0);
@@ -1653,6 +1692,15 @@ plan_volatile(struct plan *plan, size_t commit, const char *path, uint64_t offse
 	REQUIRE(range->path != NULL);
 	range->offset = offset;
 	range->length = length;
+}
+
+void
+expect_quota(struct plan *plan, size_t first, size_t last, int inconsistent, uint64_t qgroups)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_QUOTA, "/");
+
+	e->value = qgroups;
+	e->links = inconsistent != 0;
 }
 
 void

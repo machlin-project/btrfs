@@ -55,6 +55,8 @@ btrfs_xnu_error(enum btrfs_result result)
 		return ENAMETOOLONG;
 	case BTRFS_NOT_PERMITTED:
 		return EPERM;
+	case BTRFS_QUOTA_EXCEEDED:
+		return EDQUOT;
 	default:
 		return EIO;
 	}

@@ -37,7 +37,9 @@ enum btrfs_result {
 	BTRFS_CROSS_TREE,
 	BTRFS_TOO_MANY_LINKS,
 	BTRFS_NAME_TOO_LONG,
-	BTRFS_NOT_PERMITTED
+	BTRFS_NOT_PERMITTED,
+	/* A qgroup limit would be exceeded (EDQUOT). */
+	BTRFS_QUOTA_EXCEEDED
 };
 
 enum btrfs_compression {

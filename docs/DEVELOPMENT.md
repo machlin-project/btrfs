@@ -330,7 +330,8 @@ sides, so no input file is shipped.
 
 `tests/prepare_log_linux.py` builds payloads in three phases. `create` formats
 `/dev/vda` (the `logs` profile: 16 KiB nodes, DUP metadata; `logs-many`: 4 KiB
-nodes, single metadata), mounts with `commit=3600`, commits a base with `sync`,
+nodes, single metadata; `logs-quota`: `logs` with quotas enabled before the base
+and rescanned after it), mounts with `commit=3600`, commits a base with `sync`,
 then makes fsync durable: a new file, an append, an overwrite, a truncation, a
 rename, an unlink with its directory fsynced, a new hard link, an xattr set and
 removed, a removed hard link, ten removed directory entries, a preallocation,
@@ -342,7 +343,7 @@ requires the log, lets Linux replay it by mounting a disposable copy, and prints
 the manifest (every path with its number, mode, owner, links, size, content
 hash, regular files' mtime and xattrs). `verify` requires no pending log, runs
 `btrfs check --readonly`, prints the same manifest, writes a file and checks
-again. From the absolute lab directory, with `p` set to `logs` or `logs-many`
+again. From the absolute lab directory, with `p` set to `logs`, `logs-many` or `logs-quota`
 and `S` a private scratch directory:
 
 ```sh
@@ -565,6 +566,7 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 | `holes-*` (`--holes`) | Without NO_HOLES and on DUP data: truncation and writes past EOF covered by hole items, a write splitting a hole, truncation inside a hole, an inline file written far beyond its sector, Linux's split hole items and a file grown by truncation alone, a write into a 16 GiB hole item, and writes in place into Linux's preallocated file and a new NODATACOW file on both copies |
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes; compression on write by property (128 KiB zlib extents, incompressible data, compressed and plain inline files, an overwrite splitting a compressed extent, truncation) and by the zstd mount option (ZSTD feature, `no` property, NODATASUM); `release-*`: a file rewritten as 128 extents shrinks by one release step, committed as an exact prefix whose size the committed state decides within its bounds, then completes, and its unlink leaves an orphan that the next commit's cleanup finishes |
 | `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); names beyond a full INODE_REF item in new INODE_EXTREF items, a colliding one and one Linux wrote, unlinked from packed and last entries, renamed into and out of the INODE_REF item and across directories, and an INODE_EXTREF item filled to the largest item; unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item; zstd by an inherited property; writes in place into Linux's preallocated file (item split) and into an unshared NODATACOW extent, copied on write once a snapshot shares it or another reference exists; 200 one-sector files of which every other one is removed, converting their block group to bitmaps (`fst-bitmaps`); O_TMPFILE files inheriting COMPRESS, linked in or left as orphans for cleanup, with both linking refusals; RENAME_EXCHANGE of files across directories and of a file with two names and a directory, a no-op between two names of one inode and a directory refused below itself; RENAME_WHITEOUT leaving 0:0 whiteouts, also over a replaced target; inode flags as `chattr` sets them on a file, a directory and a symlink, NOCOW on an empty and a written file, COMPR and NOCOMP with their property, and an immutable file refusing a write until its flag goes, with four refusals (`fsflags`) |
+| `quota-*` (`--quota`, on `transactions-quota`) | A new subvolume's qgroup, deleted and dropped with it; a snapshot into the top level and one inside its own source (each its transaction's first change), then files on both sides; a snapshot of a subvolume in 1/100, which leaves quotas inconsistent as Linux does; a snapshot after another change (UNSUPPORTED) and a preallocation past the referenced limit (QUOTA_EXCEEDED), refused before any change beside a write that fits; two shared snapshots dropped, one leaving 1/100. Every audited state's qgroup numbers equal the independent count of `tests/qgroup_audit.c`, which computes them as `btrfs check` does |
 | `subvolume-*` (`--subvolume`) | Subvolumes at the top level, in a directory and in another subvolume, inheriting the parent subvolume's compression property; writable and read-only snapshots of a subvolume, of the multi-level top level, of a read-only snapshot and of a snapshot, edited on either side; copied subvolume entries as stubs; deletion of subvolumes, snapshots and a stub entry; the cleaner resuming a partial drop across commits, and fully dropping a subvolume whose leaves a snapshot shares and an unshared one with data |
 | `random-N` (`--random FIRST COUNT`, `--random-quick FIRST COUNT`) | Seeded differential sequences: 24 operations in three commits drawn from create of every type, link, unlink, rename (also over files and between names of one inode), xattr set/remove, write, truncation, attribute changes, orphan cleanup and expected refusals under `/fuzz`, over a name pool with real CRC32C collisions, plus RENAME_EXCHANGE and RENAME_WHITEOUT; a separate model predicts each stage's namespace facts |
 
@@ -705,14 +707,19 @@ exported sector runs, then requires Linux to agree with the recorded outcome:
 invariants and the stage's namespace facts for a valid primary (with Linux's
 `stat`, `readlink`, `getfattr`, its own `dump-tree` for inode flags and back
 references, `btrfs subvolume show` for flags and parent UUIDs, and
-`btrfs subvolume list` with and without `-d`; listings use shell globbing, which
-keeps every byte of a name),
-or a failed mount for a torn primary. For each
+`btrfs subvolume list` with and without `-d`, and the quota tree's dump for the
+status flags, its generation and the number of qgroups; listings use shell
+globbing, which keeps every byte of a name),
+or a failed mount for a torn primary. With quotas, `btrfs check` also counts
+every qgroup's referenced and exclusive bytes from the extent tree and fails on
+any difference (a deliberately wrong info item fails it with "Counts for qgroup
+id ... are different"). For each
 recovery case it runs `btrfs rescue super-recover -y`, requires status 2 and the
 same resolved generation and contents, then repeats from the crash state with
 this implementation's recovery writes and requires Linux to find every copy
 valid. After each scenario's cases Linux mounts its newest root read-write
-(cleaning any orphans the scenario left), finishes every subvolume drop this
+(cleaning any orphans the scenario left; with a v1 cache, `space_cache=v1`,
+which rebuilds the cache this implementation left stale), finishes every subvolume drop this
 implementation left (`btrfs subvolume sync`, then no deleted subvolume
 remains), writes, syncs and passes `btrfs check --check-data-csum`, which
 reads every copy of checksummed data, with no orphan item left in the

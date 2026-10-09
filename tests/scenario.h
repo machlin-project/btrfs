@@ -5,6 +5,7 @@
 #include "../adapters/posix/image.h"
 #include "encode.h"
 #include "namespace_audit.h"
+#include "qgroup_audit.h"
 #include "references.h"
 #include "space.h"
 #include "transaction.h"
@@ -277,7 +278,8 @@ enum expectation_kind {
 	EXPECT_EXTENTS,
 	EXPECT_HOLES,
 	EXPECT_BITMAPS,
-	EXPECT_GROUPS
+	EXPECT_GROUPS,
+	EXPECT_QUOTA
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -410,6 +412,8 @@ struct context {
 	size_t states;
 	size_t recoveries;
 	size_t audits;
+	/* States whose qgroup numbers the independent qgroup audit checked. */
+	size_t qgroup_audits;
 	/* Commits whose transaction view read the same as their published view. */
 	size_t reader_digests;
 	struct btrfs_fs *plan_fs;
@@ -535,6 +539,9 @@ void expect_compressed(struct plan *plan, size_t first, size_t last, const char 
 void expect_extents(struct plan *plan, size_t first, size_t last, const char *path,
     uint32_t regular, uint32_t prealloc, uint64_t distinct);
 void expect_holes(struct plan *plan, size_t first, size_t last, const char *path, uint64_t holes);
+/* The quota status (inconsistent or not, stamped with the stage's generation)
+ * and the number of qgroups. */
+void expect_quota(struct plan *plan, size_t first, size_t last, int inconsistent, uint64_t qgroups);
 void expect_bitmaps(struct plan *plan, size_t first, size_t last, const char *path, int bitmaps);
 void expect_groups(
     struct plan *plan, size_t first, size_t last, uint64_t groups, uint32_t system_entries);
@@ -573,6 +580,7 @@ void grow_scenarios(struct context *context);
 struct btrfs_object_id object(struct btrfs_fs *fs, const char *path);
 void namespace_scenarios(struct context *context);
 void subvolume_scenarios(struct context *context);
+void quota_scenarios(struct context *context);
 
 /* Scenario sets. */
 void admission_tests(struct context *context);
