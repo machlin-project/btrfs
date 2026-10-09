@@ -27,6 +27,11 @@
 #define MODE_SET_GID 02000U
 #define MODE_GROUP_EXECUTE 00010U
 #define COMPRESSION_PROPERTY "btrfs.compression"
+/* Live subvolumes the model keeps at most, and the node budget that drops
+ * every deleted one at once. */
+#define MODEL_SUBVOLUMES 8U
+#define MODEL_DROP_BUDGET 4096U
+#define STUB_MODE (BTRFS_MODE_DIRECTORY | 0755U)
 /* The codec FS_IOC_SETFLAGS records without a mount codec. */
 #define COMPRESSION_CODEC "zlib"
 /* The inode flags FS_IOC_SETFLAGS and inheritance decide. */
@@ -70,12 +75,14 @@ enum random_kind {
 	RANDOM_WHITEOUT,
 	RANDOM_FALLOCATE,
 	RANDOM_FSFLAGS,
+	RANDOM_SUBVOLUME,
+	RANDOM_DROP,
 	RANDOM_KINDS
 };
 
 /* Weights of the operation kinds, in random_kind order. */
 static const unsigned random_weights[RANDOM_KINDS] = { 9, 4, 3, 4, 6, 7, 5, 2, 12, 4, 4, 1, 4, 2, 2,
-	3, 3 };
+	3, 3, 2, 1 };
 /* Allocation and zeroing; a punch entirely within a hole leaves the times,
  * which this model, holding bytes and not extents, cannot predict. */
 static const unsigned random_fallocate_modes[] = { 0, BTRFS_FALLOCATE_KEEP_SIZE,
@@ -94,6 +101,14 @@ struct model_inode {
 	uint64_t flags;
 	int property;
 	int flags_seen;
+	/* A subvolume's root directory (read-only for a read-only snapshot, a
+	 * snapshot of source while that lives), or a stub: the empty directory
+	 * a snapshot copies for a subvolume entry. */
+	int subvolume;
+	int read_only;
+	int snapshot;
+	uint32_t source;
+	int stub;
 	int64_t access_seconds;
 	int64_t modify_seconds;
 	uint8_t *data;
@@ -115,6 +130,8 @@ struct model_entry {
 struct model {
 	struct model_inode inodes[MODEL_INODES];
 	struct model_entry entries[MODEL_ENTRIES];
+	/* Deleted subvolumes the cleaner has not dropped. */
+	size_t deleted;
 	uint32_t state;
 	size_t commit;
 	int64_t now;
@@ -228,6 +245,31 @@ model_below_directory(const struct model *model, uint32_t inode, uint32_t ancest
 	}
 }
 
+/* The subvolume holding inode: its own root for a subvolume, MODEL_ROOT for
+ * the top level, which holds RANDOM_BASE. */
+static uint32_t
+model_tree(const struct model *model, uint32_t inode)
+{
+	uint32_t entry;
+
+	for (;;) {
+		if (inode == MODEL_ROOT || model->inodes[inode].subvolume) {
+			return inode;
+		}
+		entry = model_entry_of(model, inode);
+		REQUIRE(entry != MODEL_NONE);
+		inode = model->entries[entry].parent;
+	}
+}
+
+/* Whether inode's tree accepts changes to it: a stub is no inode, and a
+ * read-only snapshot refuses them. */
+static int
+model_writable(const struct model *model, uint32_t inode)
+{
+	return !model->inodes[inode].stub && !model->inodes[model_tree(model, inode)].read_only;
+}
+
 /* An object renamed as a directory earlier in this commit, or inside one,
  * keeps its committed path until the commit ends; later operations of the
  * same commit leave it alone. */
@@ -261,7 +303,7 @@ model_pick_inode(struct model *model, uint32_t type)
 	for (i = 0; i < MODEL_INODES; i++) {
 		if (model->inodes[i].live && !model->inodes[i].orphan &&
 		    (type == 0 || model_type(&model->inodes[i]) == type) &&
-		    model_usable(model, i)) {
+		    model_usable(model, i) && model_writable(model, i)) {
 			candidates[count++] = i;
 		}
 	}
@@ -279,7 +321,9 @@ model_pick_entry(struct model *model, int (*accept)(const struct model *, uint32
 		/* The chosen name's own directory chain decides, not the inode's
 		 * first name. */
 		if (model->entries[i].used && model_usable(model, model->entries[i].parent) &&
+		    model_writable(model, model->entries[i].parent) &&
 		    !model->inodes[model->entries[i].child].frozen &&
+		    !model->inodes[model->entries[i].child].stub &&
 		    (accept == NULL || accept(model, i))) {
 			candidates[count++] = i;
 		}
@@ -403,8 +447,10 @@ accept_removable(const struct model *model, uint32_t entry)
 {
 	const struct model_inode *child = &model->inodes[model->entries[entry].child];
 
-	return model_type(child) != BTRFS_MODE_DIRECTORY ||
-	    model_empty(model, model->entries[entry].child);
+	/* unlink and rmdir leave subvolume entries alone (CROSS_TREE). */
+	return !child->subvolume &&
+	    (model_type(child) != BTRFS_MODE_DIRECTORY ||
+		model_empty(model, model->entries[entry].child));
 }
 
 static int
@@ -421,7 +467,25 @@ accept_full_directory(const struct model *model, uint32_t entry)
 	uint32_t child = model->entries[entry].child;
 
 	return model_type(&model->inodes[child]) == BTRFS_MODE_DIRECTORY &&
-	    !model_empty(model, child);
+	    !model->inodes[child].subvolume && !model_empty(model, child);
+}
+
+static int
+accept_subvolume(const struct model *model, uint32_t entry)
+{
+	return model->inodes[model->entries[entry].child].subvolume;
+}
+
+static int
+accept_read_only(const struct model *model, uint32_t entry)
+{
+	return model->inodes[model->entries[entry].child].read_only;
+}
+
+static int
+accept_inode(const struct model *model, uint32_t entry)
+{
+	return !model->inodes[model->entries[entry].child].subvolume;
 }
 
 static void
@@ -524,8 +588,10 @@ random_link(struct model *model, struct plan *plan)
 	uint32_t directory = model_pick_inode(model, BTRFS_MODE_DIRECTORY);
 	uint32_t name;
 
+	/* A link stays in its subvolume (CROSS_TREE, refused separately). */
 	if (inode == MODEL_NONE || directory == MODEL_NONE ||
-	    model->inodes[inode].links >= MODEL_LINK_LIMIT) {
+	    model->inodes[inode].links >= MODEL_LINK_LIMIT ||
+	    model_tree(model, inode) != model_tree(model, directory)) {
 		return 0;
 	}
 	name = model_free_name(model, directory);
@@ -557,8 +623,10 @@ random_unlink(struct model *model, struct plan *plan)
 		return 0;
 	}
 	child = &model->inodes[model->entries[entry].child];
-	/* An open regular file keeps its last name's inode as an orphan. */
+	/* An open regular file keeps its last name's inode as an orphan; orphan
+	 * cleanup runs on the top level. */
 	open = model_type(child) == BTRFS_MODE_REGULAR && child->links == 1 &&
+	    model_tree(model, model->entries[entry].parent) == MODEL_ROOT &&
 	    model_below(model, 4) == 0;
 	model_entry_path(model, entry, path, sizeof(path));
 	plan_unlink(plan, model->commit, path, open);
@@ -585,6 +653,17 @@ random_exchange(struct model *model, struct plan *plan)
 	}
 	a = model->entries[first].child;
 	b = model->entries[second].child;
+	/* Subvolume entries cross subvolumes, other names do not; a read-only
+	 * subvolume stays in its directory. */
+	if (model_tree(model, model->entries[first].parent) !=
+		model_tree(model, model->entries[second].parent) &&
+	    !(model->inodes[a].subvolume && model->inodes[b].subvolume)) {
+		return 0;
+	}
+	if (model->entries[first].parent != model->entries[second].parent &&
+	    (model->inodes[a].read_only || model->inodes[b].read_only)) {
+		return 0;
+	}
 	directories = model_type(&model->inodes[a]) == BTRFS_MODE_DIRECTORY ||
 	    model_type(&model->inodes[b]) == BTRFS_MODE_DIRECTORY;
 	if ((model_type(&model->inodes[a]) == BTRFS_MODE_DIRECTORY &&
@@ -642,13 +721,23 @@ random_rename(struct model *model, struct plan *plan, int whiteout)
 	if (directory_moved && model_below_directory(model, directory, moved)) {
 		return 0;
 	}
+	/* A subvolume entry may move into another subvolume, other names may
+	 * not; a read-only subvolume stays in its directory. */
+	if (!model->inodes[moved].subvolume &&
+	    model_tree(model, directory) != model_tree(model, old_parent)) {
+		return 0;
+	}
+	if (model->inodes[moved].read_only && directory != old_parent) {
+		return 0;
+	}
 	name = model_below(model, RANDOM_NAMES);
 	existing = model_find(model, directory, name);
 	if (existing != MODEL_NONE) {
 		struct model_inode *replaced = &model->inodes[model->entries[existing].child];
 
 		if (model->entries[existing].child != moved &&
-		    ((model_type(replaced) == BTRFS_MODE_DIRECTORY) != directory_moved ||
+		    (replaced->subvolume ||
+			(model_type(replaced) == BTRFS_MODE_DIRECTORY) != directory_moved ||
 			(directory_moved && !model_empty(model, model->entries[existing].child)) ||
 			!model_usable(model, model->entries[existing].child))) {
 			return 0;
@@ -673,7 +762,8 @@ random_rename(struct model *model, struct plan *plan, int whiteout)
 	}
 	if (existing != MODEL_NONE &&
 	    model_type(&model->inodes[model->entries[existing].child]) == BTRFS_MODE_REGULAR &&
-	    model->inodes[model->entries[existing].child].links == 1) {
+	    model->inodes[model->entries[existing].child].links == 1 &&
+	    model_tree(model, directory) == MODEL_ROOT) {
 		open = model_below(model, 4) == 0;
 	}
 	if (whiteout) {
@@ -1078,6 +1168,315 @@ random_clean(struct model *model, struct plan *plan)
 	return 1;
 }
 
+static size_t
+model_subvolumes(const struct model *model)
+{
+	size_t count = 0;
+	uint32_t i;
+
+	for (i = 0; i < MODEL_INODES; i++) {
+		count += model->inodes[i].live && model->inodes[i].subvolume;
+	}
+	return count;
+}
+
+/* A new subvolume: an empty root directory that inherits no inode flags,
+ * only the compression property of the root directory of the subvolume
+ * holding it (the top level's has none). */
+static int
+random_subvolume(struct model *model, struct plan *plan)
+{
+	char path[RANDOM_PATH];
+	uint32_t directory = model_pick_inode(model, BTRFS_MODE_DIRECTORY);
+	uint32_t parent;
+	uint32_t inode;
+	uint32_t name;
+
+	if (directory == MODEL_NONE || model_subvolumes(model) >= MODEL_SUBVOLUMES) {
+		return 0;
+	}
+	name = model_free_name(model, directory);
+	if (name == MODEL_NONE) {
+		return 0;
+	}
+	model_path(model, directory, path, sizeof(path));
+	if (strlen(path) > RANDOM_PATH / 2) {
+		return 0;
+	}
+	strcat(path, "/");
+	strcat(path, random_names[name]);
+	plan_subvolume(plan, model->commit, path);
+	parent = model_tree(model, directory);
+	inode = model_new_inode(model, BTRFS_MODE_DIRECTORY | 0755);
+	model->inodes[inode].subvolume = 1;
+	model->inodes[inode].source = MODEL_NONE;
+	if (parent != MODEL_ROOT && model->inodes[parent].property) {
+		model->inodes[inode].flags = BT_INODE_COMPRESS;
+		model->inodes[inode].property = 1;
+		model->inodes[inode].flags_seen = 1;
+	}
+	model_add_entry(model, directory, name, inode);
+	return 1;
+}
+
+static void
+model_link_entry(struct model *model, uint32_t directory, uint32_t name, uint32_t child)
+{
+	uint32_t i;
+
+	for (i = 0; i < MODEL_ENTRIES && model->entries[i].used; i++) {
+	}
+	REQUIRE(i < MODEL_ENTRIES);
+	model->entries[i] = (struct model_entry){ 1, directory, child, name };
+}
+
+/* The stub a snapshot copies for a subvolume entry. */
+static uint32_t
+model_new_stub(struct model *model)
+{
+	uint32_t stub = model_new_inode(model, STUB_MODE);
+
+	model->inodes[stub].stub = 1;
+	model->inodes[stub].uid = 0;
+	model->inodes[stub].gid = 0;
+	return stub;
+}
+
+/* Copies inode and, for a directory, everything below it in its subvolume,
+ * as a snapshot shares them: a subvolume entry or a stub becomes a stub, and
+ * names of one inode stay one inode (copies maps originals to copies). */
+static uint32_t
+model_copy(struct model *model, uint32_t inode, uint32_t *copies)
+{
+	uint32_t copy;
+	uint32_t child;
+	uint32_t i;
+
+	if (copies[inode] != MODEL_NONE) {
+		return copies[inode];
+	}
+	copy = model_new_inode(model, model->inodes[inode].mode);
+	model->inodes[copy] = model->inodes[inode];
+	model->inodes[copy].data = NULL;
+	if (model->inodes[inode].size != 0 &&
+	    model_type(&model->inodes[inode]) == BTRFS_MODE_REGULAR) {
+		model->inodes[copy].data = malloc(model->inodes[inode].size + 1);
+		REQUIRE(model->inodes[copy].data != NULL);
+		memcpy(
+		    model->inodes[copy].data, model->inodes[inode].data, model->inodes[inode].size);
+	}
+	copies[inode] = copy;
+	if (model_type(&model->inodes[inode]) != BTRFS_MODE_DIRECTORY) {
+		return copy;
+	}
+	for (i = 0; i < MODEL_ENTRIES; i++) {
+		if (!model->entries[i].used || model->entries[i].parent != inode) {
+			continue;
+		}
+		child = model->entries[i].child;
+		if (model->inodes[child].subvolume || model->inodes[child].stub) {
+			child = model_new_stub(model);
+		} else {
+			child = model_copy(model, child, copies);
+		}
+		model_link_entry(model, copy, model->entries[i].name, child);
+	}
+	return copy;
+}
+
+/* Inodes and entries in inode's subtree within its subvolume. */
+static uint32_t
+model_count(const struct model *model, uint32_t inode)
+{
+	uint32_t count = 1;
+	uint32_t child;
+	uint32_t i;
+
+	for (i = 0; i < MODEL_ENTRIES; i++) {
+		if (model->entries[i].used && model->entries[i].parent == inode) {
+			child = model->entries[i].child;
+			count += model->inodes[child].subvolume || model->inodes[child].stub
+			    ? 1
+			    : model_count(model, child);
+		}
+	}
+	return count;
+}
+
+static uint32_t
+model_free_inodes(const struct model *model)
+{
+	uint32_t count = 0;
+	uint32_t i;
+
+	for (i = 1; i < MODEL_INODES; i++) {
+		count += !model->inodes[i].live;
+	}
+	return count;
+}
+
+static uint32_t
+model_free_entries(const struct model *model)
+{
+	uint32_t count = 0;
+	uint32_t i;
+
+	for (i = 0; i < MODEL_ENTRIES; i++) {
+		count += !model->entries[i].used;
+	}
+	return count;
+}
+
+/* A snapshot, writable or read-only, of a subvolume the transaction has not
+ * changed yet (its first operation): the copy is taken before its entry is
+ * added, even inside its source. Paths inside the copy are named from the
+ * next commit on. */
+static int
+random_snapshot(struct model *model, struct plan *plan)
+{
+	uint32_t copies[MODEL_INODES];
+	uint32_t candidates[MODEL_INODES];
+	char source[RANDOM_PATH];
+	char target[RANDOM_PATH];
+	uint32_t count = 0;
+	uint32_t original;
+	uint32_t directory;
+	uint32_t name;
+	uint32_t copy;
+	uint32_t i;
+	int read_only;
+
+	for (i = 0; i < MODEL_INODES; i++) {
+		if (model->inodes[i].live && model->inodes[i].subvolume && model_usable(model, i)) {
+			candidates[count++] = i;
+		}
+	}
+	directory = model_pick_inode(model, BTRFS_MODE_DIRECTORY);
+	if (count == 0 || directory == MODEL_NONE || model_subvolumes(model) >= MODEL_SUBVOLUMES) {
+		return 0;
+	}
+	original = candidates[model_below(model, count)];
+	count = model_count(model, original);
+	name = model_free_name(model, directory);
+	if (name == MODEL_NONE || count + 1 > model_free_inodes(model) ||
+	    count + 1 > model_free_entries(model)) {
+		return 0;
+	}
+	model_path(model, original, source, sizeof(source));
+	model_path(model, directory, target, sizeof(target));
+	if (strlen(target) > RANDOM_PATH / 4) {
+		return 0;
+	}
+	strcat(target, "/");
+	strcat(target, random_names[name]);
+	read_only = model_below(model, 3) == 0;
+	plan_snapshot(plan, model->commit, source, target, read_only);
+	for (i = 0; i < MODEL_INODES; i++) {
+		copies[i] = MODEL_NONE;
+	}
+	copy = model_copy(model, original, copies);
+	model->inodes[copy].read_only = read_only;
+	model->inodes[copy].snapshot = 1;
+	model->inodes[copy].source = original;
+	model->inodes[copy].frozen = 1;
+	model_add_entry(model, directory, name, copy);
+	return 1;
+}
+
+/* Deletes inode and everything below it in its subvolume. */
+static void
+model_delete_tree(struct model *model, uint32_t inode)
+{
+	uint32_t i;
+
+	for (i = 0; i < MODEL_ENTRIES; i++) {
+		if (model->entries[i].used && model->entries[i].parent == inode) {
+			model->entries[i].used = 0;
+			if (model->inodes[model->entries[i].child].live) {
+				model_delete_tree(model, model->entries[i].child);
+			}
+		}
+	}
+	for (i = 0; i < MODEL_INODES; i++) {
+		if (model->inodes[i].source == inode && model->inodes[i].snapshot) {
+			model->inodes[i].source = MODEL_NONE;
+		}
+	}
+	model_delete_inode(model, inode);
+}
+
+/* Whether a subvolume holds another subvolume's entry. */
+static int
+model_holds_subvolume(const struct model *model, uint32_t inode)
+{
+	uint32_t child;
+	uint32_t i;
+
+	for (i = 0; i < MODEL_ENTRIES; i++) {
+		if (model->entries[i].used && model->entries[i].parent == inode) {
+			child = model->entries[i].child;
+			if (model->inodes[child].subvolume ||
+			    (!model->inodes[child].stub &&
+				model_type(&model->inodes[child]) == BTRFS_MODE_DIRECTORY &&
+				model_holds_subvolume(model, child))) {
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+/* Deletes a subvolume the transaction has not opened yet (its first
+ * operation), or a stub alone; one holding a subvolume is NOT_EMPTY. */
+static int
+random_delete_subvolume(struct model *model, struct plan *plan)
+{
+	uint32_t candidates[MODEL_ENTRIES];
+	char path[RANDOM_PATH];
+	uint32_t count = 0;
+	uint32_t entry;
+	uint32_t child;
+	uint32_t i;
+
+	for (i = 0; i < MODEL_ENTRIES; i++) {
+		child = model->entries[i].child;
+		if (model->entries[i].used &&
+		    (model->inodes[child].subvolume || model->inodes[child].stub) &&
+		    model_usable(model, model->entries[i].parent) &&
+		    model_writable(model, model->entries[i].parent)) {
+			candidates[count++] = i;
+		}
+	}
+	if (count == 0) {
+		return 0;
+	}
+	entry = candidates[model_below(model, count)];
+	child = model->entries[entry].child;
+	model_entry_path(model, entry, path, sizeof(path));
+	plan_delete_subvolume(plan, model->commit, path);
+	if (model->inodes[child].subvolume && model_holds_subvolume(model, child)) {
+		plan_expect_refusal(plan, model->commit, BTRFS_NOT_EMPTY);
+		return 1;
+	}
+	model->entries[entry].used = 0;
+	model->inodes[model->entries[entry].parent].modify_seconds = model->now;
+	model->deleted += model->inodes[child].subvolume;
+	model_delete_tree(model, child);
+	return 1;
+}
+
+/* The cleaner drops every deleted subvolume. */
+static int
+random_drop(struct model *model, struct plan *plan)
+{
+	if (model->deleted == 0) {
+		return 0;
+	}
+	plan_clean_subvolumes(plan, model->commit, MODEL_DROP_BUDGET, model->deleted, 0);
+	model->deleted = 0;
+	return 1;
+}
+
 /* Operations the writer must refuse before any change. */
 static int
 random_refusal(struct model *model, struct plan *plan)
@@ -1088,7 +1487,7 @@ random_refusal(struct model *model, struct plan *plan)
 	uint32_t directory;
 	uint32_t inode;
 
-	switch (model_below(model, 5)) {
+	switch (model_below(model, 10)) {
 	case 0:
 		entry = model_pick_entry(model, accept_any);
 		if (entry == MODEL_NONE) {
@@ -1132,7 +1531,7 @@ random_refusal(struct model *model, struct plan *plan)
 		plan_link(plan, model->commit, source, target);
 		plan_expect_refusal(plan, model->commit, BTRFS_IS_DIRECTORY);
 		return 1;
-	default:
+	case 4:
 		directory = model_pick_inode(model, BTRFS_MODE_DIRECTORY);
 		if (directory == MODEL_NONE) {
 			return 0;
@@ -1141,6 +1540,87 @@ random_refusal(struct model *model, struct plan *plan)
 		strcat(source, "/missing");
 		plan_unlink(plan, model->commit, source, 0);
 		plan_expect_refusal(plan, model->commit, BTRFS_NOT_FOUND);
+		return 1;
+	case 5:
+		/* unlink and rmdir leave subvolume entries alone. */
+		entry = model_pick_entry(model, accept_subvolume);
+		if (entry == MODEL_NONE) {
+			return 0;
+		}
+		model_entry_path(model, entry, source, sizeof(source));
+		plan_unlink(plan, model->commit, source, 0);
+		plan_expect_refusal(plan, model->commit, BTRFS_CROSS_TREE);
+		return 1;
+	case 6:
+		/* Other names stay in their subvolume; the VFS refuses a
+		 * directory below itself first. */
+		entry = model_pick_entry(model, accept_inode);
+		directory = model_pick_inode(model, BTRFS_MODE_DIRECTORY);
+		if (entry == MODEL_NONE || directory == MODEL_NONE ||
+		    model_tree(model, directory) ==
+			model_tree(model, model->entries[entry].parent)) {
+			return 0;
+		}
+		inode = model->entries[entry].child;
+		model_entry_path(model, entry, source, sizeof(source));
+		model_path(model, directory, target, sizeof(target));
+		strcat(target, "/moved");
+		plan_rename(plan, model->commit, source, target, 0);
+		plan_expect_refusal(plan, model->commit,
+		    model_type(&model->inodes[inode]) == BTRFS_MODE_DIRECTORY &&
+			    model_below_directory(model, directory, inode)
+			? BTRFS_INVALID_ARGUMENT
+			: BTRFS_CROSS_TREE);
+		return 1;
+	case 7:
+		/* A read-only snapshot takes no names. */
+		for (inode = 0; inode < MODEL_INODES; inode++) {
+			if (model->inodes[inode].live && model->inodes[inode].read_only &&
+			    model_usable(model, inode)) {
+				break;
+			}
+		}
+		if (inode == MODEL_INODES) {
+			return 0;
+		}
+		model_path(model, inode, source, sizeof(source));
+		strcat(source, "/inside");
+		plan_create(plan, model->commit, source, BTRFS_MODE_REGULAR | 0644, NULL);
+		plan_expect_refusal(plan, model->commit, BTRFS_READ_ONLY);
+		return 1;
+	case 8:
+		/* A read-only subvolume stays in its directory. */
+		entry = model_pick_entry(model, accept_read_only);
+		directory = model_pick_inode(model, BTRFS_MODE_DIRECTORY);
+		if (entry == MODEL_NONE || directory == MODEL_NONE ||
+		    directory == model->entries[entry].parent ||
+		    model_below_directory(model, directory, model->entries[entry].child)) {
+			return 0;
+		}
+		model_entry_path(model, entry, source, sizeof(source));
+		model_path(model, directory, target, sizeof(target));
+		strcat(target, "/moved");
+		plan_rename(plan, model->commit, source, target, 0);
+		plan_expect_refusal(plan, model->commit, BTRFS_READ_ONLY);
+		return 1;
+	default:
+		/* A stub does not move. */
+		for (entry = 0; entry < MODEL_ENTRIES; entry++) {
+			if (model->entries[entry].used &&
+			    model->inodes[model->entries[entry].child].stub &&
+			    model_usable(model, model->entries[entry].parent) &&
+			    model_writable(model, model->entries[entry].parent)) {
+				break;
+			}
+		}
+		if (entry == MODEL_ENTRIES) {
+			return 0;
+		}
+		model_entry_path(model, entry, source, sizeof(source));
+		model_path(model, model->entries[entry].parent, target, sizeof(target));
+		strcat(target, "/moved");
+		plan_rename(plan, model->commit, source, target, 0);
+		plan_expect_refusal(plan, model->commit, BTRFS_NOT_EMPTY);
 		return 1;
 	}
 }
@@ -1180,6 +1660,10 @@ random_operation(struct model *model, struct plan *plan, enum random_kind kind)
 		return random_attributes(model, plan);
 	case RANDOM_FSFLAGS:
 		return random_fsflags(model, plan);
+	case RANDOM_SUBVOLUME:
+		return random_subvolume(model, plan);
+	case RANDOM_DROP:
+		return random_drop(model, plan);
 	case RANDOM_CLEAN:
 		return random_clean(model, plan);
 	case RANDOM_REFUSAL:
@@ -1231,6 +1715,19 @@ model_expect(const struct model *model, struct plan *plan, size_t stage)
 			continue;
 		}
 		model_path(model, i, path, sizeof(path));
+		if (inode->stub) {
+			/* Linux makes a stub's times when it looks one up. */
+			expect_owner(plan, stage, stage, path, STUB_MODE, 0, 0, 1);
+			expect_names(plan, stage, stage, path, NULL, 0);
+			continue;
+		}
+		if (inode->subvolume && (!inode->snapshot || inode->source != MODEL_NONE)) {
+			if (inode->snapshot) {
+				model_path(model, inode->source, other, sizeof(other));
+			}
+			expect_subvolume(plan, stage, stage, path, inode->snapshot ? other : NULL,
+			    inode->read_only);
+		}
 		expect_owner(
 		    plan, stage, stage, path, inode->mode, inode->uid, inode->gid, inode->links);
 		expect_times(
@@ -1321,6 +1818,18 @@ random_plan(struct context *context, uint32_t seed, int quick)
 		}
 		for (i = 0; i < MODEL_INODES; i++) {
 			model->inodes[i].frozen = 0;
+		}
+		/* Snapshots and deletions open trees the transaction has not
+		 * changed or opened: the commit's first operation. */
+		switch (model_below(model, 4)) {
+		case 0:
+			(void)random_snapshot(model, &plan);
+			break;
+		case 1:
+			(void)random_delete_subvolume(model, &plan);
+			break;
+		default:
+			break;
 		}
 		for (done = attempts = 0;
 		    done < RANDOM_OPERATIONS && attempts < 16 * RANDOM_OPERATIONS; attempts++) {
