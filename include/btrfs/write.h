@@ -172,6 +172,21 @@ enum btrfs_result btrfs_transaction_write(struct btrfs_transaction *transaction,
 enum btrfs_result btrfs_transaction_truncate(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, uint64_t size, struct btrfs_time modified, size_t budget, int *done);
 
+/* FS_IOC_SETFLAGS as Linux's btrfs_fileattr_set: flags (BTRFS_FS_*_FL)
+ * replace the inode's synchronous, immutable, append-only, no-dump, no-atime
+ * and directory-sync flags. NOCOW sets NODATACOW (with NODATASUM on a
+ * regular file) only on directories and empty regular files, and clears them
+ * under the same rule. COMPR sets COMPRESS and the btrfs.compression property
+ * to the mount's codec (zlib without one); NOCOMP sets NOCOMPRESS; without
+ * either both flags and the property go. Flags another type cannot carry are
+ * dropped, as Linux masks them. Unknown flags are UNSUPPORTED; COMPR with
+ * NOCOMP or NOCOW, or NOCOW against compression flags, INVALID_ARGUMENT.
+ * Changing IMMUTABLE or APPEND needs Linux's CAP_LINUX_IMMUTABLE and any
+ * change the owner or a privileged caller: both are the caller's decision.
+ * The change time and version change; immutable inodes accept the call. */
+enum btrfs_result btrfs_transaction_set_fsflags(struct btrfs_transaction *transaction,
+    struct btrfs_object_id id, unsigned flags, struct btrfs_time time);
+
 /* Linux's fallocate modes (FALLOC_FL_*), with Linux's values. */
 #define BTRFS_FALLOCATE_KEEP_SIZE 0x01U
 #define BTRFS_FALLOCATE_PUNCH_HOLE 0x02U

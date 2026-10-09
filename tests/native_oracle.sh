@@ -67,6 +67,13 @@ while IFS="$(printf '\t')" read -r kind path a b c d e; do
     xattr) test "$(getfattr --only-values -n "$a" "$target")" = "$b" ;;
     mtime) test "$(stat -c '%Y' "$target")" = "$a" ;;
     absent) test ! -e "$target" && test ! -L "$target" ;;
+    # MASK VALUE: the flags of the top-level tree's inode item.
+    flags) inode=$(stat -c '%i' "$target") &&
+        value=$(btrfs inspect-internal dump-tree -t 5 /dev/vda |
+            awk -v key="key ($inode INODE_ITEM 0)" '
+            index($0, key) && index($0, "itemoff") { found = 1 }
+            found && match($0, /flags 0x[0-9a-f]+/) { print substr($0, RSTART + 6, RLENGTH - 6); exit }') &&
+        test -n "$value" && test $((value & a)) -eq $((b)) ;;
     *) false ;;
     esac || { echo "Native check failed: $kind $path"; exit 1; }
     checks=$((checks + 1))

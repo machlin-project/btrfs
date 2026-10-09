@@ -332,6 +332,9 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 	struct btrfs_inode inode;
 	struct btrfs_object_id identity;
 	uint64_t size = newAttributes.size;
+	unsigned fsflags = 0;
+	BOOL flagsChanged = NO;
+	BOOL locking;
 	BOOL truncate;
 	__block int done = 1;
 	enum btrfs_result error = _writable ? BTRFS_OK : BTRFS_READ_ONLY;
@@ -353,11 +356,21 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 	inode = owned->inode;
 	[_itemLock unlock];
 	identity = inode.id;
-	/* Inode flags have no Darwin mapping beyond their current value. */
-	if ((supplied & FSItemAttributeFlags) != 0 &&
-	    newAttributes.flags != btrfs_fskit_flags(inode.flags)) {
-		reply(nil, btrfs_fskit_error(BTRFS_UNSUPPORTED));
-		return;
+	/* chflags: schg, sappnd and nodump are Linux's immutable, append-only and
+	 * no-dump attributes, which the kernel authorized changing; other Darwin
+	 * flags have no Btrfs attribute. */
+	if ((supplied & FSItemAttributeFlags) != 0) {
+		if ((newAttributes.flags & ~(uint32_t)(SF_IMMUTABLE | SF_APPEND | UF_NODUMP)) !=
+		    0) {
+			reply(nil, btrfs_fskit_error(BTRFS_UNSUPPORTED));
+			return;
+		}
+		fsflags = btrfs_inode_fsflags(&inode) &
+		    ~(BTRFS_FS_IMMUTABLE_FL | BTRFS_FS_APPEND_FL | BTRFS_FS_NODUMP_FL);
+		fsflags |= (newAttributes.flags & SF_IMMUTABLE) != 0 ? BTRFS_FS_IMMUTABLE_FL : 0;
+		fsflags |= (newAttributes.flags & SF_APPEND) != 0 ? BTRFS_FS_APPEND_FL : 0;
+		fsflags |= (newAttributes.flags & UF_NODUMP) != 0 ? BTRFS_FS_NODUMP_FL : 0;
+		flagsChanged = newAttributes.flags != btrfs_fskit_flags(inode.flags);
 	}
 	handled |= supplied & FSItemAttributeFlags;
 	/* FSKit ignores a size for anything but a regular file. */
@@ -397,22 +410,35 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 		changes.mask |= BTRFS_ATTRIBUTE_MODIFY_TIME;
 		changes.modify_time = btrfs_fskit_time(newAttributes.modifyTime);
 	}
-	if (truncate || changes.mask != 0 || (supplied & FSItemAttributeChangeTime) != 0) {
+	/* Flags that lock the inode come last, flags that unlock it first. */
+	locking = (fsflags & (BTRFS_FS_IMMUTABLE_FL | BTRFS_FS_APPEND_FL)) != 0;
+	if (truncate || flagsChanged || changes.mask != 0 ||
+	    (supplied & FSItemAttributeChangeTime) != 0) {
 		enum btrfs_result (^change)(struct btrfs_transaction *) =
 		    ^enum btrfs_result(struct btrfs_transaction *transaction) {
 			    enum btrfs_result result = BTRFS_OK;
 
-			    if (truncate){ result = btrfs_transaction_drop_privileges(
-					       transaction, identity, changes.time); }
+			    if (flagsChanged && !locking){
+				result = btrfs_transaction_set_fsflags(
+				    transaction, identity, fsflags, changes.time); }
 
 		if (result == BTRFS_OK && truncate)
 		{
+			result =
+			    btrfs_transaction_drop_privileges(transaction, identity, changes.time);
+		}
+
+		if (result == BTRFS_OK && truncate) {
 			result = btrfs_transaction_truncate(transaction, identity, size,
 			    changes.time, BTRFS_RELEASE_STEP_NODES, &done);
 		}
 		if (result == BTRFS_OK &&
 		    (changes.mask != 0 || (supplied & FSItemAttributeChangeTime) != 0)) {
 			result = btrfs_transaction_set_attributes(transaction, identity, &changes);
+		}
+		if (result == BTRFS_OK && flagsChanged && locking) {
+			result = btrfs_transaction_set_fsflags(
+			    transaction, identity, fsflags, changes.time);
 		}
 		return result;
 	};

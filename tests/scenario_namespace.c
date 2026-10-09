@@ -1747,6 +1747,76 @@ namespace_fst_bitmaps_plan(struct context *context)
 	run_plan(context, &plan);
 }
 
+/* chattr as Linux's btrfs_fileattr_set: attribute flags replace the inode's;
+ * NOCOW reaches only empty files; COMPR sets the property to the mount's
+ * codec (zlib here) and anything else removes it; an immutable file refuses a
+ * write until its flag goes, which it accepts; types mask what they cannot
+ * carry. */
+static void
+namespace_fsflags_plan(struct context *context)
+{
+	static uint8_t data[NAMESPACE_DATA_BYTES];
+	const uint64_t codec_flags = BT_INODE_COMPRESS | BT_INODE_NOCOMPRESS;
+	const uint64_t directory_flags =
+	    BT_INODE_DIRSYNC | BT_INODE_NOATIME | BT_INODE_SYNC | BT_INODE_APPEND;
+	struct plan plan;
+
+	fill_pattern(data, sizeof(data), 71);
+	namespace_plan(context, &plan, "namespace-fsflags");
+	plan_create(&plan, 1, "/ns/flags", BTRFS_MODE_DIRECTORY | 0755, NULL);
+	plan_create(&plan, 1, "/ns/flags/immutable", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/ns/flags/immutable", 0, data, 3000);
+	plan_create(&plan, 1, "/ns/flags/empty", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_create(&plan, 1, "/ns/flags/full", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/ns/flags/full", 0, data, 5000);
+	plan_create(&plan, 1, "/ns/flags/dir", BTRFS_MODE_DIRECTORY | 0755, NULL);
+	plan_create(&plan, 1, "/ns/flags/link", BTRFS_MODE_SYMLINK | 0777, "full");
+	plan_set_fsflags(
+	    &plan, 1, "/ns/flags/immutable", BTRFS_FS_IMMUTABLE_FL | BTRFS_FS_NODUMP_FL);
+	plan_set_fsflags(&plan, 1, "/ns/flags/empty", BTRFS_FS_NOCOW_FL);
+	plan_set_fsflags(&plan, 1, "/ns/flags/full", BTRFS_FS_NOCOW_FL);
+	plan_set_fsflags(&plan, 1, "/ns/flags/dir",
+	    BTRFS_FS_DIRSYNC_FL | BTRFS_FS_NOATIME_FL | BTRFS_FS_SYNC_FL | BTRFS_FS_APPEND_FL);
+	plan_set_fsflags(&plan, 1, "/ns/flags/link", BTRFS_FS_NODUMP_FL | BTRFS_FS_IMMUTABLE_FL);
+	plan_set_fsflags(&plan, 1, "/ns/zstd", BTRFS_FS_NOATIME_FL);
+	plan_set_fsflags(&plan, 1, "/ns/tree", BTRFS_FS_COMPR_FL);
+	plan_set_fsflags(&plan, 1, "/ns/nocompress", BTRFS_FS_NOCOMP_FL);
+	/* Refusals change nothing: an unknown flag, both compression flags, and
+	 * compression against NOCOW. */
+	plan_set_fsflags(&plan, 1, "/ns/flags/full", 0x00000001U);
+	plan_expect_refusal(&plan, 1, BTRFS_UNSUPPORTED);
+	plan_set_fsflags(&plan, 1, "/ns/flags/full", BTRFS_FS_COMPR_FL | BTRFS_FS_NOCOMP_FL);
+	plan_expect_refusal(&plan, 1, BTRFS_INVALID_ARGUMENT);
+	plan_set_fsflags(&plan, 1, "/ns/flags/empty", BTRFS_FS_COMPR_FL);
+	plan_expect_refusal(&plan, 1, BTRFS_INVALID_ARGUMENT);
+	plan_write_new(&plan, 2, "/ns/flags/immutable", 0, data + 3000, 100);
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_PERMITTED);
+	plan_set_fsflags(&plan, 2, "/ns/flags/immutable", 0);
+	plan_write_new(&plan, 2, "/ns/flags/immutable", 3000, data + 3000, 100);
+
+	expect_flags(&plan, 1, 1, "/ns/flags/immutable", BT_INODE_IMMUTABLE | BT_INODE_NODUMP,
+	    BT_INODE_IMMUTABLE | BT_INODE_NODUMP);
+	expect_file(&plan, 1, 1, "/ns/flags/immutable", data, 3000);
+	expect_flags(
+	    &plan, 2, LAST_STAGE, "/ns/flags/immutable", BT_INODE_IMMUTABLE | BT_INODE_NODUMP, 0);
+	expect_file(&plan, 2, LAST_STAGE, "/ns/flags/immutable", data, 3100);
+	expect_flags(&plan, 1, LAST_STAGE, "/ns/flags/empty",
+	    BT_INODE_NODATACOW | BT_INODE_NODATASUM, BT_INODE_NODATACOW | BT_INODE_NODATASUM);
+	expect_flags(&plan, 1, LAST_STAGE, "/ns/flags/full", BT_INODE_NODATACOW, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/ns/flags/full", data, 5000);
+	expect_flags(&plan, 1, LAST_STAGE, "/ns/flags/dir", directory_flags, directory_flags);
+	expect_flags(&plan, 1, LAST_STAGE, "/ns/flags/link", BT_INODE_NODUMP | BT_INODE_IMMUTABLE,
+	    BT_INODE_NODUMP);
+	expect_flags(
+	    &plan, 1, LAST_STAGE, "/ns/zstd", codec_flags | BT_INODE_NOATIME, BT_INODE_NOATIME);
+	expect_xattr(&plan, 1, LAST_STAGE, "/ns/zstd", "btrfs.compression", NULL, 0);
+	expect_flags(&plan, 1, LAST_STAGE, "/ns/tree", codec_flags, BT_INODE_COMPRESS);
+	expect_xattr(&plan, 1, LAST_STAGE, "/ns/tree", "btrfs.compression", "zlib", 4);
+	expect_flags(&plan, 1, LAST_STAGE, "/ns/nocompress", codec_flags, BT_INODE_NOCOMPRESS);
+	expect_xattr(&plan, 1, LAST_STAGE, "/ns/nocompress", "btrfs.compression", NULL, 0);
+	run_plan(context, &plan);
+}
+
 void
 namespace_scenarios(struct context *context)
 {
@@ -1776,4 +1846,5 @@ namespace_scenarios(struct context *context)
 	namespace_tmpfile_plan(context);
 	namespace_exchange_plan(context);
 	namespace_whiteout_plan(context);
+	namespace_fsflags_plan(context);
 }

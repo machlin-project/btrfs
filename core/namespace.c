@@ -1944,6 +1944,63 @@ bt_ns_apply_property(struct btrfs_transaction *transaction, struct bt_disk_inode
 	bt_put64(&item->flags, flags);
 }
 
+/* Sets (value) or removes (remove) name among inode's xattrs; clear removes
+ * the name without requiring it. Refusals change nothing; a failure after the
+ * first change poisons the transaction. */
+static enum btrfs_result
+bt_ns_edit_xattr(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
+    const void *name, size_t name_length, const void *value, size_t value_length, int flags,
+    int remove, int clear)
+{
+	const struct bt_disk_dir *header;
+	struct bt_packed packed;
+	struct bt_key location = { 0, 0, 0 };
+	size_t limit = bt_ns_item_limit(transaction);
+	size_t offset = 0;
+	size_t entry_size = 0;
+	int found = 0;
+	enum btrfs_result error;
+
+	/* Linux limits a name and value to one item's payload. */
+	if (!remove && name_length + value_length > limit - sizeof(*header)) {
+		return BTRFS_NO_SPACE;
+	}
+	error = bt_ns_load(transaction, tree,
+	    (struct bt_key){ inode, bt_ns_hash(name, name_length), BT_XATTR_ITEM }, &packed);
+	if (error == BTRFS_OK && packed.present) {
+		error = bt_ns_dir_find(&packed, name, name_length, &offset, &entry_size, &header);
+		found = error == BTRFS_OK;
+		if (error == BTRFS_NOT_FOUND) {
+			error = BTRFS_OK;
+		}
+	}
+	if (error == BTRFS_OK && !found && (remove || (flags & BTRFS_XATTR_REPLACE) != 0)) {
+		error = BTRFS_NOT_FOUND;
+	}
+	if (error == BTRFS_OK && found && (flags & BTRFS_XATTR_CREATE) != 0) {
+		error = BTRFS_EXISTS;
+	}
+	/* Colliding names share the item; the new entry must fit beside them. */
+	if (error == BTRFS_OK && !clear && !remove &&
+	    packed.size - (found ? entry_size : 0) + sizeof(*header) + name_length + value_length >
+		limit) {
+		error = BTRFS_NO_SPACE;
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	if (found) {
+		error = bt_ns_cut(transaction, tree, &packed, offset, entry_size);
+	}
+	if (error == BTRFS_OK && !remove && !clear) {
+		entry_size =
+		    bt_ns_dir_entry(transaction->entry, location, bt_ns_transid(transaction), name,
+			name_length, value, value_length, BTRFS_FT_XATTR);
+		error = bt_ns_append(transaction, tree, &packed, transaction->entry, entry_size);
+	}
+	return error == BTRFS_OK ? BTRFS_OK : bt_ns_poison(transaction, error);
+}
+
 /* Sets (value) or removes (value NULL with remove) one xattr. An empty
  * compression property removes the property without requiring it to exist. */
 static enum btrfs_result
@@ -1951,16 +2008,9 @@ bt_ns_xattr(struct btrfs_transaction *transaction, struct btrfs_object_id id, co
     size_t name_length, const void *value, size_t value_length, int flags, int remove,
     struct btrfs_time time)
 {
-	const struct bt_disk_dir *header;
 	const struct bt_codec *codec = NULL;
 	struct bt_owned_root *tree = NULL;
 	struct bt_disk_inode item;
-	struct bt_packed packed;
-	struct bt_key location = { 0, 0, 0 };
-	size_t limit;
-	size_t offset = 0;
-	size_t entry_size = 0;
-	int found = 0;
 	int property = 0;
 	int ignore = 0;
 	int clear;
@@ -1994,51 +2044,134 @@ bt_ns_xattr(struct btrfs_transaction *transaction, struct btrfs_object_id id, co
 		return error;
 	}
 	clear = property && (remove || value_length == 0);
-	limit = bt_ns_item_limit(transaction);
-	/* Linux limits a name and value to one item's payload. */
-	if (!remove && name_length + value_length > limit - sizeof(*header)) {
-		return BTRFS_NO_SPACE;
+	error = bt_ns_edit_xattr(transaction, tree, id.inode, name, name_length, value,
+	    value_length, flags, remove, clear);
+	if (error != BTRFS_OK) {
+		return error;
 	}
-	error = bt_ns_load(transaction, tree,
-	    (struct bt_key){ id.inode, bt_ns_hash(name, name_length), BT_XATTR_ITEM }, &packed);
-	if (error == BTRFS_OK && packed.present) {
-		error = bt_ns_dir_find(&packed, name, name_length, &offset, &entry_size, &header);
-		found = error == BTRFS_OK;
-		if (error == BTRFS_NOT_FOUND) {
-			error = BTRFS_OK;
-		}
+	if (property) {
+		bt_ns_apply_property(transaction, &item, codec, clear);
 	}
-	if (error == BTRFS_OK && !found && (remove || (flags & BTRFS_XATTR_REPLACE) != 0)) {
-		error = BTRFS_NOT_FOUND;
+	return bt_ns_poison(transaction, bt_ns_store(transaction, tree, id.inode, &item, time));
+}
+
+/* Linux's btrfs_mask_fsflags_for_type. */
+static unsigned
+bt_ns_mask_fsflags(const struct bt_disk_inode *item, unsigned flags)
+{
+	uint32_t type = bt_u32(item->mode) & BTRFS_MODE_TYPE;
+
+	if (type == BTRFS_MODE_DIRECTORY) {
+		return flags;
 	}
-	if (error == BTRFS_OK && found && (flags & BTRFS_XATTR_CREATE) != 0) {
-		error = BTRFS_EXISTS;
+	if (type == BTRFS_MODE_REGULAR) {
+		return flags & ~BTRFS_FS_DIRSYNC_FL;
 	}
-	/* Colliding names share the item; the new entry must fit beside them. */
-	if (error == BTRFS_OK && !clear && !remove &&
-	    packed.size - (found ? entry_size : 0) + sizeof(*header) + name_length + value_length >
-		limit) {
-		error = BTRFS_NO_SPACE;
+	return flags & (BTRFS_FS_NODUMP_FL | BTRFS_FS_NOATIME_FL);
+}
+
+/* Linux's check_fsflags. */
+static enum btrfs_result
+bt_ns_check_fsflags(unsigned old_flags, unsigned flags)
+{
+	const unsigned known = BTRFS_FS_IMMUTABLE_FL | BTRFS_FS_APPEND_FL | BTRFS_FS_NOATIME_FL |
+	    BTRFS_FS_NODUMP_FL | BTRFS_FS_SYNC_FL | BTRFS_FS_DIRSYNC_FL | BTRFS_FS_NOCOMP_FL |
+	    BTRFS_FS_COMPR_FL | BTRFS_FS_NOCOW_FL;
+
+	if ((flags & ~known) != 0) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if (((flags & BTRFS_FS_NOCOMP_FL) && (flags & BTRFS_FS_COMPR_FL)) ||
+	    ((flags & BTRFS_FS_COMPR_FL) && (flags & BTRFS_FS_NOCOW_FL)) ||
+	    ((old_flags & BTRFS_FS_NOCOW_FL) &&
+		(flags & (BTRFS_FS_COMPR_FL | BTRFS_FS_NOCOMP_FL))) ||
+	    ((flags & BTRFS_FS_NOCOW_FL) &&
+		(old_flags & (BTRFS_FS_COMPR_FL | BTRFS_FS_NOCOMP_FL)))) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	return BTRFS_OK;
+}
+
+static uint64_t
+bt_ns_flag(uint64_t flags, uint64_t bit, unsigned set)
+{
+	return set != 0 ? flags | bit : flags & ~bit;
+}
+
+enum btrfs_result
+btrfs_transaction_set_fsflags(struct btrfs_transaction *transaction, struct btrfs_object_id id,
+    unsigned fsflags, struct btrfs_time time)
+{
+	const struct bt_codec *codec = NULL;
+	struct bt_owned_root *tree = NULL;
+	struct btrfs_inode current;
+	struct bt_disk_inode item;
+	uint64_t flags;
+	uint32_t type;
+	size_t i;
+	enum btrfs_result error;
+
+	if (transaction == NULL || time.nanoseconds >= BT_NANOSECONDS) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_ns_begin(transaction, id.tree, &tree);
+	if (error == BTRFS_OK) {
+		error = bt_ns_inode(transaction, tree, id.inode, &item);
 	}
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	if (found) {
-		error = bt_ns_cut(transaction, tree, &packed, offset, entry_size);
+	type = bt_u32(item.mode) & BTRFS_MODE_TYPE;
+	fsflags = bt_ns_mask_fsflags(&item, fsflags);
+	bt_zero(&current, sizeof(current));
+	current.flags = bt_u64(item.flags);
+	error = bt_ns_check_fsflags(btrfs_inode_fsflags(&current), fsflags);
+	if (error != BTRFS_OK) {
+		return error;
 	}
-	if (error == BTRFS_OK && !remove && !clear) {
-		entry_size =
-		    bt_ns_dir_entry(transaction->entry, location, bt_ns_transid(transaction), name,
-			name_length, value, value_length, BTRFS_FT_XATTR);
-		error = bt_ns_append(transaction, tree, &packed, transaction->entry, entry_size);
+	flags = bt_u64(item.flags);
+	flags = bt_ns_flag(flags, BT_INODE_SYNC, fsflags & BTRFS_FS_SYNC_FL);
+	flags = bt_ns_flag(flags, BT_INODE_IMMUTABLE, fsflags & BTRFS_FS_IMMUTABLE_FL);
+	flags = bt_ns_flag(flags, BT_INODE_APPEND, fsflags & BTRFS_FS_APPEND_FL);
+	flags = bt_ns_flag(flags, BT_INODE_NODUMP, fsflags & BTRFS_FS_NODUMP_FL);
+	flags = bt_ns_flag(flags, BT_INODE_NOATIME, fsflags & BTRFS_FS_NOATIME_FL);
+	flags = bt_ns_flag(flags, BT_INODE_DIRSYNC, fsflags & BTRFS_FS_DIRSYNC_FL);
+	/* A regular file changes copy-on-write only while it has no extents. */
+	if (type != BTRFS_MODE_REGULAR) {
+		flags = bt_ns_flag(flags, BT_INODE_NODATACOW, fsflags & BTRFS_FS_NOCOW_FL);
+	} else if (bt_u64(item.size) == 0) {
+		flags = bt_ns_flag(flags, BT_INODE_NODATACOW | BT_INODE_NODATASUM_FLAG,
+		    fsflags & BTRFS_FS_NOCOW_FL);
 	}
-	if (error == BTRFS_OK && property) {
-		bt_ns_apply_property(transaction, &item, codec, clear);
+	if ((fsflags & BTRFS_FS_NOCOMP_FL) != 0) {
+		flags = (flags & ~BT_INODE_COMPRESS) | BT_INODE_NOCOMPRESS;
+	} else if ((fsflags & BTRFS_FS_COMPR_FL) != 0) {
+		flags = (flags & ~BT_INODE_NOCOMPRESS) | BT_INODE_COMPRESS;
+		/* The mount's codec, zlib without one, as the property records it. */
+		codec = &bt_ns_codecs[0];
+		for (i = 0; i < sizeof(bt_ns_codecs) / sizeof(bt_ns_codecs[0]); i++) {
+			if (bt_ns_codecs[i].codec == transaction->io.compression) {
+				codec = &bt_ns_codecs[i];
+			}
+		}
+		/* prop_compression_validate, on the flags before the change. */
+		if (!bt_ns_can_compress(bt_u64(item.flags))) {
+			return BTRFS_INVALID_ARGUMENT;
+		}
+	} else {
+		flags &= ~(BT_INODE_COMPRESS | BT_INODE_NOCOMPRESS);
 	}
-	if (error == BTRFS_OK) {
-		error = bt_ns_store(transaction, tree, id.inode, &item, time);
+	error = bt_ns_edit_xattr(transaction, tree, id.inode, BT_COMPRESSION_PROPERTY,
+	    bt_ns_length(BT_COMPRESSION_PROPERTY), codec != NULL ? codec->name : NULL,
+	    codec != NULL ? bt_ns_length(codec->name) : 0, 0, 0, codec == NULL);
+	if (error != BTRFS_OK) {
+		return error;
 	}
-	return bt_ns_poison(transaction, error);
+	if (codec != NULL) {
+		bt_ns_require_feature(transaction, codec->feature);
+	}
+	bt_put64(&item.flags, flags);
+	return bt_ns_poison(transaction, bt_ns_store(transaction, tree, id.inode, &item, time));
 }
 
 enum btrfs_result

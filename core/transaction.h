@@ -35,8 +35,6 @@
 #define BT_ACCOUNT_ORIGINAL 1U
 #define BT_ACCOUNT_NEW 2U
 #define BT_INODE_NODATASUM_FLAG (UINT64_C(1) << 0)
-#define BT_INODE_IMMUTABLE (UINT64_C(1) << 6)
-#define BT_INODE_APPEND (UINT64_C(1) << 7)
 
 struct bt_owned_root {
 	struct bt_root root;

@@ -1362,6 +1362,12 @@ plan_fallocate_new(struct plan *plan, size_t commit, const char *path, unsigned 
 }
 
 void
+plan_set_fsflags(struct plan *plan, size_t commit, const char *path, unsigned flags)
+{
+	plan_namespace(plan, commit, OPERATION_SET_FSFLAGS, path, NULL)->flags = (int)flags;
+}
+
+void
 plan_privileges(struct plan *plan, size_t commit, const char *path, int keep)
 {
 	(void)plan_namespace(

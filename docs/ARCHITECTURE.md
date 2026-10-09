@@ -673,6 +673,22 @@ updates COMPRESS/NOCOMPRESS and records the LZO or ZSTD incompat feature when a
 codec first appears. Other `btrfs.` names are invalid. Raw xattr values are
 otherwise uninterpreted; native policy decides which namespaces callers may use.
 
+`btrfs_transaction_set_fsflags` is Linux's `FS_IOC_SETFLAGS`
+(`btrfs_fileattr_set`) on the `FS_*_FL` bits that `btrfs_inode_fsflags`
+reports. Linux's type mask applies first: directories keep every bit, regular
+files all but dirsync, other objects only nodump and noatime. The attribute
+flags (sync, immutable, append, nodump, noatime, dirsync) then replace the
+inode's. NOCOW sets or clears NODATACOW on a directory or other object, and
+NODATACOW with NODATASUM on a regular file only while it is empty. COMPR sets
+COMPRESS and writes the mount's codec (zlib unless the mount selects another)
+as the `btrfs.compression` property, recording its incompat feature; NOCOMP
+sets NOCOMPRESS; NOCOMP or neither bit removes the property, and neither bit
+clears both flags. Unknown bits (UNSUPPORTED), COMPR with NOCOMP or NOCOW, a
+compression bit against an old NOCOW or NOCOW against an old compression bit,
+and COMPR on an inode that cannot compress (INVALID_ARGUMENT) are refused
+before any change. The change time advances. Who may change which flag
+(CAP_LINUX_IMMUTABLE, the owner) is the caller's decision.
+
 Every refusal (existing or missing name, wrong type, non-empty directory, full
 packed item, exhausted numbering, read-only snapshot, crossing a subvolume entry
 or tree) is decided before the first change and leaves the transaction usable. A
@@ -824,6 +840,15 @@ transaction. Only `user.` xattrs are visible; other names stay unsupported, as
 on read. Device, FIFO and socket vnodes need special-file operations the adapter
 does not have (ENOTSUP).
 
+`chflags` maps `SF_IMMUTABLE`, `SF_APPEND` and `UF_NODUMP` to Linux's
+immutable, append and nodump flags through `btrfs_transaction_set_fsflags`,
+keeping the inode's other Linux flags; any other flag is refused (ENOTSUP)
+before a change, since Btrfs has no place for it. XNU's VFS decides who may
+change which flag, as it does for other file systems. In one `setattr` that
+also changes other attributes, flags that lock the inode are applied after
+those changes and flags that unlock it before them, so the core's immutable
+and append checks see the caller's intended order.
+
 The FSKit volume runs on the shared volume layer: reads take the newest view and
 changes are operations of the running transaction, committed at least every
 five seconds, at synchronization and at unmount. The adapter keeps device
@@ -870,6 +895,7 @@ numbers do not reach the callback) and directories with a default POSIX ACL.
 FSKit faults, ending the extension and its volume, on an attribute reply that
 lacks any attribute it wants, so every reply carries all standard ones: flags as
 the XNU adapter maps them (immutable, append-only, nodump) and the parent ID.
+Setting flags follows the XNU adapter's mapping and order.
 The mount root's parent is `FSItemIDParentOfRoot`, a directory's comes from its
 tree, and a file's is the directory it was last reached through, as Darwin's
 vnode parent; after a rename that replaced nothing FSKit asks for the absent

@@ -223,7 +223,9 @@ enum operation_kind {
 	OPERATION_TMPFILE,
 	OPERATION_LINK_TMPFILE,
 	OPERATION_EXCHANGE,
-	OPERATION_RENAME_WHITEOUT
+	OPERATION_RENAME_WHITEOUT,
+	/* FS_IOC_SETFLAGS: flags holds the attribute flags. */
+	OPERATION_SET_FSFLAGS
 };
 
 /* Operations name objects by path. A path created, renamed or removed by an
@@ -477,6 +479,7 @@ void plan_clean(struct plan *plan, size_t commit, uint64_t tree, size_t expected
 void plan_set_attributes(struct plan *plan, size_t commit, const char *path, unsigned mask,
     uint32_t mode, uint32_t uid, uint32_t gid, int64_t access_seconds, int64_t modify_seconds);
 void plan_privileges(struct plan *plan, size_t commit, const char *path, int keep);
+void plan_set_fsflags(struct plan *plan, size_t commit, const char *path, unsigned flags);
 void plan_expect_refusal(struct plan *plan, size_t commit, enum btrfs_result result);
 void plan_truncate_new(struct plan *plan, size_t commit, const char *path, uint64_t size);
 /* fallocate of a file the plan models through expectations. */

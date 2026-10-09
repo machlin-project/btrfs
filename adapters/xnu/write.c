@@ -630,6 +630,10 @@ btrfs_xnu_setattr(void *arguments)
 	struct btrfs_transaction *transaction;
 	struct btrfs_attributes changes;
 	struct btrfs_inode inode;
+	enum btrfs_result result = BTRFS_OK;
+	unsigned fsflags = 0;
+	int flags_changed = 0;
+	int locking;
 	int error;
 
 	if (!btrfs_volume_writable(node->mount->volume)) {
@@ -642,11 +646,20 @@ btrfs_xnu_setattr(void *arguments)
 	lck_mtx_lock(node->mount->nodes_lock);
 	inode = node->inode;
 	lck_mtx_unlock(node->mount->nodes_lock);
-	/* Inode flags have no Darwin mapping beyond their current value. */
+	/* chflags: schg, sappnd and nodump are Linux's immutable, append-only and
+	 * no-dump attributes, which the kernel authorized changing; other Darwin
+	 * flags have no Btrfs attribute. */
 	if (VATTR_IS_ACTIVE(attributes, va_flags)) {
-		if (attributes->va_flags != btrfs_xnu_inode_flags(inode.flags)) {
+		if ((attributes->va_flags & ~(uint32_t)(SF_IMMUTABLE | SF_APPEND | UF_NODUMP)) !=
+		    0) {
 			return ENOTSUP;
 		}
+		fsflags = btrfs_inode_fsflags(&inode) &
+		    ~(BTRFS_FS_IMMUTABLE_FL | BTRFS_FS_APPEND_FL | BTRFS_FS_NODUMP_FL);
+		fsflags |= (attributes->va_flags & SF_IMMUTABLE) != 0 ? BTRFS_FS_IMMUTABLE_FL : 0;
+		fsflags |= (attributes->va_flags & SF_APPEND) != 0 ? BTRFS_FS_APPEND_FL : 0;
+		fsflags |= (attributes->va_flags & UF_NODUMP) != 0 ? BTRFS_FS_NODUMP_FL : 0;
+		flags_changed = attributes->va_flags != btrfs_xnu_inode_flags(inode.flags);
 		VATTR_SET_SUPPORTED(attributes, va_flags);
 	}
 	if (VATTR_IS_ACTIVE(attributes, va_data_size)) {
@@ -699,15 +712,27 @@ btrfs_xnu_setattr(void *arguments)
 		changes.modify_time.nanoseconds = (uint32_t)attributes->va_modify_time.tv_nsec;
 		VATTR_SET_SUPPORTED(attributes, va_modify_time);
 	}
-	if (changes.mask == 0) {
+	if (changes.mask == 0 && !flags_changed) {
 		return 0;
 	}
 	btrfs_xnu_now(&changes.time);
 	error =
 	    btrfs_xnu_error(btrfs_xnu_begin(node->mount, BTRFS_XNU_OPERATION_NODES, &transaction));
 	if (error == 0) {
-		error = btrfs_xnu_finish(node->mount, transaction,
-		    btrfs_transaction_set_attributes(transaction, inode.id, &changes), node, NULL);
+		/* Flags that lock the inode come last, flags that unlock it first. */
+		locking = (fsflags & (BTRFS_FS_IMMUTABLE_FL | BTRFS_FS_APPEND_FL)) != 0;
+		if (flags_changed && !locking) {
+			result = btrfs_transaction_set_fsflags(
+			    transaction, inode.id, fsflags, changes.time);
+		}
+		if (result == BTRFS_OK && changes.mask != 0) {
+			result = btrfs_transaction_set_attributes(transaction, inode.id, &changes);
+		}
+		if (result == BTRFS_OK && flags_changed && locking) {
+			result = btrfs_transaction_set_fsflags(
+			    transaction, inode.id, fsflags, changes.time);
+		}
+		error = btrfs_xnu_finish(node->mount, transaction, result, node, NULL);
 	}
 	if (error == 0 && (changes.mask & BTRFS_ATTRIBUTE_MODIFY_TIME) != 0) {
 		lck_mtx_lock(node->mount->nodes_lock);

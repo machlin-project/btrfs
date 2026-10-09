@@ -69,6 +69,12 @@ struct bt_le64 {
 #define BT_INODE_NOCOMPRESS (UINT64_C(1) << 3)
 /* The inode has preallocated extents (Linux's BTRFS_INODE_PREALLOC). */
 #define BT_INODE_PREALLOC (UINT64_C(1) << 4)
+#define BT_INODE_SYNC (UINT64_C(1) << 5)
+#define BT_INODE_IMMUTABLE (UINT64_C(1) << 6)
+#define BT_INODE_APPEND (UINT64_C(1) << 7)
+#define BT_INODE_NODUMP (UINT64_C(1) << 8)
+#define BT_INODE_NOATIME (UINT64_C(1) << 9)
+#define BT_INODE_DIRSYNC (UINT64_C(1) << 10)
 #define BT_INODE_COMPRESS (UINT64_C(1) << 11)
 #define BT_LINK_MAX 65535U
 #define BT_INODE_NODATASUM UINT64_C(1)

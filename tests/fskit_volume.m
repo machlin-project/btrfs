@@ -858,6 +858,33 @@ write_tests(const char *fixture)
 	REQUIRE(attributes.size == TRUNCATED_BYTES &&
 	    attributes.allocSize == allocated + PREALLOCATED_SECTORS_BYTES);
 	compare_bytes(volume, file, expected, TRUNCATED_BYTES);
+	/* chflags: nodump and system immutable are Linux's attributes; an
+	 * immutable file refuses writes until the flag goes; other Darwin flags
+	 * have no attribute. */
+	request = [[FSItemSetAttributesRequest alloc] init];
+	request.flags = UF_NODUMP | SF_IMMUTABLE;
+	[volume setAttributes:request
+		       onItem:file
+		 replyHandler:^(FSItemAttributes *changed, NSError *replyError) {
+		   REQUIRE(replyError == nil && changed.flags == (UF_NODUMP | SF_IMMUTABLE));
+		 }];
+	REQUIRE([request wasAttributeConsumed:FSItemAttributeFlags]);
+	REQUIRE(write_data(volume, file, 0, expected, 1).code == EPERM);
+	request = [[FSItemSetAttributesRequest alloc] init];
+	request.flags = UF_NODUMP | UF_HIDDEN;
+	[volume setAttributes:request
+		       onItem:file
+		 replyHandler:^(FSItemAttributes *changed, NSError *replyError) {
+		   REQUIRE(changed == nil && replyError.code == ENOTSUP);
+		 }];
+	request = [[FSItemSetAttributesRequest alloc] init];
+	request.flags = UF_NODUMP;
+	[volume setAttributes:request
+		       onItem:file
+		 replyHandler:^(FSItemAttributes *changed, NSError *replyError) {
+		   REQUIRE(replyError == nil && changed.flags == UF_NODUMP);
+		 }];
+	REQUIRE(write_data(volume, file, 0, expected, 1) == nil);
 	[volume setXattrNamed:name_of("user.kept")
 		       toData:bytes_of("value")
 		       onItem:file

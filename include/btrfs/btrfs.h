@@ -155,6 +155,18 @@ struct btrfs_time {
 #define BTRFS_INODE_FLAG_APPEND (UINT64_C(1) << 7)
 #define BTRFS_INODE_FLAG_NODUMP (UINT64_C(1) << 8)
 
+/* Linux's inode attribute flags (FS_IOC_GETFLAGS and FS_IOC_SETFLAGS, as chattr
+ * and lsattr use them), with Linux's values. */
+#define BTRFS_FS_COMPR_FL 0x00000004U
+#define BTRFS_FS_SYNC_FL 0x00000008U
+#define BTRFS_FS_IMMUTABLE_FL 0x00000010U
+#define BTRFS_FS_APPEND_FL 0x00000020U
+#define BTRFS_FS_NODUMP_FL 0x00000040U
+#define BTRFS_FS_NOATIME_FL 0x00000080U
+#define BTRFS_FS_NOCOMP_FL 0x00000400U
+#define BTRFS_FS_DIRSYNC_FL 0x00010000U
+#define BTRFS_FS_NOCOW_FL 0x00800000U
+
 struct btrfs_inode {
 	struct btrfs_object_id id;
 	uint64_t generation;
@@ -250,6 +262,9 @@ enum btrfs_result btrfs_get_xattr(const struct btrfs_fs *fs, const struct btrfs_
     const void *name, size_t name_length, void *buffer, size_t capacity, size_t *length);
 enum btrfs_result btrfs_list_xattrs(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
     void *buffer, size_t capacity, size_t *length);
+/* FS_IOC_GETFLAGS: the attribute flags of inode's Btrfs flags, as Linux's
+ * btrfs_inode_flags_to_fsflags reports them. */
+unsigned btrfs_inode_fsflags(const struct btrfs_inode *inode);
 const char *btrfs_result_string(enum btrfs_result result);
 uint32_t btrfs_mode_for_type(uint8_t type);
 

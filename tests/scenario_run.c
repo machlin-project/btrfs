@@ -815,6 +815,9 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 		return btrfs_transaction_truncate(transaction,
 		    path_object(table, operation->path, 0, NULL), operation->offset, time,
 		    operation->size, &done);
+	case OPERATION_SET_FSFLAGS:
+		return btrfs_transaction_set_fsflags(transaction,
+		    path_object(table, operation->path, 0, NULL), (unsigned)operation->flags, time);
 	case OPERATION_FALLOCATE:
 		return btrfs_transaction_fallocate(transaction,
 		    path_object(table, operation->path, 0, NULL), (unsigned)operation->flags,

@@ -104,3 +104,35 @@ bt_inode_cursor(
 	}
 	return error;
 }
+
+unsigned
+btrfs_inode_fsflags(const struct btrfs_inode *inode)
+{
+	static const struct {
+		uint64_t inode;
+		unsigned attribute;
+	} map[] = { { BT_INODE_SYNC, BTRFS_FS_SYNC_FL },
+		{ BT_INODE_IMMUTABLE, BTRFS_FS_IMMUTABLE_FL },
+		{ BT_INODE_APPEND, BTRFS_FS_APPEND_FL }, { BT_INODE_NODUMP, BTRFS_FS_NODUMP_FL },
+		{ BT_INODE_NOATIME, BTRFS_FS_NOATIME_FL },
+		{ BT_INODE_DIRSYNC, BTRFS_FS_DIRSYNC_FL },
+		{ BT_INODE_NODATACOW, BTRFS_FS_NOCOW_FL } };
+
+	unsigned result = 0;
+	size_t i;
+
+	if (inode == NULL) {
+		return 0;
+	}
+	for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+		if ((inode->flags & map[i].inode) != 0) {
+			result |= map[i].attribute;
+		}
+	}
+	if ((inode->flags & BT_INODE_NOCOMPRESS) != 0) {
+		result |= BTRFS_FS_NOCOMP_FL;
+	} else if ((inode->flags & BT_INODE_COMPRESS) != 0) {
+		result |= BTRFS_FS_COMPR_FL;
+	}
+	return result;
+}

@@ -65,6 +65,10 @@
 #define PUNCHED_BLOCK 1U
 #define PREALLOCATED_BLOCKS 2U
 #define STAT_BLOCK_BYTES 512U
+/* native/flagged keeps Linux's no-dump attribute: the inode item's flags in
+ * the immutable, append-only and no-dump bits. */
+#define LINUX_FLAG_BITS 0x1c0U
+#define LINUX_NODUMP 0x100U
 
 static const char replacement_unit[] = "unaligned CoW replacement";
 static const char native_value[] = "macOS value";
@@ -389,6 +393,28 @@ sparse_allocated(void)
 	    off_t)((SPARSE_BLOCKS - (no_punch_hole ? 0U : 1U) + PREALLOCATED_BLOCKS) * BLOCK_BYTES);
 }
 
+/* chflags: nodump and schg are Linux's no-dump and immutable attributes; an
+ * immutable file refuses writes and removal until the flag goes; a Darwin
+ * flag without an attribute is refused. */
+static void
+flags_contracts(int directory)
+{
+	struct stat status;
+	int file;
+
+	file = openat(directory, "flagged", O_CREAT | O_EXCL | O_WRONLY, 0644);
+	REQUIRE(file >= 0 && write(file, "flags", 5) == 5 && fsync(file) == 0 && close(file) == 0);
+	file = openat(directory, "flagged", O_RDONLY);
+	REQUIRE(file >= 0 && fchflags(file, UF_NODUMP | SF_IMMUTABLE) == 0);
+	REQUIRE(fstat(file, &status) == 0 && status.st_flags == (UF_NODUMP | SF_IMMUTABLE));
+	expect_error(openat(directory, "flagged", O_WRONLY), EPERM);
+	expect_error(unlinkat(directory, "flagged", 0), EPERM);
+	expect_error(fchflags(file, UF_NODUMP | SF_IMMUTABLE | UF_HIDDEN), ENOTSUP);
+	REQUIRE(fchflags(file, UF_NODUMP) == 0);
+	REQUIRE(fstat(file, &status) == 0 && status.st_flags == UF_NODUMP);
+	REQUIRE(fsync(file) == 0 && close(file) == 0);
+}
+
 /* F_PREALLOCATE allocates from the physical end and keeps the size;
  * F_PUNCHHOLE zeroes a block and frees it, keeping the size too. */
 static void
@@ -511,6 +537,7 @@ write_phase(int root)
 		fprintf(stderr, "SKIP punch-hole contract: no interface on this mount\n");
 	}
 	sparse_contracts(directory);
+	flags_contracts(directory);
 	full_contracts(directory);
 	REQUIRE(close(directory) == 0);
 	sync();
@@ -607,7 +634,7 @@ static void
 verify_phase(int root)
 {
 	static const char *const listing[] = { "after-full", "appended", "big", "child",
-		"data-link", "data-symlink", "sparse", "suid", "suid-root" };
+		"data-link", "data-symlink", "flagged", "sparse", "suid", "suid-root" };
 	static const char *const children[] = { "moved" };
 	static const char greeting[] = "hello from Linux Btrfs\n";
 	struct stat native;
@@ -665,6 +692,9 @@ verify_phase(int root)
 	}
 	manifest_file(directory, "after-full", (const uint8_t *)after_full, sizeof(after_full) - 1,
 	    0644, 0, native.st_gid, 1);
+	manifest_file(directory, "flagged", (const uint8_t *)"flags", 5, 0644, 0, native.st_gid, 1);
+	REQUIRE(fstatat(directory, "flagged", &status, 0) == 0 && status.st_flags == UF_NODUMP);
+	printf("flags\tnative/flagged\t0x%x\t0x%x\n", LINUX_FLAG_BITS, LINUX_NODUMP);
 	sparse_data(expected, !no_punch_hole);
 	manifest_file(
 	    directory, "sparse", expected, SPARSE_BLOCKS * BLOCK_BYTES, 0644, 0, native.st_gid, 1);

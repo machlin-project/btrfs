@@ -106,8 +106,7 @@ is destroyed. `accept` is legal only after successful durable publication;
    without NO_HOLES and both copies of DUP data, and fallocate as Linux's
    `btrfs_fallocate` (allocation, zeroing and punching; `F_PREALLOCATE` and
    `F_PUNCHHOLE` natively). Remaining: a 64 KiB-sector
-   fixture, an inode-flags operation (`chattr`) and a
-   compressor in the kernel adapter. New data is written as its extents are
+   fixture and a compressor in the kernel adapter. New data is written as its extents are
    created, and files compress on write as Linux decides.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
@@ -133,7 +132,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    layer attaches them. Subvolumes and snapshots are created and deleted
    (`core/subvolume.c`), and the reader resolves unreferenced subvolume entries
    to stubs; native writers still need a cleaner. O_TMPFILE files, RENAME_EXCHANGE
-   and RENAME_WHITEOUT follow Linux. Remaining: exchanging subvolume entries;
+   and RENAME_WHITEOUT follow Linux, and inode flags change as Linux's
+   `FS_IOC_SETFLAGS` (`btrfs_transaction_set_fsflags`; `chflags` natively).
+   Remaining: exchanging subvolume entries;
    truncation orphans of pre-3.12 kernels are dropped as Linux does. Native writers supply time, mode, owner,
    set-id and ACL decisions.
 6. **Connect native writers.** Define versioned operation views, read pins,

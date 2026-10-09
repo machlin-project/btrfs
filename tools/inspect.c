@@ -197,9 +197,10 @@ inspect(struct btrfs_fs *fs, int argc, char **argv)
 	if (strcmp(argv[0], "stat") == 0) {
 		printf("{\"tree\":%" PRIu64 ",\"inode\":%" PRIu64 ",\"size\":%" PRIu64
 		       ",\"allocated\":%" PRIu64
-		       ",\"mode\":%u,\"uid\":%u,\"gid\":%u,\"links\":%u}\n",
+		       ",\"mode\":%u,\"uid\":%u,\"gid\":%u,\"links\":%u,\"flags\":%" PRIu64
+		       ",\"fsflags\":%u}\n",
 		    inode.id.tree, inode.id.inode, inode.size, inode.allocated_bytes, inode.mode,
-		    inode.uid, inode.gid, inode.links);
+		    inode.uid, inode.gid, inode.links, inode.flags, btrfs_inode_fsflags(&inode));
 		return BTRFS_OK;
 	}
 	if (strcmp(argv[0], "ls") == 0) {
