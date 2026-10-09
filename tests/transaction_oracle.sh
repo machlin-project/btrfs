@@ -75,12 +75,19 @@ tree_of() {
     btrfs subvolume show "$holder" | awk '$1 == "Subvolume" && $2 == "ID:" { print $3 }'
 }
 
+# A tree of the state under check, dumped once for all of its facts.
+tree_dump() {
+    [ -f "/tmp/dump-$1" ] ||
+        btrfs inspect-internal dump-tree -t "$1" /dev/vda > "/tmp/dump-$1"
+    cat "/tmp/dump-$1"
+}
+
 # MASK:VALUE: the flags of the path's inode item in its subvolume's tree equal
 # VALUE in the bits of MASK. Busybox lsattr shows no NOCOMPRESS flag, and
 # `btrfs inspect-internal rootid` needs a writable mount.
 check_flags() {
     inode=$(stat -c '%i' "$1")
-    flags=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+    flags=$(tree_dump "$(tree_of "$1")" |
         awk -v key="key ($inode INODE_ITEM 0)" '
         index($0, key) && index($0, "itemoff") { found = 1 }
         found && match($0, /flags 0x[0-9a-f]+/) { print substr($0, RSTART + 6, RLENGTH - 6); exit }')
@@ -92,7 +99,7 @@ check_flags() {
 check_reference() {
     inode=$(stat -c '%i' "$1")
     parent=$(stat -c '%i' "$(dirname "$1")")
-    kind=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda | awk -v inode="$inode" \
+    kind=$(tree_dump "$(tree_of "$1")" | awk -v inode="$inode" \
         -v parent="$parent" -v name="$(basename "$1")" '
         $1 == "item" && $3 == "key" {
             object = substr($4, 2); type = $5; offset = $6; sub(/\)$/, "", offset); next }
@@ -139,7 +146,7 @@ check_compressed() {
     inode=$(stat -c '%i' "$1")
     codec=1
     [ "${2%%:*}" = zstd ] && codec=3
-    counts=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+    counts=$(tree_dump "$(tree_of "$1")" |
         awk -v inode="$inode" -v codec="$codec" '
         $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
         inside && /inline extent data size/ && match($0, /compression [0-9]+/) {
@@ -157,7 +164,7 @@ check_compressed() {
 # range of a preallocated item as "prealloc data disk byte".
 check_extents() {
     inode=$(stat -c '%i' "$1")
-    counts=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+    counts=$(tree_dump "$(tree_of "$1")" |
         awk -v inode="$inode" '
         $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
         inside && $1 == "generation" && $3 == "type" { type = $4 }
@@ -172,7 +179,7 @@ check_extents() {
 # The file's hole items (disk byte 0) in Linux's own tree dump.
 check_holes() {
     inode=$(stat -c '%i' "$1")
-    count=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+    count=$(tree_dump "$(tree_of "$1")" |
         awk -v inode="$inode" '
         BEGIN { holes = 0 }
         $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
@@ -186,7 +193,7 @@ check_holes() {
 # tree.
 check_bitmaps() {
     inode=$(stat -c '%i' "$1")
-    address=$(btrfs inspect-internal dump-tree -t "$(tree_of "$1")" /dev/vda |
+    address=$(tree_dump "$(tree_of "$1")" |
         awk -v inode="$inode" '
         $1 == "item" && $3 == "key" { inside = substr($4, 2) == inode && $5 == "EXTENT_DATA"; next }
         inside && ($1 == "extent" || $1 == "prealloc") && $2 == "data" && $3 == "disk" &&
@@ -267,6 +274,7 @@ namespace_checks=0
 
 check_namespace() {
     [ -f "$1/namespace.tsv" ] || return 0
+    rm -f /tmp/dump-*
     while IFS="$(printf '\t')" read -r stage kind path arg payload; do
         [ "$stage" = "$2" ] || continue
         namespace_checks=$((namespace_checks + 1))

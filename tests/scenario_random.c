@@ -26,6 +26,18 @@
 #define MODE_SET_UID 04000U
 #define MODE_SET_GID 02000U
 #define MODE_GROUP_EXECUTE 00010U
+#define COMPRESSION_PROPERTY "btrfs.compression"
+/* The codec FS_IOC_SETFLAGS records without a mount codec. */
+#define COMPRESSION_CODEC "zlib"
+/* The inode flags FS_IOC_SETFLAGS and inheritance decide. */
+#define MODEL_FLAGS                                                                                \
+	(BT_INODE_SYNC | BT_INODE_IMMUTABLE | BT_INODE_APPEND | BT_INODE_NODUMP |                  \
+	    BT_INODE_NOATIME | BT_INODE_DIRSYNC | BT_INODE_NODATACOW | BT_INODE_NODATASUM |        \
+	    BT_INODE_COMPRESS | BT_INODE_NOCOMPRESS)
+
+static const unsigned random_attribute_flags[] = { BTRFS_FS_SYNC_FL, BTRFS_FS_NODUMP_FL,
+	BTRFS_FS_NOATIME_FL, BTRFS_FS_DIRSYNC_FL };
+#define RANDOM_ATTRIBUTE_FLAGS (sizeof(random_attribute_flags) / sizeof(random_attribute_flags[0]))
 
 /* Directory and file names: short ones and four that share one CRC32C name
  * hash, so entries are appended to and cut from packed items. */
@@ -57,12 +69,13 @@ enum random_kind {
 	RANDOM_EXCHANGE,
 	RANDOM_WHITEOUT,
 	RANDOM_FALLOCATE,
+	RANDOM_FSFLAGS,
 	RANDOM_KINDS
 };
 
 /* Weights of the operation kinds, in random_kind order. */
 static const unsigned random_weights[RANDOM_KINDS] = { 9, 4, 3, 4, 6, 7, 5, 2, 12, 4, 4, 1, 4, 2, 2,
-	3 };
+	3, 3 };
 /* Allocation and zeroing; a punch entirely within a hole leaves the times,
  * which this model, holding bytes and not extents, cannot predict. */
 static const unsigned random_fallocate_modes[] = { 0, BTRFS_FALLOCATE_KEEP_SIZE,
@@ -76,6 +89,11 @@ struct model_inode {
 	uint32_t uid;
 	uint32_t gid;
 	uint32_t links;
+	/* Inode flags (MODEL_FLAGS) and the compression property, which
+	 * expectations check once they have been set or inherited. */
+	uint64_t flags;
+	int property;
+	int flags_seen;
 	int64_t access_seconds;
 	int64_t modify_seconds;
 	uint8_t *data;
@@ -305,6 +323,42 @@ model_new_inode(struct model *model, uint32_t mode)
 	return i;
 }
 
+static int
+model_can_compress(uint64_t flags)
+{
+	return (flags & (BT_INODE_NODATACOW | BT_INODE_NODATASUM)) == 0;
+}
+
+/* A new inode's flags and compression property from its directory, as
+ * btrfs_inherit_iflags and btrfs_inode_inherit_props pass them. */
+static void
+model_inherit(struct model *model, uint32_t inode, uint32_t directory)
+{
+	struct model_inode *child = &model->inodes[inode];
+	const struct model_inode *parent = &model->inodes[directory];
+	uint32_t type = model_type(child);
+
+	child->flags = 0;
+	if ((parent->flags & BT_INODE_NOCOMPRESS) != 0) {
+		child->flags |= BT_INODE_NOCOMPRESS;
+	} else if ((parent->flags & BT_INODE_COMPRESS) != 0) {
+		child->flags |= BT_INODE_COMPRESS;
+	}
+	if ((parent->flags & BT_INODE_NODATACOW) != 0) {
+		child->flags |= BT_INODE_NODATACOW;
+		if (type == BTRFS_MODE_REGULAR) {
+			child->flags |= BT_INODE_NODATASUM;
+		}
+	}
+	child->property = (type == BTRFS_MODE_REGULAR || type == BTRFS_MODE_DIRECTORY) &&
+	    parent->property && model_can_compress(parent->flags) &&
+	    model_can_compress(child->flags);
+	if (child->property) {
+		child->flags = (child->flags & ~BT_INODE_NOCOMPRESS) | BT_INODE_COMPRESS;
+	}
+	child->flags_seen = child->flags != 0 || parent->flags_seen;
+}
+
 static void
 model_add_entry(struct model *model, uint32_t directory, uint32_t name, uint32_t child)
 {
@@ -451,6 +505,7 @@ random_create(struct model *model, struct plan *plan, uint32_t mode)
 		plan_create(plan, model->commit, path, mode, NULL);
 	}
 	inode = model_new_inode(model, mode);
+	model_inherit(model, inode, directory);
 	if ((mode & BTRFS_MODE_TYPE) == BTRFS_MODE_SYMLINK) {
 		strcpy(model->inodes[inode].target, target);
 		model->inodes[inode].size = strlen(target);
@@ -639,6 +694,7 @@ random_rename(struct model *model, struct plan *plan, int whiteout)
 		/* The whiteout under the old name; the harness resolves it by name
 		 * only from the next commit on. */
 		whiteout_inode = model_new_inode(model, BTRFS_MODE_CHARACTER);
+		model_inherit(model, whiteout_inode, old_parent);
 		model_add_entry(model, old_parent, old_name, whiteout_inode);
 		model->inodes[whiteout_inode].frozen = 1;
 	}
@@ -851,6 +907,154 @@ random_attributes(struct model *model, struct plan *plan)
 	return 1;
 }
 
+/* The FS_*_FL flags btrfs_inode_fsflags reports for the model's flags. */
+static unsigned
+model_fsflags(const struct model_inode *inode)
+{
+	static const struct {
+		uint64_t inode;
+		unsigned attribute;
+	} map[] = { { BT_INODE_SYNC, BTRFS_FS_SYNC_FL },
+		{ BT_INODE_IMMUTABLE, BTRFS_FS_IMMUTABLE_FL },
+		{ BT_INODE_APPEND, BTRFS_FS_APPEND_FL }, { BT_INODE_NODUMP, BTRFS_FS_NODUMP_FL },
+		{ BT_INODE_NOATIME, BTRFS_FS_NOATIME_FL },
+		{ BT_INODE_DIRSYNC, BTRFS_FS_DIRSYNC_FL },
+		{ BT_INODE_NODATACOW, BTRFS_FS_NOCOW_FL } };
+
+	unsigned result = 0;
+	size_t i;
+
+	for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+		if ((inode->flags & map[i].inode) != 0) {
+			result |= map[i].attribute;
+		}
+	}
+	if ((inode->flags & BT_INODE_NOCOMPRESS) != 0) {
+		result |= BTRFS_FS_NOCOMP_FL;
+	} else if ((inode->flags & BT_INODE_COMPRESS) != 0) {
+		result |= BTRFS_FS_COMPR_FL;
+	}
+	return result;
+}
+
+static uint64_t
+model_flag(uint64_t flags, uint64_t bit, unsigned set)
+{
+	return set != 0 ? flags | bit : flags & ~bit;
+}
+
+/* Applies FS_IOC_SETFLAGS to the model as btrfs_fileattr_set does: Linux's
+ * mask for the type, check_fsflags and the compression check, then the
+ * attribute flags, NOCOW (a regular file's only while it is empty) and the
+ * compression flags with their property. Returns the refusal, if any. */
+static enum btrfs_result
+model_set_fsflags(struct model_inode *object, unsigned flags)
+{
+	uint32_t type = model_type(object);
+	unsigned old_flags = model_fsflags(object);
+	uint64_t result = object->flags;
+
+	if (type == BTRFS_MODE_REGULAR) {
+		flags &= ~BTRFS_FS_DIRSYNC_FL;
+	} else if (type != BTRFS_MODE_DIRECTORY) {
+		flags &= BTRFS_FS_NODUMP_FL | BTRFS_FS_NOATIME_FL;
+	}
+	if (((flags & BTRFS_FS_NOCOMP_FL) && (flags & BTRFS_FS_COMPR_FL)) ||
+	    ((flags & BTRFS_FS_COMPR_FL) && (flags & BTRFS_FS_NOCOW_FL)) ||
+	    ((old_flags & BTRFS_FS_NOCOW_FL) &&
+		(flags & (BTRFS_FS_COMPR_FL | BTRFS_FS_NOCOMP_FL))) ||
+	    ((flags & BTRFS_FS_NOCOW_FL) &&
+		(old_flags & (BTRFS_FS_COMPR_FL | BTRFS_FS_NOCOMP_FL))) ||
+	    ((flags & BTRFS_FS_COMPR_FL) && !model_can_compress(object->flags))) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	result = model_flag(result, BT_INODE_SYNC, flags & BTRFS_FS_SYNC_FL);
+	result = model_flag(result, BT_INODE_IMMUTABLE, flags & BTRFS_FS_IMMUTABLE_FL);
+	result = model_flag(result, BT_INODE_APPEND, flags & BTRFS_FS_APPEND_FL);
+	result = model_flag(result, BT_INODE_NODUMP, flags & BTRFS_FS_NODUMP_FL);
+	result = model_flag(result, BT_INODE_NOATIME, flags & BTRFS_FS_NOATIME_FL);
+	result = model_flag(result, BT_INODE_DIRSYNC, flags & BTRFS_FS_DIRSYNC_FL);
+	if (type != BTRFS_MODE_REGULAR) {
+		result = model_flag(result, BT_INODE_NODATACOW, flags & BTRFS_FS_NOCOW_FL);
+	} else if (object->size == 0) {
+		result = model_flag(
+		    result, BT_INODE_NODATACOW | BT_INODE_NODATASUM, flags & BTRFS_FS_NOCOW_FL);
+	}
+	object->property = 0;
+	if ((flags & BTRFS_FS_NOCOMP_FL) != 0) {
+		result = (result & ~BT_INODE_COMPRESS) | BT_INODE_NOCOMPRESS;
+	} else if ((flags & BTRFS_FS_COMPR_FL) != 0) {
+		result = (result & ~BT_INODE_NOCOMPRESS) | BT_INODE_COMPRESS;
+		object->property = 1;
+	} else {
+		result &= ~(BT_INODE_COMPRESS | BT_INODE_NOCOMPRESS);
+	}
+	object->flags = result;
+	object->flags_seen = 1;
+	return BTRFS_OK;
+}
+
+/* FS_IOC_SETFLAGS as chattr sets it: attribute flags, NOCOW and the
+ * compression flags. Sometimes a file is made immutable with its other flags
+ * set again, refuses a write, and gets them back. */
+static int
+random_fsflags(struct model *model, struct plan *plan)
+{
+	static const uint8_t byte = 0x5a;
+	char path[RANDOM_PATH];
+	uint32_t inode = model_pick_inode(model, 0);
+	struct model_inode *object;
+	unsigned old_flags;
+	unsigned flags = 0;
+	enum btrfs_result result;
+	size_t i;
+
+	if (inode == MODEL_NONE) {
+		return 0;
+	}
+	object = &model->inodes[inode];
+	old_flags = model_fsflags(object);
+	model_path(model, inode, path, sizeof(path));
+	if (model_type(object) == BTRFS_MODE_REGULAR &&
+	    (object->mode & (MODE_SET_UID | MODE_SET_GID)) == 0 && model_below(model, 4) == 0) {
+		plan_set_fsflags(plan, model->commit, path, old_flags | BTRFS_FS_IMMUTABLE_FL);
+		result = model_set_fsflags(object, old_flags | BTRFS_FS_IMMUTABLE_FL);
+		if (result != BTRFS_OK) {
+			plan_expect_refusal(plan, model->commit, result);
+			return 1;
+		}
+		plan_write_new(plan, model->commit, path, object->size, &byte, 1);
+		plan_expect_refusal(plan, model->commit, BTRFS_NOT_PERMITTED);
+		plan_set_fsflags(plan, model->commit, path, old_flags);
+		REQUIRE(model_set_fsflags(object, old_flags) == BTRFS_OK);
+		return 1;
+	}
+	for (i = 0; i < RANDOM_ATTRIBUTE_FLAGS; i++) {
+		if (model_below(model, 3) == 0) {
+			flags |= random_attribute_flags[i];
+		}
+	}
+	switch (model_below(model, 4)) {
+	case 0:
+		flags |= BTRFS_FS_COMPR_FL;
+		break;
+	case 1:
+		flags |= BTRFS_FS_NOCOMP_FL;
+		break;
+	default:
+		break;
+	}
+	if (model_below(model, 4) == 0) {
+		flags |= BTRFS_FS_NOCOW_FL;
+	}
+	plan_set_fsflags(plan, model->commit, path, flags);
+	result = model_set_fsflags(object, flags);
+	if (result != BTRFS_OK) {
+		plan_expect_refusal(plan, model->commit, result);
+	}
+	return 1;
+}
+
 static int
 random_clean(struct model *model, struct plan *plan)
 {
@@ -974,6 +1178,8 @@ random_operation(struct model *model, struct plan *plan, enum random_kind kind)
 		return random_fallocate(model, plan);
 	case RANDOM_ATTRIBUTES:
 		return random_attributes(model, plan);
+	case RANDOM_FSFLAGS:
+		return random_fsflags(model, plan);
 	case RANDOM_CLEAN:
 		return random_clean(model, plan);
 	case RANDOM_REFUSAL:
@@ -1051,6 +1257,15 @@ model_expect(const struct model *model, struct plan *plan, size_t stage)
 			expect_names(plan, stage, stage, path, names, count);
 			break;
 		}
+		if (inode->flags_seen) {
+			expect_flags(plan, stage, stage, path, MODEL_FLAGS, inode->flags);
+			if (model_type(inode) == BTRFS_MODE_REGULAR ||
+			    model_type(inode) == BTRFS_MODE_DIRECTORY) {
+				expect_xattr(plan, stage, stage, path, COMPRESSION_PROPERTY,
+				    inode->property ? COMPRESSION_CODEC : NULL,
+				    inode->property ? strlen(COMPRESSION_CODEC) : 0);
+			}
+		}
 		for (j = 0; j < RANDOM_XATTRS; j++) {
 			if ((inode->xattr_seen >> j) & 1U) {
 				expect_xattr(plan, stage, stage, path, random_xattrs[j],
@@ -1124,12 +1339,13 @@ random_plan(struct context *context, uint32_t seed, int quick)
 	if (getenv("BTRFS_RANDOM_TRACE") != NULL) {
 		for (i = 1; i <= RANDOM_COMMITS; i++) {
 			for (commit = 0; commit < plan.operation_count[i]; commit++) {
-				printf("  %u.%zu kind %d %s -> %s expected %d\n", i, commit,
-				    plan.operations[i][commit].kind,
+				printf("  %u.%zu kind %d %s -> %s flags 0x%x expected %d\n", i,
+				    commit, plan.operations[i][commit].kind,
 				    plan.operations[i][commit].path,
 				    plan.operations[i][commit].target
 					? plan.operations[i][commit].target
 					: "-",
+				    (unsigned)plan.operations[i][commit].flags,
 				    plan.operations[i][commit].expected);
 			}
 		}
