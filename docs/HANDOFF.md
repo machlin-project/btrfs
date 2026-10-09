@@ -122,8 +122,8 @@ is destroyed. `accept` is legal only after successful durable publication;
    Mixed groups, the block-group tree and a metadata UUID are written, a v1
    space cache is left stale for Linux to rebuild (ARCHITECTURE.md, Format
    features), and qgroups are accounted as Linux's full mode accounts them
-   (`core/qgroup.c`, ARCHITECTURE.md, Quotas), including rescans and Linux's
-   metadata reservations against limits. Remaining: simple quotas and
+   (`core/qgroup.c`, ARCHITECTURE.md, Quotas), including rescans, Linux's
+   metadata reservations against limits and simple quotas. Remaining:
    fixtures with sectors above 4 KiB.
 5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
    orphan items for open inodes, eviction and orphan cleanup, atomic rename

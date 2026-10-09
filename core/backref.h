@@ -42,5 +42,14 @@ enum btrfs_result bt_backref_drop(struct bt_mutation *mutation, struct bt_root *
 enum btrfs_result bt_backref_set_flags(
     struct bt_mutation *mutation, struct bt_root *extents, struct bt_key extent, uint64_t flags);
 uint64_t bt_backref_data_hash(uint64_t root, uint64_t inode, uint64_t offset);
+/* The bytes bt_backref_new_data writes at most. */
+#define BT_BACKREF_NEW_DATA_BYTES                                                                  \
+	(sizeof(struct bt_disk_extent_item) + sizeof(struct bt_disk_inline_ref) + 1U +             \
+	    sizeof(struct bt_disk_data_ref))
+/* Encodes the extent item of a new data extent of generation with its one
+ * data reference, as alloc_reserved_file_extent does; with owner (simple
+ * quotas) an owner reference naming root precedes it. Returns its size. */
+size_t bt_backref_new_data(
+    uint8_t *out, uint64_t generation, uint64_t root, uint64_t inode, uint64_t offset, int owner);
 
 #endif

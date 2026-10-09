@@ -307,6 +307,9 @@ enum btrfs_result bt_chunk_add(
     struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap);
 enum btrfs_result bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,
     unsigned mirror, uint64_t *physical, unsigned *mirrors);
+/* A root owner that asks for whichever owner the node's header names; the
+ * node is verified otherwise as any other. */
+#define BT_OWNER_ANY UINT64_MAX
 enum btrfs_result bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer);
 /* bt_tree_read that returns a node in place when it can: *node is a stored
  * node, pinned until bt_tree_release(*handle), or buffer after a device read. */

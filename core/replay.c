@@ -1417,12 +1417,7 @@ bt_rp_reference(struct bt_replay *rp, struct bt_owned_root *tree,
     const struct bt_disk_extent *extent, uint64_t inode, uint64_t position)
 {
 	struct btrfs_transaction *transaction = rp->transaction;
-
-	struct {
-		struct bt_disk_extent_item item;
-		uint8_t type;
-		struct bt_disk_data_ref reference;
-	} wire;
+	uint8_t wire[BT_BACKREF_NEW_DATA_BYTES];
 	struct bt_backref reference;
 	struct bt_key key = { .objectid = bt_u64(extent->disk_bytenr),
 		.type = BT_EXTENT_ITEM,
@@ -1460,17 +1455,12 @@ bt_rp_reference(struct bt_replay *rp, struct bt_owned_root *tree,
 		error = bt_space_change_used(transaction->space, key.objectid, key.offset, 1);
 	}
 	if (error == BTRFS_OK) {
-		bt_zero(&wire, sizeof(wire));
-		bt_put64(&wire.item.refs, 1);
-		bt_put64(&wire.item.generation, bt_rp_transid(rp));
-		bt_put64(&wire.item.flags, BT_EXTENT_FLAG_DATA);
-		wire.type = BT_EXTENT_DATA_REF;
-		bt_put64(&wire.reference.root, tree->root.owner);
-		bt_put64(&wire.reference.objectid, inode);
-		bt_put64(&wire.reference.offset, position);
-		bt_put32(&wire.reference.count, 1);
-		error = bt_tx_edit(
-		    transaction, &transaction->extents.root, key, &wire, sizeof(wire), BT_INSERT);
+		/* btrfs_alloc_logged_file_extent: the replaying subvolume owns it. */
+		size =
+		    bt_backref_new_data(wire, bt_rp_transid(rp), tree->root.owner, inode, position,
+			(bt_rp_fs(rp)->info.incompat_features & BT_FEATURE_SIMPLE_QUOTA) != 0);
+		error =
+		    bt_tx_edit(transaction, &transaction->extents.root, key, wire, size, BT_INSERT);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_mutation_note_extent(transaction->mutation, key);

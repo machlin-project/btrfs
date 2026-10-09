@@ -242,6 +242,9 @@ btrfs_transaction_create_subvolume(struct btrfs_transaction *transaction,
 	if (error == BTRFS_OK) {
 		error = bt_qgroup_create(transaction, id);
 	}
+	if (error == BTRFS_OK) {
+		error = bt_qgroup_inherit_parents(transaction, id, parent.tree);
+	}
 	bt_put64(&item->legacy.inode.generation, 1);
 	bt_put64(&item->legacy.inode.size, BT_ROOT_ITEM_INODE_SIZE);
 	bt_put32(&item->legacy.inode.links, 1);
@@ -345,10 +348,11 @@ btrfs_transaction_snapshot(struct btrfs_transaction *transaction, uint64_t sourc
 	if (error == BTRFS_OK && changed) {
 		error = BTRFS_UNSUPPORTED;
 	}
-	/* With quotas the snapshot is the transaction's first change: its
+	/* With full quotas the snapshot is the transaction's first change: its
 	 * accounting starts from the base with only the copy added. Its counts
-	 * are inherited whole, which a rescan's partial counts are not. */
-	if (error == BTRFS_OK && transaction->qgroups != NULL &&
+	 * are inherited whole, which a rescan's partial counts are not. Simple
+	 * quotas follow extents alone. */
+	if (error == BTRFS_OK && transaction->qgroups != NULL && !bt_qgroup_simple(transaction) &&
 	    (transaction->changed || bt_mutation_count(transaction->mutation) != 0 ||
 		bt_qgroup_rescanning(transaction))) {
 		error = BTRFS_UNSUPPORTED;
@@ -378,6 +382,9 @@ btrfs_transaction_snapshot(struct btrfs_transaction *transaction, uint64_t sourc
 	error = bt_mutation_new_root(transaction->mutation, origin->root, id, 1, &owned.root);
 	if (error == BTRFS_OK) {
 		error = bt_qgroup_create(transaction, id);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_qgroup_inherit_parents(transaction, id, parent.tree);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_qgroup_snapshot(

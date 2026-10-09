@@ -599,30 +599,18 @@ static enum btrfs_result
 bt_tx_extent_item(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     uint64_t ino, uint64_t position, uint64_t logical, uint64_t size)
 {
-	struct {
-		struct bt_disk_extent_item item;
-		uint8_t type;
-		struct bt_disk_data_ref reference;
-	} wire;
+	uint8_t wire[BT_BACKREF_NEW_DATA_BYTES];
 	struct bt_key key = { .objectid = logical, .type = BT_EXTENT_ITEM, .offset = size };
+	size_t length;
 	enum btrfs_result error;
 
-	_Static_assert(sizeof(wire) ==
-		sizeof(struct bt_disk_extent_item) + 1 + sizeof(struct bt_disk_data_ref),
-	    "inline data reference layout");
 	error = bt_space_change_used(transaction->space, logical, size, 1);
 	if (error == BTRFS_OK) {
-		bt_zero(&wire, sizeof(wire));
-		bt_put64(&wire.item.refs, 1);
-		bt_put64(&wire.item.generation, transaction->base->info.generation + 1);
-		bt_put64(&wire.item.flags, BT_EXTENT_FLAG_DATA);
-		wire.type = BT_EXTENT_DATA_REF;
-		bt_put64(&wire.reference.root, tree->root.owner);
-		bt_put64(&wire.reference.objectid, ino);
-		bt_put64(&wire.reference.offset, position);
-		bt_put32(&wire.reference.count, 1);
+		length = bt_backref_new_data(wire, transaction->base->info.generation + 1,
+		    tree->root.owner, ino, position,
+		    (transaction->base->info.incompat_features & BT_FEATURE_SIMPLE_QUOTA) != 0);
 		error = bt_tx_edit(
-		    transaction, &transaction->extents.root, key, &wire, sizeof(wire), BT_INSERT);
+		    transaction, &transaction->extents.root, key, wire, length, BT_INSERT);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_mutation_note_extent(transaction->mutation, key);

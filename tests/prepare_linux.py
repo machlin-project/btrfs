@@ -27,7 +27,8 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-block-group-tree": (16384, "dup", ""),
             "transactions-mixed": (4096, "single", ""),
             "transactions-space-cache": (4096, "single", ""),
-            "transactions-quota": (16384, "dup", "")}
+            "transactions-quota": (16384, "dup", ""),
+            "transactions-squota": (16384, "dup", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -45,11 +46,11 @@ MKFS_FEATURES = {"transactions-holes": "-O ^no-holes",
 # Format features beyond mkfs defaults, each confirmed in Linux's own dumps: a
 # metadata UUID set by btrfstune after Linux wrote the volume (tree blocks keep
 # the old fsid, the superblock names a new one), mixed data and metadata
-# groups, a v1 free-space cache that Linux keeps current and quotas with a
-# limited subvolume carry the data payload. The block-group tree keeps the
-# base payload, whose emptied data group the group scenarios remove.
+# groups, a v1 free-space cache that Linux keeps current, and full and simple
+# quotas with a limited subvolume carry the data payload. The block-group tree
+# keeps the base payload, whose emptied data group the group scenarios remove.
 FEATURE_PROFILES = ("transactions-metadata-uuid", "transactions-mixed",
-                    "transactions-space-cache", "transactions-quota")
+                    "transactions-space-cache", "transactions-quota", "transactions-squota")
 MOUNT_OPTIONS = {"transactions-space-cache": "space_cache=v1"}
 # Linux writes no v1 cache for a block group below 100 MiB (cache_save_setup);
 # on 1 GiB its data groups are 112 MiB.
@@ -530,6 +531,24 @@ test "$(awk '$1 == "cache_generation" {print $2}' /tmp/super.txt)" = \\
 caches=$(btrfs inspect-internal dump-tree -t root /dev/vda | grep -c 'key (FREE_SPACE UNTYPED' || true)
 echo BTRFS_REFERENCE_SPACE_CACHES:$caches
 test "$caches" -gt 0'''
+    if profile == "transactions-squota":
+        # Simple quotas count extents from their enabling transaction on: the
+        # base payload before it stays uncounted, the data payload counts.
+        fill = "btrfs quota enable -s /mnt\nbtrfs filesystem sync /mnt\n" + fill + f'''
+btrfs qgroup create {QUOTA_GROUP} /mnt
+btrfs qgroup assign 0/$(btrfs inspect-internal rootid /mnt/data) {QUOTA_GROUP} /mnt
+btrfs qgroup assign 0/$(btrfs inspect-internal rootid /mnt/data-snap) {QUOTA_GROUP} /mnt
+btrfs qgroup limit {QUOTA_LIMIT_BYTES} /mnt/data
+btrfs qgroup limit -e {QUOTA_GROUP_LIMIT_BYTES} {QUOTA_GROUP} /mnt
+btrfs filesystem sync /mnt
+btrfs qgroup show -pcre --raw /mnt'''
+        after = '''btrfs inspect-internal dump-super /dev/vda | grep -w SIMPLE_QUOTA
+btrfs inspect-internal dump-tree -t quota /dev/vda > /tmp/quota.txt
+grep -c 'QGROUP_INFO' /tmp/quota.txt
+test "$(grep -c 'QGROUP_RELATION' /tmp/quota.txt)" = 4
+grep -A1 'QGROUP_STATUS' /tmp/quota.txt
+grep -A1 'QGROUP_STATUS' /tmp/quota.txt | grep -q SIMPLE
+echo BTRFS_REFERENCE_OWNER_REFS:$(btrfs inspect-internal dump-tree -t extent /dev/vda | grep -c 'EXTENT_OWNER_REF' || true)'''
     if profile == "transactions-quota":
         fill += f'''
 btrfs quota enable /mnt

@@ -223,6 +223,16 @@ if fixtures != ''
   test('quota-transactions', transaction_test,
     args: ['--quota', join_paths(fixtures, 'transactions-quota.raw')], timeout: 600,
     suite: 'images')
+  # Simple quotas: each extent counts for its owner from the enabling
+  # generation on, as btrfs check counts it.
+  test('inline-transactions-squota', transaction_test,
+    args: [join_paths(fixtures, 'transactions-squota.raw')], timeout: 300, suite: 'images')
+  test('data-extents-squota', transaction_test,
+    args: ['--data', join_paths(fixtures, 'transactions-squota.raw')], timeout: 900,
+    suite: 'images')
+  test('squota-transactions', transaction_test,
+    args: ['--squota', join_paths(fixtures, 'transactions-squota.raw')], timeout: 600,
+    suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
     suite: 'images')
@@ -248,7 +258,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-block-group-tree.raw'),
     join_paths(fixtures, 'transactions-mixed.raw'),
     join_paths(fixtures, 'transactions-space-cache.raw'),
-    join_paths(fixtures, 'transactions-quota.raw')],
+    join_paths(fixtures, 'transactions-quota.raw'),
+    join_paths(fixtures, 'transactions-squota.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

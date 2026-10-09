@@ -35,7 +35,11 @@ PROFILES = {
     # The logs workload with quotas enabled before its base: replay accounts
     # the extents it adds and drops, and btrfs check verifies the numbers.
     "logs-quota": {"node_size": 16384, "metadata": "dup", "device_bytes": 256 << 20,
-                   "quota": True},
+                   "quota": "full"},
+    # The logs workload with simple quotas enabled before its base: replay
+    # names the owner of each extent it allocates and counts it for that owner.
+    "logs-squota": {"node_size": 16384, "metadata": "dup", "device_bytes": 256 << 20,
+                    "quota": "simple"},
 }
 MANY_FILES = 2000
 INPUTS = {
@@ -184,9 +188,11 @@ mkfs.btrfs --version
 mkfs.btrfs -f -s 4096 -n {settings["node_size"]} -m {settings["metadata"]} -d single \\
     -L machlin-btrfs /dev/vda
 mount -t btrfs -o noatime,commit={COMMIT_SECONDS} /dev/vda /mnt
-{"btrfs quota enable /mnt" if settings.get("quota") else ":"}
+{"btrfs quota enable /mnt" if settings.get("quota") == "full" else
+ "btrfs quota enable -s /mnt" if settings.get("quota") == "simple" else ":"}
 {BASE}
-{"btrfs quota rescan -w /mnt && btrfs qgroup show --raw /mnt" if settings.get("quota") else ":"}
+{"btrfs quota rescan -w /mnt && btrfs qgroup show --raw /mnt" if settings.get("quota") == "full" else
+ "btrfs qgroup show --raw /mnt" if settings.get("quota") == "simple" else ":"}
 {logged}
 echo BTRFS_LOG_CREATED:{profile}
 trap - EXIT

@@ -593,6 +593,7 @@ struct btrfs_object_id object(struct btrfs_fs *fs, const char *path);
 void namespace_scenarios(struct context *context);
 void subvolume_scenarios(struct context *context);
 void quota_scenarios(struct context *context);
+void squota_scenarios(struct context *context);
 /* Volume locks for a test that runs one thread: nothing ever waits. */
 extern const struct btrfs_volume_locks single_thread_locks;
 

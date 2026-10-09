@@ -385,6 +385,113 @@ quota_maintenance(struct context *context)
 	printf("native maintenance: a drop and a rescan finished in %zu steps PASS\n", steps);
 }
 
+/* Simple quotas on the Linux image whose quotas Linux enabled in simple mode
+ * after the base payload and before the data payload, with the same qgroups,
+ * relations and limits as the full-quota image. Each extent counts once, for
+ * its owner, from the enabling generation on; Linux's btrfs check verifies the
+ * numbers of every exported state, and so does the audit of every state. */
+
+/* A subvolume and a snapshot of it inside /data join 1/100 as /data's qgroup
+ * is in it; the subvolume deleted and dropped keeps its qgroup while the
+ * snapshot still holds extents it owns. */
+static void
+squota_subvolume_plan(struct context *context)
+{
+	static uint8_t data[QUOTA_FILE_BYTES];
+	struct plan plan;
+
+	fill_pattern(data, sizeof(data), 91);
+	plan_init(&plan);
+	/* An unchanged file gives every stage its generation. */
+	plan_file(context, &plan, "/greeting");
+	plan.name = "squota-subvolume";
+	plan_subvolume(&plan, 1, "/data/sv");
+	plan_create(&plan, 1, "/data/sv/file", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/data/sv/file", 0, data, sizeof(data));
+	plan_snapshot(&plan, 2, "/data/sv", "/data/sv-snap", 0);
+	plan_create(&plan, 2, "/data/sv-snap/more", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 2, "/data/sv-snap/more", 0, data, sizeof(data));
+	plan_delete_subvolume(&plan, 3, "/data/sv");
+	plan_clean_subvolumes(&plan, 3, 4096, 1, 0);
+	expect_file(&plan, 1, 2, "/data/sv/file", data, sizeof(data));
+	expect_file(&plan, 2, LAST_STAGE, "/data/sv-snap/file", data, sizeof(data));
+	expect_file(&plan, 2, LAST_STAGE, "/data/sv-snap/more", data, sizeof(data));
+	expect_absent(&plan, 3, LAST_STAGE, "/data/sv");
+	expect_quota(&plan, 0, 0, 0, QUOTA_GROUPS);
+	expect_quota(&plan, 1, 1, 0, QUOTA_GROUPS + 1);
+	expect_quota(&plan, 2, LAST_STAGE, 0, QUOTA_GROUPS + 2);
+	run_plan(context, &plan);
+}
+
+/* A snapshot of /data in the top level joins no qgroup and counts what it
+ * writes; a shared extent goes back from /data when the snapshot frees it
+ * last, and an extent from before simple quotas changes nothing when freed.
+ * Snapshots need not be a transaction's first change: an unchanged source
+ * suffices. */
+static void
+squota_owner_plan(struct context *context)
+{
+	static uint8_t data[QUOTA_FILE_BYTES];
+	struct plan plan;
+
+	fill_pattern(data, sizeof(data), 92);
+	plan_init(&plan);
+	/* An unchanged file gives every stage its generation. */
+	plan_file(context, &plan, "/greeting");
+	plan.name = "squota-owner";
+	plan_create(&plan, 1, "/before", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_snapshot(&plan, 1, "/data", "/copy", 0);
+	plan_create(&plan, 2, "/copy/new", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 2, "/copy/new", 0, data, sizeof(data));
+	plan_write_new(&plan, 2, "/copy/big", 4096, data, sizeof(data));
+	plan_unlink(&plan, 2, "/data/small", 0);
+	plan_unlink(&plan, 3, "/copy/small", 0);
+	plan_unlink(&plan, 3, "/big", 0);
+	expect_absent(&plan, 2, LAST_STAGE, "/data/small");
+	expect_absent(&plan, 3, LAST_STAGE, "/copy/small");
+	expect_absent(&plan, 3, LAST_STAGE, "/big");
+	expect_file(&plan, 2, LAST_STAGE, "/copy/new", data, sizeof(data));
+	expect_quota(&plan, 0, 0, 0, QUOTA_GROUPS);
+	expect_quota(&plan, 1, LAST_STAGE, 0, QUOTA_GROUPS + 1);
+	run_plan(context, &plan);
+}
+
+/* Refusals before any change: a rescan, which simple quotas have no use for,
+ * and a preallocation past /data's referenced limit. Deleted snapshots that
+ * owned only their own blocks lose their qgroups, one of them in 1/100. */
+static void
+squota_drop_plan(struct context *context)
+{
+	struct plan plan;
+
+	plan_init(&plan);
+	/* An unchanged file gives every stage its generation. */
+	plan_file(context, &plan, "/greeting");
+	plan.name = "squota-drop";
+	plan_quota_rescan(&plan, 1, QUOTA_RESCAN_STEP, 0);
+	plan_expect_refusal(&plan, 1, BTRFS_INVALID_ARGUMENT);
+	plan_create(&plan, 1, "/data/over", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_fallocate_new(&plan, 1, "/data/over", 0, 0, QUOTA_OVER_BYTES);
+	plan_expect_refusal(&plan, 1, BTRFS_QUOTA_EXCEEDED);
+	plan_delete_subvolume(&plan, 2, "/data-ro");
+	plan_delete_subvolume(&plan, 2, "/data-snap");
+	plan_clean_subvolumes(&plan, 3, 4096, 2, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/data/over", NULL, 0);
+	expect_absent(&plan, 2, LAST_STAGE, "/data-ro");
+	expect_absent(&plan, 2, LAST_STAGE, "/data-snap");
+	expect_quota(&plan, 0, 2, 0, QUOTA_GROUPS);
+	expect_quota(&plan, 3, LAST_STAGE, 0, QUOTA_GROUPS - 2);
+	run_plan(context, &plan);
+}
+
+void
+squota_scenarios(struct context *context)
+{
+	squota_subvolume_plan(context);
+	squota_owner_plan(context);
+	squota_drop_plan(context);
+}
+
 void
 quota_scenarios(struct context *context)
 {

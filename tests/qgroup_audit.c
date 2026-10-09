@@ -17,6 +17,8 @@ struct qa_extent {
 	uint64_t bytenr;
 	uint64_t bytes;
 	uint64_t generation;
+	/* A data extent's owner reference, under simple quotas. */
+	uint64_t owner;
 	uint8_t level;
 	int tree;
 };
@@ -59,6 +61,9 @@ struct qa_state {
 	uint64_t visit;
 	/* A running rescan has counted the extents below this bytenr. */
 	uint64_t progress;
+	/* Simple quotas count each extent from enable_gen on for its owner. */
+	uint64_t enable_gen;
+	int simple;
 	int failed;
 };
 
@@ -156,7 +161,13 @@ qa_load(struct qa_state *state, struct bt_root quota)
 			} else if ((bt_u64(status->flags) & BT_QGROUP_STATUS_INCONSISTENT) != 0) {
 				state->audit->skipped = 1;
 			}
-			if (bt_u64(status->generation) != state->fs->info.generation) {
+			if ((bt_u64(status->flags) & BT_QGROUP_STATUS_SIMPLE) != 0 &&
+			    record.size == sizeof(struct bt_disk_qgroup_status_simple)) {
+				state->simple = 1;
+				state->enable_gen =
+				    bt_u64(((const struct bt_disk_qgroup_status_simple *)status)
+					    ->enable_gen);
+			} else if (bt_u64(status->generation) != state->fs->info.generation) {
 				state->audit->skipped = 1;
 			}
 		} else if (record.key.type == BT_QGROUP_INFO && record.size == sizeof(*info)) {
@@ -245,7 +256,11 @@ qa_scan(struct qa_state *state)
 					break;
 				}
 				offset = bt_u64(*(const struct bt_le64 *)(refs + position + 1));
-				if (type == BT_TREE_BLOCK_REF) {
+				if (type == BT_EXTENT_OWNER_REF && !extent->tree &&
+				    position == start) {
+					extent->owner = offset;
+					position += sizeof(struct bt_disk_inline_ref);
+				} else if (type == BT_TREE_BLOCK_REF) {
 					qa_add_ref(state, extent->bytenr, offset, 0);
 					position += 1 + sizeof(struct bt_le64);
 				} else if (type == BT_SHARED_BLOCK_REF) {
@@ -517,6 +532,62 @@ qa_account(struct qa_state *state, const uint64_t *roots, size_t count, uint64_t
 	free(reached);
 }
 
+/* Simple quotas, as btrfs check's simple_quota_account_extent counts them:
+ * each extent from enable_gen on counts for one root, a data extent's owner
+ * reference or a tree block's header owner, when that is a subvolume. */
+static int
+qa_simple(struct qa_state *state)
+{
+	const struct bt_disk_header *header;
+	const struct qa_extent *extent;
+	uint8_t *block;
+	uint64_t owner;
+	size_t chunk;
+	size_t i;
+
+	block = malloc(state->fs->info.node_size);
+	if (block == NULL) {
+		return qa_fail(state, "no memory");
+	}
+	header = (const void *)block;
+	for (i = 0; !state->failed && i < state->extent_count; i++) {
+		extent = &state->extents[i];
+		if (extent->generation < state->enable_gen) {
+			continue;
+		}
+		owner = extent->owner;
+		/* Linux names the owner of every data extent it allocates while
+		 * simple quotas are on. */
+		if (!extent->tree && owner == 0) {
+			qa_fail(state, "data extent %llu of generation %llu has no owner",
+			    (unsigned long long)extent->bytenr,
+			    (unsigned long long)extent->generation);
+			break;
+		}
+		if (extent->tree) {
+			chunk = bt_chunk_containing(state->fs, extent->bytenr);
+			if (chunk == state->fs->chunk_count ||
+			    (state->fs->chunks[chunk].type & BT_BLOCK_SYSTEM) != 0) {
+				continue;
+			}
+			if (bt_tree_read(state->fs,
+				(struct bt_root){ extent->bytenr, extent->generation, BT_OWNER_ANY,
+				    extent->level },
+				block) != BTRFS_OK) {
+				qa_fail(state, "tree block %llu unreadable",
+				    (unsigned long long)extent->bytenr);
+				break;
+			}
+			owner = bt_u64(header->owner);
+		}
+		if (bt_file_tree(owner)) {
+			qa_account(state, &owner, 1, extent->bytes);
+		}
+	}
+	free(block);
+	return state->failed ? -1 : 0;
+}
+
 int
 qgroup_audit(const struct btrfs_fs *fs, struct qgroup_audit *audit)
 {
@@ -547,10 +618,14 @@ qgroup_audit(const struct btrfs_fs *fs, struct qgroup_audit *audit)
 	if (result == 0 && !audit->skipped) {
 		result = qa_scan(&state);
 	}
-	if (result == 0 && !audit->skipped) {
+	if (result == 0 && !audit->skipped && state.simple) {
+		result = qa_simple(&state);
+	}
+	if (result == 0 && !audit->skipped && !state.simple) {
 		result = qa_implied(&state);
 	}
-	for (i = 0; result == 0 && !audit->skipped && i < state.extent_count; i++) {
+	for (i = 0; result == 0 && !audit->skipped && !state.simple && i < state.extent_count;
+	    i++) {
 		if (state.extents[i].bytenr >= state.progress) {
 			continue;
 		}
@@ -563,11 +638,13 @@ qgroup_audit(const struct btrfs_fs *fs, struct qgroup_audit *audit)
 	}
 	for (i = 0; result == 0 && !audit->skipped && i < state.group_count; i++) {
 		group = &state.groups[i];
+		/* Simple quotas leave the compressed counts alone. */
 		if (group->info &&
 		    (group->referenced != group->stored_referenced ||
-			group->referenced != group->stored_referenced_compressed ||
 			group->exclusive != group->stored_exclusive ||
-			group->exclusive != group->stored_exclusive_compressed)) {
+			(!state.simple &&
+			    (group->referenced != group->stored_referenced_compressed ||
+				group->exclusive != group->stored_exclusive_compressed)))) {
 			result = qa_fail(&state,
 			    "qgroup %u/%llu stores referenced %llu exclusive %llu, counts %llu and "
 			    "%llu",

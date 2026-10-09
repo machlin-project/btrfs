@@ -568,6 +568,25 @@ A snapshot waits while a rescan runs (UNSUPPORTED), and a rescan step cannot
 follow a snapshot in its transaction. Inherited counts would mix with partial
 ones, and this core does not claim Linux's numbers for that case.
 
+Simple quotas (incompat `SIMPLE_QUOTA`, status flag `SIMPLE_MODE`) count
+each extent for one subvolume, from the generation that enabled them
+(`enable_gen`) on. Every data extent allocated while they are on names its
+owner in an owner reference: the first inline item of its extent item, no
+reference itself, which the backref code keeps in place. A tree block's owner
+is its header's. At commit, each extent the transaction allocated or freed,
+from `enable_gen` on, adds or removes its bytes for its owner's qgroup and
+every qgroup above it (`btrfs_record_squota_delta`). Referenced and exclusive
+bytes change alike; the compressed counts stay as they are. Extents that
+remain, with references added or dropped, change nothing. A shared extent
+therefore leaves its owner only when the last reference goes, whoever drops
+it. Snapshots copy no counts and need not be their transaction's first change.
+A new subvolume or snapshot joins the qgroups above the qgroup of the
+subvolume holding its entry (`qgroup_auto_inherit`). A dropped subvolume's
+qgroup stays while it still owns extents. Simple quotas are never
+inconsistent, and they refuse a rescan (INVALID_ARGUMENT). Tree-block owners
+are read from the verified node; blocks in system chunks belong to no
+subvolume.
+
 Limits are checked before any change as Linux's `qgroup_reserve`, against
 the subvolume's qgroup and every qgroup above it; passing a referenced or
 exclusive limit returns QUOTA_EXCEEDED (EDQUOT natively). Reservations hold

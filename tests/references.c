@@ -198,6 +198,20 @@ load_inline(struct audit_state *state, struct extent_record *extent, const uint8
 	struct reference reference;
 	uint8_t type;
 
+	/* Simple quotas name a data extent's owner first; it is no reference. */
+	if (offset < size && data[offset] == BT_EXTENT_OWNER_REF) {
+		if ((extent->flags & BT_EXTENT_FLAG_DATA) == 0 ||
+		    size - offset < sizeof(struct bt_disk_inline_ref)) {
+			return fail(state, "misplaced owner reference at %llu",
+			    (unsigned long long)extent->bytenr);
+		}
+		memcpy(&value, data + offset + 1, sizeof(value));
+		if (!bt_file_tree(bt_u64(value))) {
+			return fail(state, "owner reference to tree %llu at %llu",
+			    (unsigned long long)bt_u64(value), (unsigned long long)extent->bytenr);
+		}
+		offset += sizeof(struct bt_disk_inline_ref);
+	}
 	while (offset < size) {
 		memset(&reference, 0, sizeof(reference));
 		reference.target = extent->bytenr;

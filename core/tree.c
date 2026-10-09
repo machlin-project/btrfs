@@ -91,7 +91,8 @@ bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *
 	}
 	owner = bt_u64(header->owner);
 	/* Snapshot blocks can retain the originating subvolume's owner. */
-	if (bt_file_tree(root.owner) ? !bt_file_tree(owner) : owner != root.owner) {
+	if (root.owner != BT_OWNER_ANY &&
+	    (bt_file_tree(root.owner) ? !bt_file_tree(owner) : owner != root.owner)) {
 		return BTRFS_CORRUPT;
 	}
 	count = bt_count(block);
@@ -105,7 +106,8 @@ bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *
 static int
 bt_owner_matches(struct bt_root root, uint64_t owner)
 {
-	return bt_file_tree(root.owner) ? bt_file_tree(owner) : owner == root.owner;
+	return root.owner == BT_OWNER_ANY ||
+	    (bt_file_tree(root.owner) ? bt_file_tree(owner) : owner == root.owner);
 }
 
 /* The shared cache holds only nodes committed in this view. */

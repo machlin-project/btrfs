@@ -115,6 +115,9 @@ struct bt_qgroups {
 	/* A running rescan's progress: extents from this bytenr on are left to
 	 * it. Linux stores it in every status item, 0 without a rescan. */
 	uint64_t progress;
+	/* Simple quotas: extents count for their owner from enable_gen on. */
+	int simple;
+	uint64_t enable_gen;
 	/* Off once quotas are inconsistent (Linux's NO_ACCOUNTING). */
 	int accounting;
 	struct bt_key *traced;
@@ -302,6 +305,10 @@ bt_qg_level(uint64_t id)
 static void
 bt_qg_inconsistent(struct bt_qgroups *qgroups)
 {
+	/* Simple quotas count each extent alone and are never inconsistent. */
+	if (qgroups->simple) {
+		return;
+	}
 	qgroups->flags =
 	    (qgroups->flags | BT_QGROUP_STATUS_INCONSISTENT) & ~BT_QGROUP_STATUS_RESCAN;
 	qgroups->accounting = 0;
@@ -339,13 +346,25 @@ bt_qg_record(struct bt_qgroups *qgroups, const struct bt_record *record)
 		qgroups->flags = bt_u64(status->flags);
 		bt_copy(qgroups->status, record->data, record->size);
 		qgroups->status_size = record->size;
-		/* Older versions, simple quotas, disabled quotas and unknown flags
-		 * need semantics this writer does not have. */
+		/* Older versions, disabled quotas and unknown flags need semantics
+		 * this writer does not have. */
 		if (bt_u64(status->version) != BT_QGROUP_STATUS_VERSION ||
 		    (qgroups->flags & ~BT_QGROUP_KNOWN_FLAGS) != 0 ||
-		    (qgroups->flags & BT_QGROUP_STATUS_SIMPLE) != 0 ||
 		    !(qgroups->flags & BT_QGROUP_STATUS_ON)) {
 			return BTRFS_UNSUPPORTED;
+		}
+		/* Simple quotas record enable_gen and know no rescan; a status
+		 * generation behind the filesystem's does not matter to them. */
+		if ((qgroups->flags & BT_QGROUP_STATUS_SIMPLE) != 0) {
+			if (record->size != sizeof(struct bt_disk_qgroup_status_simple) ||
+			    (qgroups->flags & BT_QGROUP_STATUS_RESCAN) != 0) {
+				return BTRFS_CORRUPT;
+			}
+			qgroups->simple = 1;
+			qgroups->enable_gen =
+			    bt_u64(((const struct bt_disk_qgroup_status_simple *)record->data)
+				    ->enable_gen);
+			return BTRFS_OK;
 		}
 		if ((qgroups->flags & BT_QGROUP_STATUS_RESCAN) != 0) {
 			qgroups->progress = bt_u64(status->rescan);
@@ -714,7 +733,14 @@ bt_qg_refs(struct bt_qgroup_view *view, struct bt_key key, int any_level, uint64
 			*generation = bt_u64(item->generation);
 			*level = key.type == BT_METADATA_ITEM ? (uint8_t)record.key.offset : 0;
 		}
-		for (position = sizeof(*item); error == BTRFS_OK && position < record.size;) {
+		position = sizeof(*item);
+		/* A data extent's owner reference names no referencing root. */
+		if (error == BTRFS_OK && key.type == BT_EXTENT_ITEM && position < record.size &&
+		    record.data[position] == BT_EXTENT_OWNER_REF) {
+			position += sizeof(struct bt_disk_inline_ref);
+			error = position > record.size ? BTRFS_CORRUPT : BTRFS_OK;
+		}
+		while (error == BTRFS_OK && position < record.size) {
 			error = bt_qg_inline_ref(record.data, record.size, &position, &ref);
 			if (error == BTRFS_OK) {
 				error = bt_qg_add_ref(env, refs, count, capacity, ref);
@@ -1266,6 +1292,24 @@ bt_qg_snapshot_roots(const struct bt_qgroups *qgroups, struct bt_key extent, str
 	return bt_rootset_add(qgroups->env, old, qgroups->snapshot_target);
 }
 
+/* The traced extents in key order, each once. */
+static void
+bt_qg_unique_traced(struct bt_qgroups *qgroups)
+{
+	size_t kept = 0;
+	size_t i;
+
+	bt_qg_sort(
+	    qgroups->traced, qgroups->traced_count, sizeof(*qgroups->traced), bt_qg_key_less);
+	for (i = 0; i < qgroups->traced_count; i++) {
+		if (kept == 0 ||
+		    bt_key_compare(qgroups->traced[kept - 1], qgroups->traced[i]) != 0) {
+			qgroups->traced[kept++] = qgroups->traced[i];
+		}
+	}
+	qgroups->traced_count = kept;
+}
+
 static enum btrfs_result
 bt_qg_account(struct btrfs_transaction *transaction, struct bt_qgroups *qgroups)
 {
@@ -1276,22 +1320,13 @@ bt_qg_account(struct btrfs_transaction *transaction, struct bt_qgroups *qgroups)
 	struct bt_rootset old = { NULL, 0, 0 };
 	struct bt_rootset new = { NULL, 0, 0 };
 	struct bt_root extents;
-	size_t kept = 0;
 	size_t i;
 	enum btrfs_result error;
 
 	if (view == NULL) {
 		return btrfs_transaction_failure(transaction);
 	}
-	bt_qg_sort(
-	    qgroups->traced, qgroups->traced_count, sizeof(*qgroups->traced), bt_qg_key_less);
-	for (i = 0; i < qgroups->traced_count; i++) {
-		if (kept == 0 ||
-		    bt_key_compare(qgroups->traced[kept - 1], qgroups->traced[i]) != 0) {
-			qgroups->traced[kept++] = qgroups->traced[i];
-		}
-	}
-	qgroups->traced_count = kept;
+	bt_qg_unique_traced(qgroups);
 	error = bt_find_root(transaction->base, BT_EXTENT_TREE, &extents);
 	if (error != BTRFS_OK) {
 		return error;
@@ -1334,6 +1369,167 @@ bt_qg_account(struct btrfs_transaction *transaction, struct bt_qgroups *qgroups)
 	bt_rootset_free(env, &new);
 	bt_qg_view_fini(&before);
 	bt_qg_view_fini(&after);
+	return error;
+}
+
+/* A simple quota's view of the extent at key in a filesystem: whether it
+ * exists, its generation, and its owner (0 when it counts for none): a data
+ * extent's owner reference, or the header owner of a tree block outside
+ * system chunks. block holds a node. */
+static enum btrfs_result
+bt_qg_simple_extent(const struct btrfs_fs *fs, struct bt_root extents, struct bt_key key,
+    uint8_t *block, int *found, uint64_t *generation, uint64_t *owner)
+{
+	const struct bt_disk_extent_item *item;
+	const struct bt_disk_inline_ref *reference;
+	const struct bt_disk_header *header = (const void *)block;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	size_t chunk;
+	enum btrfs_result error;
+
+	*found = 0;
+	*owner = 0;
+	bt_cursor_init(&cursor, fs, extents);
+	error = bt_cursor_seek(&cursor, key, 0);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		*found = bt_key_compare(record.key, key) == 0;
+	}
+	if (error == BTRFS_OK && *found) {
+		item = (const void *)record.data;
+		if (record.size < sizeof(*item)) {
+			error = BTRFS_CORRUPT;
+		} else {
+			*generation = bt_u64(item->generation);
+			reference = (const void *)(record.data + sizeof(*item));
+			if (key.type == BT_EXTENT_ITEM &&
+			    record.size >= sizeof(*item) + sizeof(*reference) &&
+			    reference->type == BT_EXTENT_OWNER_REF) {
+				*owner = bt_u64(reference->offset);
+			}
+		}
+	}
+	bt_cursor_fini(&cursor);
+	if (error == BTRFS_NOT_FOUND) {
+		return BTRFS_OK;
+	}
+	if (error != BTRFS_OK || !*found || key.type != BT_METADATA_ITEM) {
+		return error;
+	}
+	chunk = bt_chunk_containing(fs, key.objectid);
+	if (chunk == fs->chunk_count || (fs->chunks[chunk].type & BT_BLOCK_SYSTEM) != 0) {
+		return chunk == fs->chunk_count ? BTRFS_CORRUPT : BTRFS_OK;
+	}
+	if (key.offset >= BT_MAX_LEVEL) {
+		return BTRFS_CORRUPT;
+	}
+	error = bt_tree_read(fs,
+	    (struct bt_root){ key.objectid, *generation, BT_OWNER_ANY, (uint8_t)key.offset },
+	    block);
+	if (error == BTRFS_OK) {
+		*owner = bt_u64(header->owner);
+	}
+	return error;
+}
+
+/* btrfs_record_squota_delta: bytes added to or removed from owner's qgroup
+ * and every qgroup above it, referenced and exclusive alike; the compressed
+ * counts stay as they are. A missing qgroup or a count below zero is
+ * corruption (Linux aborts its transaction on the first). */
+static enum btrfs_result
+bt_qg_simple_delta(struct bt_qgroups *qgroups, uint64_t owner, uint64_t bytes, int add)
+{
+	struct bt_qgroup *group;
+	size_t index = bt_qg_find(qgroups, owner);
+	size_t head = 0;
+	size_t tail = 0;
+	size_t parent;
+	size_t r;
+
+	if (index == SIZE_MAX) {
+		return BTRFS_CORRUPT;
+	}
+	qgroups->visit++;
+	qgroups->queue[tail++] = index;
+	qgroups->groups[index].visit = qgroups->visit;
+	while (head < tail) {
+		group = &qgroups->groups[qgroups->queue[head++]];
+		if (!add && (group->referenced < bytes || group->exclusive < bytes)) {
+			return BTRFS_CORRUPT;
+		}
+		group->referenced = add ? group->referenced + bytes : group->referenced - bytes;
+		group->exclusive = add ? group->exclusive + bytes : group->exclusive - bytes;
+		group->dirty = 1;
+		for (r = bt_qg_relations_of(qgroups, group->id);
+		    r < qgroups->relation_count && qgroups->relations[r].member == group->id; r++) {
+			parent = bt_qg_find(qgroups, qgroups->relations[r].parent);
+			if (parent != SIZE_MAX && qgroups->groups[parent].visit != qgroups->visit) {
+				qgroups->groups[parent].visit = qgroups->visit;
+				qgroups->queue[tail++] = parent;
+			}
+		}
+	}
+	return BTRFS_OK;
+}
+
+/* Simple quotas at commit: each extent this transaction allocated or freed,
+ * from enable_gen on, counts for its owner, as Linux records a squota delta
+ * when its extent item is inserted or deleted. Reference changes to extents
+ * that remain change nothing. */
+static enum btrfs_result
+bt_qg_simple_account(struct btrfs_transaction *transaction, struct bt_qgroups *qgroups)
+{
+	const struct btrfs_environment *env = qgroups->env;
+	const struct btrfs_fs *view = bt_mutation_view(transaction->mutation);
+	struct bt_root extents;
+	uint64_t old_generation = 0;
+	uint64_t new_generation = 0;
+	uint64_t old_owner = 0;
+	uint64_t new_owner = 0;
+	uint64_t bytes;
+	uint8_t *block;
+	size_t i;
+	int old_found = 0;
+	int new_found = 0;
+	enum btrfs_result error;
+
+	if (view == NULL) {
+		return btrfs_transaction_failure(transaction);
+	}
+	bt_qg_unique_traced(qgroups);
+	error = bt_find_root(transaction->base, BT_EXTENT_TREE, &extents);
+	if (error == BTRFS_OK) {
+		error = bt_qg_scratch(qgroups);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	block = env->allocate(env->context, transaction->base->info.node_size);
+	if (block == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	for (i = 0; error == BTRFS_OK && i < qgroups->traced_count; i++) {
+		error = bt_qg_simple_extent(transaction->base, extents, qgroups->traced[i], block,
+		    &old_found, &old_generation, &old_owner);
+		if (error == BTRFS_OK) {
+			error = bt_qg_simple_extent(view, transaction->extents.root,
+			    qgroups->traced[i], block, &new_found, &new_generation, &new_owner);
+		}
+		if (error != BTRFS_OK || old_found == new_found) {
+			continue;
+		}
+		bytes = qgroups->traced[i].type == BT_METADATA_ITEM
+		    ? transaction->base->info.node_size
+		    : qgroups->traced[i].offset;
+		if (new_found && new_generation >= qgroups->enable_gen && bt_file_tree(new_owner)) {
+			error = bt_qg_simple_delta(qgroups, new_owner, bytes, 1);
+		}
+		if (old_found && old_generation >= qgroups->enable_gen && bt_file_tree(old_owner)) {
+			error = bt_qg_simple_delta(qgroups, old_owner, bytes, 0);
+		}
+	}
+	env->release(env->context, block, transaction->base->info.node_size);
 	return error;
 }
 
@@ -1562,13 +1758,22 @@ bt_qgroup_commit(struct btrfs_transaction *transaction)
 	if (qgroups == NULL) {
 		return BTRFS_OK;
 	}
-	if (qgroups->accounting && (qgroups->traced_count != 0 || qgroups->snapshot_target != 0)) {
+	if (qgroups->simple) {
+		error = bt_qg_simple_account(transaction, qgroups);
+	} else if (qgroups->accounting &&
+	    (qgroups->traced_count != 0 || qgroups->snapshot_target != 0)) {
 		error = bt_qg_account(transaction, qgroups);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_qg_scratch(qgroups);
 	}
 	for (i = 0; error == BTRFS_OK && i < qgroups->count;) {
+		/* A simple quota keeps a dropped subvolume's qgroup while extents
+		 * it owns remain (can_delete_qgroup). */
+		if (qgroups->groups[i].dropped && qgroups->simple &&
+		    (qgroups->groups[i].referenced != 0 || qgroups->groups[i].exclusive != 0)) {
+			qgroups->groups[i].dropped = 0;
+		}
 		if (qgroups->groups[i].dropped) {
 			error = bt_qg_remove(transaction, qgroups, i);
 		} else {
@@ -1586,6 +1791,12 @@ bt_qgroup_rescanning(const struct btrfs_transaction *transaction)
 {
 	return transaction->qgroups != NULL &&
 	    (transaction->qgroups->flags & BT_QGROUP_STATUS_RESCAN) != 0;
+}
+
+int
+bt_qgroup_simple(const struct btrfs_transaction *transaction)
+{
+	return transaction->qgroups != NULL && transaction->qgroups->simple;
 }
 
 int
@@ -1700,8 +1911,9 @@ btrfs_transaction_quota_rescan(struct btrfs_transaction *transaction, size_t bud
 		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
 	}
 	qgroups = transaction->qgroups;
-	if (qgroups == NULL) {
-		/* Linux's ENOTCONN: quotas are not enabled. */
+	if (qgroups == NULL || qgroups->simple) {
+		/* Linux's ENOTCONN without quotas; simple quotas need no rescan
+		 * (qgroup_rescan_init's EINVAL). */
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	/* A snapshot's inherited counts are not the scan's; btrfs_qgroup_rescan
@@ -1720,6 +1932,55 @@ btrfs_transaction_quota_rescan(struct btrfs_transaction *transaction, size_t bud
 		transaction->failure = error;
 	}
 	return error;
+}
+
+enum btrfs_result
+bt_qgroup_inherit_parents(
+    struct btrfs_transaction *transaction, uint64_t subvolume, uint64_t parent)
+{
+	struct bt_qgroups *qgroups = transaction->qgroups;
+	struct bt_key key = { .type = BT_QGROUP_RELATION };
+	uint64_t above;
+	size_t first;
+	size_t count = 0;
+	size_t i;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (qgroups == NULL || !qgroups->simple) {
+		return BTRFS_OK;
+	}
+	first = bt_qg_relations_of(qgroups, parent);
+	while (first + count < qgroups->relation_count &&
+	    qgroups->relations[first + count].member == parent) {
+		count++;
+	}
+	/* New relations go after the parent's, which stay in place until the
+	 * table is sorted again; their numbers are zero, so the qgroups above
+	 * keep theirs. */
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		above = qgroups->relations[first + i].parent;
+		key.objectid = subvolume;
+		key.offset = above;
+		error = bt_tx_edit(transaction, &transaction->quota.root, key, NULL, 0, BT_INSERT);
+		if (error == BTRFS_OK) {
+			key.objectid = above;
+			key.offset = subvolume;
+			error = bt_tx_edit(
+			    transaction, &transaction->quota.root, key, NULL, 0, BT_INSERT);
+		}
+		if (error == BTRFS_OK) {
+			error = bt_qg_grow(qgroups->env, (void **)&qgroups->relations,
+			    &qgroups->relation_capacity, qgroups->relation_count,
+			    sizeof(*qgroups->relations), BT_QGROUP_MAX);
+		}
+		if (error == BTRFS_OK) {
+			qgroups->relations[qgroups->relation_count++] =
+			    (struct bt_qgroup_relation){ subvolume, above };
+		}
+	}
+	bt_qg_sort(qgroups->relations, qgroups->relation_count, sizeof(*qgroups->relations),
+	    bt_qg_relation_less);
+	return error == BTRFS_EXISTS ? BTRFS_CORRUPT : error;
 }
 
 enum btrfs_result
@@ -1871,7 +2132,8 @@ bt_qgroup_trace_subtree(struct btrfs_transaction *transaction, struct bt_root bl
 {
 	struct bt_qgroups *qgroups = transaction->qgroups;
 
-	if (qgroups == NULL || !qgroups->accounting) {
+	/* Simple quotas follow extents, not the trees that reach them. */
+	if (qgroups == NULL || !qgroups->accounting || qgroups->simple) {
 		return BTRFS_OK;
 	}
 	if (block.level >= BT_QGROUP_SUBTREE_LEVEL) {
@@ -1887,7 +2149,9 @@ bt_qgroup_snapshot(struct btrfs_transaction *transaction, uint64_t source, uint6
 {
 	struct bt_qgroups *qgroups = transaction->qgroups;
 
-	if (qgroups == NULL) {
+	/* A simple quota's snapshot starts empty: its blocks count as they
+	 * are allocated (btrfs_qgroup_inherit copies counts in full mode only). */
+	if (qgroups == NULL || qgroups->simple) {
 		return BTRFS_OK;
 	}
 	if (qgroups->snapshot_target != 0) {

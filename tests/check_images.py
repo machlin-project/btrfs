@@ -15,7 +15,8 @@ CHECKSUM_TYPES = {"crc32c": 0, "xxhash": 1, "sha256": 2, "blake2": 3}
 # checksums, an inline file, a reflink and two snapshots.
 DATA_PAYLOAD_PROFILES = {"checksums-xxhash", "checksums-sha256", "checksums-blake2",
                          "transactions-metadata-uuid", "transactions-mixed",
-                         "transactions-space-cache", "transactions-quota"}
+                         "transactions-space-cache", "transactions-quota",
+                         "transactions-squota"}
 DATA_BIG_BYTES = 1048576
 DATA_SMALL_BYTES = 10000
 DATA_SPARSE_BYTES = 4194304

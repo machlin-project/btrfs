@@ -44,6 +44,13 @@ enum btrfs_result bt_qgroup_snapshot(struct btrfs_transaction *transaction, uint
 enum btrfs_result bt_qgroup_dropped(struct btrfs_transaction *transaction, uint64_t subvolume);
 /* Whether a quota rescan is in progress (btrfs_transaction_quota_rescan). */
 int bt_qgroup_rescanning(const struct btrfs_transaction *transaction);
+/* Whether the filesystem keeps simple quotas: each extent counts for its
+ * owning subvolume from the enabling generation on. */
+int bt_qgroup_simple(const struct btrfs_transaction *transaction);
+/* Simple quotas place a new subvolume's qgroup in the qgroups above that of
+ * parent, the subvolume holding its entry (qgroup_auto_inherit). */
+enum btrfs_result bt_qgroup_inherit_parents(
+    struct btrfs_transaction *transaction, uint64_t subvolume, uint64_t parent);
 /* The lowest subvolume id above every level-0 qgroup, or 0 without quotas:
  * Linux never reuses the id of a qgroup that outlived its subvolume. */
 uint64_t bt_qgroup_next_id(const struct btrfs_transaction *transaction);

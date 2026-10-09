@@ -95,11 +95,13 @@ struct bt_le64 {
 #define BT_FEATURE_SKINNY_METADATA (UINT64_C(1) << 8)
 #define BT_FEATURE_NO_HOLES (UINT64_C(1) << 9)
 #define BT_FEATURE_METADATA_UUID (UINT64_C(1) << 10)
+/* Simple quotas: data extents name their owning subvolume. */
+#define BT_FEATURE_SIMPLE_QUOTA (UINT64_C(1) << 16)
 #define BT_INCOMPAT_SUPPORTED                                                                      \
 	(BT_FEATURE_MIXED_BACKREF | BT_FEATURE_DEFAULT_SUBVOL | BT_FEATURE_MIXED_GROUPS |          \
 	    BT_FEATURE_COMPRESS_LZO | BT_FEATURE_COMPRESS_ZSTD | BT_FEATURE_BIG_METADATA |         \
 	    BT_FEATURE_EXTENDED_IREF | BT_FEATURE_SKINNY_METADATA | BT_FEATURE_NO_HOLES |          \
-	    BT_FEATURE_METADATA_UUID)
+	    BT_FEATURE_METADATA_UUID | BT_FEATURE_SIMPLE_QUOTA)
 #define BT_SUPER_ERROR (UINT64_C(1) << 2)
 #define BT_SUPER_SEEDING (UINT64_C(1) << 32)
 #define BT_SUPER_METADUMP (UINT64_C(1) << 33)
@@ -151,6 +153,9 @@ enum bt_item_type {
 	BT_ROOT_REF = 156,
 	BT_EXTENT_ITEM = 168,
 	BT_METADATA_ITEM = 169,
+	/* A data extent's owning subvolume: its first inline item, which is no
+	 * reference. */
+	BT_EXTENT_OWNER_REF = 172,
 	BT_TREE_BLOCK_REF = 176,
 	BT_EXTENT_DATA_REF = 178,
 	BT_SHARED_BLOCK_REF = 182,
@@ -316,6 +321,12 @@ struct bt_disk_qgroup_status {
 	struct bt_le64 version, generation, flags, rescan;
 };
 
+/* The status item of simple quotas: extents from enable_gen on count. */
+struct bt_disk_qgroup_status_simple {
+	struct bt_disk_qgroup_status status;
+	struct bt_le64 enable_gen;
+};
+
 /* (0, QGROUP_INFO, qgroup): the bytes a qgroup references and holds alone. */
 struct bt_disk_qgroup_info {
 	struct bt_le64 generation, referenced, referenced_compressed, exclusive,
@@ -398,6 +409,7 @@ _Static_assert(sizeof(struct bt_disk_extent) == 53, "file extent layout");
 _Static_assert(sizeof(struct bt_disk_data_ref) == 28, "data reference layout");
 _Static_assert(sizeof(struct bt_disk_tree_block_info) == 18, "tree block info layout");
 _Static_assert(sizeof(struct bt_disk_qgroup_status) == 32, "qgroup status layout");
+_Static_assert(sizeof(struct bt_disk_qgroup_status_simple) == 40, "simple quota status layout");
 _Static_assert(sizeof(struct bt_disk_qgroup_info) == 40, "qgroup info layout");
 _Static_assert(sizeof(struct bt_disk_qgroup_limit) == 40, "qgroup limit layout");
 

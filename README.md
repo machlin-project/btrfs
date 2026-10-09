@@ -32,11 +32,12 @@ ranges as Linux's fallocate does, replaces inline files, and
 creates, links, unlinks (with
 orphans for open files), renames and sets xattrs, the compression property and
 inode flags (as `chattr`), in any writable subvolume or snapshot, many
-operations per transaction; it creates, snapshots and deletes subvolumes and
-drops deleted ones as Linux's cleaner does. It writes filesystems with mixed
-groups, a block-group tree or a metadata UUID, leaves a v1 space cache stale for
-Linux to rebuild, and accounts qgroups as Linux does, refusing writes past
-their limits (EDQUOT). It
+operations per transaction; it creates, snapshots, renames and deletes
+subvolumes and drops deleted ones as Linux's cleaner does. It writes
+filesystems with mixed groups, a block-group tree or a metadata UUID, leaves a
+v1 space cache stale for Linux to rebuild, and accounts full and simple quotas
+as Linux does: it rescans qgroups and refuses operations past their limits
+(EDQUOT). Native mounts finish Linux's background drops and rescans. It
 updates CoW paths, shared and keyed extent backreferences with Linux's snapshot
 rules, data checksum items, block-group accounting, root items and superblock
 copies with three persistence barriers. Independent reference, checksum and

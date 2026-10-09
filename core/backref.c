@@ -34,6 +34,34 @@ bt_backref_data_hash(uint64_t root, uint64_t inode, uint64_t offset)
 	return ((uint64_t)high << 31) ^ (uint64_t)low;
 }
 
+size_t
+bt_backref_new_data(
+    uint8_t *out, uint64_t generation, uint64_t root, uint64_t inode, uint64_t offset, int owner)
+{
+	struct bt_disk_extent_item *item = (void *)out;
+	struct bt_disk_inline_ref *reference;
+	struct bt_disk_data_ref *data;
+	size_t size = sizeof(*item);
+
+	bt_zero(out, BT_BACKREF_NEW_DATA_BYTES);
+	bt_put64(&item->refs, 1);
+	bt_put64(&item->generation, generation);
+	bt_put64(&item->flags, BT_EXTENT_FLAG_DATA);
+	if (owner) {
+		reference = (void *)(out + size);
+		reference->type = BT_EXTENT_OWNER_REF;
+		bt_put64(&reference->offset, root);
+		size += sizeof(*reference);
+	}
+	out[size++] = BT_EXTENT_DATA_REF;
+	data = (void *)(out + size);
+	bt_put64(&data->root, root);
+	bt_put64(&data->objectid, inode);
+	bt_put64(&data->offset, offset);
+	bt_put32(&data->count, 1);
+	return size + sizeof(*data);
+}
+
 static uint8_t
 bt_ref_type(const struct bt_backref *reference)
 {
@@ -89,6 +117,15 @@ bt_extent_load(struct bt_mutation *mutation, struct bt_root extents, struct bt_k
 		? !(flags & BT_EXTENT_FLAG_TREE)
 		: (flags & BT_EXTENT_FLAG_TREE) != 0 || !(flags & BT_EXTENT_FLAG_DATA)) {
 		return BTRFS_CORRUPT;
+	}
+	/* A data extent's owner, first under simple quotas, stays where it is:
+	 * references are searched, added and dropped after it. */
+	if (extent.type == BT_EXTENT_ITEM && copy->size > copy->start &&
+	    copy->bytes[copy->start] == BT_EXTENT_OWNER_REF) {
+		if (copy->size - copy->start < sizeof(struct bt_disk_inline_ref)) {
+			return BTRFS_CORRUPT;
+		}
+		copy->start += sizeof(struct bt_disk_inline_ref);
 	}
 	return bt_u64(item->refs) == 0 ? BTRFS_CORRUPT : BTRFS_OK;
 }
