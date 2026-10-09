@@ -758,7 +758,27 @@ RENAME_EXCHANGE follows `btrfs_rename_exchange`: both indexes are taken (the
 source's in the new directory first), both back references inserted while the
 old ones still exist, both old names removed, and both entries inserted under
 the swapped indexes; files and directories may be exchanged across directories
-unless one would move below itself, and subvolume entries are refused.
+unless one would move below itself.
+
+Subvolume entries rename and exchange as Linux moves them (`bt_sv_rename`,
+`bt_sv_exchange`). The entry and its ROOT_REF and ROOT_BACKREF go, and
+`btrfs_add_link` adds them back. The new DIR_ITEM names the subvolume's root
+item key, whose offset records a snapshot's transaction. A subvolume entry may
+move into another subvolume's directory; other inodes stay in their subvolume
+(CROSS_TREE). Subvolume entries may be exchanged across subvolumes, and a
+subvolume entry with an inode only within one subvolume. A subvolume may
+replace an empty directory or a stub, but not another subvolume (NOT_EMPTY). A
+directory may replace a stub too. The subvolume's root directory keeps its
+times, because Linux does not write it. Linux refuses the following, and so
+does this core:
+
+- moving a subvolume below itself, found through the ROOT_BACKREF chain
+  (INVALID_ARGUMENT);
+- moving a stub, which `btrfs_rename` refuses and `btrfs_rename_exchange`
+  would abort on (NOT_EMPTY);
+- a name in a stub directory (NOT_PERMITTED);
+- moving a read-only subvolume to another directory, which `btrfs_permission`
+  refuses because the move would write its root (READ_ONLY).
 O_TMPFILE follows `btrfs_tmpfile`: a nameless regular file inherits from its
 directory like a created one, with zero links and an orphan item; its first
 name, through `btrfs_transaction_link_tmpfile`, removes the orphan item
@@ -789,8 +809,8 @@ before any change. The change time advances. Who may change which flag
 (CAP_LINUX_IMMUTABLE, the owner) is the caller's decision.
 
 Every refusal (existing or missing name, wrong type, non-empty directory, full
-packed item, exhausted numbering, read-only snapshot, crossing a subvolume entry
-or tree) is decided before the first change and leaves the transaction usable. A
+packed item, exhausted numbering, read-only snapshot, an inode leaving its
+subvolume) is decided before the first change and leaves the transaction usable. A
 failure after a change poisons the transaction.
 
 ## Subvolumes and snapshots

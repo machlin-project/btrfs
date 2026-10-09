@@ -72,7 +72,7 @@ subvolume_create_plan(struct context *context)
 	plan_subvolume(&plan, 2, "/sv1/inner");
 	plan_subvolume(&plan, 2, "/ns/zstd/sv3");
 	plan_create(&plan, 3, "/sv1/inner/deep", BTRFS_MODE_DIRECTORY | 0700, NULL);
-	/* A rename or unlink cannot cross into or remove a subvolume. */
+	/* A file stays in its subvolume, and unlink does not remove a subvolume. */
 	plan_rename(&plan, 3, "/sv1/file", "/moved", 0);
 	plan_expect_refusal(&plan, 3, BTRFS_CROSS_TREE);
 	plan_unlink(&plan, 3, "/ns/sv2", 0);
@@ -319,6 +319,162 @@ subvolume_drop_shared_plan(struct context *context)
 	expect_subvolumes(&plan, 2, 2, second);
 	expect_subvolumes(&plan, 3, LAST_STAGE, third);
 	expect_deleted(&plan, 0, LAST_STAGE, 0);
+	run_plan(context, &plan);
+}
+
+/* Subvolume entries renamed and exchanged as btrfs_rename and
+ * btrfs_rename_exchange move them: within a directory, to another directory
+ * of the same subvolume and into another subvolume, in the transaction that
+ * made them, over an empty directory or a stub, exchanged with each other
+ * across subvolumes and with an inode of their subvolume; the refusals
+ * Linux makes are decided before any change. */
+static void
+subvolume_rename_plan(struct context *context)
+{
+	static const char *const root_first[] = { "top-snap", "ro-snap", "sv-a", "plain", "dir-x",
+		NULL };
+	static const char *const root_later[] = { "top-snap", "ro-snap2", "plain", "dir-x", NULL };
+	static const char *const ns_first[] = { "moved", "fresh", "sv-b", "sv-c", NULL };
+	static const char *const ns_second[] = { "moved", "fresh", "sv-a2", "sv-c", NULL };
+	static const char *const ns_third[] = { "sv-a2", "sv-c", NULL };
+	static const char *const subvol_added[] = { "sv-b", NULL };
+	static const char *const top_added[] = { "file", NULL };
+	const char *fixture[] = { "snapshot", "subvol", NULL };
+	const char *first[] = { "snapshot", "subvol", "top-snap", "ro-snap", "ns/moved", "ns/fresh",
+		"sv-a", "ns/sv-b", "ns/sv-b/nested", "ns/sv-c", NULL };
+	const char *second[] = { "snapshot", "subvol", "top-snap", "ro-snap2", "ns/moved",
+		"ns/fresh", "ns/sv-a2", "subvol/sv-b", "subvol/sv-b/nested", "ns/sv-c", NULL };
+	const char *third[] = { "snapshot", "subvol", "top-snap", "plain", "ns/empty",
+		"subvol/sv-b", "ns/sv-a2", "ns/sv-a2/nested", "ns/sv-a2/inner", "dir-x", NULL };
+	const char *sv_a[] = { "file" };
+	const char *sv_b[] = { "inner", "nested" };
+	const char *kept[] = { "kept" };
+	uint8_t data[5000];
+	struct plan plan;
+
+	fill_pattern(data, sizeof(data), 62);
+	namespace_plan(context, &plan, "subvolume-rename");
+	/* The top level is snapshotted before it changes; its subvolume entries
+	 * become stubs in the copy. */
+	plan_snapshot(&plan, 1, "/", "/top-snap", 0);
+	plan_snapshot(&plan, 1, "/subvol", "/ro-snap", 1);
+	/* Renamed in the transaction that made them: a snapshot's entry then
+	 * names its root item key, which records the transaction. */
+	plan_snapshot(&plan, 1, "/subvol", "/moving", 0);
+	plan_rename(&plan, 1, "/moving", "/ns/moved", 0);
+	plan_subvolume(&plan, 1, "/fresh");
+	plan_rename(&plan, 1, "/fresh", "/ns/fresh", 0);
+	plan_subvolume(&plan, 1, "/sv-a");
+	plan_create(&plan, 1, "/sv-a/file", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/sv-a/file", 0, data, sizeof(data));
+	plan_subvolume(&plan, 1, "/ns/sv-b");
+	plan_create(&plan, 1, "/ns/sv-b/inner", BTRFS_MODE_DIRECTORY | 0755, NULL);
+	plan_subvolume(&plan, 1, "/ns/sv-b/nested");
+	plan_subvolume(&plan, 1, "/ns/sv-c");
+	plan_create(&plan, 1, "/plain", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_write_new(&plan, 1, "/plain", 0, subvol_value, VALUE_BYTES);
+	plan_create(&plan, 1, "/dir-x", BTRFS_MODE_DIRECTORY | 0700, NULL);
+	plan_create(&plan, 1, "/dir-x/kept", BTRFS_MODE_REGULAR | 0600, NULL);
+
+	/* To another directory and into another subvolume; a read-only
+	 * subvolume only within its directory. */
+	plan_rename(&plan, 2, "/sv-a", "/ns/sv-a2", 0);
+	plan_rename(&plan, 2, "/ns/sv-b", "/subvol/sv-b", 0);
+	plan_rename(&plan, 2, "/ro-snap", "/ro-snap2", 0);
+	plan_rename(&plan, 2, "/ns/sv-c", "/ns/sv-c", 0);
+	plan_rename(&plan, 2, "/ro-snap2", "/ns/ro", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_READ_ONLY);
+	plan_rename(&plan, 2, "/ns/sv-c", "/ns/full", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_EMPTY);
+	plan_rename(&plan, 2, "/ns/sv-c", "/plain", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_DIRECTORY);
+	plan_rename(&plan, 2, "/plain", "/ns/sv-c", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_IS_DIRECTORY);
+	plan_rename(&plan, 2, "/ns/full", "/ns/sv-c", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_EMPTY);
+	plan_rename(&plan, 2, "/ns/sv-c", "/subvol", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_EMPTY);
+	plan_rename(&plan, 2, "/ns/sv-c", "/ns/sv-c/below", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_INVALID_ARGUMENT);
+	plan_rename(&plan, 2, "/ns/one", "/subvol/one", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_CROSS_TREE);
+	/* A stub does not move and takes no names; a directory replaces it. */
+	plan_create(&plan, 2, "/top-snap/file", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_create(&plan, 2, "/top-snap/dir", BTRFS_MODE_DIRECTORY | 0700, NULL);
+	plan_rename(&plan, 2, "/top-snap/snapshot", "/top-snap/stub", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_EMPTY);
+	plan_rename(&plan, 2, "/top-snap/file", "/top-snap/snapshot/file", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_NOT_PERMITTED);
+	plan_rename(&plan, 2, "/top-snap/file", "/top-snap/subvol", 0);
+	plan_expect_refusal(&plan, 2, BTRFS_IS_DIRECTORY);
+	plan_rename(&plan, 2, "/top-snap/dir", "/top-snap/subvol", 0);
+
+	/* Refusals first: a subvolume below itself, two levels down, and
+	 * exchanges Linux refuses. */
+	plan_rename(&plan, 3, "/subvol/sv-b", "/subvol/sv-b/nested/below", 0);
+	plan_expect_refusal(&plan, 3, BTRFS_INVALID_ARGUMENT);
+	plan_rename(&plan, 3, "/subvol", "/subvol/sv-b/nested/below", 0);
+	plan_expect_refusal(&plan, 3, BTRFS_INVALID_ARGUMENT);
+	plan_exchange(&plan, 3, "/subvol/sv-b", "/subvol/sv-b/nested");
+	plan_expect_refusal(&plan, 3, BTRFS_INVALID_ARGUMENT);
+	plan_exchange(&plan, 3, "/ns/one", "/subvol/sv-b");
+	plan_expect_refusal(&plan, 3, BTRFS_CROSS_TREE);
+	plan_exchange(&plan, 3, "/top-snap/snapshot", "/top-snap/subvol");
+	plan_expect_refusal(&plan, 3, BTRFS_NOT_EMPTY);
+	plan_exchange(&plan, 3, "/ro-snap2", "/ns/fresh");
+	plan_expect_refusal(&plan, 3, BTRFS_READ_ONLY);
+	/* Over an empty directory, in its directory and in another subvolume. */
+	plan_rename(&plan, 3, "/ns/fresh", "/ns/empty", 0);
+	plan_rename(&plan, 3, "/ns/moved", "/subvol/sv-b/inner", 0);
+	/* Exchanges: two subvolumes across subvolumes, then a subvolume with a
+	 * file in its directory and with a directory in another one. */
+	plan_exchange(&plan, 3, "/ns/sv-a2", "/subvol/sv-b");
+	plan_exchange(&plan, 3, "/plain", "/ro-snap2");
+	plan_exchange(&plan, 3, "/dir-x", "/ns/sv-c");
+
+	expect_listing(context, &plan, 1, 1, "/", root_first, NULL);
+	expect_listing(context, &plan, 2, LAST_STAGE, "/", root_later, NULL);
+	expect_listing(context, &plan, 1, 1, "/ns", ns_first, NULL);
+	expect_listing(context, &plan, 2, 2, "/ns", ns_second, NULL);
+	expect_listing(context, &plan, 3, LAST_STAGE, "/ns", ns_third, NULL);
+	expect_listing(context, &plan, 2, LAST_STAGE, "/subvol", subvol_added, NULL);
+	expect_listing_from(context, &plan, 2, LAST_STAGE, "/top-snap", "/", top_added, NULL);
+	expect_names(&plan, 1, 1, "/sv-a", sv_a, 1);
+	expect_names(&plan, 2, 2, "/ns/sv-a2", sv_a, 1);
+	expect_names(&plan, 3, LAST_STAGE, "/subvol/sv-b", sv_a, 1);
+	expect_names(&plan, 1, 1, "/ns/sv-b", sv_b, 2);
+	expect_names(&plan, 2, 2, "/subvol/sv-b", sv_b, 2);
+	expect_names(&plan, 3, LAST_STAGE, "/ns/sv-a2", sv_b, 2);
+	expect_names(&plan, 1, 2, "/dir-x", kept, 1);
+	expect_names(&plan, 3, LAST_STAGE, "/ns/sv-c", kept, 1);
+	expect_names(&plan, 3, LAST_STAGE, "/dir-x", NULL, 0);
+	expect_file(&plan, 1, 1, "/sv-a/file", data, sizeof(data));
+	expect_file(&plan, 2, 2, "/ns/sv-a2/file", data, sizeof(data));
+	expect_file(&plan, 3, LAST_STAGE, "/subvol/sv-b/file", data, sizeof(data));
+	expect_text(&plan, 1, 2, "/plain", subvol_value);
+	expect_text(&plan, 3, LAST_STAGE, "/ro-snap2", subvol_value);
+	expect_text(&plan, 3, LAST_STAGE, "/ns/sv-a2/inner/value", subvol_value);
+	expect_subvolume(&plan, 1, 1, "/ro-snap", "/subvol", 1);
+	expect_subvolume(&plan, 2, 2, "/ro-snap2", "/subvol", 1);
+	expect_subvolume(&plan, 3, LAST_STAGE, "/plain", "/subvol", 1);
+	expect_subvolume(&plan, 1, 2, "/ns/moved", "/subvol", 0);
+	expect_subvolume(&plan, 3, LAST_STAGE, "/ns/sv-a2/inner", "/subvol", 0);
+	expect_subvolume(&plan, 1, 2, "/ns/fresh", NULL, 0);
+	expect_subvolume(&plan, 3, LAST_STAGE, "/ns/empty", NULL, 0);
+	expect_subvolume(&plan, 3, LAST_STAGE, "/dir-x", NULL, 0);
+	/* The directory that replaced the stub, and the stub kept. */
+	expect_owner(&plan, 2, LAST_STAGE, "/top-snap/subvol", BTRFS_MODE_DIRECTORY | 0700,
+	    NAMESPACE_UID, NAMESPACE_GID, 1);
+	expect_owner(
+	    &plan, 1, LAST_STAGE, "/top-snap/snapshot", BTRFS_MODE_DIRECTORY | 0755, 0, 0, 1);
+	expect_absent(&plan, 2, LAST_STAGE, "/top-snap/dir");
+	expect_absent(&plan, 2, LAST_STAGE, "/sv-a");
+	expect_absent(&plan, 1, LAST_STAGE, "/moving");
+	expect_absent(&plan, 1, LAST_STAGE, "/fresh");
+	expect_subvolumes(&plan, 0, 0, fixture);
+	expect_subvolumes(&plan, 1, 1, first);
+	expect_subvolumes(&plan, 2, 2, second);
+	expect_subvolumes(&plan, 3, LAST_STAGE, third);
 	run_plan(context, &plan);
 }
 
@@ -614,4 +770,5 @@ subvolume_scenarios(struct context *context)
 	subvolume_snapshot_plan(context);
 	subvolume_delete_plan(context);
 	subvolume_drop_shared_plan(context);
+	subvolume_rename_plan(context);
 }

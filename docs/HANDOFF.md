@@ -136,10 +136,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    layer attaches them. Subvolumes and snapshots are created and deleted
    (`core/subvolume.c`), and the reader resolves unreferenced subvolume entries
    to stubs; native writers still need a cleaner. O_TMPFILE files, RENAME_EXCHANGE
-   and RENAME_WHITEOUT follow Linux, and inode flags change as Linux's
+   and RENAME_WHITEOUT follow Linux, subvolume entries rename and exchange
+   across subvolumes as Linux moves them, and inode flags change as Linux's
    `FS_IOC_SETFLAGS` (`btrfs_transaction_set_fsflags`; `chflags` natively).
-   Remaining: exchanging subvolume entries;
-   truncation orphans of pre-3.12 kernels are dropped as Linux does. Native writers supply time, mode, owner,
+   Truncation orphans of pre-3.12 kernels are dropped as Linux does. Native writers supply time, mode, owner,
    set-id and ACL decisions.
 6. **Connect native writers.** Define versioned operation views, read pins,
    publication locks and UBC/FSKit dirty-page ownership first. Supply real exact

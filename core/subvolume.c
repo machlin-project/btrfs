@@ -746,3 +746,419 @@ btrfs_transaction_delete_subvolume(struct btrfs_transaction *transaction,
 	}
 	return bt_ns_poison(transaction, error);
 }
+
+/* Whether tree is ancestor or lies below it: each subvolume's ROOT_BACKREF
+ * names the subvolume holding its entry, up to one without an entry. */
+static enum btrfs_result
+bt_sv_below(struct btrfs_transaction *transaction, uint64_t tree, uint64_t ancestor, int *below)
+{
+	struct bt_owned_root roots = { .root = transaction->roots };
+	struct bt_key key;
+	struct bt_key next;
+	uint64_t current = tree;
+	uint64_t steps;
+	int found = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	*below = 0;
+	for (steps = 0; error == BTRFS_OK; steps++) {
+		if (current == ancestor) {
+			*below = 1;
+			break;
+		}
+		if (steps == BT_MAX_TREE_ITEMS) {
+			return BTRFS_CORRUPT;
+		}
+		key = (struct bt_key){ .objectid = current, .type = BT_ROOT_BACKREF };
+		error = bt_ns_neighbor(transaction, &roots, key, 0, &next, &found);
+		if (error != BTRFS_OK || !found || next.objectid != current ||
+		    next.type != BT_ROOT_BACKREF) {
+			break;
+		}
+		if (next.offset == current) {
+			return BTRFS_CORRUPT;
+		}
+		current = next.offset;
+	}
+	return error;
+}
+
+/* One name of a rename or exchange: a name of an inode in its directory's
+ * tree, or a subvolume entry. */
+struct bt_sv_side {
+	struct btrfs_object_id parent;
+	const void *name;
+	size_t length;
+	struct bt_owned_root *tree;
+	struct bt_disk_inode directory;
+	/* The named inode, or the subvolume's root directory. */
+	struct bt_disk_inode item;
+	struct bt_entry entry;
+	struct bt_sv_entry subvolume;
+	/* What a new entry for this object names, as btrfs_add_link: an inode
+	 * item, or the subvolume's root item key. */
+	struct bt_key location;
+	uint8_t type;
+	int is_subvolume;
+	int read_only;
+};
+
+/* The root item key and root directory of a subvolume, read through this
+ * transaction's view without opening the subvolume: a tree it opened holds
+ * its newest root. */
+static enum btrfs_result
+bt_sv_child(struct btrfs_transaction *transaction, struct bt_sv_side *side)
+{
+	struct bt_owned_root owned;
+	size_t i;
+	enum btrfs_result error;
+
+	bt_zero(&owned, sizeof(owned));
+	error = bt_tx_root_item(transaction, side->subvolume.child, &owned);
+	if (error == BTRFS_OK && bt_u32(owned.item.legacy.refs) == 0) {
+		/* A deleted subvolume has no entry. */
+		error = BTRFS_CORRUPT;
+	}
+	if (error != BTRFS_OK) {
+		return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
+	}
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == side->subvolume.child) {
+			owned.root = transaction->trees[i].root;
+		}
+	}
+	side->location = owned.key;
+	side->type = BTRFS_FT_DIRECTORY;
+	side->read_only = (bt_u64(owned.item.legacy.flags) & BT_ROOT_SUBVOL_READ_ONLY) != 0;
+	return bt_ns_named_inode(transaction, &owned, BTRFS_ROOT_INODE, &side->item);
+}
+
+/* Opens side's directory and resolves its name. A stub cannot move:
+ * btrfs_rename refuses it with ENOTEMPTY (btrfs_rename_exchange would abort
+ * its transaction). */
+static enum btrfs_result
+bt_sv_resolve(struct btrfs_transaction *transaction, struct bt_sv_side *side)
+{
+	enum btrfs_result error;
+
+	error = bt_ns_begin(transaction, side->parent.tree, &side->tree);
+	if (error == BTRFS_OK) {
+		error = bt_ns_parent(transaction, side->tree, side->parent.inode, &side->directory);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_lookup(transaction, side->tree, side->parent.inode, side->name,
+		    side->length, &side->entry);
+	}
+	side->is_subvolume = error == BTRFS_CROSS_TREE;
+	if (error == BTRFS_OK) {
+		side->location =
+		    (struct bt_key){ .objectid = side->entry.inode, .type = BT_INODE_ITEM };
+		side->type = side->entry.type;
+		side->read_only = 0;
+		return bt_ns_named_inode(transaction, side->tree, side->entry.inode, &side->item);
+	}
+	if (!side->is_subvolume) {
+		return error;
+	}
+	error = bt_sv_entry(transaction, side->tree, side->parent.inode, side->name, side->length,
+	    &side->subvolume);
+	if (error == BTRFS_OK && !side->subvolume.referenced) {
+		error = BTRFS_NOT_EMPTY;
+	}
+	return error == BTRFS_OK ? bt_sv_child(transaction, side) : error;
+}
+
+/* Whether directory is side's object or lies below it. */
+static enum btrfs_result
+bt_sv_contains(struct btrfs_transaction *transaction, const struct bt_sv_side *side,
+    struct btrfs_object_id directory, int *contains)
+{
+	*contains = 0;
+	if (side->is_subvolume) {
+		return bt_sv_below(transaction, directory.tree, side->subvolume.child, contains);
+	}
+	if (!bt_ns_is_directory(&side->item) || directory.tree != side->parent.tree) {
+		return BTRFS_OK;
+	}
+	return bt_ns_ancestor(
+	    transaction, side->tree, directory.inode, side->entry.inode, contains);
+}
+
+/* Removes side's name: btrfs_unlink_subvol, or __btrfs_unlink_inode. */
+static enum btrfs_result
+bt_sv_remove(struct btrfs_transaction *transaction, struct bt_sv_side *side, struct btrfs_time time)
+{
+	if (side->is_subvolume) {
+		return bt_sv_unlink(transaction, side->tree, side->parent.inode, side->name,
+		    side->length, &side->subvolume, time);
+	}
+	return bt_ns_remove_entry(transaction, side->tree, side->parent.inode, side->name,
+	    side->length, &side->entry, time);
+}
+
+/* Names side's object in place's directory under place's name with index,
+ * as btrfs_add_link does after the back reference is in place: a subvolume
+ * gains its root references there. */
+static enum btrfs_result
+bt_sv_place(struct btrfs_transaction *transaction, const struct bt_sv_side *side,
+    const struct bt_sv_side *place, uint64_t index, struct btrfs_time time)
+{
+	enum btrfs_result error;
+
+	if (side->is_subvolume) {
+		return bt_sv_link(transaction, place->tree, place->parent.inode, place->name,
+		    place->length, side->location, index, time);
+	}
+	error = bt_ns_insert_entry(transaction, place->tree, place->parent.inode, place->name,
+	    place->length, side->location, side->type, index);
+	if (error == BTRFS_OK) {
+		error = bt_ns_directory(
+		    transaction, place->tree, place->parent.inode, place->length, 1, time);
+	}
+	return error;
+}
+
+/* Linux's btrfs_rename where a subvolume entry is the old or the replaced
+ * name. A subvolume entry may move to another subvolume's directory (other
+ * names may not), replacing an empty directory or a stub but not a
+ * subvolume; its root directory keeps its times. A read-only subvolume stays
+ * in its directory, as btrfs_permission refuses to write its root for a new
+ * parent. */
+enum btrfs_result
+bt_sv_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_parent,
+    const void *old_name, size_t old_length, struct btrfs_object_id new_parent,
+    const void *new_name, size_t new_length, struct btrfs_time time, int target_open, int *moved)
+{
+	struct bt_sv_side source;
+	struct bt_sv_side target;
+	struct bt_removed removed;
+	uint64_t index = 0;
+	uint64_t inode = 0;
+	int exists = 0;
+	int below = 0;
+	int is_directory = 0;
+	int same_tree = old_parent.tree == new_parent.tree;
+	enum btrfs_result error;
+
+	*moved = 0;
+	source =
+	    (struct bt_sv_side){ .parent = old_parent, .name = old_name, .length = old_length };
+	target =
+	    (struct bt_sv_side){ .parent = new_parent, .name = new_name, .length = new_length };
+	error = bt_sv_resolve(transaction, &source);
+	if (error == BTRFS_OK && !source.is_subvolume && !same_tree) {
+		error = BTRFS_CROSS_TREE;
+	}
+	if (error == BTRFS_OK) {
+		is_directory = source.is_subvolume || bt_ns_is_directory(&source.item);
+		inode = source.is_subvolume ? 0 : source.entry.inode;
+		error = bt_ns_begin(transaction, new_parent.tree, &target.tree);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_parent(transaction, target.tree, new_parent.inode, &target.directory);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_lookup(transaction, target.tree, new_parent.inode, new_name,
+		    new_length, &target.entry);
+		exists = error == BTRFS_OK || error == BTRFS_CROSS_TREE;
+		target.is_subvolume = error == BTRFS_CROSS_TREE;
+		error = exists || error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
+	}
+	if (error == BTRFS_OK && target.is_subvolume) {
+		error = bt_sv_entry(transaction, target.tree, new_parent.inode, new_name,
+		    new_length, &target.subvolume);
+	}
+	if (error == BTRFS_OK && exists && !target.is_subvolume) {
+		error =
+		    bt_ns_named_inode(transaction, target.tree, target.entry.inode, &target.item);
+	}
+	if (error == BTRFS_OK && exists && source.is_subvolume == target.is_subvolume &&
+	    (source.is_subvolume ? target.subvolume.referenced &&
+			target.subvolume.child == source.subvolume.child
+				 : target.entry.inode == source.entry.inode)) {
+		/* One object under both names: POSIX rename does nothing. */
+		return BTRFS_OK;
+	}
+	/* Linux's may_delete for the old name and a replaced one, may_create for
+	 * a new name. */
+	if (error == BTRFS_OK &&
+	    (bt_ns_frozen(&source.directory) || bt_ns_frozen(&source.item) ||
+		bt_ns_immutable(&target.directory) || bt_ns_frozen(&target.item) ||
+		(exists && (bt_u64(target.directory.flags) & BT_INODE_APPEND) != 0))) {
+		error = BTRFS_NOT_PERMITTED;
+	}
+	if (error == BTRFS_OK && exists &&
+	    (target.is_subvolume || bt_ns_is_directory(&target.item)) != is_directory) {
+		error = is_directory ? BTRFS_NOT_DIRECTORY : BTRFS_IS_DIRECTORY;
+	}
+	if (error == BTRFS_OK && exists &&
+	    (target.is_subvolume ? target.subvolume.referenced : bt_u64(target.item.size) != 0)) {
+		error = BTRFS_NOT_EMPTY;
+	}
+	if (error == BTRFS_OK && source.read_only &&
+	    (!same_tree || old_parent.inode != new_parent.inode)) {
+		error = BTRFS_READ_ONLY;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_sv_contains(transaction, &source, new_parent, &below);
+	}
+	if (error == BTRFS_OK && below) {
+		error = BTRFS_INVALID_ARGUMENT;
+	}
+	/* A replaced name leaves room for the new one in its DIR_ITEM; the old
+	 * name leaves the items it shares with the new one. */
+	if (error == BTRFS_OK) {
+		removed = (struct bt_removed){ old_parent.inode, old_name, old_length,
+			!source.is_subvolume && source.entry.extended };
+		error = bt_ns_room(transaction, target.tree, new_parent.inode, new_name, new_length,
+		    !exists, inode, same_tree ? &removed : NULL);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_index(transaction, target.tree, new_parent.inode, &index);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	/* btrfs_rename's order: the old name, the replaced name (a stub, or an
+	 * empty directory losing its link), then the new name. */
+	error = bt_sv_remove(transaction, &source, time);
+	if (error == BTRFS_OK && exists) {
+		error = bt_sv_remove(transaction, &target, time);
+	}
+	if (error == BTRFS_OK && exists && !target.is_subvolume) {
+		error =
+		    bt_ns_release(transaction, target.tree, target.entry.inode, target_open, time);
+	}
+	if (error == BTRFS_OK && inode != 0) {
+		error = bt_ns_add_ref(
+		    transaction, target.tree, new_parent.inode, new_name, new_length, inode, index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_sv_place(transaction, &source, &target, index, time);
+	}
+	if (error == BTRFS_OK && inode != 0) {
+		error = bt_ns_named_inode(transaction, source.tree, inode, &source.item);
+		if (error == BTRFS_OK) {
+			error = bt_ns_store(transaction, source.tree, inode, &source.item, time);
+		}
+	}
+	if (error == BTRFS_OK) {
+		transaction->changed = 1;
+		*moved = 1;
+	}
+	return bt_ns_poison(transaction, error);
+}
+
+/* Linux's btrfs_rename_exchange with a subvolume entry: subvolumes may be
+ * exchanged across subvolumes, a subvolume and an inode only within one.
+ * Both indexes are taken first, the inode's back reference inserted, both
+ * names removed, then both entries inserted under the swapped indexes. */
+enum btrfs_result
+bt_sv_exchange(struct btrfs_transaction *transaction, struct btrfs_object_id old_parent,
+    const void *old_name, size_t old_length, struct btrfs_object_id new_parent,
+    const void *new_name, size_t new_length, struct btrfs_time time)
+{
+	struct bt_sv_side source;
+	struct bt_sv_side target;
+	uint64_t source_index = 0;
+	uint64_t target_index = 0;
+	int moving = old_parent.tree != new_parent.tree || old_parent.inode != new_parent.inode;
+	int below = 0;
+	enum btrfs_result error;
+
+	source =
+	    (struct bt_sv_side){ .parent = old_parent, .name = old_name, .length = old_length };
+	target =
+	    (struct bt_sv_side){ .parent = new_parent, .name = new_name, .length = new_length };
+	error = bt_sv_resolve(transaction, &source);
+	if (error == BTRFS_OK) {
+		error = bt_sv_resolve(transaction, &target);
+	}
+	if (error == BTRFS_OK && old_parent.tree != new_parent.tree &&
+	    (!source.is_subvolume || !target.is_subvolume)) {
+		error = BTRFS_CROSS_TREE;
+	}
+	if (error == BTRFS_OK && source.is_subvolume == target.is_subvolume &&
+	    (source.is_subvolume ? source.subvolume.child == target.subvolume.child
+				 : source.entry.inode == target.entry.inode)) {
+		return BTRFS_OK;
+	}
+	/* Linux's may_delete for both names in both directories. */
+	if (error == BTRFS_OK &&
+	    (bt_ns_frozen(&source.directory) || bt_ns_frozen(&target.directory) ||
+		bt_ns_frozen(&source.item) || bt_ns_frozen(&target.item))) {
+		error = BTRFS_NOT_PERMITTED;
+	}
+	if (error == BTRFS_OK && moving && (source.read_only || target.read_only)) {
+		error = BTRFS_READ_ONLY;
+	}
+	if (error == BTRFS_OK && moving) {
+		error = bt_sv_contains(transaction, &source, new_parent, &below);
+	}
+	if (error == BTRFS_OK && moving && !below) {
+		error = bt_sv_contains(transaction, &target, old_parent, &below);
+	}
+	if (error == BTRFS_OK && below) {
+		error = BTRFS_INVALID_ARGUMENT;
+	}
+	/* An inode's back reference is inserted while its old one still exists. */
+	if (error == BTRFS_OK && !source.is_subvolume) {
+		error = bt_ns_room(transaction, target.tree, new_parent.inode, new_name, new_length,
+		    0, source.entry.inode, NULL);
+	}
+	if (error == BTRFS_OK && !target.is_subvolume) {
+		error = bt_ns_room(transaction, source.tree, old_parent.inode, old_name, old_length,
+		    0, target.entry.inode, NULL);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_index(transaction, target.tree, new_parent.inode, &source_index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_index(transaction, source.tree, old_parent.inode, &target_index);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	if (!source.is_subvolume) {
+		error = bt_ns_add_ref(transaction, target.tree, new_parent.inode, new_name,
+		    new_length, source.entry.inode, source_index);
+	}
+	if (error == BTRFS_OK && !target.is_subvolume) {
+		error = bt_ns_add_ref(transaction, source.tree, old_parent.inode, old_name,
+		    old_length, target.entry.inode, target_index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_sv_remove(transaction, &source, time);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_sv_remove(transaction, &target, time);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_sv_place(transaction, &source, &target, source_index, time);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_sv_place(transaction, &target, &source, target_index, time);
+	}
+	/* An inode records the change; a subvolume's root directory keeps its
+	 * times. */
+	if (error == BTRFS_OK && !source.is_subvolume) {
+		error =
+		    bt_ns_named_inode(transaction, source.tree, source.entry.inode, &source.item);
+		if (error == BTRFS_OK) {
+			error = bt_ns_store(
+			    transaction, source.tree, source.entry.inode, &source.item, time);
+		}
+	}
+	if (error == BTRFS_OK && !target.is_subvolume) {
+		error =
+		    bt_ns_named_inode(transaction, target.tree, target.entry.inode, &target.item);
+		if (error == BTRFS_OK) {
+			error = bt_ns_store(
+			    transaction, target.tree, target.entry.inode, &target.item, time);
+		}
+	}
+	if (error == BTRFS_OK) {
+		transaction->changed = 1;
+	}
+	return bt_ns_poison(transaction, error);
+}

@@ -112,6 +112,29 @@ enum btrfs_result bt_ns_inherited_codec(struct btrfs_transaction *transaction,
     struct bt_owned_root *tree, uint64_t directory, uint64_t flags, const struct bt_codec **codec);
 int bt_ns_can_compress(uint64_t flags);
 void bt_ns_require_feature(struct btrfs_transaction *transaction, uint64_t feature);
+/* A name in directory with its back reference and index; CROSS_TREE for a
+ * subvolume entry. */
+enum btrfs_result bt_ns_lookup(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, const void *name, size_t length, struct bt_entry *entry);
+enum btrfs_result bt_ns_named_inode(struct btrfs_transaction *transaction,
+    const struct bt_owned_root *tree, uint64_t inode, struct bt_disk_inode *item);
+enum btrfs_result bt_ns_remove_entry(struct btrfs_transaction *transaction,
+    struct bt_owned_root *tree, uint64_t directory, const void *name, size_t length,
+    const struct bt_entry *entry, struct btrfs_time time);
+enum btrfs_result bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t inode, int open, struct btrfs_time time);
+enum btrfs_result bt_ns_ancestor(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t start, uint64_t directory, int *ancestor);
+/* Renames and exchanges that involve a subvolume entry (core/subvolume.c);
+ * *moved reports whether the rename changed anything. */
+enum btrfs_result bt_sv_rename(struct btrfs_transaction *transaction,
+    struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
+    struct btrfs_object_id new_parent, const void *new_name, size_t new_length,
+    struct btrfs_time time, int target_open, int *moved);
+enum btrfs_result bt_sv_exchange(struct btrfs_transaction *transaction,
+    struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
+    struct btrfs_object_id new_parent, const void *new_name, size_t new_length,
+    struct btrfs_time time);
 enum btrfs_result bt_ns_begin(
     struct btrfs_transaction *transaction, uint64_t tree_id, struct bt_owned_root **tree);
 enum btrfs_result bt_ns_poison(struct btrfs_transaction *transaction, enum btrfs_result error);

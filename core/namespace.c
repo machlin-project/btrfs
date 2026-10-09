@@ -312,7 +312,7 @@ bt_ns_inode(struct btrfs_transaction *transaction, const struct bt_owned_root *t
 }
 
 /* An inode named by a directory entry must exist. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_named_inode(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     uint64_t inode, struct bt_disk_inode *item)
 {
@@ -598,7 +598,7 @@ bt_ns_extended(const struct btrfs_transaction *transaction)
 }
 
 /* Resolves name in directory and cross-checks its inode reference and index. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_lookup(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t directory,
     const void *name, size_t length, struct bt_entry *entry)
 {
@@ -861,7 +861,7 @@ bt_ns_add_entry(struct btrfs_transaction *transaction, struct bt_owned_root *tre
 
 /* Removes a resolved name: its DIR_ITEM entry, DIR_INDEX and back reference,
  * then the directory's size and times. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_remove_entry(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     uint64_t directory, const void *name, size_t length, const struct bt_entry *entry,
     struct btrfs_time time)
@@ -986,7 +986,7 @@ bt_ns_evict_inode(struct btrfs_transaction *transaction, struct bt_owned_root *t
 /* An inode loses one name. Without a name left it is deleted now when that
  * fits a small budget; otherwise, or while still open, an orphan item keeps
  * it, and an unopened one is left to btrfs_transaction_evict's steps. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
     int open, struct btrfs_time time)
 {
@@ -1548,7 +1548,7 @@ btrfs_transaction_unlink(struct btrfs_transaction *transaction, struct btrfs_obj
 
 /* Whether directory is start or one of its ancestors, following the single
  * INODE_REF of each directory up to the tree's root directory. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_ancestor(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t start,
     uint64_t directory, int *ancestor)
 {
@@ -1606,6 +1606,7 @@ bt_ns_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_p
 	int is_directory = 0;
 	enum btrfs_result error;
 
+	*moved = 0;
 	if (time.nanoseconds >= BT_NANOSECONDS) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
@@ -1613,8 +1614,9 @@ bt_ns_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_p
 	if (error == BTRFS_OK) {
 		error = bt_ns_name(new_name, new_length);
 	}
-	if (error == BTRFS_OK && old_parent.tree != new_parent.tree) {
-		error = BTRFS_CROSS_TREE;
+	if (error == BTRFS_OK && new_parent.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		/* A stub directory takes no names: btrfs_rename's EPERM. */
+		error = BTRFS_NOT_PERMITTED;
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_begin(transaction, old_parent.tree, &tree);
@@ -1623,11 +1625,20 @@ bt_ns_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_p
 		error = bt_ns_parent(transaction, tree, old_parent.inode, &old_directory);
 	}
 	if (error == BTRFS_OK) {
-		error = bt_ns_parent(transaction, tree, new_parent.inode, &directory);
-	}
-	if (error == BTRFS_OK) {
 		error = bt_ns_lookup(
 		    transaction, tree, old_parent.inode, old_name, old_length, &source);
+	}
+	if (error == BTRFS_CROSS_TREE) {
+		/* A subvolume entry, which may move between subvolumes. */
+		return bt_sv_rename(transaction, old_parent, old_name, old_length, new_parent,
+		    new_name, new_length, time, target_open, moved);
+	}
+	/* Other inodes keep to their subvolume: btrfs_rename's EXDEV. */
+	if (error == BTRFS_OK && old_parent.tree != new_parent.tree) {
+		return BTRFS_CROSS_TREE;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_parent(transaction, tree, new_parent.inode, &directory);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_named_inode(transaction, tree, source.inode, &item);
@@ -1641,7 +1652,11 @@ bt_ns_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_p
 			error = BTRFS_OK;
 		}
 	}
-	*moved = 0;
+	if (error == BTRFS_CROSS_TREE) {
+		/* The name of a subvolume or a stub is replaced. */
+		return bt_sv_rename(transaction, old_parent, old_name, old_length, new_parent,
+		    new_name, new_length, time, target_open, moved);
+	}
 	if (error == BTRFS_OK && exists && replaced.inode == source.inode) {
 		/* Two names of one inode: POSIX rename does nothing. */
 		return BTRFS_OK;
@@ -1781,9 +1796,6 @@ btrfs_transaction_exchange(struct btrfs_transaction *transaction, struct btrfs_o
 	if (error == BTRFS_OK) {
 		error = bt_ns_name(new_name, new_length);
 	}
-	if (error == BTRFS_OK && old_parent.tree != new_parent.tree) {
-		error = BTRFS_CROSS_TREE;
-	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_begin(transaction, old_parent.tree, &tree);
 	}
@@ -1791,15 +1803,29 @@ btrfs_transaction_exchange(struct btrfs_transaction *transaction, struct btrfs_o
 		error = bt_ns_parent(transaction, tree, old_parent.inode, &old_directory);
 	}
 	if (error == BTRFS_OK) {
+		error = bt_ns_lookup(
+		    transaction, tree, old_parent.inode, old_name, old_length, &source);
+	}
+	if (error == BTRFS_CROSS_TREE) {
+		/* A subvolume entry, which may be exchanged across subvolumes. */
+		return bt_sv_exchange(transaction, old_parent, old_name, old_length, new_parent,
+		    new_name, new_length, time);
+	}
+	/* Other inodes keep to their subvolume: btrfs_rename_exchange's EXDEV. */
+	if (error == BTRFS_OK && old_parent.tree != new_parent.tree) {
+		return BTRFS_CROSS_TREE;
+	}
+	if (error == BTRFS_OK) {
 		error = bt_ns_parent(transaction, tree, new_parent.inode, &new_directory);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_lookup(
-		    transaction, tree, old_parent.inode, old_name, old_length, &source);
-	}
-	if (error == BTRFS_OK) {
-		error = bt_ns_lookup(
 		    transaction, tree, new_parent.inode, new_name, new_length, &target);
+	}
+	if (error == BTRFS_CROSS_TREE) {
+		/* A subvolume entry is the other name. */
+		return bt_sv_exchange(transaction, old_parent, old_name, old_length, new_parent,
+		    new_name, new_length, time);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_named_inode(transaction, tree, source.inode, &source_item);

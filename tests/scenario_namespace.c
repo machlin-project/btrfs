@@ -1164,8 +1164,8 @@ namespace_refusals(struct context *context)
 	    btrfs_transaction_rename(transaction, subvolume, "value", 5, ns, "value", 5, time, 0),
 	    BTRFS_CROSS_TREE, "rename across trees");
 	refused(transaction,
-	    btrfs_transaction_rename(transaction, root, "subvol", 6, root, "other", 5, time, 0),
-	    BTRFS_CROSS_TREE, "rename a subvolume");
+	    btrfs_transaction_rename(transaction, root, "subvol", 6, root, "snapshot", 8, time, 0),
+	    BTRFS_NOT_EMPTY, "rename a subvolume over a subvolume");
 	refused(transaction,
 	    btrfs_transaction_rename(transaction, ns, "missing", 7, ns, "other", 5, time, 0),
 	    BTRFS_NOT_FOUND, "rename a missing name");
