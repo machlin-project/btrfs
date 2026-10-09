@@ -129,6 +129,9 @@ btrfs_inode_fsflags(const struct btrfs_inode *inode)
 			result |= map[i].attribute;
 		}
 	}
+	if ((inode->flags & BT_INODE_RO_VERITY) != 0) {
+		result |= BTRFS_FS_VERITY_FL;
+	}
 	if ((inode->flags & BT_INODE_NOCOMPRESS) != 0) {
 		result |= BTRFS_FS_NOCOMP_FL;
 	} else if ((inode->flags & BT_INODE_COMPRESS) != 0) {

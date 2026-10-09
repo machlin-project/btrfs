@@ -79,6 +79,9 @@ struct bt_le64 {
 #define BT_INODE_NOATIME (UINT64_C(1) << 9)
 #define BT_INODE_DIRSYNC (UINT64_C(1) << 10)
 #define BT_INODE_COMPRESS (UINT64_C(1) << 11)
+/* The upper half of an inode item's flags holds Linux's read-only flags:
+ * BTRFS_INODE_RO_VERITY marks a file whose fs-verity metadata is complete. */
+#define BT_INODE_RO_VERITY (UINT64_C(1) << 32)
 #define BT_LINK_MAX 65535U
 #define BT_INODE_NODATASUM UINT64_C(1)
 #define BT_BLOCK_DATA UINT64_C(1)
@@ -123,6 +126,8 @@ struct bt_le64 {
 #define BT_EXTENT_FLAG_FULL_BACKREF (UINT64_C(1) << 8)
 #define BT_COMPAT_RO_FREE_SPACE_TREE (UINT64_C(1) << 0)
 #define BT_COMPAT_RO_FREE_SPACE_TREE_VALID (UINT64_C(1) << 1)
+/* Files with fs-verity metadata exist. */
+#define BT_COMPAT_RO_VERITY (UINT64_C(1) << 2)
 #define BT_COMPAT_RO_BLOCK_GROUP_TREE (UINT64_C(1) << 3)
 #define BT_QGROUP_STATUS_VERSION UINT64_C(1)
 #define BT_QGROUP_STATUS_ON (UINT64_C(1) << 0)
@@ -141,6 +146,10 @@ enum bt_item_type {
 	BT_INODE_REF = 12,
 	BT_INODE_EXTREF = 13,
 	BT_XATTR_ITEM = 24,
+	/* A file's fs-verity descriptor and Merkle tree bytes, keyed by byte
+	 * offset (core/verity.c). */
+	BT_VERITY_DESC_ITEM = 36,
+	BT_VERITY_MERKLE_ITEM = 37,
 	BT_ORPHAN_ITEM = 48,
 	BT_DIR_LOG_ITEM = 60,
 	BT_DIR_LOG_INDEX = 72,
@@ -327,6 +336,43 @@ struct bt_disk_qgroup_status_simple {
 	struct bt_le64 enable_gen;
 };
 
+/* (inode, VERITY_DESC_ITEM, 0): the size of the fs-verity descriptor stored
+ * in the VERITY_DESC items from offset 1 on. The reserved words would hold an
+ * fscrypt IV; Linux reads neither them nor the encryption byte. */
+struct bt_disk_verity_item {
+	struct bt_le64 size;
+	struct bt_le64 reserved[2];
+	uint8_t encryption;
+};
+
+/* Linux's struct fsverity_descriptor; a builtin signature of sig_size bytes
+ * may follow it. */
+struct bt_disk_verity_descriptor {
+	uint8_t version;
+	uint8_t hash_algorithm;
+	uint8_t log_blocksize;
+	uint8_t salt_size;
+	struct bt_le32 sig_size;
+	struct bt_le64 data_size;
+	uint8_t root_hash[64];
+	uint8_t salt[32];
+	uint8_t reserved[144];
+};
+
+#define BT_VERITY_VERSION 1U
+#define BT_VERITY_HASH_SHA256 1U
+#define BT_VERITY_HASH_SHA512 2U
+#define BT_VERITY_SALT_MAX 32U
+/* FS_VERITY_MAX_DESCRIPTOR_SIZE and FS_VERITY_MAX_LEVELS. */
+#define BT_VERITY_DESCRIPTOR_MAX 16384U
+#define BT_VERITY_LEVELS_MAX 8U
+/* Merkle tree blocks are at least 1 KiB and at most a sector. */
+#define BT_VERITY_LOG_BLOCK_MIN 10U
+/* The descriptor's offset in VERITY_DESC items, after the size item. */
+#define BT_VERITY_DESCRIPTOR_OFFSET 1U
+/* Bytes Linux's write_key_bytes stores per verity item. */
+#define BT_VERITY_ITEM_BYTES 2048U
+
 /* (0, QGROUP_INFO, qgroup): the bytes a qgroup references and holds alone. */
 struct bt_disk_qgroup_info {
 	struct bt_le64 generation, referenced, referenced_compressed, exclusive,
@@ -411,6 +457,8 @@ _Static_assert(sizeof(struct bt_disk_tree_block_info) == 18, "tree block info la
 _Static_assert(sizeof(struct bt_disk_qgroup_status) == 32, "qgroup status layout");
 _Static_assert(sizeof(struct bt_disk_qgroup_status_simple) == 40, "simple quota status layout");
 _Static_assert(sizeof(struct bt_disk_qgroup_info) == 40, "qgroup info layout");
+_Static_assert(sizeof(struct bt_disk_verity_item) == 25, "verity descriptor item layout");
+_Static_assert(sizeof(struct bt_disk_verity_descriptor) == 256, "verity descriptor layout");
 _Static_assert(sizeof(struct bt_disk_qgroup_limit) == 40, "qgroup limit layout");
 
 #endif

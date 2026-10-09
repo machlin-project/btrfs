@@ -3,7 +3,9 @@
  * host has them, reference implementations: libxxhash for XXH64, libb2 for
  * BLAKE2b-256 and CommonCrypto for SHA-256, over every length around their
  * block sizes, sector and node sizes, and unaligned buffers. Sector batches
- * and node checksums must equal the one-buffer algorithm. */
+ * and node checksums must equal the one-buffer algorithm. Streamed SHA-256 and
+ * SHA-512 (fs-verity's hashes) must equal published digests and the reference
+ * whatever pieces they are fed in. */
 #include "internal.h"
 #include <assert.h>
 #include <stdio.h>
@@ -54,6 +56,19 @@ static const struct vector vectors[] = {
 	    "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319" },
 	{ BT_CHECKSUM_BLAKE2, "The quick brown fox jumps over the lazy dog",
 	    "01718cec35cd3d796dd00020e0bfecb473ad23457d063b75eff29c0ffa2e58a9" },
+};
+
+/* SHA-512 digests of the same messages (FIPS 180-2). */
+static const char *const sha512_vectors[][2] = {
+	{ "",
+	    "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+	    "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e" },
+	{ "abc",
+	    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+	    "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f" },
+	{ "The quick brown fox jumps over the lazy dog",
+	    "07e547d9586f6a73f73fbac0435ed76951218fb7d0c8d788a309d785436bbb64"
+	    "2e93a252a954f23912547d1e8a3b5ed6e1bfd7097821233fa0538f3db854fee6" },
 };
 
 static uint8_t buffer[BUFFER_BYTES];
@@ -216,6 +231,70 @@ check_views(void)
 	}
 }
 
+static void
+sha2_digest(int wide, const uint8_t *data, size_t length, size_t piece, uint8_t *digest)
+{
+	struct bt_sha2 hash;
+	size_t position;
+	size_t count;
+
+	bt_sha2_init(&hash, wide);
+	for (position = 0; position < length; position += count) {
+		count = length - position < piece ? length - position : piece;
+		bt_sha2_update(&hash, data + position, count);
+	}
+	bt_sha2_final(&hash, digest);
+}
+
+static void
+check_sha2(void)
+{
+	static const size_t pieces[] = { 1, 3, 63, 64, 65, 127, 128, 129, 1000 };
+	uint8_t expected[BT_SHA512_DIGEST];
+	uint8_t digest[BT_SHA512_DIGEST];
+	uint8_t whole[BT_SHA512_DIGEST];
+	size_t length;
+	size_t i;
+	int wide;
+
+	for (i = 0; i < sizeof(sha512_vectors) / sizeof(sha512_vectors[0]); i++) {
+		hex(sha512_vectors[i][1], expected, BT_SHA512_DIGEST);
+		sha2_digest(1, (const uint8_t *)sha512_vectors[i][0], strlen(sha512_vectors[i][0]),
+		    SIZE_MAX, digest);
+		assert(memcmp(digest, expected, BT_SHA512_DIGEST) == 0);
+	}
+	for (wide = 0; wide <= 1; wide++) {
+		for (length = 0; length <= SHORT_LENGTHS; length += length < 300 ? 1 : 37) {
+			sha2_digest(wide, buffer + 1, length, SIZE_MAX, whole);
+#ifdef __APPLE__
+			if (wide) {
+				CC_SHA512(buffer + 1, (CC_LONG)length, expected);
+			} else {
+				CC_SHA256(buffer + 1, (CC_LONG)length, expected);
+			}
+			assert(memcmp(whole, expected,
+				   wide ? BT_SHA512_DIGEST : BT_SHA256_DIGEST) == 0);
+			references++;
+#endif
+			for (i = 0; i < sizeof(pieces) / sizeof(pieces[0]); i++) {
+				sha2_digest(wide, buffer + 1, length, pieces[i], digest);
+				assert(memcmp(digest, whole,
+					   wide ? BT_SHA512_DIGEST : BT_SHA256_DIGEST) == 0);
+			}
+		}
+		sha2_digest(wide, buffer, MAX_NODE_BYTES, SIZE_MAX, whole);
+#ifdef __APPLE__
+		if (wide) {
+			CC_SHA512(buffer, MAX_NODE_BYTES, expected);
+		} else {
+			CC_SHA256(buffer, MAX_NODE_BYTES, expected);
+		}
+		assert(memcmp(whole, expected, wide ? BT_SHA512_DIGEST : BT_SHA256_DIGEST) == 0);
+		references++;
+#endif
+	}
+}
+
 int
 main(void)
 {
@@ -231,6 +310,7 @@ main(void)
 	check_vectors();
 	check_lengths();
 	check_views();
+	check_sha2();
 	printf("checksums: %zu published digests, %llu reference comparisons\n",
 	    sizeof(vectors) / sizeof(vectors[0]), (unsigned long long)references);
 	return 0;

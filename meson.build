@@ -11,7 +11,8 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/rename.c', 'core/subvolume.c', 'core/drop.c',
-  'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c')
+  'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c',
+  'core/verity.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -63,6 +64,8 @@ mutable_test = executable('btrfs-mutable-test', 'tests/mutable.c', include_direc
   link_with: core)
 test('private-cow-trees', mutable_test, suite: 'core', timeout: 180)
 adversarial = executable('btrfs-adversarial', 'tests/adversarial.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
+verity_test = executable('btrfs-verity-test', 'tests/verity.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 replay_test = executable('btrfs-replay-test', 'tests/replay.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
@@ -148,6 +151,8 @@ if fixtures != ''
     timeout: 1800, suite: 'images')
   test('linux-crash-states', logwrites_test, args: [join_paths(fixtures, 'logwrites.log'),
     join_paths(fixtures, 'logwrites-data.raw')], timeout: 600, suite: 'images')
+  test('verity-reads', verity_test, args: [join_paths(fixtures, 'transactions-verity.raw')],
+    timeout: 300, suite: 'images')
   test('malformed-faults-and-io-budgets', adversarial,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   foreach algorithm : ['xxhash', 'blake2']

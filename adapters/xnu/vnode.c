@@ -388,11 +388,25 @@ btrfs_xnu_open(void *arguments)
 {
 	struct vnop_open_args *args = arguments;
 	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+	uint64_t flags;
+	int error;
 
-	if ((args->a_mode & FWRITE) && !btrfs_volume_writable(node->mount->volume)) {
+	if ((args->a_mode & FWRITE) == 0) {
+		return 0;
+	}
+	if (!btrfs_volume_writable(node->mount->volume)) {
 		return EROFS;
 	}
-	return 0;
+	/* fs-verity files open for reading only, as Linux's fsverity_file_open
+	 * requires. */
+	error = btrfs_xnu_refresh(node);
+	if (error != 0) {
+		return error;
+	}
+	lck_mtx_lock(node->mount->nodes_lock);
+	flags = node->inode.flags;
+	lck_mtx_unlock(node->mount->nodes_lock);
+	return (flags & BTRFS_INODE_FLAG_VERITY) != 0 ? EPERM : 0;
 }
 
 static int

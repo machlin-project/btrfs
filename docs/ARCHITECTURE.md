@@ -499,11 +499,49 @@ cache (`btrfs_read_block_groups`). A zero `cache_generation`, which names no
 v1 cache, stays zero. Cache inodes and their extents in the root tree are
 ordinary references to the writer, and a group that has one is not removed.
 
+## fs-verity
+
+fs-verity (read-only compatible VERITY) makes a regular file read-only and
+authenticates every read against a Merkle tree, as Linux's `fs/verity` does.
+Linux's Btrfs keeps the tree and the descriptor in the file's tree
+(`fs/btrfs/verity.c`): VERITY_MERKLE items hold the tree's bytes keyed by byte
+offset, in items of at most 2 KiB, and VERITY_DESC items hold a size item at
+offset 0 and the descriptor from offset 1; the inode's RO_VERITY flag (bit 32
+of its flags) marks a file whose metadata is complete. `core/verity.c` reads
+these bytes as Linux's `read_key_bytes` does: consecutive items from the one at
+or before the offset, the rest of a tree block zero-filled.
+
+Before a verity file's first byte is returned, its descriptor passes Linux's
+open-time checks: a size item without reserved bits whose size (256 bytes to
+16 KiB) its items hold, version 1, zero reserved bytes, a salt of at most 32
+bytes, the inode's size, and a signature within the descriptor. A Merkle block
+size of 1 KiB up to a sector, SHA-256 or SHA-512, and at most eight levels
+give the tree's shape; an unknown version or hash algorithm is UNSUPPORTED,
+anything else CORRUPT. Each data block of a read, zero-padded at the end of the
+file, is hashed with the salt (zero-padded to the hash's block) before it, and
+its hash must equal the one in its level-0 tree block, whose own hash must
+equal the one in the level above, up to the descriptor's root hash. A read
+keeps the blocks it verified, one per level, so that consecutive data blocks
+cost one hash each; nothing is kept across reads. A failed check returns
+CORRUPT with only verified bytes in the reported prefix. Files with
+fs-verity metadata are verified whatever their extents (inline, compressed,
+preallocated or NODATACOW without data checksums); other inode types are not,
+as Linux enables it on regular files only.
+
+`btrfs_verity_digest` returns FS_IOC_MEASURE_VERITY's digest, the hash of the
+descriptor with its signature size cleared. Linux's Btrfs answers
+FS_IOC_READ_VERITY_METADATA with ENOTTY, so the reader offers no metadata
+reads. Builtin signatures are kept but not verified, as Linux without
+`CONFIG_FS_VERITY_BUILTIN_SIGNATURES` treats them; a keyring policy belongs to
+the native layer. Both adapters refuse to open a verity file for writing
+(EPERM), as `fsverity_file_open` does. The writer does not yet admit volumes
+with VERITY.
+
 ## Quotas
 
-`core/qgroup.c` keeps Linux's full qgroup accounting. Admission loads the
-quota tree whole (at most 65,536 qgroups and relations) and refuses simple
-quotas and disabled quotas. A status generation other than the base's, or a
+`core/qgroup.c` keeps Linux's full qgroup accounting and its simple quotas.
+Admission loads the quota tree whole (at most 65,536 qgroups and relations)
+and refuses disabled quotas, older status versions and unknown status flags. A status generation other than the base's, or a
 qgroup without both its info and limit items, makes quotas inconsistent and
 stops accounting, as Linux's mount does; numbers are then kept, the status
 item still follows every commit, and limits still apply. A rescan in progress

@@ -2,8 +2,9 @@
 /* The checksum algorithms a superblock's checksum_type selects, as Linux's
  * crypto API computes them: CRC32C (stored complemented, little-endian), XXH64
  * with seed zero (little-endian), SHA-256 and unkeyed BLAKE2b with a 256-bit
- * digest. Each checksums one complete buffer; none keeps state between calls
- * or uses SIMD registers. */
+ * digest. Each checksums one complete buffer; none uses SIMD registers.
+ * SHA-256 and SHA-512 also keep state between calls (struct bt_sha2), for
+ * fs-verity's salted block hashes. */
 #include "encode.h"
 
 #define BT_XXH_PRIME1 UINT64_C(0x9e3779b185ebca87)
@@ -17,9 +18,14 @@
 #define BT_SHA256_BLOCK 64U
 #define BT_SHA256_WORDS 8U
 #define BT_SHA256_ROUNDS 64U
-/* Offset in the final block of the big-endian message length in bits. */
-#define BT_SHA256_LENGTH_OFFSET 56U
-#define BT_SHA256_PAD 0x80U
+/* Bytes of the big-endian message length in bits that ends the final
+ * block: 64 bits for SHA-256 and 128 for SHA-512. */
+#define BT_SHA256_LENGTH_BYTES 8U
+#define BT_SHA512_LENGTH_BYTES 16U
+#define BT_SHA2_PAD 0x80U
+#define BT_SHA512_BLOCK 128U
+#define BT_SHA512_WORDS 8U
+#define BT_SHA512_ROUNDS 80U
 
 #define BT_BLAKE2B_BLOCK 128U
 #define BT_BLAKE2B_WORDS 8U
@@ -261,42 +267,93 @@ bt_sha256_block(uint32_t state[BT_SHA256_WORDS], const uint8_t *block)
 	}
 }
 
-static void
-bt_sha256(const uint8_t *data, size_t length, uint8_t digest[BT_CSUM_SIZE])
-{
-	uint8_t block[BT_SHA256_BLOCK];
-	uint32_t state[BT_SHA256_WORDS];
-	uint64_t bits = (uint64_t)length * 8U;
-	size_t position;
-	size_t rest;
-	unsigned i;
+/* The first 64 bits of the fractional parts of the cube roots of the first
+ * eighty primes. */
+static const uint64_t bt_sha512_constants[BT_SHA512_ROUNDS] = {
+	UINT64_C(0x428a2f98d728ae22),
+	UINT64_C(0x7137449123ef65cd),
+	UINT64_C(0xb5c0fbcfec4d3b2f),
+	UINT64_C(0xe9b5dba58189dbbc),
+	UINT64_C(0x3956c25bf348b538),
+	UINT64_C(0x59f111f1b605d019),
+	UINT64_C(0x923f82a4af194f9b),
+	UINT64_C(0xab1c5ed5da6d8118),
+	UINT64_C(0xd807aa98a3030242),
+	UINT64_C(0x12835b0145706fbe),
+	UINT64_C(0x243185be4ee4b28c),
+	UINT64_C(0x550c7dc3d5ffb4e2),
+	UINT64_C(0x72be5d74f27b896f),
+	UINT64_C(0x80deb1fe3b1696b1),
+	UINT64_C(0x9bdc06a725c71235),
+	UINT64_C(0xc19bf174cf692694),
+	UINT64_C(0xe49b69c19ef14ad2),
+	UINT64_C(0xefbe4786384f25e3),
+	UINT64_C(0x0fc19dc68b8cd5b5),
+	UINT64_C(0x240ca1cc77ac9c65),
+	UINT64_C(0x2de92c6f592b0275),
+	UINT64_C(0x4a7484aa6ea6e483),
+	UINT64_C(0x5cb0a9dcbd41fbd4),
+	UINT64_C(0x76f988da831153b5),
+	UINT64_C(0x983e5152ee66dfab),
+	UINT64_C(0xa831c66d2db43210),
+	UINT64_C(0xb00327c898fb213f),
+	UINT64_C(0xbf597fc7beef0ee4),
+	UINT64_C(0xc6e00bf33da88fc2),
+	UINT64_C(0xd5a79147930aa725),
+	UINT64_C(0x06ca6351e003826f),
+	UINT64_C(0x142929670a0e6e70),
+	UINT64_C(0x27b70a8546d22ffc),
+	UINT64_C(0x2e1b21385c26c926),
+	UINT64_C(0x4d2c6dfc5ac42aed),
+	UINT64_C(0x53380d139d95b3df),
+	UINT64_C(0x650a73548baf63de),
+	UINT64_C(0x766a0abb3c77b2a8),
+	UINT64_C(0x81c2c92e47edaee6),
+	UINT64_C(0x92722c851482353b),
+	UINT64_C(0xa2bfe8a14cf10364),
+	UINT64_C(0xa81a664bbc423001),
+	UINT64_C(0xc24b8b70d0f89791),
+	UINT64_C(0xc76c51a30654be30),
+	UINT64_C(0xd192e819d6ef5218),
+	UINT64_C(0xd69906245565a910),
+	UINT64_C(0xf40e35855771202a),
+	UINT64_C(0x106aa07032bbd1b8),
+	UINT64_C(0x19a4c116b8d2d0c8),
+	UINT64_C(0x1e376c085141ab53),
+	UINT64_C(0x2748774cdf8eeb99),
+	UINT64_C(0x34b0bcb5e19b48a8),
+	UINT64_C(0x391c0cb3c5c95a63),
+	UINT64_C(0x4ed8aa4ae3418acb),
+	UINT64_C(0x5b9cca4f7763e373),
+	UINT64_C(0x682e6ff3d6b2b8a3),
+	UINT64_C(0x748f82ee5defb2fc),
+	UINT64_C(0x78a5636f43172f60),
+	UINT64_C(0x84c87814a1f0ab72),
+	UINT64_C(0x8cc702081a6439ec),
+	UINT64_C(0x90befffa23631e28),
+	UINT64_C(0xa4506cebde82bde9),
+	UINT64_C(0xbef9a3f7b2c67915),
+	UINT64_C(0xc67178f2e372532b),
+	UINT64_C(0xca273eceea26619c),
+	UINT64_C(0xd186b8c721c0c207),
+	UINT64_C(0xeada7dd6cde0eb1e),
+	UINT64_C(0xf57d4f7fee6ed178),
+	UINT64_C(0x06f067aa72176fba),
+	UINT64_C(0x0a637dc5a2c898a6),
+	UINT64_C(0x113f9804bef90dae),
+	UINT64_C(0x1b710b35131c471b),
+	UINT64_C(0x28db77f523047d84),
+	UINT64_C(0x32caab7b40c72493),
+	UINT64_C(0x3c9ebe0a15c9bebc),
+	UINT64_C(0x431d67c49c100d4c),
+	UINT64_C(0x4cc5d4becb3e42b6),
+	UINT64_C(0x597f299cfc657e2a),
+	UINT64_C(0x5fcb6fab3ad6faec),
+	UINT64_C(0x6c44198c4a475817),
+};
 
-	for (i = 0; i < BT_SHA256_WORDS; i++) {
-		state[i] = bt_sha256_initial[i];
-	}
-	for (position = 0; length - position >= BT_SHA256_BLOCK; position += BT_SHA256_BLOCK) {
-		bt_sha256_block(state, data + position);
-	}
-	rest = length - position;
-	bt_zero(block, sizeof(block));
-	bt_copy(block, data + position, rest);
-	block[rest] = BT_SHA256_PAD;
-	if (rest >= BT_SHA256_LENGTH_OFFSET) {
-		bt_sha256_block(state, block);
-		bt_zero(block, sizeof(block));
-	}
-	for (i = 0; i < 8; i++) {
-		block[BT_SHA256_LENGTH_OFFSET + i] = (uint8_t)(bits >> (56U - 8U * i));
-	}
-	bt_sha256_block(state, block);
-	for (i = 0; i < BT_SHA256_WORDS; i++) {
-		digest[i * 4U] = (uint8_t)(state[i] >> 24);
-		digest[i * 4U + 1U] = (uint8_t)(state[i] >> 16);
-		digest[i * 4U + 2U] = (uint8_t)(state[i] >> 8);
-		digest[i * 4U + 3U] = (uint8_t)state[i];
-	}
-}
-
+/* The first 64 bits of the fractional parts of the square roots of the first
+ * eight primes: SHA-512's initial state and BLAKE2b's IV. */
 static const uint64_t bt_blake2b_initial[BT_BLAKE2B_WORDS] = {
 	UINT64_C(0x6a09e667f3bcc908),
 	UINT64_C(0xbb67ae8584caa73b),
@@ -307,6 +364,177 @@ static const uint64_t bt_blake2b_initial[BT_BLAKE2B_WORDS] = {
 	UINT64_C(0x1f83d9abfb41bd6b),
 	UINT64_C(0x5be0cd19137e2179),
 };
+
+static inline uint64_t
+bt_load64_big(const uint8_t *bytes)
+{
+	return (uint64_t)bt_load32_big(bytes) << 32 | bt_load32_big(bytes + 4U);
+}
+
+static void
+bt_sha512_block(uint64_t state[BT_SHA512_WORDS], const uint8_t *block)
+{
+	uint64_t schedule[16];
+	uint64_t work[BT_SHA512_WORDS];
+	uint64_t word;
+	uint64_t s0;
+	uint64_t s1;
+	uint64_t choose;
+	uint64_t majority;
+	uint64_t first;
+	uint64_t second;
+	unsigned round;
+	unsigned i;
+
+	for (i = 0; i < BT_SHA512_WORDS; i++) {
+		work[i] = state[i];
+	}
+	for (round = 0; round < BT_SHA512_ROUNDS; round++) {
+		if (round < 16) {
+			word = bt_load64_big(block + round * 8U);
+		} else {
+			s0 = bt_rotr64(schedule[(round + 1) % 16], 1) ^
+			    bt_rotr64(schedule[(round + 1) % 16], 8) ^
+			    schedule[(round + 1) % 16] >> 7;
+			s1 = bt_rotr64(schedule[(round + 14) % 16], 19) ^
+			    bt_rotr64(schedule[(round + 14) % 16], 61) ^
+			    schedule[(round + 14) % 16] >> 6;
+			word = schedule[round % 16] + s0 + schedule[(round + 9) % 16] + s1;
+		}
+		schedule[round % 16] = word;
+		s1 = bt_rotr64(work[4], 14) ^ bt_rotr64(work[4], 18) ^ bt_rotr64(work[4], 41);
+		choose = (work[4] & work[5]) ^ (~work[4] & work[6]);
+		first = work[7] + s1 + choose + bt_sha512_constants[round] + word;
+		s0 = bt_rotr64(work[0], 28) ^ bt_rotr64(work[0], 34) ^ bt_rotr64(work[0], 39);
+		majority = (work[0] & work[1]) ^ (work[0] & work[2]) ^ (work[1] & work[2]);
+		second = s0 + majority;
+		for (i = BT_SHA512_WORDS - 1; i > 0; i--) {
+			work[i] = work[i - 1];
+		}
+		work[4] += first;
+		work[0] = first + second;
+	}
+	for (i = 0; i < BT_SHA512_WORDS; i++) {
+		state[i] += work[i];
+	}
+}
+
+static void
+bt_sha2_compress(struct bt_sha2 *hash, const uint8_t *block)
+{
+	if (hash->wide) {
+		bt_sha512_block(hash->large, block);
+	} else {
+		bt_sha256_block(hash->small, block);
+	}
+}
+
+void
+bt_sha2_init(struct bt_sha2 *hash, int wide)
+{
+	unsigned i;
+
+	bt_zero(hash, sizeof(*hash));
+	hash->wide = wide;
+	for (i = 0; i < BT_SHA256_WORDS; i++) {
+		hash->small[i] = bt_sha256_initial[i];
+	}
+	/* BLAKE2b's IV is SHA-512's initial state. */
+	for (i = 0; i < BT_SHA512_WORDS; i++) {
+		hash->large[i] = bt_blake2b_initial[i];
+	}
+}
+
+size_t
+bt_sha2_block_size(const struct bt_sha2 *hash)
+{
+	return hash->wide ? BT_SHA512_BLOCK : BT_SHA256_BLOCK;
+}
+
+size_t
+bt_sha2_digest_size(const struct bt_sha2 *hash)
+{
+	return hash->wide ? BT_SHA512_DIGEST : BT_SHA256_DIGEST;
+}
+
+void
+bt_sha2_update(struct bt_sha2 *hash, const void *data, size_t length)
+{
+	const uint8_t *bytes = data;
+	size_t block = bt_sha2_block_size(hash);
+	size_t count;
+
+	hash->length += length;
+	if (hash->used != 0) {
+		count = block - hash->used < length ? block - hash->used : length;
+		bt_copy(hash->pending + hash->used, bytes, count);
+		hash->used += count;
+		bytes += count;
+		length -= count;
+		if (hash->used < block) {
+			return;
+		}
+		bt_sha2_compress(hash, hash->pending);
+		hash->used = 0;
+	}
+	for (; length >= block; length -= block) {
+		bt_sha2_compress(hash, bytes);
+		bytes += block;
+	}
+	bt_copy(hash->pending, bytes, length);
+	hash->used = length;
+}
+
+void
+bt_sha2_final(struct bt_sha2 *hash, uint8_t *digest)
+{
+	size_t block = bt_sha2_block_size(hash);
+	size_t length_bytes = hash->wide ? BT_SHA512_LENGTH_BYTES : BT_SHA256_LENGTH_BYTES;
+	uint64_t bits = hash->length * 8U;
+	unsigned i;
+
+	hash->pending[hash->used++] = BT_SHA2_PAD;
+	bt_zero(hash->pending + hash->used, block - hash->used);
+	if (block - hash->used < length_bytes) {
+		bt_sha2_compress(hash, hash->pending);
+		bt_zero(hash->pending, block);
+	}
+	/* The upper bits of a 128-bit length stay zero: no message here
+	 * reaches 2^61 bytes. */
+	for (i = 0; i < 8; i++) {
+		hash->pending[block - 1U - i] = (uint8_t)(bits >> (8U * i));
+	}
+	bt_sha2_compress(hash, hash->pending);
+	if (hash->wide) {
+		for (i = 0; i < BT_SHA512_WORDS; i++) {
+			digest[i * 8U] = (uint8_t)(hash->large[i] >> 56);
+			digest[i * 8U + 1U] = (uint8_t)(hash->large[i] >> 48);
+			digest[i * 8U + 2U] = (uint8_t)(hash->large[i] >> 40);
+			digest[i * 8U + 3U] = (uint8_t)(hash->large[i] >> 32);
+			digest[i * 8U + 4U] = (uint8_t)(hash->large[i] >> 24);
+			digest[i * 8U + 5U] = (uint8_t)(hash->large[i] >> 16);
+			digest[i * 8U + 6U] = (uint8_t)(hash->large[i] >> 8);
+			digest[i * 8U + 7U] = (uint8_t)hash->large[i];
+		}
+	} else {
+		for (i = 0; i < BT_SHA256_WORDS; i++) {
+			digest[i * 4U] = (uint8_t)(hash->small[i] >> 24);
+			digest[i * 4U + 1U] = (uint8_t)(hash->small[i] >> 16);
+			digest[i * 4U + 2U] = (uint8_t)(hash->small[i] >> 8);
+			digest[i * 4U + 3U] = (uint8_t)hash->small[i];
+		}
+	}
+}
+
+static void
+bt_sha256(const uint8_t *data, size_t length, uint8_t digest[BT_CSUM_SIZE])
+{
+	struct bt_sha2 hash;
+
+	bt_sha2_init(&hash, 0);
+	bt_sha2_update(&hash, data, length);
+	bt_sha2_final(&hash, digest);
+}
 
 /* Message word order of each round; rounds 10 and 11 repeat rounds 0 and 1. */
 static const uint8_t bt_blake2b_sigma[10][16] = {

@@ -250,6 +250,12 @@ virtio_blk.ko xor-neon.ko xor.ko raid6_pq.ko crc32c_generic.ko libcrc32c.ko
 xxhash_generic.ko blake2b_generic.ko btrfs.ko
 ```
 
+The fs-verity profile needs `fsverity` from Alpine v3.22 community's
+fsverity-utils 1.6 at `root/usr/bin/fsverity`, with its `libfsverity.so.0` and
+`libcrypto.so.3` from main's libcrypto3 in `root/usr/lib`, each package checked
+against its signed APKINDEX. The reference kernel has fs-verity, SHA-256 and
+SHA-512 built in.
+
 The Linux crash-state recording also needs `dm-mod.ko` and `dm-log-writes.ko` in
 `root/modules/` and a static `dmsetup` at `root/sbin/dmsetup` (from the
 device-mapper-static APK, `usr/sbin/dmsetup.static`).
@@ -277,7 +283,7 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all twenty-nine
+Linux checks and a completed VM exit before consuming the image. Repeat all thirty-one
 profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for
 `transactions-convert` and `transactions-space-cache`, whose data groups must reach the
 100 MiB Linux needs before it writes a v1 cache,
@@ -286,9 +292,13 @@ profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for
 transaction suites. It hashes each complete image before and after reading,
 verifies 2,477 contracts (the seven reader profiles; `transactions-holes`,
 whose split hole items it reads; the checksum profiles and the metadata-UUID,
-mixed, space-cache, quota and simple-quota profiles, whose data payload it reads in the
+mixed, space-cache, quota, simple-quota and fs-verity profiles, whose data payload it reads in the
 subvolume and both snapshots; and the block-group-tree profile), and fails if any
-byte changed. The `codecs`
+byte changed. The `transactions-verity` profile enables fs-verity on fourteen
+files in a subvolume, then snapshots it read-only; Linux's `fsverity measure`
+must print the digest the preparer's independent model computes for each, and
+appending, truncating and preallocating must fail. The reader must read both
+copies of each file and report the same digests. The `codecs`
 profile mounts with `compress-force=lzo` and writes the same 64 files of an
 incompressible head and a compressible tail into `lzo`, and, through the
 `btrfs.compression` property, `zlib` and `zstd` directories; Linux must report

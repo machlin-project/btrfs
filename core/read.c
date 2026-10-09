@@ -455,19 +455,6 @@ enum btrfs_result
 btrfs_read(const struct btrfs_fs *fs, const struct btrfs_inode *inode, uint64_t offset,
     void *buffer, size_t length, size_t *completed)
 {
-	struct bt_cursor cursor;
-	struct bt_read_session session;
-	struct bt_record record;
-	struct bt_key key;
-	uint64_t extent_length;
-	uint64_t end;
-	uint64_t position;
-	uint64_t previous_end = 0;
-	uint64_t visited = 0;
-	size_t count;
-	size_t copied;
-	enum btrfs_result error;
-
 	if (completed == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
@@ -488,6 +475,33 @@ btrfs_read(const struct btrfs_fs *fs, const struct btrfs_inode *inode, uint64_t 
 	if (length > inode->size - offset) {
 		length = (size_t)(inode->size - offset);
 	}
+	/* Linux verifies only regular files: fs-verity is enabled on nothing
+	 * else. */
+	if ((inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_REGULAR &&
+	    (inode->flags & BT_INODE_RO_VERITY) != 0) {
+		return bt_verity_read(fs, inode, offset, buffer, length, completed);
+	}
+	return bt_read_data(fs, inode, offset, buffer, length, completed);
+}
+
+enum btrfs_result
+bt_read_data(const struct btrfs_fs *fs, const struct btrfs_inode *inode, uint64_t offset,
+    void *buffer, size_t length, size_t *completed)
+{
+	struct bt_cursor cursor;
+	struct bt_read_session session;
+	struct bt_record record;
+	struct bt_key key;
+	uint64_t extent_length;
+	uint64_t end;
+	uint64_t position;
+	uint64_t previous_end = 0;
+	uint64_t visited = 0;
+	size_t count;
+	size_t copied;
+	enum btrfs_result error;
+
+	*completed = 0;
 	error = bt_inode_cursor(fs, inode, &cursor);
 	if (error != BTRFS_OK) {
 		return error;

@@ -13,7 +13,8 @@ not accepted.
 It reads single-device filesystems with CRC32C, XXH64, SHA-256 or BLAKE2b
 checksums, SINGLE/DUP chunks, 4–64 KiB nodes, inodes, byte-exact names,
 directories, hard links, symlinks, inline and regular extents, sparse and
-preallocated data, raw xattrs, subvolumes and snapshots. Every adapter reads
+preallocated data, raw xattrs, subvolumes and snapshots, and verifies fs-verity
+files against their Merkle trees on every read. Every adapter reads
 zlib, LZO and Zstd extents: the platform's zlib (a bounded kernel decoder in the
 XNU adapter) and the shared freestanding LZO and Zstd decoders. Every adapter
 writes zlib and Zstd extents; the XNU adapter uses the kernel's deflate and a

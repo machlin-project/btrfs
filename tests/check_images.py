@@ -16,7 +16,7 @@ CHECKSUM_TYPES = {"crc32c": 0, "xxhash": 1, "sha256": 2, "blake2": 3}
 DATA_PAYLOAD_PROFILES = {"checksums-xxhash", "checksums-sha256", "checksums-blake2",
                          "transactions-metadata-uuid", "transactions-mixed",
                          "transactions-space-cache", "transactions-quota",
-                         "transactions-squota"}
+                         "transactions-squota", "transactions-verity"}
 DATA_BIG_BYTES = 1048576
 DATA_SMALL_BYTES = 10000
 DATA_SPARSE_BYTES = 4194304
@@ -25,6 +25,9 @@ DATA_HOLE_B = 3145728
 DATA_PREALLOC_BYTES = 262144
 DATA_ZLIB_BYTES = 262144
 DATA_NODATASUM_BYTES = 65536
+# FS_VERITY_FL and Btrfs's RO_VERITY inode flag.
+VERITY_FSFLAG = 0x00100000
+VERITY_INODE_FLAG = 1 << 32
 
 
 def check(tool: Path, image: Path, manifest: dict) -> int:
@@ -134,6 +137,18 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
                 assert run("cat", f"{directory}/{name}") == data, (directory, name)
                 cases += 1
         assert run("cat", "data/big", "4093", "8199") == big[4093:12292]
+        cases += 1
+    # fs-verity files read only what their Merkle trees authenticate (the
+    # manifest's reads above); their digests equal the independent model's,
+    # which Linux's measure matched.
+    for path, model in manifest.get("verity", {}).items():
+        attributes = stat(path)
+        assert attributes["flags"] & VERITY_INODE_FLAG and attributes["fsflags"] & VERITY_FSFLAG
+        assert run("verity", path).decode().strip() == model["digest"], path
+        cases += 2
+    if manifest.get("verity"):
+        assert not stat("greeting")["fsflags"] & VERITY_FSFLAG
+        run("verity", "greeting", success=False)
         cases += 1
     if manifest["profile"] == "transactions-holes":
         # Without NO_HOLES Linux splits hole items around written sectors and

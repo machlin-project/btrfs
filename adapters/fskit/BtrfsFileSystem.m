@@ -1432,22 +1432,29 @@ btrfs_timespec(struct btrfs_time time)
 	return NO;
 }
 
-/* Write access to a read-only volume is refused at open, before the kernel
- * admits cached writes or shared writable mappings. */
+/* Write access to a read-only volume, and to an fs-verity file as Linux's
+ * fsverity_file_open refuses it, is refused at open, before the kernel admits
+ * cached writes or shared writable mappings. */
 - (void)openItem:(FSItem *)item
        withModes:(FSVolumeOpenModes)modes
     replyHandler:(void (^)(NSError *))reply
 {
 	BtrfsItem *owned = (BtrfsItem *)item;
+	BOOL verity;
 
 	if (!_writable && (modes & FSVolumeOpenModesWrite) != 0) {
 		reply(btrfs_fskit_error(BTRFS_READ_ONLY));
 		return;
 	}
 	[_itemLock lock];
-	owned->openModes |= modes;
+	verity = (owned->inode.flags & BTRFS_INODE_FLAG_VERITY) != 0;
+	if (!verity || (modes & FSVolumeOpenModesWrite) == 0) {
+		owned->openModes |= modes;
+	}
 	[_itemLock unlock];
-	reply(nil);
+	reply(verity && (modes & FSVolumeOpenModesWrite) != 0
+		? btrfs_fskit_error(BTRFS_NOT_PERMITTED)
+		: nil);
 }
 
 - (void)closeItem:(FSItem *)item

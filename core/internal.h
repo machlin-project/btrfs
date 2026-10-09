@@ -277,6 +277,26 @@ size_t bt_checksum_size(unsigned type);
 void bt_checksum(unsigned type, const void *data, size_t length, uint8_t sum[BT_CSUM_SIZE]);
 /* The checksum of a node's bytes after its checksum field. */
 void bt_checksum_node(const struct btrfs_fs *fs, const uint8_t *node, uint8_t sum[BT_CSUM_SIZE]);
+/* SHA-256 (wide 0) and SHA-512 (wide 1) with state kept between calls, for
+ * fs-verity's salted block hashes (core/checksum.c). */
+#define BT_SHA256_DIGEST 32U
+#define BT_SHA512_DIGEST 64U
+#define BT_SHA2_BLOCK_MAX 128U
+
+struct bt_sha2 {
+	uint32_t small[8];
+	uint64_t large[8];
+	uint8_t pending[BT_SHA2_BLOCK_MAX];
+	uint64_t length;
+	size_t used;
+	int wide;
+};
+
+void bt_sha2_init(struct bt_sha2 *hash, int wide);
+size_t bt_sha2_block_size(const struct bt_sha2 *hash);
+size_t bt_sha2_digest_size(const struct bt_sha2 *hash);
+void bt_sha2_update(struct bt_sha2 *hash, const void *data, size_t length);
+void bt_sha2_final(struct bt_sha2 *hash, uint8_t *digest);
 /* Sectors one bt_checksum_sectors call covers at most. */
 size_t bt_checksum_batch(const struct btrfs_fs *fs);
 /* The checksums of count sectors, bt_checksum_size bytes each and packed as in
@@ -330,6 +350,14 @@ enum btrfs_result bt_inode_read(
 enum btrfs_result bt_cursor_next(struct bt_cursor *cursor);
 enum btrfs_result bt_cursor_record(const struct bt_cursor *cursor, struct bt_record *record);
 enum btrfs_result bt_find_root(const struct btrfs_fs *fs, uint64_t tree, struct bt_root *root);
+/* btrfs_read of a regular file or symlink without fs-verity, for offset below
+ * the size and length within it (core/read.c). */
+enum btrfs_result bt_read_data(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
+    uint64_t offset, void *buffer, size_t length, size_t *completed);
+/* btrfs_read of a regular file with fs-verity metadata: only data its Merkle
+ * tree authenticates reaches buffer (core/verity.c). */
+enum btrfs_result bt_verity_read(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
+    uint64_t offset, void *buffer, size_t length, size_t *completed);
 enum btrfs_result bt_inode_cursor(
     const struct btrfs_fs *fs, const struct btrfs_inode *inode, struct bt_cursor *cursor);
 enum btrfs_result bt_dir_record(const struct bt_record *record, size_t *offset,

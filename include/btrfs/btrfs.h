@@ -156,6 +156,9 @@ struct btrfs_time {
 #define BTRFS_INODE_FLAG_IMMUTABLE (UINT64_C(1) << 6)
 #define BTRFS_INODE_FLAG_APPEND (UINT64_C(1) << 7)
 #define BTRFS_INODE_FLAG_NODUMP (UINT64_C(1) << 8)
+/* Linux's BTRFS_INODE_RO_VERITY in the upper half: the file has fs-verity
+ * metadata, and its data is read-only and verified on every read. */
+#define BTRFS_INODE_FLAG_VERITY (UINT64_C(1) << 32)
 
 /* Linux's inode attribute flags (FS_IOC_GETFLAGS and FS_IOC_SETFLAGS, as chattr
  * and lsattr use them), with Linux's values. */
@@ -167,6 +170,7 @@ struct btrfs_time {
 #define BTRFS_FS_NOATIME_FL 0x00000080U
 #define BTRFS_FS_NOCOMP_FL 0x00000400U
 #define BTRFS_FS_DIRSYNC_FL 0x00010000U
+#define BTRFS_FS_VERITY_FL 0x00100000U
 #define BTRFS_FS_NOCOW_FL 0x00800000U
 
 struct btrfs_inode {
@@ -247,7 +251,11 @@ enum btrfs_result btrfs_directory_inode(
     struct btrfs_directory *stream, const struct btrfs_dir_entry *entry, struct btrfs_inode *inode);
 /* completed is always initialized, including on error. Only the reported prefix
  * is valid; bytes beyond it never hold unverified file data (a failed range
- * read in place is zeroed). */
+ * read in place is zeroed). A regular file with fs-verity metadata
+ * (BTRFS_INODE_FLAG_VERITY) is also verified against its Merkle tree, as
+ * Linux's fs/verity does: CORRUPT for data the tree does not authenticate or
+ * metadata Linux would refuse to open, UNSUPPORTED for an unknown descriptor
+ * version or hash algorithm. */
 enum btrfs_result btrfs_read(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
     uint64_t offset, void *buffer, size_t length, size_t *completed);
 /* lseek's SEEK_HOLE (hole nonzero) and SEEK_DATA from offset, as Linux's
@@ -267,6 +275,17 @@ enum btrfs_result btrfs_list_xattrs(const struct btrfs_fs *fs, const struct btrf
 /* FS_IOC_GETFLAGS: the attribute flags of inode's Btrfs flags, as Linux's
  * btrfs_inode_flags_to_fsflags reports them. */
 unsigned btrfs_inode_fsflags(const struct btrfs_inode *inode);
+/* fs-verity's hash algorithms (FS_VERITY_HASH_ALG_*) and largest digest. */
+#define BTRFS_VERITY_HASH_SHA256 1U
+#define BTRFS_VERITY_HASH_SHA512 2U
+#define BTRFS_VERITY_DIGEST_MAX 64U
+/* FS_IOC_MEASURE_VERITY: a verity file's digest algorithm and digest (the
+ * hash of its descriptor with sig_size 0 and no signature). NOT_FOUND for any
+ * other inode; RANGE when capacity is short, with *length the digest size. */
+enum btrfs_result btrfs_verity_digest(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
+    unsigned *algorithm, uint8_t *digest, size_t capacity, size_t *length);
+/* Linux's Btrfs answers FS_IOC_READ_VERITY_METADATA with ENOTTY; it has no
+ * counterpart here. */
 const char *btrfs_result_string(enum btrfs_result result);
 uint32_t btrfs_mode_for_type(uint8_t type);
 

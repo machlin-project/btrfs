@@ -106,9 +106,11 @@ is destroyed. `accept` is legal only after successful durable publication;
    without NO_HOLES and both copies of DUP data, and fallocate as Linux's
    `btrfs_fallocate` (allocation, zeroing and punching; `F_PREALLOCATE` and
    `F_PUNCHHOLE` natively). The kernel adapter compresses with the kernel's
-   deflate and the shared freestanding Zstd encoder. Remaining: a 64 KiB-sector
-   fixture. New data is written as its extents are
-   created, and files compress on write as Linux decides.
+   deflate and the shared freestanding Zstd encoder. New data is written as
+   its extents are created, and files compress on write as Linux decides.
+   fs-verity files are verified on every read (`core/verity.c`). Remaining: a
+   64 KiB-sector fixture, writes on volumes with fs-verity files and enabling
+   fs-verity.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
    siblings, and data and metadata chunks grow from unallocated device space

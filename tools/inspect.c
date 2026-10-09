@@ -161,6 +161,7 @@ inspect(struct btrfs_fs *fs, int argc, char **argv)
 	size_t length;
 	size_t count;
 	size_t i;
+	unsigned algorithm;
 	enum btrfs_result error;
 	const size_t buffer_size = 1024U * 1024U;
 
@@ -245,6 +246,14 @@ inspect(struct btrfs_fs *fs, int argc, char **argv)
 		    fs, &inode, argv[2], strlen(argv[2]), buffer, buffer_size, &length);
 		if (error == BTRFS_OK && fwrite(buffer, 1, length, stdout) != length) {
 			error = BTRFS_IO;
+		}
+	} else if (strcmp(argv[0], "verity") == 0) {
+		/* As fsverity measure prints it. */
+		error = btrfs_verity_digest(fs, &inode, &algorithm, buffer, buffer_size, &length);
+		if (error == BTRFS_OK) {
+			printf("%s:", algorithm == BTRFS_VERITY_HASH_SHA512 ? "sha512" : "sha256");
+			print_hex(buffer, length);
+			putchar('\n');
 		}
 	} else if (strcmp(argv[0], "listxattr") == 0) {
 		error = btrfs_list_xattrs(fs, &inode, buffer, buffer_size, &length);

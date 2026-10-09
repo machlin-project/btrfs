@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import struct
 import subprocess
 
 PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
@@ -28,7 +29,8 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-mixed": (4096, "single", ""),
             "transactions-space-cache": (4096, "single", ""),
             "transactions-quota": (16384, "dup", ""),
-            "transactions-squota": (16384, "dup", "")}
+            "transactions-squota": (16384, "dup", ""),
+            "transactions-verity": (16384, "dup", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -50,7 +52,8 @@ MKFS_FEATURES = {"transactions-holes": "-O ^no-holes",
 # quotas with a limited subvolume carry the data payload. The block-group tree
 # keeps the base payload, whose emptied data group the group scenarios remove.
 FEATURE_PROFILES = ("transactions-metadata-uuid", "transactions-mixed",
-                    "transactions-space-cache", "transactions-quota", "transactions-squota")
+                    "transactions-space-cache", "transactions-quota", "transactions-squota",
+                    "transactions-verity")
 MOUNT_OPTIONS = {"transactions-space-cache": "space_cache=v1"}
 # Linux writes no v1 cache for a block group below 100 MiB (cache_save_setup);
 # on 1 GiB its data groups are 112 MiB.
@@ -148,6 +151,84 @@ LZO_TAIL_STEP = 1531
 LZO_TAIL_BASE = 100
 FILL_XATTR_BYTES = 3800
 FILL_REMOVE_STRIDE = 7
+# fs-verity files in a subvolume with a read-only snapshot: each hash
+# algorithm, 1 KiB and 4 KiB Merkle blocks, full and odd-length salts, and
+# files of no, one and exactly one more than a tree block's data blocks, with
+# a tail, inline, sparse, preallocated, NODATACOW (no checksums) and Zstd
+# extents, and two tree levels and more. fs-verity's file digest comes from
+# the independent model below, and Linux's measure must agree with it (Linux's
+# Btrfs has no FS_IOC_READ_VERITY_METADATA). VERITY_COMPAT_RO is the
+# superblock's compat_ro bit 2.
+VERITY_SALT = bytes(range(32))
+VERITY_SHORT_SALT = bytes.fromhex("a1b2c3d4e5")
+VERITY_ALGORITHMS = {"sha256": 1, "sha512": 2}
+VERITY_COMPAT_RO = 1 << 2
+VERITY_TREE_SPAN = 4096 * 128
+VERITY_LARGE_COPIES = 2
+VERITY_LARGE_TAIL = 123
+VERITY_SPARSE_BYTES = 4194304
+VERITY_SPARSE_OFFSET = 1048576
+VERITY_PREALLOC_BYTES = 131072
+VERITY_NOCOW_BYTES = 65536
+VERITY_TAIL_BYTES = 10000
+VERITY_INLINE_BYTES = 100
+VERITY_DESCRIPTOR = struct.Struct("<BBBBIQ64s32s144s")
+
+
+def verity_model(data: bytes, algorithm: str, block: int, salt: bytes) -> dict:
+    """fs-verity's file digest: the hash of the descriptor naming the Merkle
+    tree's root hash."""
+    hash_block = hashlib.new(algorithm).block_size
+    prefix = salt + bytes(-len(salt) % hash_block) if salt else b""
+
+    def digest(chunk: bytes) -> bytes:
+        return hashlib.new(algorithm, prefix + chunk).digest()
+
+    levels = []
+    blocks = [data[i:i + block].ljust(block, b"\0") for i in range(0, len(data), block)]
+    while len(blocks) > 1:
+        hashes = b"".join(digest(chunk) for chunk in blocks)
+        blocks = [hashes[i:i + block].ljust(block, b"\0") for i in range(0, len(hashes), block)]
+        levels.append(b"".join(blocks))
+    root = digest(blocks[0]) if blocks else bytes(hashlib.new(algorithm).digest_size)
+    descriptor = VERITY_DESCRIPTOR.pack(1, VERITY_ALGORITHMS[algorithm], block.bit_length() - 1,
+                                        len(salt), 0, len(data), root, salt, b"")
+    return {"digest": f"{algorithm}:{hashlib.new(algorithm, descriptor).hexdigest()}",
+            "tree_size": sum(len(level) for level in levels)}
+
+
+def verity_files(contents: dict) -> dict:
+    """Name: (data, algorithm, block size, salt, shell commands writing it)."""
+    big = contents["big"]
+    random = contents["random"]
+    sparse = bytearray(VERITY_SPARSE_BYTES)
+    sparse[VERITY_SPARSE_OFFSET:VERITY_SPARSE_OFFSET + 6] = b"VERITY"
+    return {
+        "sha256": (random, "sha256", 4096, b"", "cat /input/random > $f"),
+        "sha512-salt": (big, "sha512", 4096, VERITY_SALT, "cat /input/big > $f"),
+        "sha512-1k": (big, "sha512", 1024, VERITY_SHORT_SALT, "cat /input/big > $f"),
+        "sha256-1k": (random, "sha256", 1024, b"", "cat /input/random > $f"),
+        "tail": (random[:VERITY_TAIL_BYTES], "sha256", 4096, b"",
+                 f"head -c {VERITY_TAIL_BYTES} /input/random > $f"),
+        "empty": (b"", "sha256", 4096, b"", ": > $f"),
+        "inline": (random[:VERITY_INLINE_BYTES], "sha256", 4096, b"",
+                   f"head -c {VERITY_INLINE_BYTES} /input/random > $f"),
+        "block": (big[:4096], "sha256", 4096, b"", "head -c 4096 /input/big > $f"),
+        "boundary": (big[:VERITY_TREE_SPAN + 1], "sha256", 4096, b"",
+                     f"head -c {VERITY_TREE_SPAN + 1} /input/big > $f"),
+        "large": (big * VERITY_LARGE_COPIES + random[:VERITY_LARGE_TAIL], "sha256", 4096, b"",
+                  f"{{ for i in $(seq {VERITY_LARGE_COPIES}); do cat /input/big; done; "
+                  f"head -c {VERITY_LARGE_TAIL} /input/random; }} > $f"),
+        "sparse": (bytes(sparse), "sha256", 4096, b"",
+                   f"truncate -s {VERITY_SPARSE_BYTES} $f; printf VERITY | "
+                   f"dd of=$f bs=1 seek={VERITY_SPARSE_OFFSET} conv=notrunc 2>/dev/null"),
+        "prealloc": (b"DATA" + bytes(VERITY_PREALLOC_BYTES - 4), "sha256", 4096, b"",
+                     f"fallocate -l {VERITY_PREALLOC_BYTES} $f; printf DATA | "
+                     f"dd of=$f conv=notrunc 2>/dev/null"),
+        "nocow/data": (random[:VERITY_NOCOW_BYTES], "sha512", 4096, VERITY_SALT,
+                       f"touch $f; chattr +C $f; head -c {VERITY_NOCOW_BYTES} /input/random > $f"),
+        "zstd/data": (big, "sha256", 4096, b"", "cat /input/big > $f"),
+    }
 
 
 def prepare(root: Path, profile: str, archive: Path) -> None:
@@ -531,6 +612,37 @@ test "$(awk '$1 == "cache_generation" {print $2}' /tmp/super.txt)" = \\
 caches=$(btrfs inspect-internal dump-tree -t root /dev/vda | grep -c 'key (FREE_SPACE UNTYPED' || true)
 echo BTRFS_REFERENCE_SPACE_CACHES:$caches
 test "$caches" -gt 0'''
+    if profile == "transactions-verity":
+        # fs-verity's ioctl refuses writable descriptors, so each file is
+        # closed before it is enabled; writes, appends and truncation then
+        # fail as Linux refuses them.
+        fill += """
+btrfs subvolume create /mnt/verity
+mkdir /mnt/verity/nocow /mnt/verity/zstd
+btrfs property set /mnt/verity/zstd compression zstd"""
+        verity = {}
+        for name, (data, algorithm, block, salt, write) in verity_files(contents).items():
+            model = verity_model(data, algorithm, block, salt)
+            salt_option = f" --salt={salt.hex()}" if salt else ""
+            fill += f'''
+f=/mnt/verity/{name}
+{write}
+fsverity enable $f --hash-alg={algorithm} --block-size={block}{salt_option}
+test "$(fsverity measure $f)" = "{model["digest"]} $f"'''
+            for directory in ("verity", "verity-ro"):
+                extra[f"{directory}/{name}"] = data
+                verity[f"{directory}/{name}"] = model
+        fill += """
+if printf x >> /mnt/verity/tail 2>/dev/null; then exit 1; fi
+if truncate -s 0 /mnt/verity/tail 2>/dev/null; then exit 1; fi
+if fallocate -l 1048576 /mnt/verity/tail 2>/dev/null; then exit 1; fi
+btrfs filesystem sync /mnt
+btrfs subvolume snapshot -r /mnt/verity /mnt/verity-ro > /dev/null
+btrfs filesystem sync /mnt"""
+        after = f"""compat_ro=$(btrfs inspect-internal dump-super /dev/vda | awk '$1 == "compat_ro_flags" {{print $2}}')
+echo BTRFS_REFERENCE_COMPAT_RO:$compat_ro
+test $((compat_ro & {VERITY_COMPAT_RO})) -ne 0
+echo BTRFS_REFERENCE_VERITY_ITEMS:$(btrfs inspect-internal dump-tree /dev/vda | grep -c 'VERITY_MERKLE_ITEM' || true)"""
     if profile == "transactions-squota":
         # Simple quotas count extents from their enabling transaction on: the
         # base payload before it stays uncounted, the data payload counts.
@@ -638,6 +750,8 @@ poweroff -f
                 "compression": compression, "device_bytes": device_bytes, "files": {
                     name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                     for name, data in {**contents, **extra}.items()}}
+    if profile == "transactions-verity":
+        manifest["verity"] = verity
     archive.with_suffix(".json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
