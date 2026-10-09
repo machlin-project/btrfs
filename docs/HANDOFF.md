@@ -106,7 +106,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    (`core/space.c`, `bt_tx_publish_chunks`); groups convert between free extent
    items and bitmaps at Linux's thresholds; system chunks grow through the
    superblock's system array and unused groups are removed by an explicit
-   cleaner pass (`core/group.c`), which native writers have yet to call.
+   cleaner pass (`core/group.c`), which the native volume runs after a
+   commit that released space. Admission keeps metadata for the commit, for
+   data written afterwards and, as Linux's global reserve, for deletions;
+   truncation, eviction and orphan cleanup run in bounded steps.
    Remaining: the v1 space cache (`cache_generation` is currently invalidated)
    with its own fixture, and quotas, mixed groups, metadata UUID and the
    block-group tree, which stay rejected until each is implemented and tested.

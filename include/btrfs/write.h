@@ -59,12 +59,11 @@ enum btrfs_result btrfs_recover_supers(const struct btrfs_environment *environme
 
 /* Current admission: any of Linux's four checksum algorithms, skinny metadata,
  * SINGLE/DUP, no free-space cache tree, quotas or mixed groups. At least two
- * superblock copies must exist and
- * agree with the mounted primary; otherwise begin returns RECOVERY_REQUIRED.
- * Changes are confined to unshared top-level tree paths. Unsupported layouts
- * return before any media write. Native adapters open read-write only on
- * request, and run btrfs_recover_supers first when admission returns
- * RECOVERY_REQUIRED.
+ * superblock copies must exist and agree with the mounted primary; otherwise
+ * begin returns RECOVERY_REQUIRED. Changes are confined to unshared top-level
+ * tree paths. Unsupported layouts return before any media write. Native
+ * adapters open read-write only on request, and run btrfs_recover_supers first
+ * when admission returns RECOVERY_REQUIRED.
  *
  * Commit writes new metadata, barrier, secondary superblocks, barrier, primary,
  * barrier. Every crash point therefore retains a valid copy at the last
@@ -127,8 +126,18 @@ enum btrfs_result btrfs_transaction_write_inline(struct btrfs_transaction *trans
 enum btrfs_result btrfs_transaction_write(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, uint64_t offset, const void *bytes, size_t size,
     struct btrfs_time modified);
+/* Tree nodes one step of a truncation, eviction or orphan cleanup changes,
+ * counting those its dropped references change at commit (the step may
+ * exceed it by one item's edit). Native writers commit between steps as the
+ * room of a releasing operation requires. */
+#define BTRFS_RELEASE_STEP_NODES 64U
+/* Shrinking removes the items beyond the new EOF from the end of the file in
+ * steps whose work reaches budget, as Linux's truncation does; a step that
+ * leaves work stores the size it reached, a valid shorter file in every
+ * committed state, and *done is 0 until the file has size bytes. Growing
+ * completes in one step. */
 enum btrfs_result btrfs_transaction_truncate(struct btrfs_transaction *transaction,
-    struct btrfs_object_id id, uint64_t size, struct btrfs_time modified);
+    struct btrfs_object_id id, uint64_t size, struct btrfs_time modified, size_t budget, int *done);
 
 /* A new inode's attributes: mode includes the file type; credentials and
  * set-id inheritance are the caller's authorization decision. device is the
@@ -179,8 +188,10 @@ enum btrfs_result btrfs_transaction_link_tmpfile(struct btrfs_transaction *trans
     struct btrfs_object_id id, struct btrfs_object_id parent, const void *name, size_t length,
     struct btrfs_time time);
 /* Removes a name; directories must be empty. An inode losing its last name is
- * deleted with its data, unless it is still open: then an orphan item keeps it
- * until btrfs_transaction_evict, or orphan cleanup after a crash. */
+ * deleted with its data when that takes a small bounded amount of work; while
+ * it is still open, or when its deletion needs more, an orphan item keeps it
+ * until btrfs_transaction_evict, or orphan cleanup after a crash. The caller
+ * evicts an unopened one that btrfs_transaction_take_deferred returns. */
 enum btrfs_result btrfs_transaction_unlink(struct btrfs_transaction *transaction,
     struct btrfs_object_id parent, const void *name, size_t length, struct btrfs_time time,
     int open);
@@ -298,14 +309,22 @@ enum btrfs_result btrfs_transaction_remove_unused_groups(
  * and orphan item. dropped counts them; pending reports remaining work. */
 enum btrfs_result btrfs_transaction_clean_subvolumes(
     struct btrfs_transaction *transaction, size_t budget, size_t *dropped, int *pending);
-/* Deletes an orphaned inode after its last native reference closes. */
+/* Deletes an orphaned inode after its last native reference closes, in steps
+ * whose work reaches budget: its data from the end of the file, then its other
+ * items and its orphan item. *done is 0 while work remains. */
 enum btrfs_result btrfs_transaction_evict(
-    struct btrfs_transaction *transaction, struct btrfs_object_id id);
-/* Deletes every orphaned unlinked inode of a tree, as Linux does at mount; an
- * orphan item of an inode that still has names, or of a missing inode, is
- * dropped. */
-enum btrfs_result btrfs_transaction_clean_orphans(
-    struct btrfs_transaction *transaction, uint64_t tree, size_t *cleaned);
+    struct btrfs_transaction *transaction, struct btrfs_object_id id, size_t budget, int *done);
+/* An unopened inode whose deletion an unlink or rename of this transaction
+ * left to btrfs_transaction_evict; NOT_FOUND when none remains. Each is taken
+ * once; one left in a committed transaction is an orphan for the next mount's
+ * cleanup. */
+enum btrfs_result btrfs_transaction_take_deferred(
+    struct btrfs_transaction *transaction, struct btrfs_object_id *id);
+/* Deletes the orphaned unlinked inodes of a tree, as Linux does at mount, with
+ * work up to budget; an orphan item of an inode that still has names, or of a
+ * missing inode, is dropped. *pending reports that orphans remain. */
+enum btrfs_result btrfs_transaction_clean_orphans(struct btrfs_transaction *transaction,
+    uint64_t tree, size_t budget, size_t *cleaned, int *pending);
 enum btrfs_result btrfs_transaction_commit(struct btrfs_transaction *transaction);
 /* Commits and returns an independently owned, immutable view of the published
  * state, without mounting the device again. tree has btrfs_mount's meaning.
@@ -330,11 +349,18 @@ enum btrfs_result btrfs_transaction_failure(const struct btrfs_transaction *tran
 const struct btrfs_fs *btrfs_transaction_reader(struct btrfs_transaction *transaction);
 /* Whether one more operation that changes at most nodes tree nodes (its
  * caller's bound) fits this transaction while leaving its commit room: half
- * of each per-transaction limit (changed nodes, file trees, directory index
- * and privilege slots, queued references) and free metadata space for twice
- * the changed nodes are kept for the commit's own accounting. NO_SPACE means
- * the caller should commit first; for an empty transaction it means the
- * operation does not fit at all. */
-enum btrfs_result btrfs_transaction_room(const struct btrfs_transaction *transaction, size_t nodes);
+ * of each per-transaction limit (changed nodes and the nodes queued reference
+ * changes will change, file trees, directory index, privilege and deferred
+ * eviction slots, queued references) and free metadata space for twice that
+ * work are kept for the commit's own accounting, and a reserve for operations
+ * that release space. Data written afterwards leaves the device space this
+ * metadata may need. NO_SPACE means the caller should commit first; for an
+ * empty transaction it means the operation does not fit at all. */
+enum btrfs_result btrfs_transaction_room(struct btrfs_transaction *transaction, size_t nodes);
+/* The same for a step that releases space (an unlink, a truncation, eviction or
+ * orphan cleanup step), which may take the reserve, as Linux's global block
+ * reserve serves deletion on a full volume. */
+enum btrfs_result btrfs_transaction_room_releasing(
+    struct btrfs_transaction *transaction, size_t nodes);
 
 #endif

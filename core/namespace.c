@@ -917,26 +917,51 @@ bt_ns_remove_entry(struct btrfs_transaction *transaction, struct bt_owned_root *
 	return error;
 }
 
-/* Deletes an inode without names, as eviction's truncation does: its file
- * extents with their references, then every remaining item of the inode. */
+/* Tree nodes an unlink spends deleting its inode before leaving the rest to
+ * eviction steps: one step's. */
+#define BT_RELEASE_INLINE_NODES BTRFS_RELEASE_STEP_NODES
+
+/* Deletes an inode without names in steps whose work reaches budget, as
+ * Linux's eviction truncates: its file extents from the last one down with
+ * their references, the size and bytes reached stored in its item; then its
+ * other items, the inode item last. */
 static enum btrfs_result
-bt_ns_delete_inode(
-    struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode)
+bt_ns_evict_inode(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
+    struct bt_disk_inode *item, size_t budget, int *done)
 {
-	struct bt_key first = { .objectid = inode };
+	struct bt_key first = { .objectid = inode, .type = BT_INODE_ITEM + 1U };
+	struct bt_key self = { .objectid = inode, .type = BT_INODE_ITEM };
 	struct bt_key key;
-	uint64_t removed;
+	size_t start = bt_tx_work(transaction);
+	uint64_t removed = 0;
+	uint64_t reached = bt_u64(item->size);
 	uint64_t steps;
+	int shrunk;
 	int found = 1;
 	enum btrfs_result error;
 
-	error = bt_tx_drop_range(transaction, tree, inode, 0, UINT64_MAX, &removed);
-	for (steps = 0; error == BTRFS_OK; steps++) {
+	*done = 0;
+	error = bt_tx_shrink(transaction, tree, inode, 0, budget, &removed, &reached, &shrunk);
+	if (error == BTRFS_OK && bt_u64(item->nbytes) < removed) {
+		error = BTRFS_CORRUPT;
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	bt_put64(&item->nbytes, bt_u64(item->nbytes) - removed);
+	if (reached < bt_u64(item->size)) {
+		bt_put64(&item->size, reached);
+	}
+	for (steps = 0; error == BTRFS_OK && shrunk; steps++) {
 		if (steps == BT_MAX_TREE_ITEMS) {
 			return BTRFS_UNSUPPORTED;
 		}
+		if (bt_tx_work(transaction) - start >= budget) {
+			break;
+		}
 		error = bt_ns_neighbor(transaction, tree, first, 0, &key, &found);
 		if (error != BTRFS_OK || !found || key.objectid != inode) {
+			*done = error == BTRFS_OK;
 			break;
 		}
 		/* Names were removed first; a remaining one is corruption. */
@@ -946,14 +971,21 @@ bt_ns_delete_inode(
 		}
 		error = bt_tx_edit(transaction, &tree->root, key, NULL, 0, BT_DELETE);
 	}
-	if (error == BTRFS_OK) {
-		transaction->changed = 1;
+	if (error != BTRFS_OK) {
+		return error;
 	}
-	return error;
+	transaction->changed = 1;
+	if (*done) {
+		return bt_tx_edit(transaction, &tree->root, self, NULL, 0, BT_DELETE);
+	}
+	/* Work remains: the item records how far the deletion got. */
+	bt_put64(&item->transid, bt_ns_transid(transaction));
+	return bt_tx_edit(transaction, &tree->root, self, item, sizeof(*item), BT_REPLACE);
 }
 
-/* An inode loses one name. With no name left it is deleted now, or kept with
- * an orphan item while still open. */
+/* An inode loses one name. Without a name left it is deleted now when that
+ * fits a small budget; otherwise, or while still open, an orphan item keeps
+ * it, and an unopened one is left to btrfs_transaction_evict's steps. */
 static enum btrfs_result
 bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
     int open, struct btrfs_time time)
@@ -961,6 +993,7 @@ bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	struct bt_disk_inode item;
 	struct bt_key orphan = { BT_ORPHAN_OBJECTID, inode, BT_ORPHAN_ITEM };
 	uint32_t links;
+	int done = 0;
 	enum btrfs_result error;
 
 	error = bt_ns_named_inode(transaction, tree, inode, &item);
@@ -971,10 +1004,19 @@ bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	if (links == 0) {
 		return BTRFS_CORRUPT;
 	}
-	if (links == 1 && !open) {
-		return bt_ns_delete_inode(transaction, tree, inode);
-	}
 	bt_put32(&item.links, links - 1);
+	if (links == 1 && !open) {
+		error = bt_ns_evict_inode(
+		    transaction, tree, inode, &item, BT_RELEASE_INLINE_NODES, &done);
+		if (error != BTRFS_OK || done) {
+			return error;
+		}
+		if (transaction->deferred_count == BT_TRANSACTION_DEFERRED) {
+			return BTRFS_NO_SPACE;
+		}
+		transaction->deferred[transaction->deferred_count++] =
+		    (struct btrfs_object_id){ tree->root.owner, inode };
+	}
 	error = bt_ns_store(transaction, tree, inode, &item, time);
 	if (error == BTRFS_OK && links == 1) {
 		error = bt_tx_edit(transaction, &tree->root, orphan, NULL, 0, BT_INSERT);
@@ -2015,7 +2057,8 @@ btrfs_transaction_remove_xattr(struct btrfs_transaction *transaction, struct btr
 }
 
 enum btrfs_result
-btrfs_transaction_evict(struct btrfs_transaction *transaction, struct btrfs_object_id id)
+btrfs_transaction_evict(
+    struct btrfs_transaction *transaction, struct btrfs_object_id id, size_t budget, int *done)
 {
 	struct bt_owned_root *tree = NULL;
 	struct bt_disk_inode item;
@@ -2023,6 +2066,10 @@ btrfs_transaction_evict(struct btrfs_transaction *transaction, struct btrfs_obje
 	struct bt_key orphan = { BT_ORPHAN_OBJECTID, id.inode, BT_ORPHAN_ITEM };
 	enum btrfs_result error;
 
+	if (done == NULL || budget == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*done = 0;
 	error = bt_ns_begin(transaction, id.tree, &tree);
 	if (error == BTRFS_OK) {
 		error = bt_ns_inode(transaction, tree, id.inode, &item);
@@ -2039,30 +2086,47 @@ btrfs_transaction_evict(struct btrfs_transaction *transaction, struct btrfs_obje
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	error = bt_ns_delete_inode(transaction, tree, id.inode);
-	if (error == BTRFS_OK) {
+	error = bt_ns_evict_inode(transaction, tree, id.inode, &item, budget, done);
+	if (error == BTRFS_OK && *done) {
 		error = bt_tx_edit(transaction, &tree->root, orphan, NULL, 0, BT_DELETE);
 	}
 	return bt_ns_poison(transaction, error);
 }
 
 enum btrfs_result
-btrfs_transaction_clean_orphans(
-    struct btrfs_transaction *transaction, uint64_t tree_id, size_t *cleaned)
+btrfs_transaction_take_deferred(struct btrfs_transaction *transaction, struct btrfs_object_id *id)
+{
+	if (transaction == NULL || id == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (transaction->deferred_count == 0) {
+		return BTRFS_NOT_FOUND;
+	}
+	*id = transaction->deferred[--transaction->deferred_count];
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+btrfs_transaction_clean_orphans(struct btrfs_transaction *transaction, uint64_t tree_id,
+    size_t budget, size_t *cleaned, int *pending)
 {
 	struct bt_owned_root *tree = NULL;
 	struct bt_disk_inode item;
 	struct bt_key first = { BT_ORPHAN_OBJECTID, 0, BT_ORPHAN_ITEM };
 	struct bt_key key;
+	size_t start;
 	uint64_t steps;
 	int found;
+	int done;
 	int edited = 0;
 	enum btrfs_result error;
 
-	if (cleaned == NULL) {
+	if (transaction == NULL || cleaned == NULL || pending == NULL || budget == 0) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	*cleaned = 0;
+	*pending = 0;
+	start = bt_tx_work(transaction);
 	error = bt_ns_begin(transaction, tree_id, &tree);
 	for (steps = 0; error == BTRFS_OK; steps++) {
 		if (steps == BT_MAX_TREE_ITEMS) {
@@ -2074,21 +2138,31 @@ btrfs_transaction_clean_orphans(
 		    key.type != BT_ORPHAN_ITEM) {
 			break;
 		}
+		if (bt_tx_work(transaction) - start >= budget) {
+			*pending = 1;
+			break;
+		}
 		if (key.offset < BTRFS_ROOT_INODE || key.offset > BT_LAST_FREE_OBJECTID) {
 			error = BTRFS_CORRUPT;
 			break;
 		}
 		/* As btrfs_orphan_cleanup: an inode without links is deleted; the
 		 * orphan item of a missing or still linked inode only goes away. */
+		done = 1;
 		error = bt_ns_inode(transaction, tree, key.offset, &item);
 		if (error == BTRFS_OK && bt_u32(item.links) == 0) {
 			edited = 1;
-			error = bt_ns_delete_inode(transaction, tree, key.offset);
-			if (error == BTRFS_OK) {
+			error = bt_ns_evict_inode(transaction, tree, key.offset, &item,
+			    budget - (bt_tx_work(transaction) - start), &done);
+			if (error == BTRFS_OK && done) {
 				(*cleaned)++;
 			}
 		} else if (error == BTRFS_NOT_FOUND) {
 			error = BTRFS_OK;
+		}
+		if (error == BTRFS_OK && !done) {
+			*pending = 1;
+			break;
 		}
 		if (error == BTRFS_OK) {
 			edited = 1;

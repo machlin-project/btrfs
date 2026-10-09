@@ -254,6 +254,23 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 static void
 export_begin(struct context *context, const struct plan *plan, struct exporter *exporter)
 {
+	memset(exporter, 0, sizeof(*exporter));
+	if (context->export_root == NULL) {
+		return;
+	}
+	REQUIRE(snprintf(exporter->directory, sizeof(exporter->directory), "%s/%s",
+		    context->export_root, plan->name) < (int)sizeof(exporter->directory));
+	REQUIRE(mkdir(exporter->directory, 0755) == 0);
+	if (plan->namespace) {
+		export_namespace(context, plan, exporter);
+	}
+	exporter->cases = export_open(exporter, "cases.tsv");
+}
+
+/* Stage contents, once truncation steps fixed every stage's sizes. */
+static void
+export_stages(struct context *context, const struct plan *plan, struct exporter *exporter)
+{
 	char name[64];
 	FILE *stages;
 	size_t stage;
@@ -262,13 +279,9 @@ export_begin(struct context *context, const struct plan *plan, struct exporter *
 	size_t j = 0;
 	int found;
 
-	memset(exporter, 0, sizeof(*exporter));
-	if (context->export_root == NULL) {
+	if (exporter->cases == NULL) {
 		return;
 	}
-	REQUIRE(snprintf(exporter->directory, sizeof(exporter->directory), "%s/%s",
-		    context->export_root, plan->name) < (int)sizeof(exporter->directory));
-	REQUIRE(mkdir(exporter->directory, 0755) == 0);
 	stages = export_open(exporter, "stages.tsv");
 	for (stage = 0; stage <= plan->commits; stage++) {
 		for (i = 0; i < plan->file_count; i++) {
@@ -299,10 +312,6 @@ export_begin(struct context *context, const struct plan *plan, struct exporter *
 		}
 	}
 	REQUIRE(fclose(stages) == 0);
-	if (plan->namespace) {
-		export_namespace(context, plan, exporter);
-	}
-	exporter->cases = export_open(exporter, "cases.tsv");
 }
 
 static void
@@ -711,6 +720,65 @@ system_growth(struct btrfs_transaction *transaction)
 	return result == BTRFS_OK ? BTRFS_UNSUPPORTED : result;
 }
 
+/* Truncation, eviction and orphan cleanup in the native writers' steps, run
+ * to completion within the transaction. */
+static enum btrfs_result
+truncate_all(struct btrfs_transaction *transaction, struct btrfs_object_id id, uint64_t size,
+    struct btrfs_time time)
+{
+	enum btrfs_result result;
+	int done = 0;
+
+	do {
+		result = btrfs_transaction_truncate(
+		    transaction, id, size, time, BTRFS_RELEASE_STEP_NODES, &done);
+	} while (result == BTRFS_OK && !done);
+	return result;
+}
+
+static enum btrfs_result
+evict_all(struct btrfs_transaction *transaction, struct btrfs_object_id id)
+{
+	enum btrfs_result result;
+	int done = 0;
+
+	do {
+		result = btrfs_transaction_evict(transaction, id, BTRFS_RELEASE_STEP_NODES, &done);
+	} while (result == BTRFS_OK && !done);
+	return result;
+}
+
+static enum btrfs_result
+clean_all_orphans(struct btrfs_transaction *transaction, uint64_t tree, size_t *cleaned)
+{
+	enum btrfs_result result;
+	size_t step;
+	int pending = 0;
+
+	*cleaned = 0;
+	do {
+		result = btrfs_transaction_clean_orphans(
+		    transaction, tree, BTRFS_RELEASE_STEP_NODES, &step, &pending);
+		*cleaned += step;
+	} while (result == BTRFS_OK && pending);
+	return result;
+}
+
+/* As the native volume does after each operation, the inodes an operation
+ * left to eviction steps are evicted at once. */
+static enum btrfs_result
+evict_deferred(struct btrfs_transaction *transaction)
+{
+	struct btrfs_object_id id;
+	enum btrfs_result result = BTRFS_OK;
+
+	while (
+	    result == BTRFS_OK && btrfs_transaction_take_deferred(transaction, &id) == BTRFS_OK) {
+		result = evict_all(transaction, id);
+	}
+	return result;
+}
+
 static enum btrfs_result
 execute(struct btrfs_transaction *transaction, struct path_table *table,
     const struct operation *operation, struct btrfs_time time)
@@ -728,6 +796,7 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 	uint64_t tree;
 	size_t cleaned;
 	int pending;
+	int done;
 	enum btrfs_result result;
 
 	switch (operation->kind) {
@@ -740,8 +809,12 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 		    path_object(table, operation->path, 0, NULL), operation->offset,
 		    operation->data, operation->size, time);
 	case OPERATION_TRUNCATE:
+		return truncate_all(transaction, path_object(table, operation->path, 0, NULL),
+		    operation->offset, time);
+	case OPERATION_TRUNCATE_STEP:
 		return btrfs_transaction_truncate(transaction,
-		    path_object(table, operation->path, 0, NULL), operation->offset, time);
+		    path_object(table, operation->path, 0, NULL), operation->offset, time,
+		    operation->size, &done);
 	case OPERATION_CREATE:
 		parent = path_object(table, operation->path, 1, &leaf);
 		memset(&attributes, 0, sizeof(attributes));
@@ -848,9 +921,9 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 		    path_object(table, operation->path, 0, NULL), operation->target,
 		    strlen(operation->target), time);
 	case OPERATION_EVICT:
-		return btrfs_transaction_evict(transaction, operation->id);
+		return evict_all(transaction, operation->id);
 	case OPERATION_CLEAN_ORPHANS:
-		result = btrfs_transaction_clean_orphans(transaction, operation->id.tree, &cleaned);
+		result = clean_all_orphans(transaction, operation->id.tree, &cleaned);
 		if (result == BTRFS_OK && cleaned != operation->size) {
 			fprintf(stderr, "cleaned %zu orphans, expected %zu\n", cleaned,
 			    operation->size);
@@ -974,6 +1047,9 @@ attempt(struct context *context, const struct plan *plan, size_t commit, enum fa
 	device->coherent = 1;
 	for (i = 0; result == BTRFS_OK && i < plan->operation_count[commit]; i++) {
 		result = execute(transaction, &table, &plan->operations[commit][i], time);
+		if (result == BTRFS_OK && !plan->operations[commit][i].keep_deferred) {
+			result = evict_deferred(transaction);
+		}
 		if (plan->operations[commit][i].expected != BTRFS_OK &&
 		    result == plan->operations[commit][i].expected) {
 			REQUIRE(transaction->failure == BTRFS_OK);
@@ -1396,6 +1472,9 @@ run_plan(struct context *context, struct plan *plan)
 		    plan->name, commit, totals.writes, totals.flushes,
 		    (unsigned long long)totals.allocations, (unsigned long long)totals.reads);
 		require_merged_writes(context, device->before_commit, device->count);
+		REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+		resolve_bounds(fs, plan, commit);
+		btrfs_unmount(fs);
 		export_writes(context, &exporter);
 		audit_state(context, plan->name);
 		if (commit == 1 && plan->new_chunks != 0) {
@@ -1420,6 +1499,7 @@ run_plan(struct context *context, struct plan *plan)
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	check_stage(context, fs, plan, plan->commits);
 	btrfs_unmount(fs);
+	export_stages(context, plan, &exporter);
 	export_end(&exporter);
 	printf("%s: %zu crash states, %zu explicit recoveries PASS\n", plan->name,
 	    context->states - states, context->recoveries - recoveries);

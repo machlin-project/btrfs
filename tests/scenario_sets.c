@@ -250,6 +250,54 @@ track_data(struct context *context, struct plan *plan, const char *name)
 	}
 }
 
+/* Shrinking and deleting a file of many extents in bounded steps, as Linux's
+ * truncation does from the end of the file: the committed state after one
+ * step is a valid shorter file with the original bytes, and an unlink leaves
+ * the rest of a deletion to eviction under an orphan item, which a later
+ * transaction's cleanup completes. The snapshots keep their copies. */
+static void
+release_plans(struct context *context)
+{
+	struct btrfs_object_id data;
+	struct btrfs_fs *fs;
+	struct plan plan;
+	uint8_t *piece;
+	size_t i;
+
+	piece = malloc(RELEASE_PIECE_BYTES);
+	REQUIRE(piece != NULL);
+	plan_init(&plan);
+	plan.name = "release-truncate";
+	track_data(context, &plan, "big");
+	for (i = 0; i < RELEASE_PIECES; i++) {
+		fill_pattern(piece, RELEASE_PIECE_BYTES, (unsigned)i);
+		plan_write(context, &plan, 1, "/data/big", (uint64_t)i * RELEASE_PIECE_BYTES, piece,
+		    RELEASE_PIECE_BYTES);
+	}
+	plan_truncate_step(
+	    context, &plan, 2, "/data/big", RELEASE_TARGET_BYTES, BTRFS_RELEASE_STEP_NODES);
+	plan_truncate(context, &plan, 3, "/data/big", RELEASE_TARGET_BYTES);
+	run_plan(context, &plan);
+
+	plan_init(&plan);
+	plan.name = "release-unlink";
+	track_data(context, &plan, "small");
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	data = object(fs, "/data");
+	btrfs_unmount(fs);
+	for (i = 0; i < RELEASE_PIECES; i++) {
+		fill_pattern(piece, RELEASE_PIECE_BYTES, (unsigned)i);
+		plan_write_new(&plan, 1, "/data/big", (uint64_t)i * RELEASE_PIECE_BYTES, piece,
+		    RELEASE_PIECE_BYTES);
+	}
+	plan_unlink_deferred(&plan, 2, "/data/big");
+	plan_clean(&plan, 3, data.tree, 1);
+	expect(&plan, 2, LAST_STAGE, EXPECT_ABSENT, "/data/big");
+	expect_current(context, &plan, 0, LAST_STAGE, "/data-snap/big", "/data-snap/big");
+	run_plan(context, &plan);
+	free(piece);
+}
+
 /* File data written as new extents: unaligned edges are rewritten from the
  * transaction's view, old extents are trimmed, moved or split, and snapshots,
  * reflinks, preallocation, compression and checksum policy are preserved. */
@@ -510,6 +558,7 @@ data_scenarios(struct context *context)
 	data_stream_test(context);
 	data_compress_plan(context);
 	data_compress_mount_plan(context);
+	release_plans(context);
 }
 
 /* A filesystem without NO_HOLES and with DUP data. Growing a file by

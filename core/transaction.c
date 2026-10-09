@@ -1550,23 +1550,71 @@ btrfs_transaction_reader(struct btrfs_transaction *transaction)
 #define BT_OPERATION_TREES 2U
 #define BT_OPERATION_INDEXES 2U
 
-enum btrfs_result
-btrfs_transaction_room(const struct btrfs_transaction *transaction, size_t nodes)
+/* Metadata that only operations releasing space may take, as Linux's global
+ * block reserve: one releasing step, which may be the drop of a largest data
+ * extent, and its commit, so that a full volume can always delete. */
+static uint64_t
+bt_tx_release_reserve(const struct btrfs_transaction *transaction)
 {
-	size_t changed;
+	struct bt_key largest = { .type = BT_EXTENT_ITEM, .offset = BT_DATA_EXTENT };
+	size_t step = bt_tx_ref_nodes(transaction, largest, 0) + 1;
+
+	if (step < BTRFS_RELEASE_STEP_NODES) {
+		step = BTRFS_RELEASE_STEP_NODES;
+	}
+	return 2 * (uint64_t)step + BT_COMMIT_FIXED_NODES;
+}
+
+/* The metadata nodes the transaction must still be able to obtain after an
+ * operation of nodes: twice its work and the operation's, the commit's own,
+ * and the reserve unless the operation releases space. */
+static uint64_t
+bt_tx_metadata_need(const struct btrfs_transaction *transaction, size_t nodes, int releasing)
+{
+	return 2 * ((uint64_t)bt_tx_work(transaction) + nodes) + BT_COMMIT_FIXED_NODES +
+	    (releasing ? 0 : bt_tx_release_reserve(transaction));
+}
+
+static enum btrfs_result
+bt_tx_room(struct btrfs_transaction *transaction, size_t nodes, int releasing)
+{
+	size_t work;
 
 	if (btrfs_transaction_failure(transaction) != BTRFS_OK) {
 		return btrfs_transaction_failure(transaction);
 	}
-	changed = bt_mutation_count(transaction->mutation);
-	if (nodes > BT_TRANSACTION_NODES / 2 || changed > BT_TRANSACTION_NODES / 2 - nodes ||
+	work = bt_tx_work(transaction);
+	if (nodes > BT_TRANSACTION_NODES / 2 || work > BT_TRANSACTION_NODES / 2 - nodes ||
 	    transaction->tree_count + BT_OPERATION_TREES > BT_TRANSACTION_TREES / 2 ||
 	    transaction->index_count + BT_OPERATION_INDEXES > BT_TRANSACTION_INDEXES / 2 ||
 	    transaction->privileged_count + 1 > BT_TRANSACTION_PRIVILEGED / 2 ||
 	    transaction->ref_count > BT_TRANSACTION_REFERENCES / 2 ||
+	    transaction->deferred_count + 1 > BT_TRANSACTION_DEFERRED / 2 ||
 	    !bt_space_metadata_available(
-		transaction->space, 2 * (uint64_t)(changed + nodes) + BT_COMMIT_FIXED_NODES)) {
+		transaction->space, bt_tx_metadata_need(transaction, nodes, releasing))) {
 		return BTRFS_NO_SPACE;
 	}
+	transaction->operation_nodes = nodes;
+	bt_space_hold_metadata(
+	    transaction->space, bt_tx_metadata_need(transaction, nodes, releasing));
 	return BTRFS_OK;
+}
+
+enum btrfs_result
+btrfs_transaction_room(struct btrfs_transaction *transaction, size_t nodes)
+{
+	return bt_tx_room(transaction, nodes, 0);
+}
+
+enum btrfs_result
+btrfs_transaction_room_releasing(struct btrfs_transaction *transaction, size_t nodes)
+{
+	return bt_tx_room(transaction, nodes, 1);
+}
+
+void
+bt_tx_hold_metadata(struct btrfs_transaction *transaction)
+{
+	bt_space_hold_metadata(
+	    transaction->space, bt_tx_metadata_need(transaction, transaction->operation_nodes, 0));
 }

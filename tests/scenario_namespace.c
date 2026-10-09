@@ -1087,6 +1087,7 @@ namespace_refusals(struct context *context)
 	char xattr[64];
 	uint8_t *value;
 	size_t limit = item_limit(context);
+	int done;
 
 	memset(long_name, 'n', BTRFS_NAME_MAX + 1);
 	memset(long_target, 't', LINUX_PATH_MAX);
@@ -1199,8 +1200,9 @@ namespace_refusals(struct context *context)
 	refused(transaction,
 	    btrfs_transaction_set_xattr(transaction, one, "user.x", 6, "x", 1, 4, time),
 	    BTRFS_INVALID_ARGUMENT, "unknown xattr flags");
-	refused(transaction, btrfs_transaction_evict(transaction, one), BTRFS_INVALID_ARGUMENT,
-	    "evict a linked inode");
+	refused(transaction,
+	    btrfs_transaction_evict(transaction, one, BTRFS_RELEASE_STEP_NODES, &done),
+	    BTRFS_INVALID_ARGUMENT, "evict a linked inode");
 	refused(transaction,
 	    btrfs_transaction_set_xattr(transaction, one, "btrfs.other", 11, "x", 1, 0, time),
 	    BTRFS_INVALID_ARGUMENT, "an unknown property");
@@ -1536,6 +1538,7 @@ namespace_flag_refusals(struct context *context)
 	struct btrfs_fs *fs;
 	struct btrfs_transaction *transaction;
 	struct btrfs_time time = { 1800000000, 0 };
+	int done;
 
 	memset(&changes, 0, sizeof(changes));
 	changes.mask = BTRFS_ATTRIBUTE_MODE;
@@ -1554,7 +1557,9 @@ namespace_flag_refusals(struct context *context)
 	set_inode_flags(transaction, tree, BT_INODE_APPEND);
 	refused(transaction, btrfs_transaction_write(transaction, victim, 0, "x", 1, time),
 	    BTRFS_NOT_PERMITTED, "write an immutable file");
-	refused(transaction, btrfs_transaction_truncate(transaction, victim, 0, time),
+	refused(transaction,
+	    btrfs_transaction_truncate(
+		transaction, victim, 0, time, BTRFS_RELEASE_STEP_NODES, &done),
 	    BTRFS_NOT_PERMITTED, "truncate an immutable file");
 	refused(transaction, btrfs_transaction_unlink(transaction, ns, "victim", 6, time, 0),
 	    BTRFS_NOT_PERMITTED, "unlink an immutable file");
@@ -1572,7 +1577,9 @@ namespace_flag_refusals(struct context *context)
 	    BTRFS_NOT_PERMITTED, "drop privileges of an immutable file");
 	refused(transaction, btrfs_transaction_write(transaction, clone, 0, "x", 1, time),
 	    BTRFS_NOT_PERMITTED, "overwrite an append-only file");
-	refused(transaction, btrfs_transaction_truncate(transaction, clone, 0, time),
+	refused(transaction,
+	    btrfs_transaction_truncate(
+		transaction, clone, 0, time, BTRFS_RELEASE_STEP_NODES, &done),
 	    BTRFS_NOT_PERMITTED, "truncate an append-only file");
 	refused(transaction, btrfs_transaction_unlink(transaction, ns, "clone", 5, time, 0),
 	    BTRFS_NOT_PERMITTED, "unlink an append-only file");
@@ -1596,7 +1603,8 @@ namespace_flag_refusals(struct context *context)
 	REQUIRE(btrfs_transaction_create(transaction, ns, "suid", 4, &setuid, &id) == BTRFS_OK);
 	refused(transaction, btrfs_transaction_write(transaction, id, 0, "x", 1, time),
 	    BTRFS_UNSUPPORTED, "write a set-id file without a decision");
-	refused(transaction, btrfs_transaction_truncate(transaction, id, 0, time),
+	refused(transaction,
+	    btrfs_transaction_truncate(transaction, id, 0, time, BTRFS_RELEASE_STEP_NODES, &done),
 	    BTRFS_UNSUPPORTED, "truncate a set-id file without a decision");
 	REQUIRE(btrfs_transaction_keep_privileges(transaction, id) == BTRFS_OK);
 	REQUIRE(btrfs_transaction_write(transaction, id, 0, "x", 1, time) == BTRFS_OK);

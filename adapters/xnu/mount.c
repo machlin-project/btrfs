@@ -511,13 +511,18 @@ btrfs_xnu_clean_orphans(struct btrfs_xnu_mount *mount)
 {
 	struct btrfs_transaction *transaction;
 	size_t cleaned = 0;
-	enum btrfs_result result;
+	int pending = 1;
+	enum btrfs_result result = BTRFS_OK;
 
-	result = btrfs_volume_begin(mount->volume, &transaction);
-	if (result == BTRFS_OK) {
-		result = btrfs_transaction_clean_orphans(
-		    transaction, mount->info.default_tree, &cleaned);
-		if (result == BTRFS_OK && cleaned != 0) {
+	/* In bounded steps, each committed; a step without changes writes nothing. */
+	while (result == BTRFS_OK && pending) {
+		result = btrfs_volume_begin(mount->volume, &transaction);
+		if (result != BTRFS_OK) {
+			break;
+		}
+		result = btrfs_transaction_clean_orphans(transaction, mount->info.default_tree,
+		    BTRFS_RELEASE_STEP_NODES, &cleaned, &pending);
+		if (result == BTRFS_OK) {
 			result = btrfs_volume_commit(mount->volume, transaction);
 		} else {
 			btrfs_volume_abort(mount->volume, transaction);

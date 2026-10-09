@@ -97,6 +97,9 @@ logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
   link_with: [posix, core], dependencies: [zlib, zstd])
 volume_test = executable('btrfs-volume-test', 'tests/volume.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
+full_volume_test = executable('btrfs-full-volume-test', 'tests/full_volume.c',
+  include_directories: inc, link_with: [volume, posix, core],
+  dependencies: [zlib, zstd, dependency('threads')])
 volume_window_test = executable('btrfs-volume-window-test', 'tests/volume.c',
   'adapters/common/volume.c', include_directories: inc, c_args: ['-DBTRFS_VOLUME_TEST_HOOKS'],
   link_with: [posix, core], dependencies: [zlib, zstd, dependency('threads')])
@@ -217,6 +220,12 @@ if fixtures != ''
   test('random-writer-dup', transaction_test,
     args: ['--random-quick', '1', '500', join_paths(fixtures, 'transactions-dup.raw')],
     timeout: 900, suite: 'images')
+  foreach profile : ['transactions-data', 'checksums-xxhash', 'checksums-sha256',
+      'checksums-blake2']
+    test('full-volume-' + profile, full_volume_test,
+      args: [join_paths(fixtures, profile + '.raw'), meson.current_build_dir()], timeout: 600,
+      suite: 'images')
+  endforeach
   test('native-volume-views', volume_test,
     args: [join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
   test('native-volume-stress', volume_test,

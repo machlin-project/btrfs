@@ -904,6 +904,44 @@ model_resize(struct tracked *file, size_t stage, uint64_t size)
 }
 
 void
+plan_truncate_step(struct context *context, struct plan *plan, size_t commit, const char *path,
+    uint64_t size, size_t budget)
+{
+	plan_operation(context, plan, commit, path, OPERATION_TRUNCATE_STEP, size, NULL, 0);
+	plan->operations[commit][plan->operation_count[commit] - 1].size = budget;
+}
+
+void
+resolve_bounds(struct btrfs_fs *fs, struct plan *plan, size_t stage)
+{
+	struct tracked *file;
+	uint8_t *contents;
+	size_t size;
+	size_t i;
+
+	for (i = 0; i < plan->file_count; i++) {
+		file = &plan->files[i];
+		if (!file->bounded[stage]) {
+			continue;
+		}
+		contents = read_file(fs, file->path, &size);
+		/* The step made progress and left work, as its plan intends. */
+		if (size <= file->minimum[stage] || size >= file->size[stage] ||
+		    (size != 0 && memcmp(contents, file->data[stage], size) != 0)) {
+			fprintf(stderr, "%s stage %zu: %s is no prefix of %zu..%zu bytes (%zu)\n",
+			    plan->name, stage, file->path, file->minimum[stage], file->size[stage],
+			    size);
+			exit(1);
+		}
+		free(contents);
+		printf("%s stage %zu: %s shrank from %zu to %zu bytes toward %zu\n", plan->name,
+		    stage, file->path, file->size[stage], size, file->minimum[stage]);
+		file->size[stage] = size;
+		file->bounded[stage] = 0;
+	}
+}
+
+void
 plan_finish(struct plan *plan)
 {
 	const struct operation *operation;
@@ -921,11 +959,17 @@ plan_finish(struct plan *plan)
 		}
 		for (i = 0; i < plan->operation_count[stage]; i++) {
 			operation = &plan->operations[stage][i];
-			if (operation->file == NO_FILE || operation->kind > OPERATION_TRUNCATE) {
+			if (operation->file == NO_FILE ||
+			    operation->kind > OPERATION_TRUNCATE_STEP) {
 				continue;
 			}
 			file = &plan->files[operation->file];
-			if (operation->kind == OPERATION_INLINE) {
+			if (operation->kind == OPERATION_TRUNCATE_STEP) {
+				/* Only completing the truncation may follow in the plan. */
+				REQUIRE(operation->offset < file->size[stage]);
+				file->bounded[stage] = 1;
+				file->minimum[stage] = (size_t)operation->offset;
+			} else if (operation->kind == OPERATION_INLINE) {
 				model_resize(file, stage, operation->size);
 				memcpy(file->data[stage], operation->data, operation->size);
 			} else if (operation->kind == OPERATION_WRITE) {
@@ -1184,6 +1228,12 @@ void
 plan_unlink(struct plan *plan, size_t commit, const char *path, int open)
 {
 	plan_namespace(plan, commit, OPERATION_UNLINK, path, NULL)->flags = open;
+}
+
+void
+plan_unlink_deferred(struct plan *plan, size_t commit, const char *path)
+{
+	plan_namespace(plan, commit, OPERATION_UNLINK, path, NULL)->keep_deferred = 1;
 }
 
 void

@@ -5,12 +5,15 @@
 #define BT_DATA_WRITE (1024U * 1024U)
 /* Bytes one rewrite holds in memory; longer ranges are written in pieces. */
 #define BT_REWRITE_CHUNK (UINT64_C(8) * 1024 * 1024)
-/* Linux's limit on one uncompressed data extent. */
-#define BT_DATA_EXTENT (UINT64_C(128) * 1024 * 1024)
 /* Linux compresses data in pieces of at most 128 KiB (BTRFS_MAX_UNCOMPRESSED),
  * each one extent. */
 #define BT_COMPRESS_CHUNK (128U * 1024U)
 #define BT_FILE_SIZE_LIMIT ((UINT64_C(1) << 63) - 1)
+/* Tree nodes a queued reference change edits at commit besides checksum
+ * leaves: the extent item's leaf and, for a freed extent, its free-space
+ * entry; parents are within the commit's own allowance. */
+#define BT_REF_EDIT_NODES 1U
+#define BT_REF_FREE_NODES 1U
 
 struct bt_file_item {
 	struct bt_key key;
@@ -30,6 +33,33 @@ bt_tx_release_data(struct btrfs_transaction *transaction)
 	}
 	transaction->refs = NULL;
 	transaction->ref_count = 0;
+	transaction->ref_nodes = 0;
+}
+
+size_t
+bt_tx_work(const struct btrfs_transaction *transaction)
+{
+	return bt_mutation_count(transaction->mutation) + transaction->ref_nodes;
+}
+
+size_t
+bt_tx_ref_nodes(const struct btrfs_transaction *transaction, struct bt_key extent, int add)
+{
+	const struct btrfs_fs *fs = transaction->base;
+	uint64_t sums;
+	uint64_t per_leaf;
+
+	if (add) {
+		return BT_REF_EDIT_NODES;
+	}
+	/* Linux's per-item limit of sums per leaf; the range may straddle one
+	 * more leaf. */
+	sums = extent.offset / fs->info.sector_size;
+	per_leaf =
+	    (fs->info.node_size - sizeof(struct bt_disk_header) - 2 * sizeof(struct bt_disk_item)) /
+	    bt_checksum_size(fs->info.checksum_type);
+	return BT_REF_EDIT_NODES + BT_REF_FREE_NODES + (size_t)((sums + per_leaf - 1) / per_leaf) +
+	    1;
 }
 
 enum btrfs_result
@@ -50,6 +80,7 @@ bt_tx_queue(struct btrfs_transaction *transaction, struct bt_key extent,
 	}
 	transaction->refs[transaction->ref_count++] =
 	    (struct bt_file_ref){ extent, *reference, add };
+	transaction->ref_nodes += bt_tx_ref_nodes(transaction, extent, add);
 	return BTRFS_OK;
 }
 
@@ -94,6 +125,7 @@ bt_tx_apply_refs(struct btrfs_transaction *transaction)
 		}
 	}
 	transaction->ref_count = 0;
+	transaction->ref_nodes = 0;
 	return error;
 }
 
@@ -215,18 +247,52 @@ bt_tx_inode(struct btrfs_transaction *transaction, struct bt_owned_root *tree, u
 	return bt_tx_privileges_settled(transaction, tree, inode, item);
 }
 
+/* Decodes a file extent item of inode; *valid is 0 for another inode or type. */
+static enum btrfs_result
+bt_tx_decode_file_item(
+    const struct bt_record *record, uint64_t inode, struct bt_file_item *item, int *valid)
+{
+	const struct bt_disk_extent *extent = (const void *)record->data;
+	uint64_t length;
+
+	*valid = 0;
+	if (record->key.objectid != inode || record->key.type != BT_EXTENT_DATA) {
+		return BTRFS_OK;
+	}
+	if (record->size < sizeof(extent->header) ||
+	    (extent->header.type == BT_EXTENT_INLINE ? record->key.offset != 0 ||
+			record->size - sizeof(extent->header) > BT_MAX_NODE_SIZE
+						     : record->size != sizeof(*extent))) {
+		return BTRFS_CORRUPT;
+	}
+	bt_zero(&item->extent, sizeof(item->extent));
+	bt_copy(&item->extent, record->data,
+	    record->size < sizeof(item->extent) ? record->size : sizeof(item->extent));
+	item->key = record->key;
+	item->size = record->size;
+	length = extent->header.type == BT_EXTENT_INLINE ? bt_u64(extent->header.ram_bytes)
+							 : bt_u64(extent->length);
+	if (length == 0 || length > UINT64_MAX - record->key.offset ||
+	    (extent->header.type != BT_EXTENT_INLINE && extent->header.type != BT_EXTENT_REGULAR &&
+		extent->header.type != BT_EXTENT_PREALLOC)) {
+		return BTRFS_CORRUPT;
+	}
+	item->end = record->key.offset + length;
+	*valid = 1;
+	return BTRFS_OK;
+}
+
 /* Finds the first file extent item of inode overlapping [start, end). */
 static enum btrfs_result
 bt_tx_file_item(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     uint64_t inode, uint64_t start, uint64_t end, struct bt_file_item *item, int *found)
 {
 	const struct btrfs_fs *view = bt_mutation_view(transaction->mutation);
-	const struct bt_disk_extent *extent;
 	struct bt_cursor cursor;
 	struct bt_record record;
 	struct bt_key key = { .objectid = inode, .type = BT_EXTENT_DATA, .offset = start };
-	uint64_t length;
 	enum btrfs_result error = BTRFS_OK;
+	int valid;
 	int pass;
 
 	*found = 0;
@@ -248,31 +314,38 @@ bt_tx_file_item(struct btrfs_transaction *transaction, const struct bt_owned_roo
 		    record.key.offset >= end) {
 			continue;
 		}
-		extent = (const void *)record.data;
-		if (record.size < sizeof(extent->header) ||
-		    (extent->header.type == BT_EXTENT_INLINE ? record.key.offset != 0 ||
-				record.size - sizeof(extent->header) > BT_MAX_NODE_SIZE
-							     : record.size != sizeof(*extent))) {
-			error = BTRFS_CORRUPT;
-			break;
-		}
-		bt_zero(&item->extent, sizeof(item->extent));
-		bt_copy(&item->extent, record.data,
-		    record.size < sizeof(item->extent) ? record.size : sizeof(item->extent));
-		item->key = record.key;
-		item->size = record.size;
-		length = extent->header.type == BT_EXTENT_INLINE ? bt_u64(extent->header.ram_bytes)
-								 : bt_u64(extent->length);
-		if (length == 0 || length > UINT64_MAX - record.key.offset ||
-		    (extent->header.type != BT_EXTENT_INLINE &&
-			extent->header.type != BT_EXTENT_REGULAR &&
-			extent->header.type != BT_EXTENT_PREALLOC)) {
-			error = BTRFS_CORRUPT;
-			break;
-		}
-		item->end = record.key.offset + length;
-		*found = item->end > start;
+		error = bt_tx_decode_file_item(&record, inode, item, &valid);
+		*found = error == BTRFS_OK && valid && item->end > start;
 	}
+	bt_cursor_fini(&cursor);
+	return error;
+}
+
+/* Finds the last file extent item of inode, when it ends past start. */
+static enum btrfs_result
+bt_tx_last_file_item(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    uint64_t inode, uint64_t start, struct bt_file_item *item, int *found)
+{
+	const struct btrfs_fs *view = bt_mutation_view(transaction->mutation);
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { .objectid = inode, .type = BT_EXTENT_DATA, .offset = UINT64_MAX };
+	enum btrfs_result error;
+	int valid = 0;
+
+	*found = 0;
+	if (view == NULL) {
+		return transaction->failure;
+	}
+	bt_cursor_init(&cursor, view, tree->root);
+	error = bt_cursor_seek(&cursor, key, 1);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		error = bt_tx_decode_file_item(&record, inode, item, &valid);
+	} else if (error == BTRFS_NOT_FOUND) {
+		error = BTRFS_OK;
+	}
+	*found = error == BTRFS_OK && valid && item->end > start;
 	bt_cursor_fini(&cursor);
 	return error;
 }
@@ -375,6 +448,68 @@ bt_tx_drop_range(struct btrfs_transaction *transaction, struct bt_owned_root *tr
 		if (error == BTRFS_OK) {
 			error = bt_tx_edit(
 			    transaction, &tree->root, key, &piece, sizeof(piece), BT_INSERT);
+		}
+	}
+	return error;
+}
+
+/* Tree nodes removing a file extent item takes: its own edit and the
+ * reference drop it queues, for an extent on disk. */
+static size_t
+bt_tx_item_nodes(const struct btrfs_transaction *transaction, const struct bt_file_item *item)
+{
+	struct bt_key extent = { .objectid = bt_u64(item->extent.disk_bytenr),
+		.type = BT_EXTENT_ITEM,
+		.offset = bt_u64(item->extent.disk_bytes) };
+
+	if (item->extent.header.type == BT_EXTENT_INLINE || extent.objectid == 0) {
+		return 1;
+	}
+	return 1 + bt_tx_ref_nodes(transaction, extent, 0);
+}
+
+/* Removes the file extent items of inode at and beyond start from the last
+ * one down, as Linux's btrfs_truncate_inode_items does from the end of a file,
+ * until the work of this call (bt_tx_work) reaches budget; at least one item
+ * goes. An item across start is cut there. *reached becomes the lowest offset
+ * from which every item is gone (start when *done); removed adds the bytes
+ * the inode counts. */
+enum btrfs_result
+bt_tx_shrink(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
+    uint64_t start, size_t budget, uint64_t *removed, uint64_t *reached, int *done)
+{
+	struct bt_file_item item;
+	size_t first = bt_tx_work(transaction);
+	uint64_t cut;
+	uint64_t piece;
+	uint64_t steps;
+	int found;
+	enum btrfs_result error = BTRFS_OK;
+
+	*done = 0;
+	for (steps = 0; error == BTRFS_OK; steps++) {
+		if (steps == BT_MAX_TREE_ITEMS) {
+			return BTRFS_UNSUPPORTED;
+		}
+		error = bt_tx_last_file_item(transaction, tree, inode, start, &item, &found);
+		if (error != BTRFS_OK) {
+			break;
+		}
+		if (!found) {
+			*reached = start;
+			*done = 1;
+			break;
+		}
+		if (steps != 0 &&
+		    bt_tx_work(transaction) - first + bt_tx_item_nodes(transaction, &item) >
+			budget) {
+			break;
+		}
+		cut = item.key.offset > start ? item.key.offset : start;
+		error = bt_tx_drop_range(transaction, tree, inode, cut, UINT64_MAX, &piece);
+		if (error == BTRFS_OK) {
+			*removed += piece;
+			*reached = cut;
 		}
 	}
 	return error;
@@ -1059,7 +1194,9 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	old_size = bt_u64(inode.size);
 	final = offset + size > old_size ? offset + size : old_size;
 	/* The whole range's data space is checked before any change, as Linux
-	 * reserves it at write time; compression may need less. */
+	 * reserves it at write time, leaving what metadata may still need;
+	 * compression may need less. */
+	bt_tx_hold_metadata(transaction);
 	if (!bt_space_data_available(
 		transaction->space, size + 2 * sector - (uint64_t)size % sector)) {
 		return BTRFS_NO_SPACE;
@@ -1115,7 +1252,7 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 
 enum btrfs_result
 btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_object_id id,
-    uint64_t size, struct btrfs_time modified)
+    uint64_t size, struct btrfs_time modified, size_t budget, int *done)
 {
 	struct bt_owned_root *tree;
 	struct bt_disk_inode inode;
@@ -1123,12 +1260,15 @@ btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_o
 	uint64_t old_size;
 	uint64_t inline_end;
 	uint64_t edge;
-	uint64_t removed;
+	uint64_t removed = 0;
+	uint64_t reached;
 	enum btrfs_result error;
 
-	if (transaction == NULL || modified.nanoseconds >= 1000000000U) {
+	if (transaction == NULL || done == NULL || budget == 0 ||
+	    modified.nanoseconds >= 1000000000U) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
+	*done = 0;
 	if (size > BT_FILE_SIZE_LIMIT) {
 		return BTRFS_RANGE;
 	}
@@ -1141,6 +1281,29 @@ btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_o
 	}
 	sector = transaction->base->info.sector_size;
 	old_size = bt_u64(inode.size);
+	edge = size + (sector - size % sector) % sector;
+	if (size < old_size && inline_end == 0) {
+		/* Items past the new EOF's sector go from the end in bounded steps;
+		 * each step stores the size reached, a valid shorter file. */
+		reached = old_size;
+		error = bt_tx_shrink(
+		    transaction, tree, id.inode, edge, budget, &removed, &reached, done);
+		if (error == BTRFS_OK) {
+			error = bt_u64(inode.nbytes) < removed ? BTRFS_CORRUPT : BTRFS_OK;
+			bt_put64(&inode.nbytes, bt_u64(inode.nbytes) - removed);
+		}
+		if (error == BTRFS_OK && !*done) {
+			error = bt_tx_store_inode(transaction, tree, id.inode, &inode,
+			    reached < old_size ? reached : old_size, modified);
+		}
+		if (error != BTRFS_OK) {
+			transaction->failure = error;
+		}
+		if (error != BTRFS_OK || !*done) {
+			return error;
+		}
+	}
+	*done = 1;
 	if (inline_end != 0) {
 		/* Convert, then truncate the regular extent like any other. */
 		edge = inline_end + (sector - inline_end % sector) % sector;
@@ -1162,7 +1325,7 @@ btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_o
 	if (error == BTRFS_OK && size > old_size) {
 		error = bt_tx_expand(transaction, tree, &inode, id.inode, old_size, size);
 	}
-	if (error == BTRFS_OK && size < old_size) {
+	if (error == BTRFS_OK && size < old_size && inline_end != 0) {
 		edge = size + (sector - size % sector) % sector;
 		error = bt_tx_drop_range(transaction, tree, id.inode, edge, UINT64_MAX, &removed);
 		if (error == BTRFS_OK) {

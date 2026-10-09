@@ -51,6 +51,11 @@
 #define SHARED_LAST 1599U
 #define PAIR_LAST 119U
 #define DATA_SCENARIO_BYTES 8192U
+/* The release scenarios rewrite /data/big in pieces, one extent each, and
+ * shrink it toward an unaligned size. */
+#define RELEASE_PIECES 128U
+#define RELEASE_PIECE_BYTES 8192U
+#define RELEASE_TARGET_BYTES 100003U
 #define EXHAUSTION_WRITE_BYTES (16U * 1024U * 1024U)
 #define FRAGMENT_WRITE_BYTES (2U * 1024U * 1024U)
 #define FAULT_POINTS 512U
@@ -163,12 +168,20 @@ struct tracked {
 	char path[32];
 	uint8_t *data[MAX_STAGES];
 	size_t size[MAX_STAGES];
+	/* A stage whose size one truncation step decides: the file is a prefix
+	 * of the model longer than minimum and shorter than the model; the
+	 * committed stage fixes it (resolve_bounds) before any crash state. */
+	int bounded[MAX_STAGES];
+	size_t minimum[MAX_STAGES];
 };
 
 enum operation_kind {
 	OPERATION_INLINE,
 	OPERATION_WRITE,
 	OPERATION_TRUNCATE,
+	/* One bounded truncation step: offset is the size sought, size the
+	 * budget. */
+	OPERATION_TRUNCATE_STEP,
 	OPERATION_CREATE,
 	OPERATION_LINK,
 	OPERATION_UNLINK,
@@ -215,6 +228,9 @@ struct operation {
 	/* A refusal the operation must return without poisoning the transaction;
 	 * BTRFS_OK for an operation that must succeed. */
 	enum btrfs_result expected;
+	/* The inodes the operation leaves to eviction stay orphans in its commit
+	 * instead of being evicted at once as the native volume does. */
+	int keep_deferred;
 };
 
 enum expectation_kind {
@@ -418,6 +434,13 @@ void plan_device(
     struct plan *plan, size_t commit, const char *path, uint32_t mode, uint64_t device);
 void plan_link(struct plan *plan, size_t commit, const char *path, const char *target);
 void plan_unlink(struct plan *plan, size_t commit, const char *path, int open);
+/* An unlink of an unopened inode whose remaining eviction stays an orphan. */
+void plan_unlink_deferred(struct plan *plan, size_t commit, const char *path);
+void plan_truncate_step(struct context *context, struct plan *plan, size_t commit, const char *path,
+    uint64_t size, size_t budget);
+/* Fixes the stage sizes bounded truncation steps decided, from the committed
+ * stage fs, after checking the bounds and prefix. */
+void resolve_bounds(struct btrfs_fs *fs, struct plan *plan, size_t stage);
 void plan_rename(
     struct plan *plan, size_t commit, const char *path, const char *target, int target_open);
 void plan_set_xattr(struct plan *plan, size_t commit, const char *path, const char *name,

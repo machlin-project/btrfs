@@ -1027,6 +1027,7 @@ stress_store(struct btrfs_transaction *transaction, struct btrfs_object_id root,
 	char name[STRESS_NAME];
 	size_t length;
 	size_t size = stress_size(version);
+	int done = 0;
 
 	length = stress_name(name, file);
 	if (model->versions[file] == 0) {
@@ -1036,7 +1037,10 @@ stress_store(struct btrfs_transaction *transaction, struct btrfs_object_id root,
 		result = btrfs_transaction_create(
 		    transaction, root, name, length, &attributes, &model->ids[file]);
 	} else {
-		result = btrfs_transaction_truncate(transaction, model->ids[file], 0, time);
+		do {
+			result = btrfs_transaction_truncate(transaction, model->ids[file], 0, time,
+			    BTRFS_RELEASE_STEP_NODES, &done);
+		} while (result == BTRFS_OK && !done);
 	}
 	if (result == BTRFS_OK) {
 		result =

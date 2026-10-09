@@ -338,6 +338,39 @@ edits copied) may still run out after every edit fitted; it too returns
 NO_SPACE before any media write, the transaction is failed and the volume stays
 usable.
 
+Admission keeps that from happening, as Linux's block reserves do.
+`btrfs_transaction_room` admits an operation of a declared node count only
+while the metadata the transaction may need stays obtainable, from free
+metadata or as growth from unallocated device space: twice the work so far and
+the operation's, the commit's own 64 nodes, and a release reserve. The work
+counts the nodes already changed and an estimate of those the queued reference
+changes will change at commit: per dropped extent its extent item, its
+free-space entry and its checksum leaves at Linux's per-leaf limit, plus one
+straddled leaf. The reserve, like Linux's global block reserve, is twice the
+larger of a release step (64 nodes) and the drop of a largest (128 MiB) data
+extent, plus the commit's nodes; only `btrfs_transaction_room_releasing`
+(unlinks and truncation, eviction and orphan-cleanup steps) may take it, so a
+volume that ordinary operations filled can still delete. Data written
+afterwards honors the same metadata: data chunks grow only into device space
+beyond what metadata growth would need, and availability counts device space
+in whole 1 MiB units per stripe, as chunks take it, so an admitted operation
+does not find its chunk impossible later. A data range takes the largest chunk
+that fits when one for the whole range does not.
+
+Deleting data is bounded the same way. A shrinking truncation removes file
+extent items from the end of the file, as Linux's `btrfs_truncate_inode_items`
+does, in steps whose work reaches a budget; a step that leaves work stores the
+size it reached, so every committed state is a valid shorter file with the
+original bytes. An unlink of a last name deletes the inode at once only within
+one step's budget; otherwise the inode keeps an orphan item with its progress
+and `btrfs_transaction_take_deferred` hands it to the caller, whose
+`btrfs_transaction_evict` steps finish it, from the end of the file, then its
+other items and the inode item last. Orphan cleanup works in the same steps.
+The native volume evicts deferred inodes when the operation ends, committing
+between steps as room requires, and the transaction after one that released
+space removes the block groups it emptied, as Linux's cleaner does. One that
+finds no room keeps its orphan for the next mount, as Linux does.
+
 `core/transaction.c` owns the private root set and a separate write environment.
 File data and namespace operations are described in their own sections below.
 Its own operation is replacing an existing uncompressed inline regular file,
@@ -585,8 +618,10 @@ Each name change updates the parent's size (twice the name lengths), mtime,
 ctime, change counter and transid, the affected inode's ctime and links, and the
 tree's root-item ctransid. Directories have one link and may be removed only when
 empty. An inode losing its last name is deleted with its items, dropping its
-file extent references through the data writer's ordered reference pass, unless
-the caller holds it open: then it keeps zero links and an ORPHAN item until
+file extent references through the data writer's ordered reference pass, when
+that fits one release step (larger ones continue in eviction steps under an
+orphan item, as above), unless the caller holds it open: then it keeps zero
+links and an ORPHAN item until
 `btrfs_transaction_evict`, or until `btrfs_transaction_clean_orphans` runs as
 Linux's orphan cleanup does at mount (an orphan item of a missing or still
 linked inode only goes away). Rename removes the old name, then any replaced
@@ -720,6 +755,9 @@ reader of the running transaction waits on a page fault. Vnodes are looked up by
 and inode generation, so an inode number reused after deletion gets a new vnode;
 unlinking a name that is still open keeps an orphan item until `VNOP_INACTIVE`
 evicts it, and a read-write mount cleans orphans of its tree as Linux does.
+Unlinks and shrinking truncations are releasing operations; a truncation, an
+eviction and the mount's orphan cleanup continue in release steps, each a
+valid state, committed as room requires.
 
 Below UBC and the transaction engine, the XNU adapter combines device writes in
 `btrfs_staging`. Up to 32 MiB of payload forms at most 4,096 disjoint runs, each
@@ -799,8 +837,9 @@ before its first change. The 26.x callbacks carry no caller credentials, so data
 writes, truncation and owner changes drop set-id bits and the file capability,
 as a writer without CAP_FSETID does; the extension's identity is never taken
 for the caller's privilege. A name removed while its item is open leaves an
-orphan, evicted when FSKit reclaims the item or cleaned at the next writable
-load. Creation needs the kernel's mode and owner, refuses device nodes (their
+orphan, evicted in release steps when FSKit reclaims the item or cleaned at the
+next writable load; unlinks and shrinking truncations release space as in the
+XNU adapter. Creation needs the kernel's mode and owner, refuses device nodes (their
 numbers do not reach the callback) and directories with a default POSIX ACL.
 FSKit faults, ending the extension and its volume, on an attribute reply that
 lacks any attribute it wants, so every reply carries all standard ones: flags as

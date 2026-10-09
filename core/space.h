@@ -55,6 +55,9 @@ enum btrfs_result bt_space_reserve_data(
  * new data chunk could take: Linux reserves a buffered write's data space
  * before accepting it. */
 int bt_space_data_available(const struct bt_space *space, uint64_t length);
+/* Metadata nodes the transaction must still be able to obtain: data growth
+ * and bt_space_data_available leave the device space their growth needs. */
+void bt_space_hold_metadata(struct bt_space *space, uint64_t nodes);
 /* Whether nodes tree nodes fit in free metadata space and in device space a
  * new metadata chunk could take. */
 int bt_space_metadata_available(const struct bt_space *space, uint64_t nodes);

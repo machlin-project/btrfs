@@ -144,6 +144,13 @@ struct btrfs_time btrfs_fskit_now(void);
 			       first:(nullable BtrfsItem *)first
 			      second:(nullable BtrfsItem *)second
 			   operation:(enum btrfs_result (^)(struct btrfs_transaction *))operation;
+/* The same for a change that releases space (an unlink, a shrinking
+ * truncation step), which may use the metadata reserve. */
+- (enum btrfs_result)releasingChangeWithNodes:(size_t)nodes
+					first:(nullable BtrfsItem *)first
+				       second:(nullable BtrfsItem *)second
+				    operation:(enum btrfs_result (^)(
+						  struct btrfs_transaction *))operation;
 @end
 
 /* The volume's changes (BtrfsVolumeMutation.m); the protocol methods of the

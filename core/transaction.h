@@ -16,6 +16,8 @@
 /* Queued file reference changes of one transaction. */
 #define BT_TRANSACTION_REFERENCES 65536U
 #define BT_INLINE_WRITE_LIMIT 2048U
+/* Linux's limit on one uncompressed data extent. */
+#define BT_DATA_EXTENT (UINT64_C(128) * 1024 * 1024)
 /* A commit merges physically contiguous node copies into writes of at most
  * this many bytes. */
 #define BT_WRITE_RUN (256U * 1024U)
@@ -26,6 +28,8 @@
 #define BT_COUNTER_SLOTS 1024U
 #define BT_COUNTER_LOAD 768U
 #define BT_TRANSACTION_PRIVILEGED 64U
+/* Deleted inodes whose eviction one transaction leaves to later steps. */
+#define BT_TRANSACTION_DEFERRED 64U
 #define BT_ACCOUNT_ORIGINAL 1U
 #define BT_ACCOUNT_NEW 2U
 #define BT_INODE_NODATASUM_FLAG (UINT64_C(1) << 0)
@@ -130,6 +134,14 @@ struct btrfs_transaction {
 	uint8_t *entry;
 	struct bt_file_ref *refs;
 	size_t ref_count;
+	/* Tree nodes the queued reference changes edit at commit, estimated. */
+	size_t ref_nodes;
+	/* The nodes the current operation declared (btrfs_transaction_room). */
+	size_t operation_nodes;
+	/* Deleted inodes whose eviction exceeded an unlink's own budget; each
+	 * keeps an orphan item until btrfs_transaction_evict completes it. */
+	struct btrfs_object_id deferred[BT_TRANSACTION_DEFERRED];
+	size_t deferred_count;
 	/* Inode numbers and directory indexes handed out in this transaction stay
 	 * monotonic even when the highest one is removed again. */
 	uint64_t next_objectid[BT_TRANSACTION_TREES];
@@ -184,6 +196,18 @@ enum btrfs_result bt_tx_apply_refs(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_remove_groups(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_drop_range(struct btrfs_transaction *transaction,
     struct bt_owned_root *tree, uint64_t inode, uint64_t start, uint64_t end, uint64_t *removed);
+/* The tree nodes the transaction changed and those its queued reference
+ * changes will change at commit: the work its room and steps are bounded by. */
+size_t bt_tx_work(const struct btrfs_transaction *transaction);
+/* Tree nodes a reference change of extent edits at commit, at most: the
+ * extent item and, for a drop that frees it, its free-space entry and the
+ * leaves of its checksums. */
+size_t bt_tx_ref_nodes(const struct btrfs_transaction *transaction, struct bt_key extent, int add);
+/* Holds the metadata the transaction and its current operation may still
+ * need against data growth. */
+void bt_tx_hold_metadata(struct btrfs_transaction *transaction);
+enum btrfs_result bt_tx_shrink(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t inode, uint64_t start, size_t budget, uint64_t *removed, uint64_t *reached, int *done);
 void bt_tx_release_data(struct btrfs_transaction *transaction);
 /* A write or truncation of a regular file needs a settled privilege decision
  * when it has set-id bits Linux removes or a file capability. */

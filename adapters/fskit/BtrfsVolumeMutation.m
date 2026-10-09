@@ -255,13 +255,14 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 	[_itemLock lock];
 	open = owned->openModes != 0;
 	[_itemLock unlock];
-	error = [self changeWithNodes:BTRFS_FSKIT_OPERATION_NODES
-				first:parent
-			       second:owned
-			    operation:^enum btrfs_result(struct btrfs_transaction *transaction) {
-			      return btrfs_transaction_unlink(
-				  transaction, within, bytes.bytes, bytes.length, now, open);
-			    }];
+	error = [self
+	    releasingChangeWithNodes:BTRFS_FSKIT_OPERATION_NODES
+			       first:parent
+			      second:owned
+			   operation:^enum btrfs_result(struct btrfs_transaction *transaction) {
+			     return btrfs_transaction_unlink(
+				 transaction, within, bytes.bytes, bytes.length, now, open);
+			   }];
 	if (error == BTRFS_OK) {
 		[self changedDirectory:parent];
 		[self nameRemovedFrom:owned];
@@ -332,6 +333,7 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 	struct btrfs_object_id identity;
 	uint64_t size = newAttributes.size;
 	BOOL truncate;
+	__block int done = 1;
 	enum btrfs_result error = _writable ? BTRFS_OK : BTRFS_READ_ONLY;
 
 	if (error == BTRFS_OK &&
@@ -396,38 +398,56 @@ btrfs_fskit_supplied(FSItemSetAttributesRequest *request)
 		changes.modify_time = btrfs_fskit_time(newAttributes.modifyTime);
 	}
 	if (truncate || changes.mask != 0 || (supplied & FSItemAttributeChangeTime) != 0) {
-		error = [self
-		    changeWithNodes:BTRFS_FSKIT_OPERATION_NODES
-			      first:owned
-			     second:nil
-			  operation:^enum btrfs_result(struct btrfs_transaction *transaction) {
+		enum btrfs_result (^change)(struct btrfs_transaction *) =
+		    ^enum btrfs_result(struct btrfs_transaction *transaction) {
 			    enum btrfs_result result = BTRFS_OK;
 
-			    if (truncate) {
-				    result = btrfs_transaction_drop_privileges(
-					transaction, identity, changes.time);
-			    }
-			    if (result == BTRFS_OK && truncate) {
-				    result = btrfs_transaction_truncate(
-					transaction, identity, size, changes.time);
-			    }
-			    if (result == BTRFS_OK &&
-				(changes.mask != 0 ||
-				    (supplied & FSItemAttributeChangeTime) != 0)) {
-				    result = btrfs_transaction_set_attributes(
-					transaction, identity, &changes);
-			    }
-			    return result;
-			  }];
-	}
-	if (error == BTRFS_OK) {
-		newAttributes.consumedAttributes = supplied & handled;
-		error = [self refreshItem:owned];
-	}
-	if (error == BTRFS_OK) {
-		attributes = [self attributesForItem:owned result:&error];
-	}
-	reply(attributes, btrfs_fskit_error(error));
+			    if (truncate){ result = btrfs_transaction_drop_privileges(
+					       transaction, identity, changes.time); }
+
+		if (result == BTRFS_OK && truncate)
+		{
+			result = btrfs_transaction_truncate(transaction, identity, size,
+			    changes.time, BTRFS_RELEASE_STEP_NODES, &done);
+		}
+		if (result == BTRFS_OK &&
+		    (changes.mask != 0 || (supplied & FSItemAttributeChangeTime) != 0)) {
+			result = btrfs_transaction_set_attributes(transaction, identity, &changes);
+		}
+		return result;
+	};
+
+	/* A shrink releases space and may use the metadata reserve. */
+	error = truncate && size < inode.size
+	    ? [self releasingChangeWithNodes:BTRFS_FSKIT_OPERATION_NODES
+				       first:owned
+				      second:nil
+				   operation:change]
+	    : [self changeWithNodes:BTRFS_FSKIT_OPERATION_NODES
+			      first:owned
+			     second:nil
+			  operation:change];
+}
+
+/* A long shrink continues in releasing steps, each a valid shorter file. */
+while (error == BTRFS_OK && !done) {
+	error = [self
+	    releasingChangeWithNodes:BTRFS_RELEASE_STEP_NODES
+			       first:owned
+			      second:nil
+			   operation:^enum btrfs_result(struct btrfs_transaction *transaction) {
+			     return btrfs_transaction_truncate(transaction, identity, size,
+				 changes.time, BTRFS_RELEASE_STEP_NODES, &done);
+			   }];
+}
+if (error == BTRFS_OK) {
+	newAttributes.consumedAttributes = supplied & handled;
+	error = [self refreshItem:owned];
+}
+if (error == BTRFS_OK) {
+	attributes = [self attributesForItem:owned result:&error];
+}
+reply(attributes, btrfs_fskit_error(error));
 }
 
 /* One write callback is one operation: the core refuses it before its first

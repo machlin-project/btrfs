@@ -74,7 +74,20 @@ void btrfs_volume_abort(struct btrfs_volume *volume, struct btrfs_transaction *t
  * aborted transaction. A begin commits the running transaction first. */
 enum btrfs_result btrfs_volume_join(
     struct btrfs_volume *volume, size_t nodes, struct btrfs_transaction **transaction);
+/* join for a step that releases space (btrfs_transaction_room_releasing): a
+ * truncation or eviction step, which may take the metadata reserve. After
+ * such a step commits, the next transaction removes the block groups it left
+ * empty, as Linux's cleaner does. */
+enum btrfs_result btrfs_volume_join_releasing(
+    struct btrfs_volume *volume, size_t nodes, struct btrfs_transaction **transaction);
+/* leave first evicts the inodes the operation left to eviction steps
+ * (btrfs_transaction_take_deferred), committing between steps as room
+ * requires; one that finds no room keeps its orphan for the next mount. */
 void btrfs_volume_leave(struct btrfs_volume *volume, struct btrfs_transaction *transaction);
+/* Evicts an orphan whose last native reference closed, in releasing steps
+ * with commits between them as room requires; the steps' changes are durable
+ * after a sync. */
+enum btrfs_result btrfs_volume_evict(struct btrfs_volume *volume, struct btrfs_object_id id);
 /* The generation that will publish an operation applied now; record it
  * between join and leave. */
 uint64_t btrfs_volume_pending(struct btrfs_volume *volume);

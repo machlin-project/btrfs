@@ -75,6 +75,9 @@ struct bt_space {
 	size_t change_count;
 	size_t change_capacity;
 	size_t node_limit;
+	/* Metadata nodes the transaction must still be able to obtain: data
+	 * growth leaves the device space that metadata growth would need. */
+	uint64_t metadata_hold;
 };
 
 /* The allocator state of one committed generation, kept by the owner across
@@ -705,6 +708,66 @@ bt_space_take(struct bt_gaps *device, uint64_t length, uint64_t *physical)
 	return 0;
 }
 
+/* Free metadata nodes, counting chunks not loaded yet. */
+static uint64_t
+bt_space_metadata_free(const struct bt_space *space, uint64_t enough)
+{
+	uint64_t node = space->fs->info.node_size;
+	uint64_t available = 0;
+	size_t i;
+
+	for (i = space->metadata.next; i < space->metadata.count && available < enough; i++) {
+		available += (space->metadata.items[i].end - space->metadata.items[i].start) / node;
+	}
+	return available + space->unloaded_free[BT_SPACE_METADATA] / node;
+}
+
+/* Units of BT_CHUNK_ALIGN bytes of unallocated device space that chunk
+ * stripes can take, gap by gap as bt_space_take aligns them; a chunk takes
+ * whole units, one run per stripe. */
+static uint64_t
+bt_space_device_units(const struct bt_space *space)
+{
+	const struct bt_gap *gap;
+	uint64_t start;
+	uint64_t units = 0;
+	size_t i;
+
+	for (i = space->device.next; i < space->device.count; i++) {
+		gap = &space->device.items[i];
+		start = (gap->start + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
+		if (start >= gap->start && start < gap->end) {
+			units += (gap->end - start) / BT_CHUNK_ALIGN;
+		}
+	}
+	return units;
+}
+
+/* Device units data growth leaves unallocated so that metadata can still
+ * grow to the held nodes: the shortfall in whole units for each copy. */
+static uint64_t
+bt_space_holdback(const struct bt_space *space)
+{
+	uint64_t free = bt_space_metadata_free(space, space->metadata_hold);
+	uint64_t bytes;
+
+	if (free >= space->metadata_hold) {
+		return 0;
+	}
+	bytes = (space->metadata_hold - free) * space->fs->info.node_size;
+	return (bytes + BT_CHUNK_ALIGN - 1) / BT_CHUNK_ALIGN * space->metadata_copies;
+}
+
+/* Bytes new chunks with copies stripes can still take, leaving held units. */
+static uint64_t
+bt_space_growable(const struct bt_space *space, unsigned copies, uint64_t held)
+{
+	uint64_t units = bt_space_device_units(space);
+
+	units = units > held ? units - held : 0;
+	return units / copies * BT_CHUNK_ALIGN;
+}
+
 /* Free system space this transaction can still hand out. */
 static uint64_t
 bt_space_system_free(const struct bt_space *space)
@@ -752,6 +815,7 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	    : kind == BT_BLOCK_SYSTEM	       ? BT_CHUNK_SYSTEM_MAX
 					       : BT_CHUNK_METADATA_MAX;
 	uint64_t physical[BT_MAX_MIRRORS];
+	uint64_t allowed = UINT64_MAX;
 	size_t i;
 	unsigned stripes;
 	unsigned stripe;
@@ -794,6 +858,10 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	length = length < BT_CHUNK_ALIGN ? BT_CHUNK_ALIGN : length;
 	minimum = (minimum + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
 	length = length < minimum ? minimum : length;
+	/* Data leaves the device space metadata would need to grow. */
+	if (kind == BT_BLOCK_DATA) {
+		allowed = bt_space_growable(space, stripes, bt_space_holdback(space));
+	}
 	/* Device gaps are copied so a failed attempt leaves them untouched. */
 	copy = fs->env.allocate(fs->env.context, (saved.count + 1) * sizeof(*copy));
 	if (copy == NULL) {
@@ -801,6 +869,9 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	}
 	for (fits = 0; !fits && length >= minimum && length >= BT_CHUNK_ALIGN;
 	    length = (length / 2) & ~(BT_CHUNK_ALIGN - 1)) {
+		if (length > allowed) {
+			continue;
+		}
 		bt_copy(copy, saved.items, saved.count * sizeof(*copy));
 		space->device.items = copy;
 		fits = 1;
@@ -908,7 +979,12 @@ bt_space_reserve_data(struct bt_space *space, uint64_t length, uint64_t *logical
 			continue;
 		}
 		if (space->data.next == space->data.count) {
+			/* One chunk for the whole range, or else the largest one that
+			 * fits: the caller takes the range in pieces. */
 			error = bt_space_grow(space, BT_BLOCK_DATA, length);
+			if (error == BTRFS_NO_SPACE) {
+				error = bt_space_grow(space, BT_BLOCK_DATA, sector);
+			}
 			if (error != BTRFS_OK) {
 				return error;
 			}
@@ -926,11 +1002,16 @@ bt_space_reserve_data(struct bt_space *space, uint64_t length, uint64_t *logical
 	}
 }
 
+void
+bt_space_hold_metadata(struct bt_space *space, uint64_t nodes)
+{
+	space->metadata_hold = nodes;
+}
+
 int
 bt_space_data_available(const struct bt_space *space, uint64_t length)
 {
 	uint64_t available = 0;
-	uint64_t unallocated = 0;
 	size_t i;
 
 	for (i = space->data.next; i < space->data.count && available < length; i++) {
@@ -943,34 +1024,23 @@ bt_space_data_available(const struct bt_space *space, uint64_t length)
 	if (!space->growth) {
 		return 0;
 	}
-	for (i = space->device.next; i < space->device.count; i++) {
-		unallocated += space->device.items[i].end - space->device.items[i].start;
-	}
-	return unallocated / space->data_copies >= length - available;
+	return bt_space_growable(space, space->data_copies, bt_space_holdback(space)) >=
+	    length - available;
 }
 
 int
 bt_space_metadata_available(const struct bt_space *space, uint64_t nodes)
 {
-	uint64_t node = space->fs->info.node_size;
-	uint64_t available = 0;
-	uint64_t unallocated = 0;
-	size_t i;
+	uint64_t available = bt_space_metadata_free(space, nodes);
 
-	for (i = space->metadata.next; i < space->metadata.count && available < nodes; i++) {
-		available += (space->metadata.items[i].end - space->metadata.items[i].start) / node;
-	}
-	available += space->unloaded_free[BT_SPACE_METADATA] / node;
 	if (available >= nodes) {
 		return 1;
 	}
 	if (!space->growth) {
 		return 0;
 	}
-	for (i = space->device.next; i < space->device.count; i++) {
-		unallocated += space->device.items[i].end - space->device.items[i].start;
-	}
-	return unallocated / space->metadata_copies / node >= nodes - available;
+	return bt_space_growable(space, space->metadata_copies, 0) / space->fs->info.node_size >=
+	    nodes - available;
 }
 
 enum btrfs_result

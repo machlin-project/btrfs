@@ -947,17 +947,23 @@ btrfs_timespec(struct btrfs_time time)
 {
 	struct btrfs_transaction *transaction;
 	size_t cleaned = 0;
-	enum btrfs_result result;
+	int pending = 1;
+	enum btrfs_result result = BTRFS_OK;
 
-	result = btrfs_volume_begin(_volume, &transaction);
-	if (result != BTRFS_OK) {
-		return result;
+	/* In bounded steps, each committed; a step without changes writes nothing. */
+	while (result == BTRFS_OK && pending) {
+		result = btrfs_volume_begin(_volume, &transaction);
+		if (result != BTRFS_OK) {
+			break;
+		}
+		result = btrfs_transaction_clean_orphans(
+		    transaction, _rootIdentity.tree, BTRFS_RELEASE_STEP_NODES, &cleaned, &pending);
+		if (result == BTRFS_OK) {
+			result = btrfs_volume_commit(_volume, transaction);
+		} else {
+			btrfs_volume_abort(_volume, transaction);
+		}
 	}
-	result = btrfs_transaction_clean_orphans(transaction, _rootIdentity.tree, &cleaned);
-	if (result == BTRFS_OK && cleaned != 0) {
-		return btrfs_volume_commit(_volume, transaction);
-	}
-	btrfs_volume_abort(_volume, transaction);
 	return result;
 }
 
@@ -1094,6 +1100,32 @@ btrfs_timespec(struct btrfs_time time)
 			      second:(BtrfsItem *)second
 			   operation:(enum btrfs_result (^)(struct btrfs_transaction *))operation
 {
+	return [self changeWithNodes:nodes
+			   releasing:NO
+			       first:first
+			      second:second
+			   operation:operation];
+}
+
+- (enum btrfs_result)releasingChangeWithNodes:(size_t)nodes
+					first:(BtrfsItem *)first
+				       second:(BtrfsItem *)second
+				    operation:
+					(enum btrfs_result (^)(struct btrfs_transaction *))operation
+{
+	return [self changeWithNodes:nodes
+			   releasing:YES
+			       first:first
+			      second:second
+			   operation:operation];
+}
+
+- (enum btrfs_result)changeWithNodes:(size_t)nodes
+			   releasing:(BOOL)releasing
+			       first:(BtrfsItem *)first
+			      second:(BtrfsItem *)second
+			   operation:(enum btrfs_result (^)(struct btrfs_transaction *))operation
+{
 	struct btrfs_transaction *transaction;
 	uint64_t pending;
 	enum btrfs_result result;
@@ -1101,7 +1133,8 @@ btrfs_timespec(struct btrfs_time time)
 	if (!_writable) {
 		return BTRFS_READ_ONLY;
 	}
-	result = btrfs_volume_join(_volume, nodes, &transaction);
+	result = releasing ? btrfs_volume_join_releasing(_volume, nodes, &transaction)
+			   : btrfs_volume_join(_volume, nodes, &transaction);
 	if (result != BTRFS_OK) {
 		return result;
 	}
@@ -1405,14 +1438,8 @@ btrfs_timespec(struct btrfs_time time)
 	owned->orphan = NO;
 	identity = owned->inode.id;
 	[_itemLock unlock];
-	if (orphan) {
-		error = [self
-		    changeWithNodes:BTRFS_FSKIT_OPERATION_NODES
-			      first:nil
-			     second:nil
-			  operation:^enum btrfs_result(struct btrfs_transaction *transaction) {
-			    return btrfs_transaction_evict(transaction, identity);
-			  }];
+	if (orphan && _writable) {
+		error = btrfs_volume_evict(_volume, identity);
 	}
 	reply(btrfs_fskit_error(error));
 }

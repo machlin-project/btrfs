@@ -87,6 +87,18 @@ btrfs_xnu_begin(struct btrfs_xnu_mount *mount, size_t nodes, struct btrfs_transa
 	return btrfs_xnu_start(mount, mount->synchronous, nodes, transaction);
 }
 
+/* An operation that releases space (an unlink, a shrinking truncation step),
+ * which may use the metadata reserve so that a full volume can delete. */
+static enum btrfs_result
+btrfs_xnu_begin_releasing(
+    struct btrfs_xnu_mount *mount, size_t nodes, struct btrfs_transaction **transaction)
+{
+	if (mount->synchronous) {
+		return btrfs_volume_begin(mount->volume, transaction);
+	}
+	return btrfs_volume_join_releasing(mount->volume, nodes, transaction);
+}
+
 static enum btrfs_result
 btrfs_xnu_end(struct btrfs_xnu_mount *mount, struct btrfs_transaction *transaction,
     enum btrfs_result result, struct btrfs_xnu_node *first, struct btrfs_xnu_node *second)
@@ -393,6 +405,7 @@ btrfs_xnu_truncate(struct btrfs_xnu_node *node, vnode_t vnode, uint64_t size, vf
 	struct btrfs_time now;
 	uint64_t old_size;
 	enum btrfs_result result;
+	int done = 0;
 	int error;
 
 	error = btrfs_xnu_settle_privileges(node, context);
@@ -409,16 +422,29 @@ btrfs_xnu_truncate(struct btrfs_xnu_node *node, vnode_t vnode, uint64_t size, vf
 	if (size < old_size) {
 		ubc_setsize(vnode, (off_t)size);
 	}
-	error =
-	    btrfs_xnu_error(btrfs_xnu_begin(node->mount, BTRFS_XNU_OPERATION_NODES, &transaction));
+	error = btrfs_xnu_error(size < old_size
+		? btrfs_xnu_begin_releasing(node->mount, BTRFS_XNU_OPERATION_NODES, &transaction)
+		: btrfs_xnu_begin(node->mount, BTRFS_XNU_OPERATION_NODES, &transaction));
 	if (error == 0) {
 		result = node->privileged
 		    ? btrfs_transaction_keep_privileges(transaction, node->inode.id)
 		    : btrfs_transaction_drop_privileges(transaction, node->inode.id, now);
 		if (result == BTRFS_OK) {
-			result = btrfs_transaction_truncate(transaction, node->inode.id, size, now);
+			result = btrfs_transaction_truncate(transaction, node->inode.id, size, now,
+			    BTRFS_RELEASE_STEP_NODES, &done);
 		}
 		error = btrfs_xnu_finish(node->mount, transaction, result, node, NULL);
+	}
+	/* A long shrink continues in releasing steps, each a valid shorter file. */
+	while (error == 0 && !done) {
+		error = btrfs_xnu_error(
+		    btrfs_xnu_begin_releasing(node->mount, BTRFS_RELEASE_STEP_NODES, &transaction));
+		if (error == 0) {
+			error = btrfs_xnu_finish(node->mount, transaction,
+			    btrfs_transaction_truncate(transaction, node->inode.id, size, now,
+				BTRFS_RELEASE_STEP_NODES, &done),
+			    node, NULL);
+		}
 	}
 	if (error == 0) {
 		lck_mtx_lock(node->mount->nodes_lock);
@@ -730,7 +756,7 @@ btrfs_xnu_unlink(vnode_t parent, vnode_t vnode, struct componentname *name, int 
 	}
 	btrfs_xnu_now(&now);
 	error = btrfs_xnu_error(
-	    btrfs_xnu_begin(directory->mount, BTRFS_XNU_OPERATION_NODES, &transaction));
+	    btrfs_xnu_begin_releasing(directory->mount, BTRFS_XNU_OPERATION_NODES, &transaction));
 	if (error == 0) {
 		error = btrfs_xnu_finish(directory->mount, transaction,
 		    btrfs_transaction_unlink(transaction, directory->inode.id, name->cn_nameptr,
@@ -805,7 +831,6 @@ btrfs_xnu_inactive(void *arguments)
 {
 	struct vnop_inactive_args *args = arguments;
 	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
-	struct btrfs_transaction *transaction;
 	int orphan;
 	int error;
 
@@ -816,11 +841,10 @@ btrfs_xnu_inactive(void *arguments)
 		return 0;
 	}
 	ubc_setsize(args->a_vp, 0);
-	error =
-	    btrfs_xnu_error(btrfs_xnu_begin(node->mount, BTRFS_XNU_OPERATION_NODES, &transaction));
-	if (error == 0) {
-		error = btrfs_xnu_finish(node->mount, transaction,
-		    btrfs_transaction_evict(transaction, node->inode.id), NULL, NULL);
+	error = btrfs_xnu_error(btrfs_volume_evict(node->mount->volume, node->inode.id));
+	if (error == 0 && node->mount->synchronous) {
+		error = btrfs_xnu_error(btrfs_volume_sync(
+		    node->mount->volume, btrfs_volume_pending(node->mount->volume)));
 	}
 	lck_mtx_lock(node->mount->nodes_lock);
 	node->orphan = 0;

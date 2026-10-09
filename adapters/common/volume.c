@@ -8,6 +8,9 @@
  * one unpinned. */
 #define VOLUME_STRIPES 16U
 #define VOLUME_LINE 64U
+/* Inodes one operation can leave to eviction steps: a transaction keeps room
+ * for at most this many (btrfs_transaction_room). */
+#define VOLUME_DEFERRED 32U
 
 struct volume_active {
 	uint32_t count;
@@ -61,6 +64,11 @@ struct btrfs_volume {
 	int writable;
 	/* The writer turn: a begin's transaction, an operation, a sync. */
 	int writer;
+	/* A committed transaction released space: the next one removes the block
+	 * groups that became empty, as Linux's cleaner does. */
+	int released;
+	/* The running transaction released space. */
+	int releasing;
 };
 
 static enum btrfs_result
@@ -405,6 +413,7 @@ volume_give_turn(struct btrfs_volume *volume)
 static enum btrfs_result
 volume_start(struct btrfs_volume *volume, struct btrfs_transaction **transaction)
 {
+	size_t removed;
 	enum btrfs_result error;
 
 	*transaction = NULL;
@@ -422,10 +431,14 @@ volume_start(struct btrfs_volume *volume, struct btrfs_transaction **transaction
 	}
 	if (error == BTRFS_OK) {
 		error = btrfs_transaction_use_counters(*transaction, volume->counters);
-		if (error != BTRFS_OK) {
-			btrfs_transaction_destroy(*transaction);
-			*transaction = NULL;
-		}
+	}
+	if (error == BTRFS_OK && volume->released) {
+		error = btrfs_transaction_remove_unused_groups(*transaction, &removed);
+		volume->released = 0;
+	}
+	if (error != BTRFS_OK && *transaction != NULL) {
+		btrfs_transaction_destroy(*transaction);
+		*transaction = NULL;
 	}
 	return error;
 }
@@ -477,6 +490,10 @@ volume_commit_running(struct btrfs_volume *volume)
 	error = volume_commit_view(volume, transaction, &view);
 	/* Before publication: the transaction refers to the view it began on. */
 	btrfs_transaction_destroy(transaction);
+	if (error == BTRFS_OK && volume->releasing) {
+		volume->released = 1;
+	}
+	volume->releasing = 0;
 	volume->locks.lock(volume->locks.context);
 	retired = volume_publish(volume, view, error);
 	__atomic_store_n(&volume->committing, 0, __ATOMIC_SEQ_CST);
@@ -528,11 +545,18 @@ enum btrfs_result
 btrfs_volume_commit(struct btrfs_volume *volume, struct btrfs_transaction *transaction)
 {
 	struct btrfs_volume_view *view = NULL;
+	struct btrfs_object_id deferred[VOLUME_DEFERRED];
+	size_t count = 0;
+	size_t i;
 	enum btrfs_result error;
 	enum btrfs_result failure = BTRFS_OK;
 
 	if (transaction == NULL || transaction != volume->open) {
 		return BTRFS_INVALID_ARGUMENT;
+	}
+	while (count < VOLUME_DEFERRED &&
+	    btrfs_transaction_take_deferred(transaction, &deferred[count]) == BTRFS_OK) {
+		count++;
 	}
 	/* Data written while the transaction ran went to space no committed root
 	 * references; only the commit's own writes can make the medium
@@ -546,6 +570,16 @@ btrfs_volume_commit(struct btrfs_volume *volume, struct btrfs_transaction *trans
 		failure = error;
 	}
 	volume_end(volume, view, failure);
+	/* Inodes the transaction left to eviction steps are deleted now and
+	 * committed before returning; one without room keeps its orphan. */
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		if (btrfs_volume_evict(volume, deferred[i]) != BTRFS_OK) {
+			break;
+		}
+	}
+	if (error == BTRFS_OK && count != 0) {
+		(void)btrfs_volume_sync(volume, btrfs_volume_pending(volume));
+	}
 	return error;
 }
 
@@ -559,10 +593,44 @@ btrfs_volume_abort(struct btrfs_volume *volume, struct btrfs_transaction *transa
 	volume_end(volume, NULL, BTRFS_OK);
 }
 
-enum btrfs_result
-btrfs_volume_join(struct btrfs_volume *volume, size_t nodes, struct btrfs_transaction **transaction)
+/* Makes the running transaction able to take one more operation of nodes,
+ * with the turn held: a running transaction without room commits first, and
+ * a new one begins when none runs. */
+static enum btrfs_result
+volume_room(struct btrfs_volume *volume, size_t nodes, int releasing)
 {
 	struct btrfs_transaction *running = NULL;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (volume->running != NULL &&
+	    (releasing ? btrfs_transaction_room_releasing(volume->running, nodes)
+		       : btrfs_transaction_room(volume->running, nodes)) != BTRFS_OK) {
+		error = volume_commit_running(volume);
+	}
+	if (error == BTRFS_OK && volume->running == NULL) {
+		error = volume_start(volume, &running);
+		if (error == BTRFS_OK) {
+			error = releasing ? btrfs_transaction_room_releasing(running, nodes)
+					  : btrfs_transaction_room(running, nodes);
+		}
+		if (error != BTRFS_OK) {
+			btrfs_transaction_destroy(running);
+		} else {
+			volume->locks.lock(volume->locks.context);
+			__atomic_store_n(&volume->running, running, __ATOMIC_SEQ_CST);
+			volume->locks.unlock(volume->locks.context);
+		}
+	}
+	if (error == BTRFS_OK && releasing) {
+		volume->releasing = 1;
+	}
+	return error;
+}
+
+static enum btrfs_result
+volume_join(struct btrfs_volume *volume, size_t nodes, int releasing,
+    struct btrfs_transaction **transaction)
+{
 	enum btrfs_result error;
 
 	*transaction = NULL;
@@ -573,23 +641,8 @@ btrfs_volume_join(struct btrfs_volume *volume, size_t nodes, struct btrfs_transa
 	volume_take_turn(volume);
 	error = volume->failure;
 	volume->locks.unlock(volume->locks.context);
-	/* A running transaction without room commits first. */
-	if (error == BTRFS_OK && volume->running != NULL &&
-	    btrfs_transaction_room(volume->running, nodes) != BTRFS_OK) {
-		error = volume_commit_running(volume);
-	}
-	if (error == BTRFS_OK && volume->running == NULL) {
-		error = volume_start(volume, &running);
-		if (error == BTRFS_OK) {
-			error = btrfs_transaction_room(running, nodes);
-		}
-		if (error != BTRFS_OK) {
-			btrfs_transaction_destroy(running);
-		} else {
-			volume->locks.lock(volume->locks.context);
-			__atomic_store_n(&volume->running, running, __ATOMIC_SEQ_CST);
-			volume->locks.unlock(volume->locks.context);
-		}
+	if (error == BTRFS_OK) {
+		error = volume_room(volume, nodes, releasing);
 	}
 	if (error != BTRFS_OK) {
 		volume->locks.lock(volume->locks.context);
@@ -601,45 +654,123 @@ btrfs_volume_join(struct btrfs_volume *volume, size_t nodes, struct btrfs_transa
 	return BTRFS_OK;
 }
 
-void
-btrfs_volume_leave(struct btrfs_volume *volume, struct btrfs_transaction *transaction)
+enum btrfs_result
+btrfs_volume_join(struct btrfs_volume *volume, size_t nodes, struct btrfs_transaction **transaction)
 {
-	const struct btrfs_fs *view = NULL;
-	enum btrfs_result failure;
+	return volume_join(volume, nodes, 0, transaction);
+}
 
-	if (transaction == NULL || transaction != volume->running) {
-		return;
+enum btrfs_result
+btrfs_volume_join_releasing(
+    struct btrfs_volume *volume, size_t nodes, struct btrfs_transaction **transaction)
+{
+	return volume_join(volume, nodes, 1, transaction);
+}
+
+/* Evicts an orphan in releasing steps, with the turn held; the running
+ * transaction commits whenever it lacks room for the next step. */
+static enum btrfs_result
+volume_evict(struct btrfs_volume *volume, struct btrfs_object_id id)
+{
+	enum btrfs_result error = BTRFS_OK;
+	int done = 0;
+
+	while (error == BTRFS_OK && !done) {
+		error = volume_room(volume, BTRFS_RELEASE_STEP_NODES, 1);
+		if (error == BTRFS_OK) {
+			error = btrfs_transaction_evict(
+			    volume->running, id, BTRFS_RELEASE_STEP_NODES, &done);
+			volume->operations++;
+		}
 	}
-	failure = btrfs_transaction_failure(transaction);
+	return error;
+}
+
+/* Ends an operation, with the turn held, after evicting the inodes it left to
+ * eviction steps; as Linux's eviction, one that finds no room even in a new
+ * transaction keeps its orphan for the next mount's cleanup. A transaction
+ * that failed after acknowledged operations fails the volume; an operation
+ * that failed alone is discarded as an aborted transaction. */
+static void
+volume_finish(struct btrfs_volume *volume)
+{
+	struct btrfs_transaction *transaction = volume->running;
+	struct btrfs_object_id deferred[VOLUME_DEFERRED];
+	const struct btrfs_fs *view = NULL;
+	size_t count = 0;
+	size_t i;
+	enum btrfs_result failure = btrfs_transaction_failure(transaction);
+	enum btrfs_result error = BTRFS_OK;
+
 	if (failure == BTRFS_OK) {
+		volume->operations++;
+		while (count < VOLUME_DEFERRED &&
+		    btrfs_transaction_take_deferred(transaction, &deferred[count]) == BTRFS_OK) {
+			count++;
+		}
+		for (i = 0; error == BTRFS_OK && i < count; i++) {
+			error = volume_evict(volume, deferred[i]);
+		}
+		transaction = volume->running;
+		failure = transaction != NULL ? btrfs_transaction_failure(transaction) : BTRFS_OK;
+	}
+	if (failure == BTRFS_OK && transaction != NULL) {
 		view = btrfs_transaction_reader(transaction);
 		/* Readers cannot see the changes in place: publish them now. */
 		if (view == NULL) {
-			volume->operations++;
 			(void)volume_commit_running(volume);
-			volume->locks.lock(volume->locks.context);
-			volume_give_turn(volume);
-			volume->locks.unlock(volume->locks.context);
-			return;
 		}
-		volume->locks.lock(volume->locks.context);
-		volume->operations++;
-		volume->running_view = view;
-		volume_give_turn(volume);
-		volume->locks.unlock(volume->locks.context);
-		return;
 	}
-	/* The operation failed after changing the transaction. */
-	btrfs_transaction_destroy(transaction);
 	volume->locks.lock(volume->locks.context);
-	__atomic_store_n(&volume->running, NULL, __ATOMIC_SEQ_CST);
-	volume->running_view = NULL;
-	if (volume->operations != 0 && volume->failure == BTRFS_OK) {
-		volume->failure = failure;
+	if (failure != BTRFS_OK) {
+		__atomic_store_n(&volume->running, NULL, __ATOMIC_SEQ_CST);
+		volume->running_view = NULL;
+		if (volume->operations != 0 && volume->failure == BTRFS_OK) {
+			volume->failure = failure;
+		}
+		volume->operations = 0;
+	} else if (volume->running != NULL) {
+		volume->running_view = view;
 	}
-	volume->operations = 0;
 	volume_give_turn(volume);
 	volume->locks.unlock(volume->locks.context);
+	if (failure != BTRFS_OK) {
+		btrfs_transaction_destroy(transaction);
+	}
+}
+
+void
+btrfs_volume_leave(struct btrfs_volume *volume, struct btrfs_transaction *transaction)
+{
+	if (transaction == NULL || transaction != volume->running) {
+		return;
+	}
+	volume_finish(volume);
+}
+
+enum btrfs_result
+btrfs_volume_evict(struct btrfs_volume *volume, struct btrfs_object_id id)
+{
+	enum btrfs_result error;
+
+	if (!volume->writable) {
+		return BTRFS_READ_ONLY;
+	}
+	volume->locks.lock(volume->locks.context);
+	volume_take_turn(volume);
+	error = volume->failure;
+	volume->locks.unlock(volume->locks.context);
+	if (error == BTRFS_OK) {
+		error = volume_evict(volume, id);
+	}
+	if (volume->running != NULL) {
+		volume_finish(volume);
+	} else {
+		volume->locks.lock(volume->locks.context);
+		volume_give_turn(volume);
+		volume->locks.unlock(volume->locks.context);
+	}
+	return error == BTRFS_OK ? btrfs_volume_failure(volume) : error;
 }
 
 uint64_t
