@@ -239,9 +239,10 @@ btrfs_xnu_refresh(struct btrfs_xnu_node *node)
 	int fresh;
 	int error;
 
+	/* A stub never changes, and only its lookup knows its owner. */
 	lck_mtx_lock(mount->nodes_lock);
 	changes = mount->changes;
-	fresh = changes == node->seen;
+	fresh = changes == node->seen || node->inode.id.inode == BTRFS_EMPTY_SUBVOLUME_INODE;
 	lck_mtx_unlock(mount->nodes_lock);
 	if (fresh) {
 		return 0;

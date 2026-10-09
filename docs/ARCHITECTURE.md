@@ -82,8 +82,12 @@ entry (directory and name), as Linux's `fixup_tree_root_location` requires.
 Otherwise (an entry a snapshot copied, or one whose subvolume was deleted) it
 resolves, as Linux's `new_simple_dir` presents it, to an empty stub directory:
 inode `BTRFS_EMPTY_SUBVOLUME_INODE` (2) of the containing tree, mode 0755, one
-link, no xattrs and no parent of its own (`btrfs_parent` reports NOT_FOUND;
-adapters keep the path they came from). A deleted subvolume cannot be opened
+link, the owner and access time of the directory a lookup or directory stream
+resolves it in (Linux gives it the lookup's other times), no xattrs and no
+parent of its own (`btrfs_parent` reports NOT_FOUND; adapters keep the path
+they came from). Since every stub of a tree has one identity, only that
+resolution knows its owner: `btrfs_get_inode` reports 0:0, and the adapters
+keep a stub's attributes from its lookup instead of reading them again. A deleted subvolume cannot be opened
 (NOT_FOUND, Linux's ENOENT). Symlink payload reading is separate from platform
 namei.
 

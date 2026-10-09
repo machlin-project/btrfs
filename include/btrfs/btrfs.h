@@ -12,7 +12,10 @@
 #define BTRFS_ROOT_INODE UINT64_C(256)
 /* A subvolume entry whose subvolume this tree does not reference (copied by
  * a snapshot, or deleted) resolves, as on Linux, to an empty read-only stub
- * directory with this inode number in the containing tree. */
+ * directory with this inode number in the containing tree. btrfs_lookup and
+ * btrfs_directory_inode give it the owner and access time of the directory
+ * they resolve it in, as Linux's new_simple_dir does; btrfs_get_inode, which
+ * knows no directory, gives owner 0:0 and zero times. A stub never changes. */
 #define BTRFS_EMPTY_SUBVOLUME_INODE UINT64_C(2)
 #define BTRFS_COOKIE_END UINT64_MAX
 

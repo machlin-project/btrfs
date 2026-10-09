@@ -1122,6 +1122,10 @@ btrfs_timespec(struct btrfs_time time)
 	[_itemLock lock];
 	identity = item->inode.id;
 	[_itemLock unlock];
+	/* A stub never changes, and only its lookup knows its owner. */
+	if (identity.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		return BTRFS_OK;
+	}
 	fs = btrfs_volume_read(_volume, &view);
 	error = btrfs_get_inode(fs, identity, &inode);
 	btrfs_volume_unread(_volume, view);

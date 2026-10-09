@@ -1145,10 +1145,12 @@ digest_directory(struct digest_state *state, const struct btrfs_inode *directory
 		digest_mix(state->digest, entry.name, entry.name_length);
 		digest_u64(state->digest, entry.type);
 		digest_u64(state->digest, cookie);
-		/* The stream's own inode path reads what a lookup alone reads. */
+		/* The stream's own inode path reads what a lookup alone reads; a
+		 * stub's owner comes from its directory in both. */
 		result = btrfs_directory_inode(stream, &entry, &child);
 		if (result == BTRFS_OK) {
-			result = btrfs_get_inode(state->fs, entry.id, &alone);
+			result = btrfs_lookup(
+			    state->fs, directory, entry.name, entry.name_length, &alone);
 		}
 		if (result == BTRFS_OK && !same_inode(&child, &alone)) {
 			result = BTRFS_CORRUPT;

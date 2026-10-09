@@ -182,6 +182,16 @@ bt_default_tree(const struct btrfs_fs *fs, uint64_t *tree)
 	return error;
 }
 
+/* Linux's new_simple_dir gives a stub the owner and access time of the
+ * directory it was looked up in; the other times are those of the lookup. */
+static void
+bt_dir_stub(uint32_t uid, uint32_t gid, struct btrfs_time access_time, struct btrfs_inode *inode)
+{
+	inode->uid = uid;
+	inode->gid = gid;
+	inode->access_time = access_time;
+}
+
 enum btrfs_result
 btrfs_lookup(const struct btrfs_fs *fs, const struct btrfs_inode *directory, const void *name,
     size_t length, struct btrfs_inode *inode)
@@ -212,7 +222,13 @@ btrfs_lookup(const struct btrfs_fs *fs, const struct btrfs_inode *directory, con
 	}
 	error = bt_lookup_record(&cursor, directory->id.inode, name, length, 1, &id);
 	bt_cursor_fini(&cursor);
-	return error == BTRFS_OK ? btrfs_get_inode(fs, id, inode) : error;
+	if (error == BTRFS_OK) {
+		error = btrfs_get_inode(fs, id, inode);
+	}
+	if (error == BTRFS_OK && id.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+		bt_dir_stub(directory->uid, directory->gid, directory->access_time, inode);
+	}
+	return error;
 }
 
 struct btrfs_directory {
@@ -222,6 +238,10 @@ struct btrfs_directory {
 	struct bt_cursor inodes;
 	int inodes_ready;
 	uint64_t inode;
+	/* What the directory passes to the stubs among its entries. */
+	uint32_t uid;
+	uint32_t gid;
+	struct btrfs_time access_time;
 	int advance;
 	int end;
 };
@@ -267,6 +287,9 @@ btrfs_directory_open(const struct btrfs_fs *fs, const struct btrfs_inode *direct
 		return error;
 	}
 	stream->inode = directory->id.inode;
+	stream->uid = directory->uid;
+	stream->gid = directory->gid;
+	stream->access_time = directory->access_time;
 	key.objectid = directory->id.inode;
 	key.type = BT_DIR_INDEX;
 	key.offset = cookie;
@@ -351,12 +374,18 @@ enum btrfs_result
 btrfs_directory_inode(
     struct btrfs_directory *stream, const struct btrfs_dir_entry *entry, struct btrfs_inode *inode)
 {
+	enum btrfs_result error;
+
 	if (stream == NULL || entry == NULL || inode == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	/* A subvolume's root directory, or its empty stub, is in another tree. */
 	if (entry->id.tree != stream->cursor.root.owner || entry->id.inode < BTRFS_ROOT_INODE) {
-		return btrfs_get_inode(stream->cursor.fs, entry->id, inode);
+		error = btrfs_get_inode(stream->cursor.fs, entry->id, inode);
+		if (error == BTRFS_OK && entry->id.inode == BTRFS_EMPTY_SUBVOLUME_INODE) {
+			bt_dir_stub(stream->uid, stream->gid, stream->access_time, inode);
+		}
+		return error;
 	}
 	if (!stream->inodes_ready) {
 		bt_cursor_init(&stream->inodes, stream->cursor.fs, stream->cursor.root);

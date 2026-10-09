@@ -1801,8 +1801,13 @@ model_expect(const struct model *model, struct plan *plan, size_t stage)
 		}
 		model_path(model, i, path, sizeof(path));
 		if (inode->stub) {
-			/* Linux makes a stub's times when it looks one up. */
-			expect_owner(plan, stage, stage, path, STUB_MODE, 0, 0, 1);
+			/* Linux makes a stub's times when it looks one up, and gives it
+			 * its directory's owner. */
+			entry = model_entry_of(model, i);
+			REQUIRE(entry != MODEL_NONE);
+			expect_owner(plan, stage, stage, path, STUB_MODE,
+			    model->inodes[model->entries[entry].parent].uid,
+			    model->inodes[model->entries[entry].parent].gid, 1);
 			expect_names(plan, stage, stage, path, NULL, 0);
 			continue;
 		}
