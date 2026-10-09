@@ -141,7 +141,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
 		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
 		"subvolumes", "deleted", "compressed", "extents", "holes", "bitmaps", "groups",
-		"quota", "verity", "compat_ro" };
+		"quota", "verity", "compat_ro", "layout" };
 	const struct expectation *e;
 	char payload[64];
 	char argument[160];
@@ -151,8 +151,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	size_t i;
 	size_t j;
 
-	_Static_assert(
-	    sizeof(kinds) / sizeof(kinds[0]) == EXPECT_COMPAT_RO + 1, "expectation kinds");
+	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_LAYOUT + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
@@ -167,7 +166,7 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 		}
 		detail = "-";
 		if (e->kind == EXPECT_SAME || e->kind == EXPECT_XATTR ||
-		    e->kind == EXPECT_NO_XATTR) {
+		    e->kind == EXPECT_NO_XATTR || e->kind == EXPECT_LAYOUT) {
 			detail = e->other;
 		} else if (e->kind == EXPECT_DIRECTORY) {
 			REQUIRE(snprintf(argument, sizeof(argument), "%llu",

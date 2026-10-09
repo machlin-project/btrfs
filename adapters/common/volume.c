@@ -251,6 +251,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 		volume->counted.flush = volume_flush;
 		volume->counted.compress = writer->compress != NULL ? volume_compress : NULL;
 		volume->counted.compression = writer->compression;
+		volume->counted.compress_force = writer->compress_force;
 	}
 	error = volume_view(volume, &volume->current);
 	if (error == BTRFS_OK && volume->writable) {

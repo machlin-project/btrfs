@@ -809,13 +809,38 @@ NODATACOW, NODATASUM and NOCOMPRESS files are never compressed. Otherwise a
 file's `btrfs.compression` property names the codec; without one, the COMPRESS
 flag or the adapter's compress mount option selects the mount's codec (zlib
 when it names none). The adapter supplies the compressor (`compress` in the
-write environment); without it nothing is compressed. Data is compressed in
-pieces of at most 128 KiB, each one extent whose stream, padded to whole
-sectors, is kept only when that saves at least a sector; its file extent item
-records the codec, the uncompressed length and the stored size, and checksums
-cover the stored bytes. Writing ZSTD or LZO data records that incompat
-feature. Linux's compressibility heuristic is not reproduced: compression is
-attempted and its result judged. LZO data is framed as Linux's
+write environment); without it nothing is compressed. `compress_force` in the
+write environment is Linux's compress-force: every range is tried, NOCOMPRESS
+files' too. Each write is flushed as Linux's `btrfs_run_delalloc_range` takes
+dirty data: in delalloc ranges of at most 128 MiB. A range of a NODATACOW or
+PREALLOC file goes through `run_delalloc_nocow`: written in place where that
+is allowed (decided before the bytes before it are written), every other run
+written as new uncompressed extents. Any other range is compressed only when
+`inode_need_compress` says so for the whole range: never for a range of one
+sector, always under compress-force, else when `btrfs_compress_heuristic`
+accepts its first 128 KiB (`core/heuristic.c`, an exact reimplementation:
+16 bytes of every 256 read by pages, so bytes past EOF in the last page sample
+as zeros; repeated sample halves; a byte set below 64; the core set covering
+90% of the sample after Linux's radix sort; Linux's integer Shannon entropy
+below 80%). Such a range is written in chunks of 512 KiB, each in pieces of at
+most 128 KiB that are tried while the heuristic accepts them and that compress
+while their stream, padded to whole sectors, saves at least a sector; each is
+one extent whose item records the codec, the uncompressed length and the
+stored size, and checksums cover the stored bytes. A piece of one sector is
+never compressed unless it is the whole file from offset 0. The first piece of
+a chunk that is not compressed leaves the rest of the chunk as one
+uncompressed run, and when compression was tried and failed it marks the file
+NOCOMPRESS, as `mark_incompressible` does, unless compress-force or the file's
+property chose compression; the heuristic's refusal marks nothing. Chunks run
+in order, so a later chunk of the same range sees that mark; Linux runs chunks
+concurrently, so a later chunk may or may not see it. A file that fits its
+first sector follows `cow_file_range_inline` (below). Writing ZSTD or LZO data
+records that incompat feature. Linux versions differ for single-sector files:
+6.12.94 and this writer mark a file NOCOMPRESS when its compressed inline
+attempt fails, 6.16.4 also marks a single sector at offset 0 that cannot be
+inlined, and 7.3-rc6 marks neither. The compression twins
+(`tests/scenario_twins.c`) compare these decisions with Linux's own files.
+LZO data is framed as Linux's
 `lzo_compress_folios` frames it: a 32-bit total length, then one segment per
 sector of input, each a 32-bit length and an LZO1X stream, a length never
 crossing a sector (the sector's last bytes are zero instead); a piece is given

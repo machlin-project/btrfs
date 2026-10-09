@@ -177,6 +177,48 @@ check_compressed() {
     test "$counts" = "${2#*:}:0"
 }
 
+# The inode flags and file extent items of a file as the layout fact compares
+# them (tests/scenario.h), from Linux's own tree dump: OFFSET:KIND:LENGTH:RAM:
+# EXTENT-OFFSET:CODEC per item, where adjacent uncompressed regular, hole and
+# preallocated items, which the allocator may split anywhere, form one run
+# without RAM or EXTENT-OFFSET.
+layout_of() {
+    inode=$(stat -c '%i' "$1")
+    tree_dump "$(tree_of "$1")" |
+        awk -v inode="$inode" '
+        function emit() {
+            if (have) printf "%s:%s:%s:%s:%s:%s\n", start, kind, size, ram, at, codec
+            have = 0 }
+        function add(offset, k, n, r, o, c, run) {
+            if (run && have && kind == k && start + size == offset) { size += n; return }
+            emit(); have = 1; start = offset; kind = k; size = n; ram = r; at = o; codec = c }
+        $1 == "item" && $3 == "key" {
+            object = substr($4, 2); key = $6; sub(/\)$/, "", key)
+            inside = object == inode && $5 == "EXTENT_DATA"
+            item = object == inode && $5 == "INODE_ITEM"
+            next }
+        item && match($0, /flags 0x[0-9a-f]+/) {
+            flags = substr($0, RSTART + 6, RLENGTH - 6); item = 0 }
+        inside && $1 == "inline" && $2 == "extent" { add(key, "inline", $7, $7, 0, $9, 0) }
+        inside && $1 == "extent" && $2 == "data" && $3 == "disk" { disk = $5 }
+        inside && $1 == "extent" && $2 == "data" && $3 == "offset" { o = $4; n = $6; r = $8 }
+        inside && $1 == "extent" && $2 == "compression" {
+            if ($3 + 0 == 0) add(key, disk == 0 ? "hole" : "regular", n, 0, 0, 0, 1)
+            else add(key, "regular", n, r, o, $3, 0) }
+        inside && $1 == "prealloc" && $2 == "data" && $3 == "offset" {
+            add(key, "prealloc", $6, 0, 0, 0, 1) }
+        END { emit(); printf "flags:%s\n", flags }'
+}
+
+# The path's layout equals that of the second path.
+check_layout() {
+    layout_of "$1" > /tmp/layout-mine
+    layout_of "$2" > /tmp/layout-theirs
+    cmp -s /tmp/layout-mine /tmp/layout-theirs ||
+        { echo "layout of $1:" >&2; cat /tmp/layout-mine >&2
+          echo "layout of $2:" >&2; cat /tmp/layout-theirs >&2; return 1; }
+}
+
 # REGULAR:PREALLOC:DISTINCT: the file's regular and preallocated extent items
 # and its distinct disk extents in Linux's own tree dump, which prints the disk
 # range of a preallocated item as "prealloc data disk byte".
@@ -328,6 +370,7 @@ check_namespace() {
         quota) check_quota "$arg" ;;
         verity) check_verity "$target" "$arg" ;;
         compat_ro) check_compat_ro "$arg" ;;
+        layout) check_layout "$target" "/mnt$arg" ;;
         *) false ;;
         esac || {
             echo "Namespace check failed: $kind $path"

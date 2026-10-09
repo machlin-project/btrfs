@@ -347,6 +347,127 @@ check_compressed(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
 	}
 }
 
+/* One entry of a file's layout as EXPECT_LAYOUT compares it: an item, or a
+ * run of adjacent uncompressed regular, hole or preallocated items, whose
+ * extents and offsets in them are the allocator's. */
+struct layout_entry {
+	uint64_t offset;
+	uint64_t length;
+	uint64_t ram;
+	uint64_t extent_offset;
+	uint8_t type;
+	uint8_t compression;
+	uint8_t hole;
+};
+
+/* The inode's file extent items as layout entries; returns their count. */
+static size_t
+file_layout(struct btrfs_fs *fs, const struct btrfs_inode *inode, struct layout_entry *entries)
+{
+	const struct bt_disk_extent_header *header;
+	const struct bt_disk_extent *extent;
+	struct layout_entry entry;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key = { inode->id.inode, 0, BT_EXTENT_DATA };
+	struct layout_entry *last;
+	size_t count = 0;
+	int run;
+	enum btrfs_result result;
+
+	REQUIRE(bt_find_root(fs, inode->id.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != inode->id.inode || record.key.type != BT_EXTENT_DATA) {
+			break;
+		}
+		REQUIRE(record.size >= sizeof(*header));
+		header = (const void *)record.data;
+		memset(&entry, 0, sizeof(entry));
+		entry.offset = record.key.offset;
+		entry.type = header->type;
+		entry.compression = header->compression;
+		entry.ram = bt_u64(header->ram_bytes);
+		entry.length = entry.ram;
+		if (header->type != BT_EXTENT_INLINE) {
+			REQUIRE(record.size == sizeof(*extent));
+			extent = (const void *)record.data;
+			entry.length = bt_u64(extent->length);
+			entry.extent_offset = bt_u64(extent->offset);
+			entry.hole = bt_u64(extent->disk_bytenr) == 0;
+		}
+		run = header->type != BT_EXTENT_INLINE &&
+		    header->compression == BTRFS_COMPRESSION_NONE;
+		if (run) {
+			entry.ram = 0;
+			entry.extent_offset = 0;
+		}
+		last = count != 0 ? &entries[count - 1] : NULL;
+		if (run && last != NULL && last->type == entry.type &&
+		    last->compression == BTRFS_COMPRESSION_NONE && last->hole == entry.hole &&
+		    last->offset + last->length == entry.offset) {
+			last->length += entry.length;
+		} else {
+			REQUIRE(count < MAX_LAYOUT_ENTRIES);
+			entries[count++] = entry;
+		}
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	return count;
+}
+
+static void
+show_layout(const char *path, const struct layout_entry *entries, size_t count, uint64_t flags)
+{
+	size_t i;
+
+	fprintf(stderr, "%s: flags 0x%llx\n", path, (unsigned long long)flags);
+	for (i = 0; i < count; i++) {
+		fprintf(stderr, "  %llu type %u codec %u%s length %llu ram %llu offset %llu\n",
+		    (unsigned long long)entries[i].offset, entries[i].type, entries[i].compression,
+		    entries[i].hole ? " hole" : "", (unsigned long long)entries[i].length,
+		    (unsigned long long)entries[i].ram,
+		    (unsigned long long)entries[i].extent_offset);
+	}
+}
+
+static int
+same_layout(const struct layout_entry *a, const struct layout_entry *b)
+{
+	return a->offset == b->offset && a->length == b->length && a->ram == b->ram &&
+	    a->extent_offset == b->extent_offset && a->type == b->type &&
+	    a->compression == b->compression && a->hole == b->hole;
+}
+
+/* The file's flags and layout equal those of e->other. */
+static void
+check_layout(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
+    const struct expectation *e, const struct btrfs_inode *inode)
+{
+	static struct layout_entry mine[MAX_LAYOUT_ENTRIES];
+	static struct layout_entry theirs[MAX_LAYOUT_ENTRIES];
+	struct btrfs_inode other;
+	size_t count;
+	size_t other_count;
+	size_t i;
+
+	REQUIRE(btrfs_image_lookup(fs, e->other, &other) == BTRFS_OK);
+	count = file_layout(fs, inode, mine);
+	other_count = file_layout(fs, &other, theirs);
+	for (i = 0; i < count && count == other_count && same_layout(&mine[i], &theirs[i]); i++) {
+	}
+	if (inode->flags != other.flags || count != other_count || i != count) {
+		fprintf(stderr, "%s stage %zu: layout differs\n", plan->name, stage);
+		show_layout(e->path, mine, count, inode->flags);
+		show_layout(e->other, theirs, other_count, other.flags);
+		exit(1);
+	}
+}
+
 static void
 check_subvolumes(
     struct btrfs_fs *fs, const struct plan *plan, size_t stage, const struct expectation *e)
@@ -839,6 +960,9 @@ check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, si
 		return;
 	case EXPECT_VERITY:
 		check_verity(fs, plan, stage, e, &inode);
+		return;
+	case EXPECT_LAYOUT:
+		check_layout(fs, plan, stage, e, &inode);
 		return;
 	case EXPECT_COMPAT_RO:
 		btrfs_get_info(fs, &info);
@@ -1562,6 +1686,15 @@ void
 expect_same(struct plan *plan, size_t first, size_t last, const char *path, const char *other)
 {
 	struct expectation *e = expect(plan, first, last, EXPECT_SAME, path);
+
+	e->other = strdup(other);
+	REQUIRE(e->other != NULL);
+}
+
+void
+expect_layout(struct plan *plan, size_t first, size_t last, const char *path, const char *other)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_LAYOUT, path);
 
 	e->other = strdup(other);
 	REQUIRE(e->other != NULL);

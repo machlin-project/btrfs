@@ -107,7 +107,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    `btrfs_fallocate` (allocation, zeroing and punching; `F_PREALLOCATE` and
    `F_PUNCHHOLE` natively). The kernel adapter compresses with the kernel's
    deflate and the shared freestanding Zstd encoder. New data is written as
-   its extents are created, and files compress on write as Linux decides.
+   its extents are created, and files compress on write as Linux decides:
+   per delalloc range, by its heuristic (`core/heuristic.c`), in 512 KiB
+   chunks of 128 KiB pieces, marking NOCOMPRESS after a failed attempt; the
+   compression twins compare every decision with files Linux wrote.
    fs-verity files are verified on every read, keep their data on writable
    volumes, and fs-verity is enabled in bounded steps whose interruption orphan
    cleanup undoes, as Linux does (`core/verity.c`). Remaining: a 64 KiB-sector

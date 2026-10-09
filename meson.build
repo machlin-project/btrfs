@@ -12,7 +12,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/rename.c', 'core/subvolume.c', 'core/drop.c',
   'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c',
-  'core/verity.c')
+  'core/verity.c', 'core/heuristic.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -53,8 +53,8 @@ transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
   'tests/scenario_random.c', 'tests/scenario_subvolume.c', 'tests/scenario_quota.c',
-  'tests/scenario_verity.c', 'tests/references.c', 'tests/namespace_audit.c',
-  'tests/qgroup_audit.c',
+  'tests/scenario_verity.c', 'tests/scenario_twins.c', 'tests/references.c',
+  'tests/namespace_audit.c', 'tests/qgroup_audit.c',
   include_directories: inc, link_with: [volume, posix, codec, core], dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
   'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
@@ -263,6 +263,16 @@ if fixtures != ''
   test('data-extents-16k', transaction_test,
     args: ['--data', join_paths(fixtures, 'transactions-16k.raw')], timeout: 900,
     suite: 'images')
+  # Compression twins: copies of the files Linux wrote under compress=zlib,
+  # compress-force=zlib and a zlib property, written in the same steps, have
+  # their twins' extent layouts and NOCOMPRESS flags, with 4 KiB and 16 KiB
+  # sectors.
+  test('compression-twins', transaction_test,
+    args: ['--twins', join_paths(fixtures, 'transactions-twins.raw')], timeout: 900,
+    suite: 'images')
+  test('compression-twins-16k', transaction_test,
+    args: ['--twins', join_paths(fixtures, 'transactions-16k-twins.raw')], timeout: 900,
+    suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
     suite: 'images')
@@ -291,7 +301,9 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-quota.raw'),
     join_paths(fixtures, 'transactions-squota.raw'),
     join_paths(fixtures, 'transactions-verity.raw'),
-    join_paths(fixtures, 'sectors-16k.raw'), join_paths(fixtures, 'transactions-16k.raw')],
+    join_paths(fixtures, 'sectors-16k.raw'), join_paths(fixtures, 'transactions-16k.raw'),
+    join_paths(fixtures, 'transactions-twins.raw'),
+    join_paths(fixtures, 'transactions-16k-twins.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

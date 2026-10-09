@@ -23,6 +23,11 @@ struct btrfs_write_environment {
 	/* The compress mount option's codec, or NONE: files ask for compression
 	 * with their property or COMPRESS flag only. */
 	enum btrfs_compression compression;
+	/* compress-force: every piece is tried, NOCOMPRESS files' too. Without
+	 * it Linux's heuristic decides whether a piece is tried, and a piece
+	 * that does not compress marks its file NOCOMPRESS unless the file's
+	 * property names the codec. */
+	int compress_force;
 };
 
 #define BTRFS_SUPER_COPIES 3U

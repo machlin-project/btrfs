@@ -29,8 +29,9 @@ The XNU guest suite passes on four image profiles, including mmap, native user
 xattrs, Unix permissions, directory cookies, snapshots and concurrent reads.
 
 The portable writer writes and truncates regular files as copy-on-write data
-with checksums (streaming new data to the device, compressing with zlib or Zstd
-and storing small files inline as Linux decides), preallocates, zeroes and punches
+with checksums (streaming new data to the device, compressing with zlib, LZO or
+Zstd where Linux's heuristic, chunks and NOCOMPRESS marking would, and storing
+small files inline as Linux decides), preallocates, zeroes and punches
 ranges as Linux's fallocate does, replaces inline files, and
 creates, links, unlinks (with
 orphans for open files), renames and sets xattrs, the compression property and

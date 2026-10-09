@@ -31,11 +31,14 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-quota": (16384, "dup", ""),
             "transactions-squota": (16384, "dup", ""),
             "transactions-verity": (16384, "dup", ""),
-            "sectors-16k": (16384, "dup", ""), "transactions-16k": (16384, "dup", "")}
+            "sectors-16k": (16384, "dup", ""), "transactions-16k": (16384, "dup", ""),
+            "transactions-twins": (16384, "dup", ""),
+            "transactions-16k-twins": (16384, "dup", "")}
 # Profiles with sectors above 4 KiB, which only a kernel whose pages are at
 # least as large mounts: the staged 16 KiB-page root and kernel build them
 # (docs/DEVELOPMENT.md).
-SECTOR_SIZES = {"sectors-16k": 16384, "transactions-16k": 16384}
+SECTOR_SIZES = {"sectors-16k": 16384, "transactions-16k": 16384,
+                "transactions-16k-twins": 16384}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -178,6 +181,37 @@ VERITY_NOCOW_BYTES = 65536
 VERITY_TAIL_BYTES = 10000
 VERITY_INLINE_BYTES = 100
 VERITY_DESCRIPTOR = struct.Struct("<BBBBIQ64s32s144s")
+# Compression twins: files Linux writes under compress=zlib (twins/zlib),
+# compress-force=zlib (twins/force) and a zlib compression property on a
+# compress=no mount (twins/prop), each step a write at an offset followed by
+# a sync, so that each step is one delalloc range. twins/steps keeps every
+# step's bytes, written without compression, and twins/manifest.tsv lists
+# MODE, NAME and OFFSET:STEP-FILE for each step; the twin scenarios write the
+# same steps and compare the extent layouts and inode flags with Linux's. The
+# data around Linux's decisions: its heuristic (repeated sample halves, byte
+# sets below 64, core sets, entropy near its 80% threshold), 128 KiB pieces in
+# 512 KiB chunks, the range-wide decision, NOCOMPRESS marking by a failed
+# attempt (not by the heuristic, the property or compress-force) and its effect
+# on later writes, a last piece of one sector and small files. Within one sync
+# no chunk follows the one that marks a file, as Linux runs chunks
+# concurrently.
+TWIN_PIECE = 131072
+TWIN_CHUNK = 524288
+TWIN_TEXT_WORDS = 512
+TWIN_VALUES = (40, 70, 76, 80, 82, 84, 86, 88, 100, 130)
+TWIN_SMALL_BYTES = 1000
+# A file of one 4 KiB sector that zlib shrinks, but beyond the 2 KiB inline
+# limit: Linux 6.12 and 7.3 write it uncompressed and unmarked; 6.16, the
+# 16 KiB-page reference, marked it NOCOMPRESS, which later kernels undid, so it
+# is a twin with 4 KiB sectors only.
+TWIN_SMALL_VALUES_BYTES = 4000
+TWIN_SMALL_VALUES = 40
+TWIN_UNALIGNED_BYTES = 200001
+TWIN_TAIL_BYTES = 100
+TWIN_PATCH_OFFSET = 102400
+TWIN_PATCH_BYTES = 40960
+TWIN_MODES = {"zlib": "compress=zlib", "force": "compress-force=zlib", "prop": "compress=no"}
+TWIN_PROFILES = ("transactions-twins", "transactions-16k-twins")
 
 
 def verity_model(data: bytes, algorithm: str, block: int, salt: bytes) -> dict:
@@ -236,6 +270,122 @@ def verity_files(contents: dict) -> dict:
     }
 
 
+def twin_stream(label: str, size: int) -> bytes:
+    return hashlib.shake_256(f"Machlin compression twin {label}".encode()).digest(size)
+
+
+def twin_text(label: str, size: int) -> bytes:
+    """Words of a fixed pseudo-random vocabulary: a byte set far below 64."""
+    letters = b"abcdefghijklmnopqrstuvwxyz"
+    seed = twin_stream("vocabulary", TWIN_TEXT_WORDS * 9)
+    words = [bytes(letters[seed[9 * i + j] % len(letters)] for j in range(3 + seed[9 * i] % 6))
+             for i in range(TWIN_TEXT_WORDS)]
+    choice = twin_stream(label, size)
+    text = bytearray()
+    i = 0
+    while len(text) < size:
+        word = choice[i % size] | (choice[(i + 1) % size] << 8)
+        text += words[word % TWIN_TEXT_WORDS] + (b"\n" if i % 13 == 12 else b" ")
+        i += 2
+    return bytes(text[:size])
+
+
+def twin_values(label: str, size: int, count: int) -> bytes:
+    """Bytes nearly uniform over count values."""
+    return bytes(value % count for value in twin_stream(label, size))
+
+
+def twin_halves(label: str, size: int) -> bytes:
+    """Incompressible 64 KiB repeated once per 128 KiB: the heuristic's sample
+    halves are equal, which zlib's 32 KiB window cannot use."""
+    return b"".join(twin_stream(f"{label}{i}", TWIN_PIECE // 2) * 2
+                    for i in range(size // TWIN_PIECE))
+
+
+def twin_files(sector: int) -> dict:
+    """(mode, name): [(offset, bytes)], one entry per step."""
+    t, r, h = twin_text, twin_stream, twin_halves
+    piece = TWIN_PIECE
+    zlib = {
+        "text": [(0, t("text", 300000))],
+        "random": [(0, r("random", 300000))],
+        "zeros": [(0, bytes(2 * piece))],
+        "halves-append": [(0, h("halves", piece)), (piece, t("append", piece))],
+        "text-random-text": [(0, t("a", piece) + r("b", piece) + t("c", 2 * piece))],
+        "text-halves-text": [(0, t("d", piece) + h("e", piece) + t("f", 2 * piece))],
+        "random-text": [(0, r("g", piece) + t("h", 8 * piece))],
+        "text-random-chunks": [(0, t("i", TWIN_CHUNK) + r("j", TWIN_CHUNK))],
+        "tail-sector": [(0, t("k", piece + sector))],
+        "tail-bytes": [(0, t("l", piece + TWIN_TAIL_BYTES))],
+        "unaligned": [(0, t("m", TWIN_UNALIGNED_BYTES))],
+        "random-then-text": [(0, r("n", piece)), (piece, t("o", piece))],
+        "rewrite": [(0, t("p", 2 * piece)), (piece // 2, r("q", piece))],
+        "patch": [(0, t("s", 2 * piece)), (TWIN_PATCH_OFFSET, t("u", TWIN_PATCH_BYTES))],
+        "small-text": [(0, t("v", TWIN_SMALL_BYTES))],
+        "small-random": [(0, r("y", TWIN_SMALL_BYTES))],
+        **{f"values-{count}": [(0, twin_values(f"values{count}", 2 * piece, count))]
+           for count in TWIN_VALUES},
+    }
+    if sector == 4096:
+        zlib["small-values"] = [(0, twin_values("small", TWIN_SMALL_VALUES_BYTES,
+                                                TWIN_SMALL_VALUES))]
+    force = {name: zlib[name] for name in (
+        "text", "zeros", "text-random-text", "random-text", "tail-sector", "small-text",
+        "rewrite", "values-100", "values-130")}
+    force["random-chunks"] = [(0, r("w", 2 * TWIN_CHUNK))]
+    force["halves"] = [(0, h("x", 2 * piece))]
+    prop = {name: zlib[name] for name in (
+        "text", "text-halves-text", "halves-append", "random-text", "values-100")}
+    return {**{("zlib", name): steps for name, steps in zlib.items()},
+            **{("force", name): steps for name, steps in force.items()},
+            **{("prop", name): steps for name, steps in prop.items()}}
+
+
+def twins_fill(inputs: Path, sector: int, extra: dict) -> str:
+    """Stages the twins' steps and returns the commands writing them."""
+    files = twin_files(sector)
+    (inputs / "twins").mkdir(exist_ok=True)
+    manifest = []
+    commands = ["mkdir -p /mnt/twins/steps " +
+                " ".join(f"/mnt/twins/{mode}" for mode in TWIN_MODES)]
+    for (mode, name), steps in files.items():
+        entries = []
+        contents = bytearray()
+        for k, (offset, data) in enumerate(steps, 1):
+            step = f"{mode}-{name}.{k}"
+            (inputs / "twins" / step).write_bytes(data)
+            extra[f"twins/steps/{step}"] = data
+            entries.append(f"{offset}:{step}")
+            contents[len(contents):offset] = bytes(max(0, offset - len(contents)))
+            contents[offset:offset + len(data)] = data
+            commands.append(f"cat /input/twins/{step} > /mnt/twins/steps/{step}")
+        extra[f"twins/{mode}/{name}"] = bytes(contents)
+        manifest.append(f"{mode}\t{name}\t{','.join(entries)}\n")
+    (inputs / "twins" / "manifest.tsv").write_text("".join(manifest))
+    extra["twins/manifest.tsv"] = "".join(manifest).encode()
+    commands.append("cp /input/twins/manifest.tsv /mnt/twins/manifest.tsv")
+    commands.append("btrfs filesystem sync /mnt")
+    for mode, option in TWIN_MODES.items():
+        commands.append(f"mount -o remount,{option} /mnt")
+        for (twin_mode, name), steps in files.items():
+            if twin_mode != mode:
+                continue
+            target = f"/mnt/twins/{mode}/{name}"
+            commands.append(f"touch {target}")
+            if mode == "prop":
+                commands.append(f"btrfs property set {target} compression zlib")
+            for k, (offset, _) in enumerate(steps, 1):
+                commands.append(f"dd if=/input/twins/{mode}-{name}.{k} of={target} bs=4096 "
+                                f"seek={offset // 4096} conv=notrunc 2>/dev/null")
+                commands.append("btrfs filesystem sync /mnt")
+    commands.append("mount -o remount,compress=no /mnt")
+    # Linux's decisions, for the log: each twin's extent items and flags.
+    commands.append("btrfs inspect-internal dump-tree -t 5 /dev/vda > /tmp/twins.txt")
+    commands.append("echo BTRFS_REFERENCE_TWIN_COMPRESSED:"
+                    "$(grep -c 'extent compression 1' /tmp/twins.txt || true)")
+    return "\n".join(commands)
+
+
 def prepare(root: Path, profile: str, archive: Path) -> None:
     node_size, metadata, compression = PROFILES[profile]
     sector_size = SECTOR_SIZES.get(profile, 4096)
@@ -266,6 +416,8 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
     len_random = len(contents["random"])
     extra = {}
     fill = ":"
+    if profile in TWIN_PROFILES:
+        fill = twins_fill(inputs, sector_size, extra)
     if profile == "codecs":
         for directory in CODEC_DIRECTORIES:
             for i in range(LZO_FILES):

@@ -172,7 +172,7 @@ def main() -> None:
     args = parser.parse_args()
     profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "codecs", "sectors-16k",
                 "default-subvolume", "transactions-holes", "transactions-block-group-tree",
-                *sorted(DATA_PAYLOAD_PROFILES)]
+                "transactions-twins", "transactions-16k-twins", *sorted(DATA_PAYLOAD_PROFILES)]
     total = 0
     for profile in profiles:
         image = args.fixtures / f"{profile}.raw"

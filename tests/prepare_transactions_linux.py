@@ -44,7 +44,8 @@ NAMESPACE_ARGUMENT = {
     "groups": re.compile(r"^[0-9]+:[0-9]+$"),
     "quota": re.compile(r"^(consistent|inconsistent|rescan):[0-9]+$"),
     "verity": re.compile(r"^(none|sha256:[0-9a-f]{64}|sha512:[0-9a-f]{128})$"),
-    "compat_ro": re.compile(r"^0x[0-9a-f]+$")}
+    "compat_ro": re.compile(r"^0x[0-9a-f]+$"),
+    "layout": NAMESPACE_PATH}
 PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr", "subvolumes"}
 # Facts that may name the top-level directory itself.
 ROOT_KINDS = {"dir", "stat", "xattr", "noxattr", "flags", "times", "feature", "subvolume",
@@ -109,7 +110,7 @@ def load_scenario(directory, device_bytes):
             if (int(stage) not in stages or kind not in NAMESPACE_ARGUMENT or
                     not (safe_path(path) or (kind in ROOT_KINDS and path == "/")) or
                     not NAMESPACE_ARGUMENT[kind].match(argument) or
-                    (kind == "same" and not safe_path(argument))):
+                    (kind in ("same", "layout") and not safe_path(argument))):
                 raise ValueError(f"Invalid namespace record {line!r}")
             if (payload == "-") == (kind in PAYLOAD_KINDS):
                 raise ValueError(f"Invalid namespace payload {line!r}")

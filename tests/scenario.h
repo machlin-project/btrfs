@@ -301,7 +301,12 @@ enum expectation_kind {
 	 * algorithm mode, and value VERITY_DESC and VERITY_MERKLE items. */
 	EXPECT_VERITY,
 	/* The read-only compatible features in value are set. */
-	EXPECT_COMPAT_RO
+	EXPECT_COMPAT_RO,
+	/* The file's inode flags and file extent items equal those of other:
+	 * each item's offset and kind, a compressed or inline item's lengths
+	 * and codec; runs of adjacent uncompressed regular items, which the
+	 * allocator may split anywhere, count as one. */
+	EXPECT_LAYOUT
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -374,6 +379,7 @@ struct volatile_range {
  * old or new bytes. */
 #define DEVICE_VOLATILE_SECTOR DEVICE_SECTOR
 #define MAX_EXTENT_DISKS 256U
+#define MAX_LAYOUT_ENTRIES 4096U
 
 struct plan {
 	const char *name;
@@ -558,6 +564,8 @@ void expect_subvolume(struct plan *plan, size_t first, size_t last, const char *
     const char *source, int read_only);
 void expect_subvolumes(struct plan *plan, size_t first, size_t last, const char **paths);
 void expect_deleted(struct plan *plan, size_t first, size_t last, size_t count);
+void expect_layout(
+    struct plan *plan, size_t first, size_t last, const char *path, const char *other);
 void expect_compressed(struct plan *plan, size_t first, size_t last, const char *path,
     enum btrfs_compression codec, uint32_t regular, uint32_t inline_extents);
 void expect_extents(struct plan *plan, size_t first, size_t last, const char *path,
@@ -625,6 +633,7 @@ void subvolume_scenarios(struct context *context);
 void quota_scenarios(struct context *context);
 void squota_scenarios(struct context *context);
 void verity_scenarios(struct context *context);
+void twin_scenarios(struct context *context);
 /* Volume locks for a test that runs one thread: nothing ever waits. */
 extern const struct btrfs_volume_locks single_thread_locks;
 

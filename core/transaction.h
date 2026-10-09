@@ -150,6 +150,12 @@ struct btrfs_transaction {
 	 * keeps an orphan item until btrfs_transaction_evict completes it. */
 	struct btrfs_object_id deferred[BT_TRANSACTION_DEFERRED];
 	size_t deferred_count;
+	/* While a write rewrites its range (write_sizes): the file's size after
+	 * it and before it, which Linux's compression decisions read as i_size
+	 * and disk_i_size; other rewrites read the inode's size for both. */
+	uint64_t write_size;
+	uint64_t write_disk_size;
+	int write_sizes;
 	/* Inode numbers and directory indexes handed out in this transaction stay
 	 * monotonic even when the highest one is removed again. */
 	uint64_t next_objectid[BT_TRANSACTION_TREES];

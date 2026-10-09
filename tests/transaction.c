@@ -40,6 +40,7 @@ main(int argc, char **argv)
 	int quotas = 0;
 	int simple_quotas = 0;
 	int verity = 0;
+	int twins = 0;
 	int kernel_codecs = 0;
 	uint32_t random_first = 0;
 	uint32_t random_count = 0;
@@ -79,6 +80,8 @@ main(int argc, char **argv)
 			simple_quotas = 1;
 		} else if (strcmp(argv[i], "--verity") == 0) {
 			verity = 1;
+		} else if (strcmp(argv[i], "--twins") == 0) {
+			twins = 1;
 		} else if (strcmp(argv[i], "--kernel-codecs") == 0) {
 			kernel_codecs = 1;
 		} else if ((strcmp(argv[i], "--random") == 0 ||
@@ -105,7 +108,7 @@ main(int argc, char **argv)
 	context->env.decompress = decompress_device;
 	context->writer = (struct btrfs_write_environment){ context->device, write_device,
 		flush_device, kernel_codecs ? kernel_compress : btrfs_image_compress,
-		BTRFS_COMPRESSION_NONE };
+		BTRFS_COMPRESSION_NONE, 0 };
 	context->seed = UINT32_C(0x142857);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	btrfs_get_info(fs, &info);
@@ -160,6 +163,9 @@ main(int argc, char **argv)
 	}
 	if (verity) {
 		verity_scenarios(context);
+	}
+	if (twins) {
+		twin_scenarios(context);
 	}
 	if (random_count != 0) {
 		random_scenarios(context, random_first, random_count, random_quick);

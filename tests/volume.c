@@ -366,7 +366,7 @@ harness_open(struct harness *harness, const char *path)
 	harness->environment.release = overlay_release;
 	harness->environment.decompress = overlay_decompress;
 	harness->device = (struct btrfs_write_environment){ &harness->overlay, overlay_write,
-		overlay_flush, NULL, BTRFS_COMPRESSION_NONE };
+		overlay_flush, NULL, BTRFS_COMPRESSION_NONE, 0 };
 	pthread_mutex_init(&harness->locks.mutex, NULL);
 	pthread_cond_init(&harness->locks.condition, NULL);
 	harness->callbacks =

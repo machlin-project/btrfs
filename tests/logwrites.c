@@ -537,7 +537,7 @@ main(int argc, char **argv)
 	state.environment.release = release;
 	state.environment.decompress = NULL;
 	state.writer = (struct btrfs_write_environment){ &state, device_write, device_flush, NULL,
-		BTRFS_COMPRESSION_NONE };
+		BTRFS_COMPRESSION_NONE, 0 };
 	parse_log(&state);
 	/* Epochs end at a flush, before its write, and at a FUA write or a mark,
 	 * after it: a FUA write is durable once complete, and the workload issues
