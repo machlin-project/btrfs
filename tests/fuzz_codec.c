@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-/* libFuzzer entry point for the adapters' LZO1X and Zstandard decoders and the
- * kernel's Zstandard encoder. The first input byte selects the codec (its top
- * bit an encoder round trip of the rest), the next two the output capacity;
+/* libFuzzer entry point for the adapters' LZO1X and Zstandard decoders and
+ * encoders. The first input byte selects the codec (its top bit an encoder
+ * round trip of the rest), the next two the output capacity;
  * the rest is the stream. With the reference libraries the decoders follow the
  * oracles of tests/codec.c: LZO1X as liblzo2 with Linux's stricter end
  * instruction, Zstandard within what libzstd accepts as one buffer and at
@@ -22,6 +22,7 @@
 
 static _Alignas(16) unsigned char workspace[BTRFS_ZSTD_WORKSPACE_BYTES];
 static _Alignas(16) unsigned char encoder[BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES];
+static _Alignas(16) unsigned char lzo_encoder[BTRFS_LZO1X_COMPRESS_WORKSPACE_BYTES];
 static unsigned char output[1U << 16];
 static unsigned char reference[1U << 16];
 
@@ -117,8 +118,39 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 		return 0;
 	}
 	capacity = ((size_t)data[1] | (size_t)data[2] << 8) + 1U;
-	/* Every frame the encoder writes, into any capacity, decodes to its
-	 * input with this decoder and with libzstd. */
+	/* Every LZO1X stream the encoder writes, into any capacity, decodes to
+	 * its input with this decoder and with liblzo2 under Linux's end rule. */
+	if ((data[0] & FUZZ_ENCODE) != 0 && (data[0] & 1U) == 0) {
+		expected = size - FUZZ_HEADER_BYTES;
+		if (expected > sizeof(reference)) {
+			return 0;
+		}
+		capacity = capacity < sizeof(output) ? capacity : sizeof(output);
+		result = btrfs_lzo1x_compress(
+		    lzo_encoder, data + FUZZ_HEADER_BYTES, expected, output, capacity, &produced);
+		if (result == BTRFS_RANGE) {
+			return 0;
+		}
+		if (result != BTRFS_OK || produced > capacity ||
+		    btrfs_lzo1x_decompress(
+			output, produced, reference, sizeof(reference), &decoded) != BTRFS_OK ||
+		    decoded != expected ||
+		    memcmp(reference, data + FUZZ_HEADER_BYTES, expected) != 0) {
+			abort();
+		}
+#ifdef BTRFS_HAVE_LZO
+		reference_size = sizeof(reference);
+		if (lzo1x_decompress_safe(output, produced, reference, &reference_size, NULL) !=
+			LZO_E_OK ||
+		    reference_size != expected ||
+		    memcmp(reference, data + FUZZ_HEADER_BYTES, expected) != 0) {
+			abort();
+		}
+#endif
+		return 0;
+	}
+	/* Every frame the Zstandard encoder writes, into any capacity, decodes
+	 * to its input with this decoder and with libzstd. */
 	if ((data[0] & FUZZ_ENCODE) != 0) {
 		expected = size - FUZZ_HEADER_BYTES;
 		if (expected == 0 || expected > sizeof(reference)) {

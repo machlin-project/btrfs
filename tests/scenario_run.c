@@ -201,10 +201,13 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 		} else if (e->kind == EXPECT_COMPRESSED) {
 			/* codec:regular:inline */
 			REQUIRE(e->value == BTRFS_COMPRESSION_ZLIB ||
+			    e->value == BTRFS_COMPRESSION_LZO ||
 			    e->value == BTRFS_COMPRESSION_ZSTD);
 			REQUIRE(snprintf(argument, sizeof(argument), "%s:%u:%u",
-				    e->value == BTRFS_COMPRESSION_ZLIB ? "zlib" : "zstd", e->links,
-				    e->mode) < (int)sizeof(argument));
+				    e->value == BTRFS_COMPRESSION_ZLIB	    ? "zlib"
+					: e->value == BTRFS_COMPRESSION_LZO ? "lzo"
+									    : "zstd",
+				    e->links, e->mode) < (int)sizeof(argument));
 			detail = argument;
 		} else if (e->kind == EXPECT_QUOTA) {
 			/* consistent, inconsistent or rescan:qgroups */

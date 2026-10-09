@@ -162,6 +162,7 @@ list_names() {
 check_compressed() {
     inode=$(stat -c '%i' "$1")
     codec=1
+    [ "${2%%:*}" = lzo ] && codec=2
     [ "${2%%:*}" = zstd ] && codec=3
     counts=$(tree_dump "$(tree_of "$1")" |
         awk -v inode="$inode" -v codec="$codec" '

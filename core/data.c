@@ -9,6 +9,9 @@
 /* Linux compresses data in pieces of at most 128 KiB (BTRFS_MAX_UNCOMPRESSED),
  * each one extent. */
 #define BT_COMPRESS_CHUNK (128U * 1024U)
+/* Btrfs's LZO extent: a little-endian 32-bit total length, then a segment per
+ * sector of input, each a 32-bit length and an LZO1X stream. */
+#define BT_LZO_LENGTH_BYTES 4U
 #define BT_FILE_SIZE_LIMIT ((UINT64_C(1) << 63) - 1)
 /* Tree nodes a queued reference change edits at commit besides checksum
  * leaves: the extent item's leaf and, for a freed extent, its free-space
@@ -563,8 +566,8 @@ bt_tx_write_data(
  * inode_need_compress and compress_type choose: none for NODATACOW, NODATASUM
  * or NOCOMPRESS files; else the file's compression property, else the mount's
  * codec when the file has COMPRESS or the mount compresses everything (zlib
- * when the mount names none). LZO is read only here: such files are written
- * uncompressed. Without a compress callback nothing is compressed. */
+ * when the mount names none). Without a compress callback nothing is
+ * compressed. */
 static enum btrfs_result
 bt_tx_codec(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t ino,
     const struct bt_disk_inode *inode, enum btrfs_compression *codec)
@@ -588,10 +591,78 @@ bt_tx_codec(struct btrfs_transaction *transaction, struct bt_owned_root *tree, u
 	} else if ((flags & BT_INODE_COMPRESS) != 0 || mount != BTRFS_COMPRESSION_NONE) {
 		*codec = mount != BTRFS_COMPRESSION_NONE ? mount : BTRFS_COMPRESSION_ZLIB;
 	}
-	if (*codec != BTRFS_COMPRESSION_ZLIB && *codec != BTRFS_COMPRESSION_ZSTD) {
+	if (*codec != BTRFS_COMPRESSION_ZLIB && *codec != BTRFS_COMPRESSION_LZO &&
+	    *codec != BTRFS_COMPRESSION_ZSTD) {
 		*codec = BTRFS_COMPRESSION_NONE;
 	}
 	return BTRFS_OK;
+}
+
+/* Linux's lzo_compress_folios: the environment compresses each sector of
+ * input into one LZO1X segment; a segment's length never crosses a sector,
+ * which is padded with zeros instead, and the output is given up (RANGE) once
+ * more than two sectors are in and it is larger than they are. */
+static enum btrfs_result
+bt_tx_lzo(struct btrfs_transaction *transaction, const uint8_t *input, size_t length,
+    uint8_t *output, size_t capacity, size_t *size)
+{
+	struct bt_le32 field;
+	size_t sector = transaction->base->info.sector_size;
+	size_t position = BT_LZO_LENGTH_BYTES;
+	size_t done;
+	size_t chunk;
+	size_t pad;
+	size_t segment;
+	enum btrfs_result error;
+
+	if (capacity < BT_LZO_LENGTH_BYTES) {
+		return BTRFS_RANGE;
+	}
+	for (done = 0; done < length; done += chunk) {
+		chunk = length - done < sector ? length - done : sector;
+		pad = sector - position % sector;
+		if (pad < BT_LZO_LENGTH_BYTES) {
+			if (pad > capacity - position) {
+				return BTRFS_RANGE;
+			}
+			bt_zero(output + position, pad);
+			position += pad;
+		}
+		if (capacity - position < BT_LZO_LENGTH_BYTES) {
+			return BTRFS_RANGE;
+		}
+		error = transaction->io.compress(transaction->io.context, BTRFS_COMPRESSION_LZO,
+		    input + done, chunk, output + position + BT_LZO_LENGTH_BYTES,
+		    capacity - position - BT_LZO_LENGTH_BYTES, &segment);
+		if (error == BTRFS_OK && segment > capacity - position - BT_LZO_LENGTH_BYTES) {
+			error = BTRFS_CORRUPT;
+		}
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		bt_put32(&field, (uint32_t)segment);
+		bt_copy(output + position, &field, sizeof(field));
+		position += BT_LZO_LENGTH_BYTES + segment;
+		if (done + chunk > 2U * sector && done + chunk < position) {
+			return BTRFS_RANGE;
+		}
+	}
+	bt_put32(&field, (uint32_t)position);
+	bt_copy(output, &field, sizeof(field));
+	*size = position;
+	return BTRFS_OK;
+}
+
+/* One compressed stream of codec, LZO in Btrfs's segments. */
+static enum btrfs_result
+bt_tx_encode(struct btrfs_transaction *transaction, enum btrfs_compression codec,
+    const uint8_t *input, size_t length, uint8_t *output, size_t capacity, size_t *size)
+{
+	if (codec == BTRFS_COMPRESSION_LZO) {
+		return bt_tx_lzo(transaction, input, length, output, capacity, size);
+	}
+	return transaction->io.compress(
+	    transaction->io.context, codec, input, length, output, capacity, size);
 }
 
 /* The extent item of a new data extent at logical of size bytes, with the
@@ -656,6 +727,9 @@ bt_tx_extent(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	if (error == BTRFS_OK && codec == BTRFS_COMPRESSION_ZSTD) {
 		bt_ns_require_feature(transaction, BT_FEATURE_COMPRESS_ZSTD);
 	}
+	if (error == BTRFS_OK && codec == BTRFS_COMPRESSION_LZO) {
+		bt_ns_require_feature(transaction, BT_FEATURE_COMPRESS_LZO);
+	}
 	return error;
 }
 
@@ -671,8 +745,8 @@ bt_tx_compress(struct btrfs_transaction *transaction, enum btrfs_compression cod
 	enum btrfs_result error;
 
 	*stored = 0;
-	error = transaction->io.compress(transaction->io.context, codec, bytes, (size_t)length,
-	    compressed, BT_COMPRESS_CHUNK, &size);
+	error = bt_tx_encode(
+	    transaction, codec, bytes, (size_t)length, compressed, BT_COMPRESS_CHUNK, &size);
 	if (error == BTRFS_RANGE || error == BTRFS_UNSUPPORTED) {
 		return BTRFS_OK;
 	}
@@ -1043,8 +1117,8 @@ bt_tx_small(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	if (error == BTRFS_OK) {
 		bt_copy(buffer + offset, bytes, size);
 		if (codec != BTRFS_COMPRESSION_NONE) {
-			error = transaction->io.compress(transaction->io.context, codec, buffer,
-			    (size_t) final, data, BT_INLINE_WRITE_LIMIT, &data_size);
+			error = bt_tx_encode(transaction, codec, buffer, (size_t) final, data,
+			    BT_INLINE_WRITE_LIMIT, &data_size);
 			if (error == BTRFS_RANGE || error == BTRFS_UNSUPPORTED ||
 			    data_size >= final) {
 				error = BTRFS_OK;
@@ -1078,6 +1152,9 @@ bt_tx_small(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 		bt_put64(&inode->nbytes, bt_u64(inode->nbytes) - removed + final);
 		if (codec == BTRFS_COMPRESSION_ZSTD) {
 			bt_ns_require_feature(transaction, BT_FEATURE_COMPRESS_ZSTD);
+		}
+		if (codec == BTRFS_COMPRESSION_LZO) {
+			bt_ns_require_feature(transaction, BT_FEATURE_COMPRESS_LZO);
 		}
 		*stored = 1;
 	}

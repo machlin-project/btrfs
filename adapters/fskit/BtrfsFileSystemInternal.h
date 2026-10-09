@@ -60,6 +60,8 @@ NS_ASSUME_NONNULL_BEGIN
 #define BTRFS_FSKIT_COMMIT_SECONDS 5U
 /* Background steps (btrfs_volume_maintain) each commit tick may take. */
 #define BTRFS_FSKIT_MAINTENANCE_STEPS 16U
+/* Linux's default btrfs zlib level. */
+#define BTRFS_FSKIT_ZLIB_LEVEL 3
 /* Tree nodes one namespace or attribute operation may change, and the data
  * bytes one more node covers (btrfs_volume_join). */
 #define BTRFS_FSKIT_OPERATION_NODES 64U

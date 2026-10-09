@@ -494,6 +494,82 @@ lzo_tests(void)
 }
 #endif
 
+/* The LZO1X encoder: segments of every sector size Btrfs uses, of each data
+ * pattern and of crafted repeats whose distances need M2, M3 and M4 matches
+ * and length extensions, decode to their input with this decoder and, when
+ * the build has it, with liblzo2 under Linux's end check; a stream never
+ * starts with 17, which Linux's decoder takes for an LZO-RLE version, and one
+ * byte less of output space is refused. */
+#define LZO_ENCODER_MAX_INPUT 65536U
+#define LZO_ENCODER_ROUNDS 600U
+#define LZO_WORST(size) ((size) + (size) / 16U + 64U + 3U)
+#define LZO_FAR_REPEAT 40000U
+#define LZO_MIDDLE_REPEAT 12000U
+#define LZO_NEAR_REPEAT 700U
+#define LZO_REPEAT_BYTES 300U
+/* A first byte Linux's decoder reads as LZO-RLE's marker. */
+#define LZO_RLE_FIRST_BYTE 17U
+
+static void
+lzo_encoder_tests(void)
+{
+	static const size_t sectors[] = { 4096, 16384, 65536 };
+	static uint8_t data[LZO_ENCODER_MAX_INPUT];
+	static uint8_t stream[LZO_WORST(LZO_ENCODER_MAX_INPUT)];
+	static uint8_t output[LZO_ENCODER_MAX_INPUT];
+	void *work = malloc(BTRFS_LZO1X_COMPRESS_WORKSPACE_BYTES);
+	size_t size;
+	size_t produced;
+	size_t decoded;
+	unsigned round;
+	unsigned smaller = 0;
+#ifdef BTRFS_HAVE_LZO
+	lzo_uint reference_size;
+#endif
+
+	REQUIRE(work != NULL);
+	for (round = 0; round < LZO_ENCODER_ROUNDS; round++) {
+		size = round < 20 ? round : 1U + next_random() % sectors[round % 3U];
+		if (round % 50U == 20U) {
+			size = sectors[(round / 50U) % 3U];
+		}
+		fill(data, size, (enum pattern)(round % PATTERN_COUNT));
+		if (round % 7U == 3U && size > LZO_FAR_REPEAT + LZO_REPEAT_BYTES) {
+			/* Repeats far enough apart for M4, M3 and M2 matches. */
+			memcpy(data + LZO_FAR_REPEAT, data, LZO_REPEAT_BYTES);
+			memcpy(data + LZO_MIDDLE_REPEAT, data + 1, LZO_REPEAT_BYTES);
+			memcpy(data + LZO_NEAR_REPEAT, data + 2, LZO_REPEAT_BYTES);
+		}
+		REQUIRE(btrfs_lzo1x_compress(work, data, size, stream, sizeof(stream), &produced) ==
+		    BTRFS_OK);
+		REQUIRE(produced <= LZO_WORST(size));
+		REQUIRE(produced < 5U || stream[0] != LZO_RLE_FIRST_BYTE);
+		REQUIRE(btrfs_lzo1x_decompress(
+			    stream, produced, output, sizeof(output), &decoded) == BTRFS_OK);
+		REQUIRE(decoded == size && memcmp(output, data, size) == 0);
+#ifdef BTRFS_HAVE_LZO
+		reference_size = sizeof(output);
+		REQUIRE(lzo1x_decompress_safe(stream, produced, output, &reference_size, NULL) ==
+		    LZO_E_OK);
+		REQUIRE(reference_size == size && memcmp(output, data, size) == 0);
+		REQUIRE(lzo_linux_end(stream, produced));
+#endif
+		REQUIRE(btrfs_lzo1x_compress(work, data, size, stream, produced - 1U, &decoded) ==
+		    BTRFS_RANGE);
+		smaller += produced < size;
+	}
+	free(work);
+	printf("lzo1x encoder: %u segments decoded by this decoder%s, %u smaller than their "
+	       "input PASS\n",
+	    LZO_ENCODER_ROUNDS,
+#ifdef BTRFS_HAVE_LZO
+	    " and liblzo2 with Linux's end check",
+#else
+	    "",
+#endif
+	    smaller);
+}
+
 /* Streams written by hand, for builds without the reference libraries. */
 #define ENCODER_ROUNDS 900U
 
@@ -609,6 +685,7 @@ main(void)
 	REQUIRE(workspace != NULL);
 	fixed_tests(workspace);
 	zstd_encoder_tests(workspace);
+	lzo_encoder_tests();
 #ifdef BTRFS_HAVE_ZSTD
 	zstd_tests(workspace);
 #else

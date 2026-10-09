@@ -37,7 +37,7 @@ NAMESPACE_ARGUMENT = {
     "subvolume": re.compile(r"^(ro|rw):(-|/|(/[A-Za-z0-9._-]{1,255})+)$"),
     "subvolumes": re.compile(r"^-$"),
     "deleted": re.compile(r"^[0-9]+$"),
-    "compressed": re.compile(r"^(zlib|zstd):[0-9]+:[0-9]+$"),
+    "compressed": re.compile(r"^(zlib|lzo|zstd):[0-9]+:[0-9]+$"),
     "extents": re.compile(r"^[0-9]+:[0-9]+:[0-9]+$"),
     "holes": re.compile(r"^[0-9]+$"),
     "bitmaps": re.compile(r"^[01]$"),

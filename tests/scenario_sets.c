@@ -435,6 +435,74 @@ data_compress_plan(struct context *context)
 	run_plan(context, &plan);
 }
 
+/* LZO on write, in Btrfs's segments of one sector each: the same writes as
+ * the zlib plan on files whose property names lzo, which records the LZO
+ * incompat feature. */
+static void
+data_compress_lzo_plan(struct context *context)
+{
+	static uint8_t text[COMPRESS_TEXT_BYTES];
+	static uint8_t noise[COMPRESS_NOISE_BYTES];
+	static uint8_t small[COMPRESS_SMALL_BYTES];
+	static uint8_t patch[COMPRESS_PATCH_BYTES];
+	static uint8_t grown[2 * COMPRESS_SMALL_BYTES];
+	uint8_t *patched;
+	struct plan plan;
+
+	fill_text(text, sizeof(text), 11);
+	fill_random(noise, sizeof(noise), 12);
+	fill_text(small, sizeof(small), 13);
+	fill_text(patch, sizeof(patch), 14);
+	fill_text(grown, sizeof(grown), 15);
+	memcpy(grown, small, sizeof(small));
+	patched = malloc(sizeof(text));
+	REQUIRE(patched != NULL);
+	memcpy(patched, text, sizeof(text));
+	memcpy(patched + COMPRESS_PATCH_OFFSET, patch, sizeof(patch));
+	plan_init(&plan);
+	plan.name = "data-compress-lzo";
+	(void)plan_file(context, &plan, "/data/small");
+	plan_create(&plan, 1, "/data/lzo", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_set_xattr(&plan, 1, "/data/lzo", COMPRESSION_PROPERTY, "lzo", 3, 0);
+	plan_write_new(&plan, 1, "/data/lzo", 0, text, sizeof(text));
+	plan_create(&plan, 1, "/data/lzo-noise", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_set_xattr(&plan, 1, "/data/lzo-noise", COMPRESSION_PROPERTY, "lzo", 3, 0);
+	plan_write_new(&plan, 1, "/data/lzo-noise", 0, noise, sizeof(noise));
+	plan_create(&plan, 1, "/data/lzo-small", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_set_xattr(&plan, 1, "/data/lzo-small", COMPRESSION_PROPERTY, "lzo", 3, 0);
+	plan_write_new(&plan, 1, "/data/lzo-small", 0, small, sizeof(small));
+	plan_write_new(&plan, 2, "/data/lzo", COMPRESS_PATCH_OFFSET, patch, sizeof(patch));
+	plan_write_new(
+	    &plan, 2, "/data/lzo-small", sizeof(small), grown + sizeof(small), sizeof(small));
+	plan_truncate_new(&plan, 3, "/data/lzo", COMPRESS_TRUNCATE_SIZE);
+	expect_file(&plan, 1, 1, "/data/lzo", text, sizeof(text));
+	expect_file(&plan, 2, 2, "/data/lzo", patched, sizeof(text));
+	expect_file(&plan, 3, LAST_STAGE, "/data/lzo", patched, COMPRESS_TRUNCATE_SIZE);
+	/* As the zlib plan's file: 128 KiB, 128 KiB and the rest; the patch
+	 * splits the second extent; the truncation drops the third. */
+	expect_compressed(&plan, 1, 1, "/data/lzo", BTRFS_COMPRESSION_LZO, 3, 0);
+	expect_compressed(&plan, 2, 2, "/data/lzo", BTRFS_COMPRESSION_LZO,
+	    context->sector_size == 4096 ? 5 : 4, 0);
+	expect_compressed(&plan, 3, LAST_STAGE, "/data/lzo", BTRFS_COMPRESSION_LZO,
+	    context->sector_size == 4096 ? 4 : 3, 0);
+	expect_compressed(&plan, 1, LAST_STAGE, "/data/lzo-noise", BTRFS_COMPRESSION_LZO, 0, 0);
+	expect_file(&plan, 1, LAST_STAGE, "/data/lzo-noise", noise, sizeof(noise));
+	expect_compressed(&plan, 1, 1, "/data/lzo-small", BTRFS_COMPRESSION_LZO, 0, 1);
+	expect_file(&plan, 1, 1, "/data/lzo-small", small, sizeof(small));
+	/* Within one 16 KiB sector the grown file stays inline, as the zlib plan's. */
+	if (context->sector_size == 4096) {
+		expect_compressed(
+		    &plan, 2, LAST_STAGE, "/data/lzo-small", BTRFS_COMPRESSION_LZO, 1, 0);
+	} else {
+		expect_compressed(
+		    &plan, 2, LAST_STAGE, "/data/lzo-small", BTRFS_COMPRESSION_LZO, 0, 1);
+	}
+	expect_file(&plan, 2, LAST_STAGE, "/data/lzo-small", grown, sizeof(grown));
+	expect_value(&plan, 1, LAST_STAGE, EXPECT_FEATURE, "/", BT_FEATURE_COMPRESS_LZO);
+	run_plan(context, &plan);
+	free(patched);
+}
+
 /* The compress mount option: plain files compress with its codec, which
  * records the ZSTD incompat feature; a file whose property says "no" and a
  * NODATASUM file stay uncompressed. */
@@ -660,6 +728,7 @@ data_scenarios(struct context *context)
 	fallocate_plans(context);
 	data_stream_test(context);
 	data_compress_plan(context);
+	data_compress_lzo_plan(context);
 	data_compress_mount_plan(context);
 	release_plans(context);
 }

@@ -307,6 +307,54 @@ btrfs_resource_release(void *context, void *allocation, size_t size)
 	free(allocation);
 }
 
+/* Compresses one piece as the kernel adapter does: zlib at Linux's default
+ * level, and Zstandard and LZO1X segments with the shared encoders. The core
+ * stores the piece uncompressed when the stream would not save space (RANGE). */
+static enum btrfs_result
+btrfs_resource_compress(void *context, enum btrfs_compression codec, const void *input,
+    size_t input_size, void *output, size_t capacity, size_t *size)
+{
+	z_stream stream;
+	void *workspace;
+	enum btrfs_result encoded;
+	int result;
+
+	(void)context;
+	*size = 0;
+	if (codec == BTRFS_COMPRESSION_LZO || codec == BTRFS_COMPRESSION_ZSTD) {
+		workspace =
+		    malloc(codec == BTRFS_COMPRESSION_LZO ? BTRFS_LZO1X_COMPRESS_WORKSPACE_BYTES
+							  : BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES);
+		if (workspace == NULL) {
+			return BTRFS_NO_MEMORY;
+		}
+		encoded = codec == BTRFS_COMPRESSION_LZO
+		    ? btrfs_lzo1x_compress(workspace, input, input_size, output, capacity, size)
+		    : btrfs_zstd_compress(workspace, input, input_size, output, capacity, size);
+		free(workspace);
+		return encoded;
+	}
+	if (codec != BTRFS_COMPRESSION_ZLIB) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if (input_size > UINT32_MAX || capacity > UINT32_MAX) {
+		return BTRFS_RANGE;
+	}
+	memset(&stream, 0, sizeof(stream));
+	result = deflateInit(&stream, BTRFS_FSKIT_ZLIB_LEVEL);
+	if (result != Z_OK) {
+		return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_IO;
+	}
+	stream.next_in = (Bytef *)input;
+	stream.avail_in = (uInt)input_size;
+	stream.next_out = output;
+	stream.avail_out = (uInt)capacity;
+	result = deflate(&stream, Z_FINISH);
+	*size = stream.total_out;
+	(void)deflateEnd(&stream);
+	return result == Z_STREAM_END ? BTRFS_OK : BTRFS_RANGE;
+}
+
 static enum btrfs_result
 btrfs_resource_decompress(void *context, enum btrfs_compression codec, const void *input,
     size_t input_size, void *output, size_t capacity, size_t *produced)
@@ -907,6 +955,7 @@ btrfs_timespec(struct btrfs_time time)
 		writer.context = (__bridge void *)device;
 		writer.write = btrfs_device_write;
 		writer.flush = btrfs_device_flush;
+		writer.compress = btrfs_resource_compress;
 		writer.compression = BTRFS_COMPRESSION_NONE;
 	}
 	*result =

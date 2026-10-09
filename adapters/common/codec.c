@@ -198,6 +198,195 @@ btrfs_lzo1x_decompress(
 	}
 }
 
+/* The LZO1X encoder: greedy matches of four bytes or more found through a
+ * hash of four bytes, encoded in the shortest instruction their distance and
+ * length allow (M2 within 2 KiB and up to 8 bytes, M3 within 16 KiB, M4
+ * beyond, to 48 KiB); literals before the first match use the first-byte form,
+ * one to three later literals the two low bits of the match before them, and
+ * longer runs an instruction of their own. M1 is never written, and the
+ * stream never starts with 17, which Linux's decoder reads as an LZO-RLE
+ * version. */
+#define LZO_HASH_BITS 12U
+#define LZO_HASH_ENTRIES (1U << LZO_HASH_BITS)
+#define LZO_HASH_MULTIPLIER UINT32_C(2654435761)
+#define LZO_MIN_MATCH 4U
+#define LZO_M2_MAX_LENGTH 8U
+#define LZO_M2_MAX_DISTANCE 2048U
+#define LZO_M3_MAX_DISTANCE 16384U
+#define LZO_M4_MAX_DISTANCE 49151U
+#define LZO_M2_MARKER 64U
+#define LZO_M3_MARKER 32U
+#define LZO_M4_MARKER 16U
+#define LZO_M3_LENGTH_BITS 31U
+#define LZO_M4_LENGTH_BITS 7U
+#define LZO_RUN_LENGTH_BITS 15U
+#define LZO_FIRST_LITERALS_MAX 238U
+#define LZO_EXTENSION_UNIT 255U
+#define LZO_NO_STATE SIZE_MAX
+
+_Static_assert(BTRFS_LZO1X_COMPRESS_WORKSPACE_BYTES >= LZO_HASH_ENTRIES * sizeof(uint32_t),
+    "LZO1X match table");
+
+struct lzo_writer {
+	uint8_t *out;
+	size_t position;
+	size_t capacity;
+	/* The byte whose two low bits count the literals after the last match. */
+	size_t state;
+	int started;
+};
+
+static void
+lzo_put(struct lzo_writer *writer, unsigned byte)
+{
+	if (writer->position < writer->capacity) {
+		writer->out[writer->position] = (uint8_t)byte;
+	}
+	writer->position++;
+}
+
+/* A length extension: a zero byte for each 255, then the rest (1-255). */
+static void
+lzo_put_extension(struct lzo_writer *writer, size_t value)
+{
+	while (value > LZO_EXTENSION_UNIT) {
+		lzo_put(writer, 0);
+		value -= LZO_EXTENSION_UNIT;
+	}
+	lzo_put(writer, (unsigned)value);
+}
+
+static void
+lzo_put_literals(struct lzo_writer *writer, const uint8_t *literals, size_t count)
+{
+	size_t i;
+
+	if (count == 0) {
+		return;
+	}
+	if (!writer->started) {
+		if (count <= LZO_FIRST_LITERALS_MAX) {
+			lzo_put(writer, LZO_FIRST_LITERALS + (unsigned)count);
+		} else {
+			lzo_put(writer, 0);
+			lzo_put_extension(writer, count - 3U - LZO_RUN_LENGTH_BITS);
+		}
+	} else if (count < LZO_RUN_STATE) {
+		if (writer->state < writer->capacity) {
+			writer->out[writer->state] |= (uint8_t)count;
+		}
+	} else if (count - 3U <= LZO_RUN_LENGTH_BITS) {
+		lzo_put(writer, (unsigned)(count - 3U));
+	} else {
+		lzo_put(writer, 0);
+		lzo_put_extension(writer, count - 3U - LZO_RUN_LENGTH_BITS);
+	}
+	writer->started = 1;
+	for (i = 0; i < count; i++) {
+		lzo_put(writer, literals[i]);
+	}
+}
+
+static void
+lzo_put_match(struct lzo_writer *writer, size_t distance, size_t length)
+{
+	size_t field;
+
+	writer->started = 1;
+	if (length <= LZO_M2_MAX_LENGTH && distance <= LZO_M2_MAX_DISTANCE) {
+		field = distance - 1U;
+		writer->state = writer->position;
+		lzo_put(writer, (unsigned)((length - 1U) << 5 | (field & 7U) << 2));
+		lzo_put(writer, (unsigned)(field >> 3));
+		return;
+	}
+	if (distance <= LZO_M3_MAX_DISTANCE) {
+		field = distance - 1U;
+		if (length - 2U <= LZO_M3_LENGTH_BITS) {
+			lzo_put(writer, LZO_M3_MARKER | (unsigned)(length - 2U));
+		} else {
+			lzo_put(writer, LZO_M3_MARKER);
+			lzo_put_extension(writer, length - 2U - LZO_M3_LENGTH_BITS);
+		}
+	} else {
+		field = distance - LZO_MATCH_16K_DISTANCE;
+		if (length - 2U <= LZO_M4_LENGTH_BITS) {
+			lzo_put(writer,
+			    LZO_M4_MARKER | (unsigned)(field >> 11 & 8U) | (unsigned)(length - 2U));
+		} else {
+			lzo_put(writer, LZO_M4_MARKER | (unsigned)(field >> 11 & 8U));
+			lzo_put_extension(writer, length - 2U - LZO_M4_LENGTH_BITS);
+		}
+		field &= 0x3fffU;
+	}
+	writer->state = writer->position;
+	lzo_put(writer, (unsigned)(field << 2 & 0xffU));
+	lzo_put(writer, (unsigned)(field >> 6));
+}
+
+static uint32_t
+lzo_load32(const uint8_t *bytes)
+{
+	return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 | (uint32_t)bytes[2] << 16 |
+	    (uint32_t)bytes[3] << 24;
+}
+
+enum btrfs_result
+btrfs_lzo1x_compress(void *workspace, const void *input, size_t input_size, void *output,
+    size_t capacity, size_t *produced)
+{
+	struct lzo_writer writer = { output, 0, capacity, LZO_NO_STATE, 0 };
+	const uint8_t *in = input;
+	uint32_t *table = workspace;
+	size_t position = 0;
+	size_t literal = 0;
+	size_t candidate;
+	size_t length;
+	uint32_t word;
+	uint32_t slot;
+	size_t i;
+
+	if (workspace == NULL || (input == NULL && input_size != 0) || output == NULL ||
+	    produced == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	for (i = 0; i < LZO_HASH_ENTRIES; i++) {
+		table[i] = 0;
+	}
+	while (input_size >= LZO_MIN_MATCH && position <= input_size - LZO_MIN_MATCH) {
+		word = lzo_load32(in + position);
+		slot = (word * LZO_HASH_MULTIPLIER) >> (32U - LZO_HASH_BITS);
+		/* Entries hold a position plus one; zero is empty. */
+		candidate = table[slot];
+		table[slot] = (uint32_t)(position + 1U);
+		if (candidate == 0 || position - (candidate - 1U) > LZO_M4_MAX_DISTANCE ||
+		    lzo_load32(in + candidate - 1U) != word) {
+			position++;
+			continue;
+		}
+		candidate--;
+		length = LZO_MIN_MATCH;
+		while (position + length < input_size &&
+		    in[candidate + length] == in[position + length]) {
+			length++;
+		}
+		lzo_put_literals(&writer, in + literal, position - literal);
+		lzo_put_match(&writer, position - candidate, length);
+		position += length;
+		literal = position;
+	}
+	lzo_put_literals(&writer, in + literal, input_size - literal);
+	/* The end: an M4 instruction of length 3 at distance 0. */
+	lzo_put(&writer, LZO_M4_MARKER | 1U);
+	lzo_put(&writer, 0);
+	lzo_put(&writer, 0);
+	if (writer.position > capacity) {
+		return BTRFS_RANGE;
+	}
+	*produced = writer.position;
+	return BTRFS_OK;
+}
+
 /* Zstandard (RFC 8878). Literals of a compressed block are decoded into the end
  * of the output, after everything the block can write: the block writes at
  * most all its literals plus its matches, so writing never overtakes the

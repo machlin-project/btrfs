@@ -144,9 +144,9 @@ btrfs_xnu_decompress(void *context, enum btrfs_compression codec, const void *in
 }
 
 /* Compresses one chunk: zlib as Linux's btrfs zlib does, at its default level,
- * and Zstandard with the shared kernel encoder, which compresses less than
- * Linux's. The core stores the chunk uncompressed when the stream would not
- * save space (RANGE) or the codec has no encoder here (UNSUPPORTED: LZO). */
+ * and Zstandard and LZO1X segments with the shared kernel encoders, which
+ * compress less than Linux's. The core stores the chunk uncompressed when the
+ * stream would not save space (RANGE). */
 static enum btrfs_result
 btrfs_xnu_compress(void *context, enum btrfs_compression codec, const void *input,
     size_t input_size, void *output, size_t capacity, size_t *size)
@@ -158,6 +158,17 @@ btrfs_xnu_compress(void *context, enum btrfs_compression codec, const void *inpu
 
 	(void)context;
 	*size = 0;
+	if (codec == BTRFS_COMPRESSION_LZO) {
+		workspace =
+		    _MALLOC(BTRFS_LZO1X_COMPRESS_WORKSPACE_BYTES, M_TEMP, M_WAITOK | M_NULL);
+		if (workspace == NULL) {
+			return BTRFS_NO_MEMORY;
+		}
+		encoded =
+		    btrfs_lzo1x_compress(workspace, input, input_size, output, capacity, size);
+		_FREE(workspace, M_TEMP);
+		return encoded;
+	}
 	if (codec == BTRFS_COMPRESSION_ZSTD) {
 		workspace = _MALLOC(BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES, M_TEMP, M_WAITOK | M_NULL);
 		if (workspace == NULL) {

@@ -17,8 +17,10 @@ preallocated data, raw xattrs, subvolumes and snapshots, and verifies fs-verity
 files against their Merkle trees on every read. Every adapter reads
 zlib, LZO and Zstd extents: the platform's zlib (a bounded kernel decoder in the
 XNU adapter) and the shared freestanding LZO and Zstd decoders. Every adapter
-writes zlib and Zstd extents; the XNU adapter uses the kernel's deflate and a
-shared freestanding Zstd encoder.
+writes zlib, LZO and Zstd extents: zlib with the platform's deflate (the
+kernel's in the XNU adapter), LZO with a shared freestanding LZO1X encoder, and
+Zstd with libzstd in the image tools and a shared freestanding encoder in the
+FSKit and XNU adapters.
 
 Independent Linux-created images are compared byte-for-byte under ASan/UBSan.
 The tests also exercise checksum-correct malformed metadata, allocation/I/O

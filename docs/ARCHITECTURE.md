@@ -813,12 +813,23 @@ write environment); without it nothing is compressed. Data is compressed in
 pieces of at most 128 KiB, each one extent whose stream, padded to whole
 sectors, is kept only when that saves at least a sector; its file extent item
 records the codec, the uncompressed length and the stored size, and checksums
-cover the stored bytes. Writing ZSTD data records the ZSTD incompat feature.
-Linux's compressibility heuristic is not reproduced: compression is attempted
-and its result judged. LZO files are written uncompressed. The FSKit and
-image adapters compress with zlib and libzstd; the XNU adapter with the
-kernel's exported deflate (Linux's default level 3) and, for Zstandard, the
-shared freestanding encoder in `adapters/common/codec.c`: one single-segment
+cover the stored bytes. Writing ZSTD or LZO data records that incompat
+feature. Linux's compressibility heuristic is not reproduced: compression is
+attempted and its result judged. LZO data is framed as Linux's
+`lzo_compress_folios` frames it: a 32-bit total length, then one segment per
+sector of input, each a 32-bit length and an LZO1X stream, a length never
+crossing a sector (the sector's last bytes are zero instead); a piece is given
+up once more than two sectors are in and the output is larger. The core frames
+the segments and the adapter encodes each. The image adapter compresses with
+zlib and libzstd, the FSKit adapter with zlib, and the XNU adapter with the
+kernel's exported deflate, both at Linux's default level 3; LZO everywhere, and
+Zstandard in FSKit and XNU, use the shared freestanding encoders in
+`adapters/common/codec.c`. The LZO1X encoder takes greedy matches of four
+bytes or more from a 4K-entry hash of four bytes, writes M2, M3 and M4 matches
+(never M1) and never starts a stream with 17, which Linux's decoder reads as an
+LZO-RLE version; its streams differ from `lzo1x_1`'s, so a borderline piece may
+compress where Linux's would not, or stay inline where Linux's would not. The
+Zstandard encoder writes one single-segment
 frame per piece (the window is the piece, within Linux's 128 KiB), greedy
 matches of at least four bytes from a 16K-entry hash of four bytes, at most
 8,192 sequences per piece, raw literals and the predefined sequence tables,

@@ -17,6 +17,17 @@
 enum btrfs_result btrfs_lzo1x_decompress(
     const void *input, size_t input_size, void *output, size_t capacity, size_t *produced);
 
+/* The LZO1X encoder's match table: the caller provides this many bytes, aligned
+ * for a pointer, and uses them for one call at a time. */
+#define BTRFS_LZO1X_COMPRESS_WORKSPACE_BYTES (16U * 1024U)
+
+/* Encodes input as one LZO1X stream, one segment of Btrfs's LZO format, which
+ * Linux's lzo1x_decompress_safe and the LZO library read: greedy matches of
+ * four bytes or more. Returns BTRFS_RANGE when the stream would not fit
+ * capacity; the output is then unspecified. */
+enum btrfs_result btrfs_lzo1x_compress(void *workspace, const void *input, size_t input_size,
+    void *output, size_t capacity, size_t *produced);
+
 /* The Zstandard decoder's tables: the caller provides this many bytes, aligned
  * for a pointer, and uses them for one call at a time. Their contents need no
  * initialization. */

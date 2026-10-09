@@ -131,8 +131,14 @@ btrfs_image_compress(void *context, enum btrfs_compression codec, const void *in
 	size_t encoded;
 #endif
 
+	/* The shared LZO1X encoder's match table, one per thread. */
+	static _Thread_local _Alignas(16) uint8_t workspace[BTRFS_LZO1X_COMPRESS_WORKSPACE_BYTES];
+
 	(void)context;
 	*size = 0;
+	if (codec == BTRFS_COMPRESSION_LZO) {
+		return btrfs_lzo1x_compress(workspace, input, input_size, output, capacity, size);
+	}
 	if (codec == BTRFS_COMPRESSION_ZLIB) {
 		if (input_size > UINT_MAX || capacity > UINT_MAX) {
 			return BTRFS_RANGE;
