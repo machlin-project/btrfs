@@ -651,8 +651,10 @@ profile flag Meson uses: `--full` for `transactions-full`, `--shared` for
 `transactions-data`, `--data --fragment` for `transactions-fst`, `--grow`
 for `transactions-grow`, `--data --holes` for `transactions-holes`,
 `--convert` for `transactions-convert`, `--groups` for `transactions` and
-`transactions-dup`, and `--namespace` or `--subvolume` for
-`transactions-namespace`. Reader
+`transactions-dup`, `--namespace` or `--subvolume` for
+`transactions-namespace`, `--quota` for `transactions-quota`, and
+`--data --kernel-codecs` for `transactions-data` with the kernel adapter's
+encoders writing its compressed extents. Reader
 profiles with a free-space tree (`plain`, `small-nodes`) also run the default
 scenarios:
 

@@ -849,6 +849,9 @@ zstd_compressed_block(struct zstd_workspace *ws, struct zstd_frame *frame, const
 	const uint8_t *literals;
 	struct bits bits;
 	uint8_t *out = *output;
+	/* A compressed block decodes to at most the block maximum, as libzstd
+	 * bounds it (an RLE block is not bounded so). */
+	uint8_t *limit = (size_t)(frame->end - out) > block_max ? out + block_max : frame->end;
 	size_t literal_count;
 	size_t used;
 	size_t sequences;
@@ -864,8 +867,7 @@ zstd_compressed_block(struct zstd_workspace *ws, struct zstd_frame *frame, const
 	unsigned modes;
 
 	if (size == 0 ||
-	    !zstd_literals(
-		ws, in, size, out, frame->end, block_max, &literals, &literal_count, &used)) {
+	    !zstd_literals(ws, in, size, out, limit, block_max, &literals, &literal_count, &used)) {
 		return 0;
 	}
 	in += used;
@@ -952,7 +954,7 @@ zstd_compressed_block(struct zstd_workspace *ws, struct zstd_frame *frame, const
 		/* The block's remaining literals must still fit after the match: at
 		 * the end of the output they also stay ahead of everything written. */
 		if (bits_overflowed(&bits) || offset == 0 || literal_length > literal_count ||
-		    match_length + literal_count > (uint64_t)(frame->end - out)) {
+		    match_length + literal_count > (uint64_t)(limit - out)) {
 			return 0;
 		}
 		copy_forward(out, literals, (size_t)literal_length);
@@ -1183,5 +1185,366 @@ btrfs_zstd_decompress(void *workspace, const void *input, size_t input_size, voi
 		}
 	}
 	*produced = (size_t)(out - frame.start);
+	return BTRFS_OK;
+}
+
+/* Zstandard encoding (RFC 8878) for kernels without a library: one
+ * single-segment frame of one compressed block. Matches of at least four
+ * bytes come greedily from a hash of four bytes, at most ZSTD_ENCODE_SEQUENCES
+ * of them (the rest stays literal); literals are stored raw; the sequences use
+ * the predefined distributions, so the frame describes no table. */
+#define ZSTD_ENCODE_HASH_LOG 14U
+#define ZSTD_ENCODE_SEQUENCES 8192U
+#define ZSTD_ENCODE_MIN_MATCH 4U
+/* Offset values 1-3 name repeated offsets; a new offset is stored plus 3. */
+#define ZSTD_REPEAT_CODES 3U
+#define ZSTD_HEADER_SINGLE_SEGMENT 0x20U
+#define ZSTD_CONTENT_FIELD_SHIFT 6U
+#define ZSTD_SHORT_CONTENT 256U
+#define ZSTD_LITERALS_SIZE_FORMAT_20 (3U << 2)
+#define ZSTD_HEADER_BYTES 3U
+#define ZSTD_SEQUENCES_SHORT 128U
+#define ZSTD_SEQUENCES_LONG 0x7F00U
+#define ZSTD_HASH_MULTIPLIER 2654435761U
+
+struct fse_transform {
+	int32_t find_state;
+	uint32_t delta_bits;
+};
+
+/* An FSE encoding table (the inverse of fse_build's decoding table). */
+struct fse_encoder {
+	uint16_t states[1U << LL_DEFAULT_LOG];
+	struct fse_transform symbols[ML_MAX_SYMBOL + 1];
+	unsigned log;
+};
+
+struct zstd_sequence {
+	uint32_t literals;
+	uint32_t match;
+	uint32_t offset;
+};
+
+struct zstd_encoder {
+	uint32_t hash[1U << ZSTD_ENCODE_HASH_LOG];
+	struct zstd_sequence sequences[ZSTD_ENCODE_SEQUENCES];
+	struct fse_encoder ll;
+	struct fse_encoder ml;
+	struct fse_encoder of;
+	struct fse_entry spread[1U << LL_DEFAULT_LOG];
+	uint16_t next[ML_MAX_SYMBOL + 1];
+};
+
+_Static_assert(sizeof(struct zstd_encoder) <= BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES,
+    "the declared workspace holds the encoder's tables");
+
+struct bit_writer {
+	uint8_t *out;
+	size_t capacity;
+	size_t position;
+	uint64_t container;
+	unsigned count;
+	int overflow;
+};
+
+struct fse_state {
+	const struct fse_encoder *encoder;
+	uint32_t value;
+};
+
+/* Appends the low count bits (at most 25) of value, least significant first. */
+static void
+bit_write(struct bit_writer *writer, uint64_t value, unsigned count)
+{
+	if (count == 0) {
+		return;
+	}
+	writer->container |= (value & ((UINT64_C(1) << count) - 1U)) << writer->count;
+	writer->count += count;
+	while (writer->count >= 8U) {
+		if (writer->position == writer->capacity) {
+			writer->overflow = 1;
+		} else {
+			writer->out[writer->position++] = (uint8_t)writer->container;
+		}
+		writer->container >>= 8;
+		writer->count -= 8U;
+	}
+}
+
+/* The end marker above the last bit, which the backward reader starts from. */
+static void
+bit_close(struct bit_writer *writer)
+{
+	bit_write(writer, 1, 1);
+	if (writer->count != 0) {
+		bit_write(writer, 0, 8U - writer->count);
+	}
+}
+
+/* zstd's FSE_buildCTable over the same spread as fse_build. */
+static int
+fse_encoder_build(struct zstd_encoder *encoder, struct fse_encoder *table, const int16_t *norm,
+    unsigned max_symbol, unsigned log)
+{
+	uint32_t cumulative[ML_MAX_SYMBOL + 2];
+	uint32_t size = UINT32_C(1) << log;
+	uint32_t total = 0;
+	uint32_t count;
+	uint32_t state;
+	unsigned symbol;
+	unsigned bits;
+
+	if (!fse_build(encoder->spread, norm, max_symbol, log, encoder->next)) {
+		return 0;
+	}
+	cumulative[0] = 0;
+	for (symbol = 0; symbol <= max_symbol; symbol++) {
+		cumulative[symbol + 1] =
+		    cumulative[symbol] + (norm[symbol] == -1 ? 1U : (uint32_t)norm[symbol]);
+	}
+	for (state = 0; state < size; state++) {
+		symbol = encoder->spread[state].symbol;
+		table->states[cumulative[symbol]++] = (uint16_t)(size + state);
+	}
+	for (symbol = 0; symbol <= max_symbol; symbol++) {
+		if (norm[symbol] == 0) {
+			table->symbols[symbol].delta_bits = ((log + 1U) << 16) - size;
+			table->symbols[symbol].find_state = 0;
+		} else if (norm[symbol] == -1 || norm[symbol] == 1) {
+			table->symbols[symbol].delta_bits = (log << 16) - size;
+			table->symbols[symbol].find_state = (int32_t)total - 1;
+			total++;
+		} else {
+			count = (uint32_t)norm[symbol];
+			bits = log - highbit(count - 1U);
+			table->symbols[symbol].delta_bits = (bits << 16) - (count << bits);
+			table->symbols[symbol].find_state = (int32_t)total - (int32_t)count;
+			total += count;
+		}
+	}
+	table->log = log;
+	return 1;
+}
+
+static void
+fse_state_init(struct fse_state *state, const struct fse_encoder *encoder, unsigned symbol)
+{
+	const struct fse_transform *transform = &encoder->symbols[symbol];
+	uint32_t bits = (transform->delta_bits + (1U << 15)) >> 16;
+	uint32_t value = (bits << 16) - transform->delta_bits;
+
+	state->encoder = encoder;
+	state->value = encoder->states[(int32_t)(value >> bits) + transform->find_state];
+}
+
+static void
+fse_state_encode(struct bit_writer *writer, struct fse_state *state, unsigned symbol)
+{
+	const struct fse_transform *transform = &state->encoder->symbols[symbol];
+	uint32_t bits = (state->value + transform->delta_bits) >> 16;
+
+	bit_write(writer, state->value, bits);
+	state->value =
+	    state->encoder->states[(int32_t)(state->value >> bits) + transform->find_state];
+}
+
+/* The code of value: the last whose base it reaches. */
+static unsigned
+zstd_code(const uint32_t *base, unsigned max_symbol, uint32_t value)
+{
+	unsigned low = 0;
+	unsigned high = max_symbol;
+	unsigned middle;
+
+	while (low < high) {
+		middle = (low + high + 1U) / 2U;
+		if (base[middle] <= value) {
+			low = middle;
+		} else {
+			high = middle - 1U;
+		}
+	}
+	return low;
+}
+
+/* Greedy matches over the hash of four bytes; returns the sequence count. */
+static size_t
+zstd_find_matches(struct zstd_encoder *encoder, const uint8_t *in, size_t size, size_t *anchor)
+{
+	uint32_t hash;
+	uint32_t candidate;
+	size_t position = 0;
+	size_t length;
+	size_t count = 0;
+
+	__builtin_memset(encoder->hash, 0, sizeof(encoder->hash));
+	*anchor = 0;
+	while (size >= ZSTD_ENCODE_MIN_MATCH && position <= size - ZSTD_ENCODE_MIN_MATCH &&
+	    count < ZSTD_ENCODE_SEQUENCES) {
+		hash = (le32(in + position) * ZSTD_HASH_MULTIPLIER) >> (32U - ZSTD_ENCODE_HASH_LOG);
+		candidate = encoder->hash[hash];
+		/* Positions are stored plus one: zero is an empty slot. */
+		encoder->hash[hash] = (uint32_t)position + 1U;
+		if (candidate == 0 || le32(in + candidate - 1U) != le32(in + position)) {
+			position++;
+			continue;
+		}
+		length = ZSTD_ENCODE_MIN_MATCH;
+		while (position + length < size &&
+		    in[candidate - 1U + length] == in[position + length]) {
+			length++;
+		}
+		encoder->sequences[count].literals = (uint32_t)(position - *anchor);
+		encoder->sequences[count].match = (uint32_t)length;
+		encoder->sequences[count].offset = (uint32_t)(position - (candidate - 1U));
+		count++;
+		position += length;
+		*anchor = position;
+	}
+	return count;
+}
+
+/* The sequences as zstd's ZSTD_encodeSequences writes them: backwards, so
+ * the decoder reads the first sequence first. */
+static void
+zstd_encode_sequences(const struct zstd_encoder *encoder, size_t count, struct bit_writer *writer)
+{
+	const struct zstd_sequence *sequence = &encoder->sequences[count - 1U];
+	struct fse_state ll;
+	struct fse_state ml;
+	struct fse_state of;
+	uint32_t offset;
+	unsigned ll_code;
+	unsigned ml_code;
+	unsigned of_code;
+	size_t n;
+
+	ll_code = zstd_code(ll_base, LL_MAX_SYMBOL, sequence->literals);
+	ml_code = zstd_code(ml_base, ML_MAX_SYMBOL, sequence->match);
+	offset = sequence->offset + ZSTD_REPEAT_CODES;
+	of_code = highbit(offset);
+	fse_state_init(&ml, &encoder->ml, ml_code);
+	fse_state_init(&of, &encoder->of, of_code);
+	fse_state_init(&ll, &encoder->ll, ll_code);
+	bit_write(writer, sequence->literals - ll_base[ll_code], ll_bits[ll_code]);
+	bit_write(writer, sequence->match - ml_base[ml_code], ml_bits[ml_code]);
+	bit_write(writer, offset - (UINT32_C(1) << of_code), of_code);
+	for (n = count - 1U; n-- > 0;) {
+		sequence = &encoder->sequences[n];
+		ll_code = zstd_code(ll_base, LL_MAX_SYMBOL, sequence->literals);
+		ml_code = zstd_code(ml_base, ML_MAX_SYMBOL, sequence->match);
+		offset = sequence->offset + ZSTD_REPEAT_CODES;
+		of_code = highbit(offset);
+		fse_state_encode(writer, &of, of_code);
+		fse_state_encode(writer, &ml, ml_code);
+		fse_state_encode(writer, &ll, ll_code);
+		bit_write(writer, sequence->literals - ll_base[ll_code], ll_bits[ll_code]);
+		bit_write(writer, sequence->match - ml_base[ml_code], ml_bits[ml_code]);
+		bit_write(writer, offset - (UINT32_C(1) << of_code), of_code);
+	}
+	bit_write(writer, ml.value, ml.encoder->log);
+	bit_write(writer, of.value, of.encoder->log);
+	bit_write(writer, ll.value, ll.encoder->log);
+	bit_close(writer);
+}
+
+enum btrfs_result
+btrfs_zstd_compress(void *workspace, const void *input, size_t input_size, void *output,
+    size_t capacity, size_t *produced)
+{
+	struct zstd_encoder *encoder = workspace;
+	struct bit_writer writer;
+	const uint8_t *in = input;
+	uint8_t *out = output;
+	size_t count;
+	size_t anchor;
+	size_t literals;
+	size_t position;
+	size_t block;
+	size_t source = 0;
+	size_t i;
+	unsigned content_field;
+
+	*produced = 0;
+	if (input_size == 0 || input_size > BTRFS_ZSTD_COMPRESS_MAX_BYTES ||
+	    !fse_encoder_build(encoder, &encoder->ll, ll_default, LL_MAX_SYMBOL, LL_DEFAULT_LOG) ||
+	    !fse_encoder_build(encoder, &encoder->ml, ml_default, ML_MAX_SYMBOL, ML_DEFAULT_LOG) ||
+	    !fse_encoder_build(
+		encoder, &encoder->of, of_default, OF_DEFAULT_MAX_SYMBOL, OF_DEFAULT_LOG)) {
+		return BTRFS_RANGE;
+	}
+	count = zstd_find_matches(encoder, in, input_size, &anchor);
+	if (count == 0) {
+		return BTRFS_RANGE;
+	}
+	literals = input_size - anchor;
+	for (i = 0; i < count; i++) {
+		literals += encoder->sequences[i].literals;
+	}
+	/* Magic, header descriptor and content size (single segment: the
+	 * window is the content). */
+	content_field = input_size < ZSTD_SHORT_CONTENT ? 0U
+	    : input_size < ZSTD_SHORT_CONTENT + 65536U	? 1U
+							: 2U;
+	position = 4U + 1U + (content_field == 0 ? 1U : content_field == 1 ? 2U : 4U);
+	block = position;
+	position += ZSTD_HEADER_BYTES;
+	if (position + ZSTD_HEADER_BYTES + literals + 3U + 1U >= input_size ||
+	    position + ZSTD_HEADER_BYTES + literals + 3U + 1U > capacity) {
+		return BTRFS_RANGE;
+	}
+	out[0] = (uint8_t)ZSTD_MAGIC;
+	out[1] = (uint8_t)(ZSTD_MAGIC >> 8);
+	out[2] = (uint8_t)(ZSTD_MAGIC >> 16);
+	out[3] = (uint8_t)(ZSTD_MAGIC >> 24);
+	out[4] =
+	    (uint8_t)((content_field << ZSTD_CONTENT_FIELD_SHIFT) | ZSTD_HEADER_SINGLE_SEGMENT);
+	if (content_field == 0) {
+		out[5] = (uint8_t)input_size;
+	} else if (content_field == 1) {
+		out[5] = (uint8_t)(input_size - ZSTD_SHORT_CONTENT);
+		out[6] = (uint8_t)((input_size - ZSTD_SHORT_CONTENT) >> 8);
+	} else {
+		out[5] = (uint8_t)input_size;
+		out[6] = (uint8_t)(input_size >> 8);
+		out[7] = (uint8_t)(input_size >> 16);
+		out[8] = (uint8_t)(input_size >> 24);
+	}
+	/* Raw literals with a three-byte header, in input order. */
+	out[position] =
+	    (uint8_t)(ZSTD_LITERALS_RAW | ZSTD_LITERALS_SIZE_FORMAT_20 | ((literals & 15U) << 4));
+	out[position + 1U] = (uint8_t)(literals >> 4);
+	out[position + 2U] = (uint8_t)(literals >> 12);
+	position += ZSTD_HEADER_BYTES;
+	for (i = 0; i < count; i++) {
+		__builtin_memcpy(out + position, in + source, encoder->sequences[i].literals);
+		position += encoder->sequences[i].literals;
+		source += (size_t)encoder->sequences[i].literals + encoder->sequences[i].match;
+	}
+	__builtin_memcpy(out + position, in + source, input_size - source);
+	position += input_size - source;
+	/* The sequence count, predefined modes for all three tables, the stream. */
+	if (count < ZSTD_SEQUENCES_SHORT) {
+		out[position++] = (uint8_t)count;
+	} else {
+		out[position++] = (uint8_t)((count >> 8) + 0x80U);
+		out[position++] = (uint8_t)count;
+	}
+	out[position++] = ZSTD_SEQUENCE_PREDEFINED;
+	writer = (struct bit_writer){ out, capacity < input_size ? capacity : input_size - 1U,
+		position, 0, 0, 0 };
+	zstd_encode_sequences(encoder, count, &writer);
+	if (writer.overflow) {
+		return BTRFS_RANGE;
+	}
+	position = writer.position;
+	/* The last block, compressed, its size after the header. */
+	i = position - block - ZSTD_HEADER_BYTES;
+	i = 1U | (ZSTD_BLOCK_COMPRESSED << 1) | (i << 3);
+	out[block] = (uint8_t)i;
+	out[block + 1U] = (uint8_t)(i >> 8);
+	out[block + 2U] = (uint8_t)(i >> 16);
+	*produced = position;
 	return BTRFS_OK;
 }

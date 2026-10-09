@@ -15,7 +15,9 @@ checksums, SINGLE/DUP chunks, 4–64 KiB nodes, inodes, byte-exact names,
 directories, hard links, symlinks, inline and regular extents, sparse and
 preallocated data, raw xattrs, subvolumes and snapshots. Every adapter reads
 zlib, LZO and Zstd extents: the platform's zlib (a bounded kernel decoder in the
-XNU adapter) and the shared freestanding LZO and Zstd decoders.
+XNU adapter) and the shared freestanding LZO and Zstd decoders. Every adapter
+writes zlib and Zstd extents; the XNU adapter uses the kernel's deflate and a
+shared freestanding Zstd encoder.
 
 Independent Linux-created images are compared byte-for-byte under ASan/UBSan.
 The tests also exercise checksum-correct malformed metadata, allocation/I/O

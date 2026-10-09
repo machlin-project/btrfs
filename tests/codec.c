@@ -2,7 +2,8 @@
 /* The adapters' LZO1X and Zstandard decoders against the reference libraries
  * (liblzo2 and libzstd) when the build has them: frames from many compression
  * settings must decode to the same bytes, and mutated frames must never be
- * accepted unless the reference accepts them with the same bytes. */
+ * accepted unless the reference accepts them with the same bytes. The kernel's
+ * Zstandard encoder must write frames that both decoders return exactly. */
 #include <btrfs/codec.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -337,6 +338,84 @@ zstd_tests(void *workspace)
 #endif
 
 #ifdef BTRFS_HAVE_LZO
+/* LZO1X instruction bytes (Linux's Documentation/staging/lzo.rst). */
+#define LZO_FIRST_RUN_MIN 18U
+#define LZO_M4_MIN 16U
+#define LZO_M3_MIN 32U
+#define LZO_M2_MIN 64U
+#define LZO_LONG_RUN 4U
+#define LZO_END_INSTRUCTION 0x11U
+
+/* Whether a stream ends as Linux's lzo1x_decompress_safe requires: walking
+ * instruction boundaries only, the end-of-stream marker (an M4 match at
+ * distance 16384) must be the unextended instruction 0x11 and end the input. */
+static int
+lzo_linux_end(const uint8_t *stream, size_t size)
+{
+	size_t at = 0;
+	size_t start;
+	unsigned state = 0;
+	unsigned byte;
+	unsigned distance;
+
+	if (size == 0) {
+		return 0;
+	}
+	if (stream[0] >= LZO_FIRST_RUN_MIN) {
+		at = 1U + (stream[0] - 17U);
+		state = stream[0] - 17U < LZO_LONG_RUN ? stream[0] - 17U : LZO_LONG_RUN;
+	}
+	while (at < size) {
+		start = at;
+		byte = stream[at++];
+		if (byte < LZO_M4_MIN && state == 0) {
+			/* A literal run, its length extended by zero bytes. */
+			size_t length = byte;
+
+			if (length == 0) {
+				while (at < size && stream[at] == 0) {
+					at++;
+					length += 255U;
+				}
+				if (at == size) {
+					return 0;
+				}
+				length += 15U + stream[at++];
+			}
+			at += length + 3U;
+			state = LZO_LONG_RUN;
+			continue;
+		}
+		if (byte < LZO_M4_MIN || byte >= LZO_M2_MIN) {
+			/* M1 and M2: one distance byte; the literals that follow
+			 * are counted in the instruction. */
+			at += 1U;
+			state = byte & 3U;
+		} else {
+			/* M4 and M3: a length extended by zero bytes, then a
+			 * 16-bit distance whose low bits count the literals. */
+			if ((byte & (byte < LZO_M3_MIN ? 7U : 31U)) == 0) {
+				while (at < size && stream[at] == 0) {
+					at++;
+				}
+				at++;
+			}
+			if (at + 2U > size) {
+				return 0;
+			}
+			distance = (unsigned)stream[at] | (unsigned)stream[at + 1] << 8;
+			at += 2U;
+			if (byte < LZO_M3_MIN && (byte & 8U) == 0 && (distance >> 2) == 0) {
+				return byte == LZO_END_INSTRUCTION && start + 3U == size &&
+				    at == size;
+			}
+			state = distance & 3U;
+		}
+		at += state;
+	}
+	return 0;
+}
+
 static void
 lzo_tests(void)
 {
@@ -395,9 +474,8 @@ lzo_tests(void)
 			reference_size = size;
 			status = lzo1x_decompress_safe(copy, cut, reference, &reference_size, NULL);
 			/* Linux, which Btrfs reads LZO with, also requires the end
-			 * instruction to be the three bytes 0x11, d, 0 (d < 4). */
-			linux_accepts = status == LZO_E_OK && cut >= 3 && copy[cut - 3] == 0x11 &&
-			    copy[cut - 2] < 4 && copy[cut - 1] == 0;
+			 * instruction to be the unextended 0x11 at the end. */
+			linux_accepts = status == LZO_E_OK && lzo_linux_end(copy, cut);
 			mutations++;
 			if (result == BTRFS_OK) {
 				accepted++;
@@ -417,6 +495,75 @@ lzo_tests(void)
 #endif
 
 /* Streams written by hand, for builds without the reference libraries. */
+#define ENCODER_ROUNDS 900U
+
+/* Every frame the encoder writes is smaller than its input and decodes, with
+ * this decoder and with libzstd, to exactly that input; runs and text always
+ * compress. */
+static void
+zstd_encoder_tests(void *workspace)
+{
+	void *encoder = malloc(BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES);
+	uint8_t *data = malloc(BTRFS_ZSTD_COMPRESS_MAX_BYTES);
+	uint8_t *frame = malloc(BTRFS_ZSTD_COMPRESS_MAX_BYTES);
+	uint8_t *back = malloc(BTRFS_ZSTD_COMPRESS_MAX_BYTES);
+	uint64_t input_bytes = 0;
+	uint64_t frame_bytes = 0;
+	size_t size;
+	size_t frame_size;
+	size_t produced;
+	unsigned round;
+	unsigned written = 0;
+	unsigned declined = 0;
+	enum pattern pattern;
+	enum btrfs_result result;
+
+	REQUIRE(encoder != NULL && data != NULL && frame != NULL && back != NULL);
+	for (round = 0; round < ENCODER_ROUNDS; round++) {
+		size = sample_size(round);
+		size = size > BTRFS_ZSTD_COMPRESS_MAX_BYTES ? BTRFS_ZSTD_COMPRESS_MAX_BYTES : size;
+		pattern = (enum pattern)(round % PATTERN_COUNT);
+		fill(data, size, pattern);
+		result = btrfs_zstd_compress(encoder, data, size, frame, size, &frame_size);
+		if (result == BTRFS_RANGE) {
+			/* Short inputs may not pay for a frame; noise never does. */
+			REQUIRE((pattern != PATTERN_ZERO && pattern != PATTERN_TEXT) || size < 64U);
+			declined++;
+			continue;
+		}
+		REQUIRE(result == BTRFS_OK && frame_size < size);
+		memset(back, 0xa5, size);
+		REQUIRE(btrfs_zstd_decompress(
+			    workspace, frame, frame_size, back, size, &produced) == BTRFS_OK &&
+		    produced == size && memcmp(back, data, size) == 0);
+#ifdef BTRFS_HAVE_ZSTD
+		memset(back, 0x5a, size);
+		REQUIRE(ZSTD_getFrameContentSize(frame, frame_size) == size);
+		REQUIRE(ZSTD_decompress(back, size, frame, frame_size) == size &&
+		    memcmp(back, data, size) == 0);
+#endif
+		/* A smaller capacity than the frame is refused, never overrun. */
+		REQUIRE(btrfs_zstd_compress(
+			    encoder, data, size, frame, frame_size - 1U, &produced) == BTRFS_RANGE);
+		input_bytes += size;
+		frame_bytes += frame_size;
+		written++;
+	}
+	printf("zstd encoder: %u frames decode exactly with this decoder%s, %u inputs declined; "
+	       "%llu bytes in %llu PASS\n",
+	    written,
+#ifdef BTRFS_HAVE_ZSTD
+	    " and libzstd",
+#else
+	    "",
+#endif
+	    declined, (unsigned long long)input_bytes, (unsigned long long)frame_bytes);
+	free(encoder);
+	free(data);
+	free(frame);
+	free(back);
+}
+
 static void
 fixed_tests(void *workspace)
 {
@@ -461,6 +608,7 @@ main(void)
 
 	REQUIRE(workspace != NULL);
 	fixed_tests(workspace);
+	zstd_encoder_tests(workspace);
 #ifdef BTRFS_HAVE_ZSTD
 	zstd_tests(workspace);
 #else

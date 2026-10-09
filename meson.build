@@ -53,7 +53,7 @@ transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
   'tests/scenario_random.c', 'tests/scenario_subvolume.c', 'tests/scenario_quota.c',
   'tests/references.c', 'tests/namespace_audit.c', 'tests/qgroup_audit.c',
-  include_directories: inc, link_with: [volume, posix, core], dependencies: [zlib, zstd])
+  include_directories: inc, link_with: [volume, posix, codec, core], dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
   'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
@@ -180,6 +180,10 @@ if fixtures != ''
       args: ['--data', join_paths(fixtures, 'checksums-' + algorithm + '.raw')], timeout: 600,
       suite: 'images')
   endforeach
+  # The kernel adapter's encoders write the compressed extents.
+  test('data-extents-kernel-codecs', transaction_test,
+    args: ['--data', '--kernel-codecs', join_paths(fixtures, 'transactions-data.raw')],
+    timeout: 600, suite: 'images')
   test('holes-and-dup-data', transaction_test,
     args: ['--data', '--holes', join_paths(fixtures, 'transactions-holes.raw')], timeout: 600,
     suite: 'images')

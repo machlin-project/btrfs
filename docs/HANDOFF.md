@@ -105,8 +105,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    preallocated and unshared NODATACOW extents, with hole items on filesystems
    without NO_HOLES and both copies of DUP data, and fallocate as Linux's
    `btrfs_fallocate` (allocation, zeroing and punching; `F_PREALLOCATE` and
-   `F_PUNCHHOLE` natively). Remaining: a 64 KiB-sector
-   fixture and a compressor in the kernel adapter. New data is written as its extents are
+   `F_PUNCHHOLE` natively). The kernel adapter compresses with the kernel's
+   deflate and the shared freestanding Zstd encoder. Remaining: a 64 KiB-sector
+   fixture. New data is written as its extents are
    created, and files compress on write as Linux decides.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull

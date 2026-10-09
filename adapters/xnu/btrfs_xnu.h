@@ -20,6 +20,8 @@
 #define BTRFS_XNU_MINIMUM_BUCKETS 128
 /* Node cache per mount: 4,096 nodes of 4 KiB or 1,024 of 16 KiB. */
 #define BTRFS_XNU_CACHE_BYTES (16U * 1024U * 1024U)
+/* Linux's default zlib level for Btrfs (BTRFS_ZLIB_DEFAULT_LEVEL). */
+#define BTRFS_XNU_ZLIB_LEVEL 3
 /* Seconds between commits of the running transaction (Linux's commit=). */
 #define BTRFS_XNU_COMMIT_SECONDS 5U
 /* Tree nodes one namespace or attribute operation declares when it joins the

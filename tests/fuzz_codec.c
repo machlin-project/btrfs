@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-/* libFuzzer entry point for the adapters' LZO1X and Zstandard decoders. The
- * first input byte selects the codec, the next two the output capacity; the
- * rest is the stream. With the reference libraries the decoders follow the
+/* libFuzzer entry point for the adapters' LZO1X and Zstandard decoders and the
+ * kernel's Zstandard encoder. The first input byte selects the codec (its top
+ * bit an encoder round trip of the rest), the next two the output capacity;
+ * the rest is the stream. With the reference libraries the decoders follow the
  * oracles of tests/codec.c: LZO1X as liblzo2 with Linux's stricter end
  * instruction, Zstandard within what libzstd accepts as one buffer and at
  * least what it decodes identically as one buffer and as a stream. */
@@ -17,8 +18,10 @@
 
 #define FUZZ_HEADER_BYTES 3U
 #define REFERENCE_INPUT_PIECE 1024U
+#define FUZZ_ENCODE 0x80U
 
 static _Alignas(16) unsigned char workspace[BTRFS_ZSTD_WORKSPACE_BYTES];
+static _Alignas(16) unsigned char encoder[BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES];
 static unsigned char output[1U << 16];
 static unsigned char reference[1U << 16];
 
@@ -97,6 +100,7 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	size_t capacity;
 	size_t produced = 0;
 	size_t expected = 0;
+	size_t decoded = 0;
 	enum btrfs_result result;
 	int accepted = -1;
 #ifdef BTRFS_HAVE_ZSTD
@@ -113,6 +117,34 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 		return 0;
 	}
 	capacity = ((size_t)data[1] | (size_t)data[2] << 8) + 1U;
+	/* Every frame the encoder writes, into any capacity, decodes to its
+	 * input with this decoder and with libzstd. */
+	if ((data[0] & FUZZ_ENCODE) != 0) {
+		expected = size - FUZZ_HEADER_BYTES;
+		if (expected == 0 || expected > sizeof(reference)) {
+			return 0;
+		}
+		capacity = capacity < sizeof(output) ? capacity : sizeof(output);
+		result = btrfs_zstd_compress(
+		    encoder, data + FUZZ_HEADER_BYTES, expected, output, capacity, &produced);
+		if (result == BTRFS_RANGE) {
+			return 0;
+		}
+		if (result != BTRFS_OK || produced > capacity || produced >= expected ||
+		    btrfs_zstd_decompress(
+			workspace, output, produced, reference, expected, &decoded) != BTRFS_OK ||
+		    decoded != expected ||
+		    memcmp(reference, data + FUZZ_HEADER_BYTES, expected) != 0) {
+			abort();
+		}
+#ifdef BTRFS_HAVE_ZSTD
+		if (ZSTD_decompress(reference, expected, output, produced) != expected ||
+		    memcmp(reference, data + FUZZ_HEADER_BYTES, expected) != 0) {
+			abort();
+		}
+#endif
+		return 0;
+	}
 	if ((data[0] & 1U) != 0) {
 		result = btrfs_zstd_decompress(workspace, data + FUZZ_HEADER_BYTES,
 		    size - FUZZ_HEADER_BYTES, output, capacity, &produced);

@@ -246,8 +246,9 @@ adapter shares: they allocate nothing, take a 16 KiB table workspace for
 Zstandard (a kernel allocation per call, per-thread storage in user space)
 and decode Zstandard literals into the end of the output instead of a block
 buffer. A frame is accepted only as libzstd, which Linux shares, accepts it
-both as one buffer and as a stream; LZO1X follows Linux's decoder, which also
-requires the three-byte end instruction.
+both as one buffer and as a stream: a compressed block decodes to at most the
+block maximum (the window, at most 128 KiB), an RLE block to any size; LZO1X
+follows Linux's decoder, which also requires the three-byte end instruction.
 
 ## Bounds
 
@@ -682,7 +683,15 @@ sectors, is kept only when that saves at least a sector; its file extent item
 records the codec, the uncompressed length and the stored size, and checksums
 cover the stored bytes. Writing ZSTD data records the ZSTD incompat feature.
 Linux's compressibility heuristic is not reproduced: compression is attempted
-and its result judged. LZO files are written uncompressed. Writing or
+and its result judged. LZO files are written uncompressed. The FSKit and
+image adapters compress with zlib and libzstd; the XNU adapter with the
+kernel's exported deflate (Linux's default level 3) and, for Zstandard, the
+shared freestanding encoder in `adapters/common/codec.c`: one single-segment
+frame per piece (the window is the piece, within Linux's 128 KiB), greedy
+matches of at least four bytes from a 16K-entry hash of four bytes, at most
+8,192 sequences per piece, raw literals and the predefined sequence tables,
+so no table is described. It compresses less than libzstd does, and every
+Zstandard decoder reads it. Writing or
 truncating a set-id file needs the caller's settled privilege decision
 (`btrfs_transaction_drop_privileges` or `_keep_privileges`, Linux's
 `file_remove_privs`); immutable inodes refuse every change and append-only

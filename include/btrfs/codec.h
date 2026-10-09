@@ -29,4 +29,18 @@ enum btrfs_result btrfs_lzo1x_decompress(
 enum btrfs_result btrfs_zstd_decompress(void *workspace, const void *input, size_t input_size,
     void *output, size_t capacity, size_t *produced);
 
+/* The Zstandard encoder's tables and match state, as for the decoder. */
+#define BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES (192U * 1024U)
+/* The largest input of one encoded frame: Linux's Btrfs window (128 KiB). */
+#define BTRFS_ZSTD_COMPRESS_MAX_BYTES (128U * 1024U)
+
+/* Encodes input (at most BTRFS_ZSTD_COMPRESS_MAX_BYTES) as one single-segment
+ * frame of one compressed block, for kernels without a Zstandard library: its
+ * literals are stored raw and its sequences use the predefined tables, so it
+ * compresses less than libzstd does, and every Zstandard decoder reads it.
+ * Returns BTRFS_RANGE when the frame would not be smaller than the input or
+ * would not fit capacity; the output is then unspecified. */
+enum btrfs_result btrfs_zstd_compress(void *workspace, const void *input, size_t input_size,
+    void *output, size_t capacity, size_t *produced);
+
 #endif

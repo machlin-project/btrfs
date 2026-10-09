@@ -3,6 +3,21 @@
  * for its profile; --export writes the crash cases for the Linux oracle. */
 #define _POSIX_C_SOURCE 200809L
 #include "scenario.h"
+#include <btrfs/codec.h>
+
+/* The kernel adapter's encoders: zlib is the platform's, Zstandard the shared
+ * freestanding encoder in place of libzstd. */
+static enum btrfs_result
+kernel_compress(void *context, enum btrfs_compression codec, const void *input, size_t input_size,
+    void *output, size_t capacity, size_t *size)
+{
+	static uint64_t workspace[BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES / sizeof(uint64_t)];
+
+	if (codec == BTRFS_COMPRESSION_ZSTD) {
+		return btrfs_zstd_compress(workspace, input, input_size, output, capacity, size);
+	}
+	return btrfs_image_compress(context, codec, input, input_size, output, capacity, size);
+}
 
 int
 main(int argc, char **argv)
@@ -23,6 +38,7 @@ main(int argc, char **argv)
 	int names = 0;
 	int subvolumes = 0;
 	int quotas = 0;
+	int kernel_codecs = 0;
 	uint32_t random_first = 0;
 	uint32_t random_count = 0;
 	int random_quick = 0;
@@ -57,6 +73,8 @@ main(int argc, char **argv)
 			subvolumes = 1;
 		} else if (strcmp(argv[i], "--quota") == 0) {
 			quotas = 1;
+		} else if (strcmp(argv[i], "--kernel-codecs") == 0) {
+			kernel_codecs = 1;
 		} else if ((strcmp(argv[i], "--random") == 0 ||
 			       strcmp(argv[i], "--random-quick") == 0) &&
 		    i + 2 < argc) {
@@ -80,7 +98,8 @@ main(int argc, char **argv)
 	context->env.release = release;
 	context->env.decompress = decompress_device;
 	context->writer = (struct btrfs_write_environment){ context->device, write_device,
-		flush_device, btrfs_image_compress, BTRFS_COMPRESSION_NONE };
+		flush_device, kernel_codecs ? kernel_compress : btrfs_image_compress,
+		BTRFS_COMPRESSION_NONE };
 	context->seed = UINT32_C(0x142857);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	btrfs_get_info(fs, &info);

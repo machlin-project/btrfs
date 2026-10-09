@@ -143,6 +143,53 @@ btrfs_xnu_decompress(void *context, enum btrfs_compression codec, const void *in
 	return BTRFS_OK;
 }
 
+/* Compresses one chunk: zlib as Linux's btrfs zlib does, at its default level,
+ * and Zstandard with the shared kernel encoder, which compresses less than
+ * Linux's. The core stores the chunk uncompressed when the stream would not
+ * save space (RANGE) or the codec has no encoder here (UNSUPPORTED: LZO). */
+static enum btrfs_result
+btrfs_xnu_compress(void *context, enum btrfs_compression codec, const void *input,
+    size_t input_size, void *output, size_t capacity, size_t *size)
+{
+	z_stream stream;
+	void *workspace;
+	enum btrfs_result encoded;
+	int result;
+
+	(void)context;
+	*size = 0;
+	if (codec == BTRFS_COMPRESSION_ZSTD) {
+		workspace = _MALLOC(BTRFS_ZSTD_COMPRESS_WORKSPACE_BYTES, M_TEMP, M_WAITOK | M_NULL);
+		if (workspace == NULL) {
+			return BTRFS_NO_MEMORY;
+		}
+		encoded = btrfs_zstd_compress(workspace, input, input_size, output, capacity, size);
+		_FREE(workspace, M_TEMP);
+		return encoded;
+	}
+	if (codec != BTRFS_COMPRESSION_ZLIB) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if (input_size > UINT32_MAX || capacity > UINT32_MAX) {
+		return BTRFS_RANGE;
+	}
+	bzero(&stream, sizeof(stream));
+	stream.zalloc = btrfs_xnu_zalloc;
+	stream.zfree = btrfs_xnu_zfree;
+	result = deflateInit(&stream, BTRFS_XNU_ZLIB_LEVEL);
+	if (result != Z_OK) {
+		return result == Z_MEM_ERROR ? BTRFS_NO_MEMORY : BTRFS_IO;
+	}
+	stream.next_in = (Bytef *)input;
+	stream.avail_in = (uInt)input_size;
+	stream.next_out = output;
+	stream.avail_out = (uInt)capacity;
+	result = deflate(&stream, Z_FINISH);
+	*size = stream.total_out;
+	(void)deflateEnd(&stream);
+	return result == Z_STREAM_END ? BTRFS_OK : BTRFS_RANGE;
+}
+
 static enum btrfs_result
 btrfs_xnu_read_aligned(struct btrfs_xnu_mount *mount, uint64_t offset, void *buffer, size_t length)
 {
@@ -659,8 +706,9 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	writer.context = mount;
 	writer.write = btrfs_xnu_resource_write;
 	writer.flush = btrfs_xnu_resource_flush;
-	/* The kernel adapter writes no compressed data yet. */
-	writer.compress = NULL;
+	/* Files compress as their flags and property ask; no compress mount
+	 * option is offered. */
+	writer.compress = btrfs_xnu_compress;
 	writer.compression = BTRFS_COMPRESSION_NONE;
 	if (!read_only) {
 		error = btrfs_xnu_error(
