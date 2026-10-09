@@ -38,6 +38,15 @@ struct bt_removed {
 	int extended;
 };
 
+/* A subvolume entry in directory: its child tree and index. */
+struct bt_sv_entry {
+	uint64_t child;
+	uint64_t index;
+	/* The tree's ROOT_REF names this entry; otherwise it is a stub copied
+	 * by a snapshot. */
+	int referenced;
+};
+
 /* A packed item (DIR_ITEM, DIR_INDEX, INODE_REF or XATTR_ITEM) loaded into the
  * transaction's namespace item buffer. An absent item has size 0. */
 struct bt_packed {
@@ -123,17 +132,16 @@ enum btrfs_result bt_ns_remove_entry(struct btrfs_transaction *transaction,
     const struct bt_entry *entry, struct btrfs_time time);
 enum btrfs_result bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     uint64_t inode, int open, struct btrfs_time time);
-enum btrfs_result bt_ns_ancestor(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
-    uint64_t start, uint64_t directory, int *ancestor);
-/* Renames and exchanges that involve a subvolume entry (core/subvolume.c);
- * *moved reports whether the rename changed anything. */
-enum btrfs_result bt_sv_rename(struct btrfs_transaction *transaction,
-    struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
-    struct btrfs_object_id new_parent, const void *new_name, size_t new_length,
-    struct btrfs_time time, int target_open, int *moved);
-enum btrfs_result bt_sv_exchange(struct btrfs_transaction *transaction,
-    struct btrfs_object_id old_parent, const void *old_name, size_t old_length,
-    struct btrfs_object_id new_parent, const void *new_name, size_t new_length,
+/* Subvolume entries (core/subvolume.c): resolving one (INVALID_ARGUMENT for
+ * another name), removing it with its root references, and adding one with
+ * them for location, a subvolume's root item key. */
+enum btrfs_result bt_sv_entry(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, const void *name, size_t length, struct bt_sv_entry *entry);
+enum btrfs_result bt_sv_unlink(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, const void *name, size_t length, const struct bt_sv_entry *entry,
+    struct btrfs_time time);
+enum btrfs_result bt_sv_link(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, const void *name, size_t length, struct bt_key location, uint64_t index,
     struct btrfs_time time);
 enum btrfs_result bt_ns_begin(
     struct btrfs_transaction *transaction, uint64_t tree_id, struct bt_owned_root **tree);

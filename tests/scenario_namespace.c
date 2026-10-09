@@ -1137,6 +1137,12 @@ namespace_refusals(struct context *context)
 	    BTRFS_IS_DIRECTORY, "link a directory");
 	refused(transaction, btrfs_transaction_link(transaction, one, subvolume, "x", 1, time),
 	    BTRFS_CROSS_TREE, "link across trees");
+	/* vfs_link decides before btrfs_link's EXDEV. */
+	refused(transaction,
+	    btrfs_transaction_link(transaction, object(fs, "/ns/tree"), subvolume, "x", 1, time),
+	    BTRFS_IS_DIRECTORY, "link a directory across trees");
+	refused(transaction, btrfs_transaction_link(transaction, one, subvolume, "value", 5, time),
+	    BTRFS_EXISTS, "link across trees over a name");
 	refused(transaction, btrfs_transaction_link(transaction, one, ns, "victim", 6, time),
 	    BTRFS_EXISTS, "link over a name");
 	refused(transaction, btrfs_transaction_unlink(transaction, ns, "missing", 7, time, 0),

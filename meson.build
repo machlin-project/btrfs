@@ -10,7 +10,7 @@ add_project_arguments(cc.get_supported_arguments(warnings), language: 'c')
 sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
-  'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c',
+  'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/rename.c', 'core/subvolume.c', 'core/drop.c',
   'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')

@@ -184,6 +184,10 @@ enum btrfs_result bt_tx_add_tree(struct btrfs_transaction *transaction,
 /* The current root item of tree, without admitting edits of the tree. */
 enum btrfs_result bt_tx_root_item(
     struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root *result);
+/* A tree as this transaction sees it without opening it: an opened tree's
+ * newest root, otherwise its current root item. */
+enum btrfs_result bt_tx_tree_view(
+    struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root *view);
 /* The next free tree id: after the highest object of the root tree below
  * BTRFS_LAST_FREE_OBJECTID, and after every id the mount's counters handed out. */
 enum btrfs_result bt_tx_root_id(struct btrfs_transaction *transaction, uint64_t *result);

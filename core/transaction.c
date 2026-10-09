@@ -333,6 +333,21 @@ bt_tx_root_item(struct btrfs_transaction *transaction, uint64_t tree, struct bt_
 }
 
 enum btrfs_result
+bt_tx_tree_view(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root *view)
+{
+	size_t i;
+
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == tree) {
+			*view = transaction->trees[i];
+			return BTRFS_OK;
+		}
+	}
+	bt_zero(view, sizeof(*view));
+	return bt_tx_root_item(transaction, tree, view);
+}
+
+enum btrfs_result
 bt_tx_add_tree(struct btrfs_transaction *transaction, const struct bt_owned_root *owned,
     struct bt_owned_root **result)
 {

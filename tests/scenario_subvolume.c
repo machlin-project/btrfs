@@ -423,6 +423,12 @@ subvolume_rename_plan(struct context *context)
 	plan_expect_refusal(&plan, 3, BTRFS_NOT_EMPTY);
 	plan_exchange(&plan, 3, "/ro-snap2", "/ns/fresh");
 	plan_expect_refusal(&plan, 3, BTRFS_READ_ONLY);
+	/* The VFS decides before btrfs_rename's EXDEV: a directory moved into a
+	 * subvolume below it, and a file replacing a directory above its own. */
+	plan_rename(&plan, 3, "/ns", "/ns/sv-a2/below", 0);
+	plan_expect_refusal(&plan, 3, BTRFS_INVALID_ARGUMENT);
+	plan_rename(&plan, 3, "/ns/sv-a2/file", "/ns", 0);
+	plan_expect_refusal(&plan, 3, BTRFS_NOT_EMPTY);
 	/* Over an empty directory, in its directory and in another subvolume. */
 	plan_rename(&plan, 3, "/ns/fresh", "/ns/empty", 0);
 	plan_rename(&plan, 3, "/ns/moved", "/subvol/sv-b/inner", 0);

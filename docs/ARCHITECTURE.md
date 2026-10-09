@@ -699,8 +699,8 @@ inodes everything but growth (NOT_PERMITTED), as Linux does.
 
 ## Namespace mutations
 
-`core/namespace.c` creates, links, unlinks and renames names and edits xattrs in
-the transaction's private file trees, following Linux's `btrfs_add_link` and
+`core/namespace.c` creates, links and unlinks names and edits xattrs in the
+transaction's private file trees, and `core/rename.c` renames and exchanges them, following Linux's `btrfs_add_link` and
 `btrfs_unlink_inode`. A name exists as three coupled records: an INODE_REF entry
 (index and name) keyed by inode and parent, a DIR_ITEM entry keyed by the parent
 and the name's CRC32C hash, and a DIR_INDEX item keyed by the parent and the
@@ -749,36 +749,49 @@ orphan item, as above), unless the caller holds it open: then it keeps zero
 links and an ORPHAN item until
 `btrfs_transaction_evict`, or until `btrfs_transaction_clean_orphans` runs as
 Linux's orphan cleanup does at mount (an orphan item of a missing or still
-linked inode only goes away). Rename removes the old name, then any replaced
-name and its link, then adds the new name, all in one transaction; two names of
-one inode make it a no-op, and a directory cannot move below itself.
-renameat2's RENAME_WHITEOUT then creates, under the old name, a whiteout: a
-character device 0:0 without permission bits owned by the caller.
-RENAME_EXCHANGE follows `btrfs_rename_exchange`: both indexes are taken (the
-source's in the new directory first), both back references inserted while the
-old ones still exist, both old names removed, and both entries inserted under
-the swapped indexes; files and directories may be exchanged across directories
-unless one would move below itself.
+linked inode only goes away).
 
-Subvolume entries rename and exchange as Linux moves them (`bt_sv_rename`,
-`bt_sv_exchange`). The entry and its ROOT_REF and ROOT_BACKREF go, and
-`btrfs_add_link` adds them back. The new DIR_ITEM names the subvolume's root
-item key, whose offset records a snapshot's transaction. A subvolume entry may
-move into another subvolume's directory; other inodes stay in their subvolume
-(CROSS_TREE). Subvolume entries may be exchanged across subvolumes, and a
-subvolume entry with an inode only within one subvolume. A subvolume may
-replace an empty directory or a stub, but not another subvolume (NOT_EMPTY). A
-directory may replace a stub too. The subvolume's root directory keeps its
-times, because Linux does not write it. Linux refuses the following, and so
-does this core:
+Rename and exchange decide as Linux's renameat2 does, in its order:
 
-- moving a subvolume below itself, found through the ROOT_BACKREF chain
-  (INVALID_ARGUMENT);
+1. The lookups.
+2. The VFS checks: a directory or subvolume cannot move below itself
+   (INVALID_ARGUMENT), and a replaced name cannot be an ancestor of the old one
+   (NOT_EMPTY). Ancestry follows INODE_REF items and, across subvolumes,
+   ROOT_BACKREF items.
+3. One object under both names makes the operation a no-op.
+4. `may_delete` and `may_create`: immutable and append-only inodes and
+   directories, and the object types.
+5. Write access to a directory moving to a new parent: a read-only
+   subvolume's root (READ_ONLY, from `btrfs_permission`).
+6. `btrfs_rename`'s own refusals.
+
+Rename removes the old name, then any replaced name and its link, then adds
+the new name, all in one transaction. renameat2's RENAME_WHITEOUT then creates,
+under the old name, a whiteout: a character device 0:0 without permission bits
+owned by the caller. RENAME_EXCHANGE follows `btrfs_rename_exchange`:
+
+1. Both indexes are taken, the source's in the new directory first.
+2. Both back references are inserted while the old ones still exist.
+3. Both old names are removed.
+4. Both entries are inserted under the swapped indexes.
+
+Subvolume entries rename and exchange as Linux moves them. The entry and its
+ROOT_REF and ROOT_BACKREF go, and `btrfs_add_link` adds them back. The new
+DIR_ITEM names the subvolume's root item key, whose offset records a
+snapshot's transaction. A subvolume entry may move into another subvolume's
+directory; other inodes stay in their subvolume (CROSS_TREE). Subvolume
+entries may be exchanged across subvolumes, and a subvolume entry with an
+inode only within one subvolume. A subvolume or a directory may replace an
+empty directory or a stub, but nothing replaces a subvolume (NOT_EMPTY). The
+subvolume's root directory keeps its times, because Linux does not write it.
+Linux also refuses the following, and so does this core:
+
 - moving a stub, which `btrfs_rename` refuses and `btrfs_rename_exchange`
   would abort on (NOT_EMPTY);
-- a name in a stub directory (NOT_PERMITTED);
-- moving a read-only subvolume to another directory, which `btrfs_permission`
-  refuses because the move would write its root (READ_ONLY).
+- a name in a stub directory (NOT_PERMITTED). This is decided before the
+  lookups: every stub of a tree has the same identity, which does not say
+  where its entry is, so its ancestry cannot be walked.
+
 O_TMPFILE follows `btrfs_tmpfile`: a nameless regular file inherits from its
 directory like a created one, with zero links and an orphan item; its first
 name, through `btrfs_transaction_link_tmpfile`, removes the orphan item
