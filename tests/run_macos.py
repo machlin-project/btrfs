@@ -19,8 +19,14 @@ import plistlib
 import re
 import shutil
 import subprocess
+import time
 
 MODULE = "org.machlin.btrfs.kext"
+# Probes record their output and exit status in guest files; after a dropped
+# exec transport the status file is read again at this interval.
+PROBE_POLL_SECONDS = 2
+# Runs each probe with its output and exit status in files beside BASE.
+PROBE_WRAPPER = 'base=$1; shift; "$@" > "$base.out" 2> "$base.err"; echo $? > "$base.status"'
 
 
 def digest(path):
@@ -101,14 +107,48 @@ def main():
         record.update(kernel_uuid=kernel, boot_session=session, loaded_module=module)
 
     mountpoint = guest_dir + "/mount"
+    probes = []
+
+    def probe(*command, timeout):
+        """Runs a probe as root and returns its stdout and stderr. The guest's
+        recorded exit status decides the result: a dropped exec transport
+        neither loses nor forges it; a status that never appears fails."""
+        probes.append(command)
+        base = f"{guest_dir}/probe-{len(probes)}"
+        try:
+            guest("/usr/bin/sudo", "-n", "/bin/sh", "-c", PROBE_WRAPPER, "sh", base, *command,
+                  timeout=timeout)
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            # The status file decides; the transport failure stays on record.
+            record.setdefault("transport_errors", []).append(
+                {"probe": list(command), "error": str(error)})
+            save()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                status = int(guest("/usr/bin/sudo", "-n", "/bin/cat", base + ".status"))
+                break
+            except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"Guest probe left no status: {command!r}")
+                time.sleep(PROBE_POLL_SECONDS)
+        stdout = guest("/usr/bin/sudo", "-n", "/bin/cat", base + ".out")
+        stderr = guest("/usr/bin/sudo", "-n", "/bin/cat", base + ".err")
+        record["commands"].append({"probe": list(command), "status": status,
+                                   "stdout": stdout.decode(errors="backslashreplace"),
+                                   "stderr": stderr.decode(errors="backslashreplace")})
+        save()
+        if status != 0:
+            raise RuntimeError(f"Guest probe failed: {command!r}: "
+                               + stderr.decode(errors="backslashreplace"))
+        return stdout, stderr
 
     def walk(item):
         """Walks the mounted image; returns its manifest lines."""
         if args.walk_probe is None:
             return b""
-        listing = guest("/usr/bin/sudo", "-n", guest_dir + "/" + args.walk_probe.name, mountpoint,
-                        timeout=3600)
-        summary = record["commands"][-1]["stderr"].strip().splitlines()
+        listing, stderr = probe(guest_dir + "/" + args.walk_probe.name, mountpoint, timeout=3600)
+        summary = stderr.decode(errors="backslashreplace").strip().splitlines()
         if not summary or not summary[-1].startswith("mounted walk:") or not summary[-1].endswith(" PASS"):
             raise RuntimeError("Missing mounted walk success evidence")
         item["walk"] = summary[-1]
@@ -134,7 +174,7 @@ def main():
         item = {"image": str(source), "sha256": expected, "device": device, "mode": "write",
                 "commit": mode, "result": "FAIL"}
         record["cases"].append(item)
-        probe = guest_dir + "/" + args.write_probe.name
+        writer = guest_dir + "/" + args.write_probe.name
         helper = guest_dir + "/" + args.mount_helper.name
         mounted = False
         try:
@@ -147,13 +187,12 @@ def main():
                 raise RuntimeError("Guest raw device differs from source")
             guest("/usr/bin/sudo", "-n", helper, *flags, device, mountpoint)
             mounted = True
-            item["write"] = guest("/usr/bin/sudo", "-n", probe, "write", mountpoint,
-                                  timeout=3600).decode()
+            item["write"] = probe(writer, "write", mountpoint, timeout=3600)[0].decode()
             guest("/usr/bin/sudo", "-n", "/sbin/umount", mountpoint)
             mounted = False
             guest("/usr/bin/sudo", "-n", helper, *flags, device, mountpoint)
             mounted = True
-            manifest = guest("/usr/bin/sudo", "-n", probe, "verify", mountpoint, timeout=600)
+            manifest = probe(writer, "verify", mountpoint, timeout=600)[0]
             guest("/usr/bin/sudo", "-n", "/sbin/umount", mountpoint)
             mounted = False
             if args.walk_probe is not None:
@@ -229,8 +268,8 @@ def main():
                 guest("/usr/bin/sudo", "-n", guest_dir + "/" + args.mount_helper.name, device, mountpoint)
                 mounted = True
                 if contracts:
-                    item["probe"] = guest("/usr/bin/sudo", "-n", guest_dir + "/" + args.probe.name,
-                                          mountpoint).decode()
+                    item["probe"] = probe(guest_dir + "/" + args.probe.name, mountpoint,
+                                          timeout=120)[0].decode()
                     if "EROFS PASS" not in item["probe"]:
                         raise RuntimeError("Missing mounted contract success evidence")
                 listing = walk(item)
