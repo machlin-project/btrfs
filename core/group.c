@@ -129,7 +129,7 @@ bt_group_remove(struct btrfs_transaction *transaction, const struct bt_chunk *ch
 	unsigned stripe;
 	enum btrfs_result error;
 
-	error = bt_tx_edit(transaction, &transaction->extents.root, key, NULL, 0, BT_DELETE);
+	error = bt_tx_edit(transaction, bt_tx_groups(transaction), key, NULL, 0, BT_DELETE);
 	if (error == BTRFS_OK && transaction->has_free_space) {
 		error = bt_fst_remove_group(
 		    transaction->mutation, &transaction->free_space.root, chunk);

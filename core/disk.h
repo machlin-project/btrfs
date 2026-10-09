@@ -47,6 +47,9 @@ struct bt_le64 {
 #define BT_CSUM_TREE UINT64_C(7)
 #define BT_QUOTA_TREE UINT64_C(8)
 #define BT_FREE_SPACE_TREE UINT64_C(10)
+/* Block-group items, when the BLOCK_GROUP_TREE feature moves them out of the
+ * extent tree. */
+#define BT_BLOCK_GROUP_TREE UINT64_C(11)
 /* Root-tree items (objectid, 0, block group) naming a v1 space-cache inode. */
 #define BT_FREE_SPACE_OBJECTID (UINT64_MAX - UINT64_C(10))
 #define BT_DATA_RELOC_TREE (UINT64_MAX - UINT64_C(8))
@@ -118,6 +121,7 @@ struct bt_le64 {
 #define BT_EXTENT_FLAG_FULL_BACKREF (UINT64_C(1) << 8)
 #define BT_COMPAT_RO_FREE_SPACE_TREE (UINT64_C(1) << 0)
 #define BT_COMPAT_RO_FREE_SPACE_TREE_VALID (UINT64_C(1) << 1)
+#define BT_COMPAT_RO_BLOCK_GROUP_TREE (UINT64_C(1) << 3)
 #define BT_FREE_SPACE_USING_BITMAPS UINT32_C(1)
 #define BT_FREE_SPACE_BITMAP_BYTES 256U
 

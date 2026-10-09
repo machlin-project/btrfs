@@ -203,12 +203,18 @@ check_bitmaps() {
 
 # GROUPS:SYSTEM: chunk items and block group items in Linux's dumps (they
 # agree), and entries of the superblock's system chunk array. Only leaf item
-# lines count; internal nodes print their children's first keys as well.
+# lines count; internal nodes print their children's first keys as well. With
+# a block-group tree (tree 11) the items are there and none in the extent tree.
 check_groups() {
     chunks=$(btrfs inspect-internal dump-tree -t chunk /dev/vda |
         grep -c 'item [0-9]* key (FIRST_CHUNK_TREE CHUNK_ITEM ' || true)
     groups=$(btrfs inspect-internal dump-tree -t extent /dev/vda |
         grep -c 'item [0-9]* key ([0-9]* BLOCK_GROUP_ITEM ' || true)
+    if btrfs inspect-internal dump-super /dev/vda | grep -qw BLOCK_GROUP_TREE; then
+        test "$groups" = 0 || { echo "groups: $groups block groups in the extent tree" >&2; return 1; }
+        groups=$(btrfs inspect-internal dump-tree -t 11 /dev/vda |
+            grep -c 'item [0-9]* key ([0-9]* BLOCK_GROUP_ITEM ' || true)
+    fi
     system=$(btrfs inspect-internal dump-super -f /dev/vda |
         grep -c 'item [0-9]* key (FIRST_CHUNK_TREE CHUNK_ITEM ' || true)
     test "$chunks" = "${1%%:*}" && test "$groups" = "${1%%:*}" && test "$system" = "${1#*:}" ||
@@ -342,7 +348,9 @@ for scenario in /transaction/*; do
     fi
     commit=
     # Linux continues read-write from the scenario's newest root, cleaning any
-    # orphans it left. A free-space tree must stay enabled; the other profiles
+    # orphans it left. A free-space tree must stay enabled; a v1 space cache,
+    # which this implementation leaves behind the superblock's generation, is
+    # cleared and rebuilt by Linux and must then be current; the other profiles
     # keep no space cache. A large device does this for its last scenario only.
     if [ "$large" = 1 ] && [ "$scenario" != "$last" ]; then
         echo "BTRFS_TRANSACTION_SCENARIO:$name"
@@ -352,8 +360,15 @@ for scenario in /transaction/*; do
     apply "$scenario" all.tsv
     verify "$scenario" "$(cat "$scenario/final.txt")"
     options=nospace_cache
-    if btrfs inspect-internal dump-super /dev/vda | grep -q FREE_SPACE_TREE_VALID; then
+    space_cache_v1=0
+    btrfs inspect-internal dump-super /dev/vda > /tmp/super.txt
+    if grep -q FREE_SPACE_TREE_VALID /tmp/super.txt; then
         options=defaults
+    elif [ "$(awk '$1 == "cache_generation" { print $2 }' /tmp/super.txt)" != 0 ]; then
+        test "$(awk '$1 == "cache_generation" { print $2 }' /tmp/super.txt)" != \
+            "$(awk '$1 == "generation" { print $2 }' /tmp/super.txt)"
+        options=space_cache=v1
+        space_cache_v1=1
     fi
     mount -t btrfs -o "$options" /dev/vda /mnt
     printf 'Linux accepted the new root\n' > /mnt/after-machlin
@@ -362,7 +377,13 @@ for scenario in /transaction/*; do
     test "$(btrfs subvolume list -d /mnt | wc -l)" -eq 0
     btrfs filesystem sync /mnt
     umount /mnt
-    # Every copy of every checksummed data sector, DUP included.
+    if [ "$space_cache_v1" = 1 ]; then
+        btrfs inspect-internal dump-super /dev/vda > /tmp/super.txt
+        test "$(awk '$1 == "cache_generation" { print $2 }' /tmp/super.txt)" = \
+            "$(awk '$1 == "generation" { print $2 }' /tmp/super.txt)"
+    fi
+    # Every copy of every checksummed data sector, DUP included; a current v1
+    # space cache is checked against the extent tree.
     btrfs check --readonly --check-data-csum /dev/vda < /dev/null
     test "$(btrfs inspect-internal dump-tree -t 5 /dev/vda | grep -c ORPHAN_ITEM || true)" = 0
     if [ "$large" = 0 ]; then

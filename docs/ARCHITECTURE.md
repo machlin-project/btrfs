@@ -465,6 +465,42 @@ array entry for a system group), and the device item's used bytes shrink. The
 device space becomes allocatable in the next transaction, never in this one,
 since the committed root set still maps it.
 
+## Format features
+
+A metadata UUID (METADATA_UUID, `btrfstune -m`) separates the filesystem's
+visible fsid from the UUID its tree blocks and device items carry. The reader
+checks every header against the metadata UUID; the writer creates blocks from
+existing headers and edits device items in place, so both keep it, and the
+superblock keeps both values.
+
+With the block-group tree (BLOCK_GROUP_TREE, tree 11) block-group items move
+out of the extent tree. Admission requires it beside a valid free-space tree
+and NO_HOLES, as Linux does. Allocation state reads the items from that tree,
+which must hold exactly one item per chunk in chunk order and nothing else; a
+block-group item left in the extent tree is corrupt. Chunk publication,
+accounting and group removal edit the tree, and its root item follows its
+root at commit.
+
+Mixed groups (MIXED_GROUPS) hold data and metadata in DATA|METADATA block
+groups; admission requires the node size to equal the sector size, and a mixed
+group without the feature is corrupt (`read_one_block_group`). Both classes
+allocate from one free list, and growth creates mixed groups sized as Linux
+sizes any type with the data bit. A data range first takes a free range that
+holds all of it, then a new group, and only then pieces, since metadata leaves
+node-sized holes; this is `find_free_extent` before `btrfs_reserve_extent`
+splits a request. Data admission also leaves the metadata nodes the
+transaction holds, which separate groups get from growth holdback instead.
+
+A v1 free-space cache (`space_cache=v1`) is not maintained. Every commit leaves
+`cache_generation` behind the superblock's generation (all ones), which Linux
+reads as a stale cache: its next v1 mount clears and rebuilds each group's
+cache (`btrfs_read_block_groups`). A zero `cache_generation`, which names no
+v1 cache, stays zero. Cache inodes and their extents in the root tree are
+ordinary references to the writer, and a group that has one is not removed.
+
+Quotas stay refused: a filesystem with a quota tree is not admitted for
+writing.
+
 ## Free-space tree
 
 Filesystems created with Linux defaults carry a free-space tree. Admission

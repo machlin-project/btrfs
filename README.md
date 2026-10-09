@@ -28,10 +28,12 @@ with checksums (streaming new data to the device, compressing with zlib or Zstd
 and storing small files inline as Linux decides), preallocates, zeroes and punches
 ranges as Linux's fallocate does, replaces inline files, and
 creates, links, unlinks (with
-orphans for open files), renames and sets xattrs and the compression property,
-in any writable subvolume or snapshot, many operations per transaction; it
-creates, snapshots and deletes subvolumes and drops deleted ones as Linux's
-cleaner does. It
+orphans for open files), renames and sets xattrs, the compression property and
+inode flags (as `chattr`), in any writable subvolume or snapshot, many
+operations per transaction; it creates, snapshots and deletes subvolumes and
+drops deleted ones as Linux's cleaner does. It writes filesystems with mixed
+groups, a block-group tree or a metadata UUID, leaves a v1 space cache stale for
+Linux to rebuild, and refuses to write a filesystem with quotas. It
 updates CoW paths, shared and keyed extent backreferences with Linux's snapshot
 rules, data checksum items, block-group accounting, root items and superblock
 copies with three persistence barriers. Independent reference, checksum and

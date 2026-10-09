@@ -238,7 +238,10 @@ The initrd needs BusyBox, musl, `mkfs.btrfs`, `btrfs`, `setfattr`, `getfattr`, a
 their dynamic dependencies. The staged root uses the lab reference BusyBox,
 musl, zlib and Zstd; additional Alpine v3.22 AArch64 main APKs are btrfs-progs,
 eudev-libs, libblkid, libuuid, lzo, libeconf, attr and libattr. Extract packages
-into the disposable root with symlinks preserved. Do not copy dependencies into
+into the disposable root with symlinks preserved. The metadata-UUID profile also
+needs `btrfstune` from btrfs-progs-extra of the same version, checked against the
+APKINDEX checksum, placed at `root/sbin/btrfstune` (its other programs need
+libraries the root does not carry). Do not copy dependencies into
 tracked driver sources. Standard `unsquashfs` or the sibling ext4 test extractor
 can extract the matching module archive. Put these modules in `root/modules/`:
 
@@ -274,14 +277,18 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all twenty-four
-profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for `transactions-convert`,
+Linux checks and a completed VM exit before consuming the image. Repeat all twenty-nine
+profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for
+`transactions-convert` and `transactions-space-cache`, whose data groups must reach the
+100 MiB Linux needs before it writes a v1 cache,
 2 GiB for `transactions-scale`, 257 GiB for `transactions-copies`, created with
 `truncate` so they stay sparse and never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
-verifies 1,802 contracts (the seven reader profiles, `transactions-holes`,
-whose split hole items it reads, and the checksum profiles, whose data payload
-it reads in the subvolume and both snapshots), and fails if any byte changed. The `codecs`
+verifies 2,386 contracts (the seven reader profiles; `transactions-holes`,
+whose split hole items it reads; the checksum profiles and the metadata-UUID,
+mixed, space-cache and quota profiles, whose data payload it reads in the
+subvolume and both snapshots; and the block-group-tree profile), and fails if any
+byte changed. The `codecs`
 profile mounts with `compress-force=lzo` and writes the same 64 files of an
 incompressible head and a compressible tail into `lzo`, and, through the
 `btrfs.compression` property, `zlib` and `zstd` directories; Linux must report

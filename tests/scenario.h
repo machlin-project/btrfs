@@ -578,6 +578,7 @@ void subvolume_scenarios(struct context *context);
 void admission_tests(struct context *context);
 void copy_tests(struct context *context);
 void allocation_map_tests(struct context *context);
+struct bt_root group_root(const struct btrfs_fs *fs);
 void audit_self_test(struct context *context);
 void exhaustion_test(struct context *context);
 

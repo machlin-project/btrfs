@@ -13,7 +13,9 @@ CHECKSUM_TYPES = {"crc32c": 0, "xxhash": 1, "sha256": 2, "blake2": 3}
 # The data payload of tests/prepare_linux.py: prefixes of its inputs, a sparse
 # file, a preallocation, a zlib property file, a NODATACOW file without
 # checksums, an inline file, a reflink and two snapshots.
-DATA_PAYLOAD_PROFILES = {"checksums-xxhash", "checksums-sha256", "checksums-blake2"}
+DATA_PAYLOAD_PROFILES = {"checksums-xxhash", "checksums-sha256", "checksums-blake2",
+                         "transactions-metadata-uuid", "transactions-mixed",
+                         "transactions-space-cache", "transactions-quota"}
 DATA_BIG_BYTES = 1048576
 DATA_SMALL_BYTES = 10000
 DATA_SPARSE_BYTES = 4194304
@@ -151,7 +153,8 @@ def main() -> None:
     parser.add_argument("--fixtures", type=Path, required=True)
     args = parser.parse_args()
     profiles = ["plain", "small-nodes", "large-nodes", "zlib", "zstd", "codecs",
-                "default-subvolume", "transactions-holes", *sorted(DATA_PAYLOAD_PROFILES)]
+                "default-subvolume", "transactions-holes", "transactions-block-group-tree",
+                *sorted(DATA_PAYLOAD_PROFILES)]
     total = 0
     for profile in profiles:
         image = args.fixtures / f"{profile}.raw"

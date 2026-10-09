@@ -574,6 +574,20 @@ check_bitmaps(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
 	}
 }
 
+/* The tree holding block-group items: the block-group tree when the filesystem
+ * has one, otherwise the extent tree. */
+struct bt_root
+group_root(const struct btrfs_fs *fs)
+{
+	struct bt_root root;
+	uint64_t tree = (fs->info.readonly_features & BT_COMPAT_RO_BLOCK_GROUP_TREE) != 0
+	    ? BT_BLOCK_GROUP_TREE
+	    : BT_EXTENT_TREE;
+
+	REQUIRE(bt_find_root(fs, tree, &root) == BTRFS_OK);
+	return root;
+}
+
 /* Block groups as chunk items and as block group items, which must agree,
  * and the entries of the primary superblock's system chunk array. */
 static void
@@ -591,7 +605,7 @@ check_groups(
 	size_t offset = 0;
 	enum btrfs_result result;
 
-	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &root) == BTRFS_OK);
+	root = group_root(fs);
 	bt_cursor_init(&cursor, fs, root);
 	result = bt_cursor_seek(&cursor, key, 0);
 	while (result == BTRFS_OK) {

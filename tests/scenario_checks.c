@@ -489,6 +489,7 @@ allocation_map_tests(struct context *context)
 {
 	struct btrfs_fs *fs;
 	struct bt_root extents;
+	struct bt_root groups;
 	struct bt_disk_extent_item *extent;
 	struct bt_disk_block_group *group;
 	struct bt_disk_item *item;
@@ -512,6 +513,7 @@ allocation_map_tests(struct context *context)
 	REQUIRE(leaf != NULL);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	REQUIRE(bt_find_root(fs, BT_EXTENT_TREE, &extents) == BTRFS_OK);
+	groups = group_root(fs);
 	for (i = 0; i < fs->chunk_count; i++) {
 		if (fs->chunks[i].logical + fs->chunks[i].length > chunk_end) {
 			chunk_end = fs->chunks[i].logical + fs->chunks[i].length;
@@ -521,13 +523,13 @@ allocation_map_tests(struct context *context)
 		}
 	}
 
-	REQUIRE(find_leaf(fs, extents, match_group, NULL, leaf, &logical, &slot));
+	REQUIRE(find_leaf(fs, groups, match_group, NULL, leaf, &logical, &slot));
 	group = leaf_data(leaf, slot);
 	bt_put64(&group->used_bytes, bt_u64(group->used_bytes) + fs->info.node_size);
 	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
 	expect_corrupt_map(context, "block-group total");
 
-	REQUIRE(find_leaf(fs, extents, match_group, NULL, leaf, &logical, &slot));
+	REQUIRE(find_leaf(fs, groups, match_group, NULL, leaf, &logical, &slot));
 	leaf_item(leaf, slot)->key.type = BT_BLOCK_GROUP_ITEM + 1;
 	replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
 	expect_corrupt_map(context, "missing block group");
@@ -589,7 +591,7 @@ allocation_map_tests(struct context *context)
 		bt_put64(&leaf_item(leaf, slot)->key.objectid, chunk_end + fs->info.node_size);
 		replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
 		REQUIRE(
-		    find_leaf(fs, extents, match_group_at, &group_logical, leaf, &logical, &slot));
+		    find_leaf(fs, groups, match_group_at, &group_logical, leaf, &logical, &slot));
 		group = leaf_data(leaf, slot);
 		bt_put64(&group->used_bytes, bt_u64(group->used_bytes) - length);
 		replace_leaf(context, fs, leaf, logical, BT_BLOCK_METADATA);
@@ -599,8 +601,17 @@ allocation_map_tests(struct context *context)
 		       "(last record is a keyed backreference)\n");
 	}
 
-	/* Logical separation does not authorize writes into another chunk's stripe. */
+	/* Logical separation does not authorize writes into another chunk's
+	 * stripe: a data chunk moved onto a metadata chunk. Mixed groups hold the
+	 * trees the mount reads, so moving one leaves nothing to admit. */
 	type = BT_BLOCK_DATA;
+	if ((fs->info.incompat_features & BT_FEATURE_MIXED_GROUPS) != 0) {
+		btrfs_unmount(fs);
+		printf("allocation map physical chunk alias: not constructed on this image "
+		       "(mixed groups)\n");
+		free(leaf);
+		return;
+	}
 	REQUIRE(find_leaf(fs, fs->chunk_tree, match_chunk, &type, leaf, &logical, &slot));
 	chunk = leaf_data(leaf, slot);
 	stripes = (void *)(chunk + 1);

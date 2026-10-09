@@ -198,6 +198,23 @@ if fixtures != ''
     suite: 'images')
   test('keyed-references', transaction_test,
     args: ['--keyed', join_paths(fixtures, 'transactions-keyed.raw')], timeout: 300, suite: 'images')
+  # Format features: a metadata UUID, mixed groups and a v1 space cache under the
+  # inline and data scenarios, the block-group tree under the inline and group
+  # scenarios.
+  foreach profile : ['metadata-uuid', 'mixed', 'space-cache']
+    test('inline-transactions-' + profile, transaction_test,
+      args: [join_paths(fixtures, 'transactions-' + profile + '.raw')], timeout: 300,
+      suite: 'images')
+    test('data-extents-' + profile, transaction_test,
+      args: ['--data', join_paths(fixtures, 'transactions-' + profile + '.raw')], timeout: 900,
+      suite: 'images')
+  endforeach
+  test('inline-transactions-block-group-tree', transaction_test,
+    args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
+    suite: 'images')
+  test('block-group-removal-tree', transaction_test,
+    args: ['--groups', join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
+    suite: 'images')
   test('linux-reference-audit', reference_audit, args: [
     join_paths(fixtures, 'plain.raw'), join_paths(fixtures, 'small-nodes.raw'),
     join_paths(fixtures, 'large-nodes.raw'), join_paths(fixtures, 'zlib.raw'),
@@ -212,7 +229,12 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-convert.raw'),
     join_paths(fixtures, 'transactions-copies.raw'),
     join_paths(fixtures, 'checksums-xxhash.raw'), join_paths(fixtures, 'checksums-sha256.raw'),
-    join_paths(fixtures, 'checksums-blake2.raw')],
+    join_paths(fixtures, 'checksums-blake2.raw'),
+    join_paths(fixtures, 'transactions-metadata-uuid.raw'),
+    join_paths(fixtures, 'transactions-block-group-tree.raw'),
+    join_paths(fixtures, 'transactions-mixed.raw'),
+    join_paths(fixtures, 'transactions-space-cache.raw'),
+    join_paths(fixtures, 'transactions-quota.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,
@@ -227,7 +249,8 @@ if fixtures != ''
     args: ['--random-quick', '1', '500', join_paths(fixtures, 'transactions-dup.raw')],
     timeout: 900, suite: 'images')
   foreach profile : ['transactions-data', 'checksums-xxhash', 'checksums-sha256',
-      'checksums-blake2']
+      'checksums-blake2', 'transactions-metadata-uuid', 'transactions-mixed',
+      'transactions-space-cache']
     test('full-volume-' + profile, full_volume_test,
       args: [join_paths(fixtures, profile + '.raw'), meson.current_build_dir()], timeout: 600,
       suite: 'images')

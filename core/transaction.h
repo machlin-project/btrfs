@@ -113,6 +113,9 @@ struct btrfs_transaction {
 	struct bt_owned_root extents;
 	struct bt_owned_root checksums;
 	struct bt_owned_root free_space;
+	/* Block-group items, when the filesystem keeps them in their own tree. */
+	struct bt_owned_root groups;
+	int has_group_tree;
 	/* Subvolume UUIDs, when the filesystem has the tree. */
 	struct bt_owned_root uuids;
 	int has_uuids;
@@ -184,6 +187,7 @@ enum btrfs_result bt_tx_root_id(struct btrfs_transaction *transaction, uint64_t 
  * the shared form naming address as parent; otherwise references name root. */
 enum btrfs_result bt_tx_children(struct btrfs_transaction *transaction, const uint8_t *node,
     uint64_t address, int full, uint64_t root, int add);
+struct bt_root *bt_tx_groups(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_edit(struct btrfs_transaction *transaction, struct bt_root *root,
     struct bt_key key, const void *data, size_t size, enum bt_edit edit);
 /* Queues a file reference change for bt_tx_apply_refs. */

@@ -101,8 +101,9 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	struct bt_root quota;
 	int mapped;
 	enum btrfs_result error;
-	uint64_t unsupported = BT_FEATURE_MIXED_GROUPS | BT_FEATURE_METADATA_UUID;
 	uint64_t free_space = BT_COMPAT_RO_FREE_SPACE_TREE | BT_COMPAT_RO_FREE_SPACE_TREE_VALID;
+	uint64_t maintained = free_space | BT_COMPAT_RO_BLOCK_GROUP_TREE;
+	uint64_t readonly;
 
 	if (result == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
@@ -112,11 +113,17 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	    environment->flush == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	/* The free-space tree is maintained; other read-only features are not. */
-	if ((base->info.readonly_features & ~free_space) != 0 ||
-	    ((base->info.readonly_features & free_space) != 0 &&
-		(base->info.readonly_features & free_space) != free_space) ||
-	    (base->info.incompat_features & unsupported) != 0 ||
+	/* The free-space and block-group trees are maintained; other read-only
+	 * features are not. Linux keeps a block-group tree only beside a valid
+	 * free-space tree and NO_HOLES. */
+	readonly = base->info.readonly_features;
+	if ((readonly & ~maintained) != 0 ||
+	    ((readonly & free_space) != 0 && (readonly & free_space) != free_space) ||
+	    ((readonly & BT_COMPAT_RO_BLOCK_GROUP_TREE) != 0 &&
+		((readonly & free_space) != free_space ||
+		    !(base->info.incompat_features & BT_FEATURE_NO_HOLES))) ||
+	    ((base->info.incompat_features & BT_FEATURE_MIXED_GROUPS) != 0 &&
+		base->info.node_size != base->info.sector_size) ||
 	    !(base->info.incompat_features & BT_FEATURE_SKINNY_METADATA) ||
 	    base->info.generation == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
@@ -175,6 +182,10 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	transaction->has_free_space = (base->info.readonly_features & free_space) != 0;
 	if (error == BTRFS_OK && transaction->has_free_space) {
 		error = bt_tx_root(base, BT_FREE_SPACE_TREE, &transaction->free_space);
+	}
+	transaction->has_group_tree = (readonly & BT_COMPAT_RO_BLOCK_GROUP_TREE) != 0;
+	if (error == BTRFS_OK && transaction->has_group_tree) {
+		error = bt_tx_root(base, BT_BLOCK_GROUP_TREE, &transaction->groups);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_tx_root(base, BT_UUID_TREE, &transaction->uuids);
@@ -913,7 +924,7 @@ bt_tx_publish_chunks(struct btrfs_transaction *transaction)
 			bt_put64(&group.chunk_objectid, BT_FIRST_CHUNK_OBJECTID);
 			bt_put64(&group.flags, chunk->type);
 			key = (struct bt_key){ chunk->logical, chunk->length, BT_BLOCK_GROUP_ITEM };
-			error = bt_tx_edit(transaction, &transaction->extents.root, key, &group,
+			error = bt_tx_edit(transaction, bt_tx_groups(transaction), key, &group,
 			    sizeof(group), BT_INSERT);
 		}
 		if (error == BTRFS_OK && transaction->has_free_space) {
@@ -930,6 +941,13 @@ bt_tx_publish_chunks(struct btrfs_transaction *transaction)
 		}
 	}
 	return error;
+}
+
+/* The tree holding block-group items: their own tree, or the extent tree. */
+struct bt_root *
+bt_tx_groups(struct btrfs_transaction *transaction)
+{
+	return transaction->has_group_tree ? &transaction->groups.root : &transaction->extents.root;
 }
 
 /* Apply a snapshot of this round's log. Edits can allocate nodes and grow the
@@ -1054,7 +1072,7 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 			key = (struct bt_key){ .objectid = chunk->logical,
 				.type = BT_BLOCK_GROUP_ITEM,
 				.offset = chunk->length };
-			error = bt_tx_edit(transaction, &transaction->extents.root, key, &item,
+			error = bt_tx_edit(transaction, bt_tx_groups(transaction), key, &item,
 			    sizeof(item), BT_REPLACE);
 			if (error != BTRFS_OK) {
 				return error;
@@ -1069,6 +1087,11 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 		    transaction->devices.root.address !=
 			bt_u64(transaction->devices.item.legacy.bytenr)) {
 			error = bt_tx_update_root(transaction, &transaction->devices);
+		}
+		if (error == BTRFS_OK && transaction->has_group_tree &&
+		    transaction->groups.root.address !=
+			bt_u64(transaction->groups.item.legacy.bytenr)) {
+			error = bt_tx_update_root(transaction, &transaction->groups);
 		}
 		if (error != BTRFS_OK) {
 			return error;
@@ -1094,8 +1117,13 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 			bt_put64(
 			    &transaction->super.chunk_generation, transaction->chunks.generation);
 			transaction->super.chunk_level = transaction->chunks.level;
-			/* A v1 free-space cache is advisory and has not been maintained. */
-			bt_put64(&transaction->super.cache_generation, UINT64_MAX);
+			/* A v1 free-space cache, which this writer does not maintain, is
+			 * invalid once its generation differs from the superblock's:
+			 * Linux then clears and rebuilds it. Zero means no v1 cache is
+			 * in use (a free-space tree or none) and stays. */
+			if (bt_u64(transaction->super.cache_generation) != 0) {
+				bt_put64(&transaction->super.cache_generation, UINT64_MAX);
+			}
 			/* A commit names no tree log: a pending one was replayed. */
 			bt_put64(&transaction->super.log_root, 0);
 			transaction->super.log_level = 0;

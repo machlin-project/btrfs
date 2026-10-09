@@ -22,7 +22,12 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-copies": (4096, "single", ""),
             "transactions-scale": (4096, "single", ""),
             "checksums-xxhash": (16384, "dup", ""), "checksums-sha256": (4096, "single", ""),
-            "checksums-blake2": (65536, "dup", "")}
+            "checksums-blake2": (65536, "dup", ""),
+            "transactions-metadata-uuid": (4096, "single", ""),
+            "transactions-block-group-tree": (16384, "dup", ""),
+            "transactions-mixed": (4096, "single", ""),
+            "transactions-space-cache": (4096, "single", ""),
+            "transactions-quota": (16384, "dup", "")}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
 WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transactions-full",
@@ -33,12 +38,33 @@ WRITABLE = {"transactions", "transactions-dup", "transactions-large", "transacti
 # explicit hole items, and with DUP data, so every data sector has two copies;
 # it adds a file grown by truncation alone and a NODATACOW directory.
 DATA_PROFILES = {"transactions-holes": "dup", "checksums-blake2": "dup"}
-MKFS_FEATURES = {"transactions-holes": "-O ^no-holes"}
+MKFS_FEATURES = {"transactions-holes": "-O ^no-holes",
+                 "transactions-block-group-tree": "-O block-group-tree",
+                 "transactions-mixed": "--mixed",
+                 "transactions-space-cache": "-R ^free-space-tree"}
+# Format features beyond mkfs defaults, each confirmed in Linux's own dumps: a
+# metadata UUID set by btrfstune after Linux wrote the volume (tree blocks keep
+# the old fsid, the superblock names a new one), mixed data and metadata
+# groups, a v1 free-space cache that Linux keeps current and quotas with a
+# limited subvolume carry the data payload. The block-group tree keeps the
+# base payload, whose emptied data group the group scenarios remove.
+FEATURE_PROFILES = ("transactions-metadata-uuid", "transactions-mixed",
+                    "transactions-space-cache", "transactions-quota")
+MOUNT_OPTIONS = {"transactions-space-cache": "space_cache=v1"}
+# Linux writes no v1 cache for a block group below 100 MiB (cache_save_setup);
+# on 1 GiB its data groups are 112 MiB.
+SPACE_CACHE_DEVICE_BYTES = 1024 * 1024 * 1024
+QUOTA_LIMIT_BYTES = 64 * 1024 * 1024
+# A level-1 qgroup holding the data subvolume and its writable snapshot, with an
+# exclusive limit of its own.
+QUOTA_GROUP = "1/100"
+QUOTA_GROUP_LIMIT_BYTES = 96 * 1024 * 1024
 # The checksum profiles repeat the data payload under each algorithm other than
 # CRC32C, with 16, 4 and 64 KiB nodes; Linux also verifies every data checksum.
 CHECKSUMS = {"checksums-xxhash": "xxhash", "checksums-sha256": "sha256",
              "checksums-blake2": "blake2"}
-DATA_PAYLOAD = ("transactions-data", "transactions-fst", "transactions-holes", *CHECKSUMS)
+DATA_PAYLOAD = ("transactions-data", "transactions-fst", "transactions-holes", *CHECKSUMS,
+                *FEATURE_PROFILES)
 HOLES_GROWN_BYTES = 1048576
 # The convert profile keeps mkfs defaults (a free-space tree) on 1 GiB, so data
 # block groups span enough bitmaps for both of Linux's conversion thresholds.
@@ -104,6 +130,7 @@ DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
                 "transactions-holes": 512 * 1024 * 1024,
                 "checksums-blake2": 512 * 1024 * 1024,
                 "transactions-convert": 1024 * 1024 * 1024,
+                "transactions-space-cache": SPACE_CACHE_DEVICE_BYTES,
                 "transactions-copies": COPIES_DEVICE_BYTES,
                 "transactions-scale": SCALE_DEVICE_BYTES}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
@@ -143,6 +170,8 @@ def prepare(root: Path, profile: str, archive: Path) -> None:
     data_profile = DATA_PROFILES.get(profile, "single")
     if profile in WRITABLE:
         options += ",nospace_cache"
+    if profile in MOUNT_OPTIONS:
+        options += f",{MOUNT_OPTIONS[profile]}"
     set_default = "btrfs subvolume set-default /mnt/subvol" if profile == "default-subvolume" else ":"
     device_bytes = DEVICE_BYTES.get(profile, 256 * 1024 * 1024)
     len_random = len(contents["random"])
@@ -471,6 +500,52 @@ btrfs filesystem sync /mnt
 btrfs inspect-internal dump-tree -t 10 /dev/vda > /tmp/free-space.txt
 echo BTRFS_REFERENCE_FREE_SPACE_BITMAPS:$(grep -c 'FREE_SPACE_BITMAP' /tmp/free-space.txt || true)
 echo BTRFS_REFERENCE_FREE_SPACE_EXTENTS:$(grep -c 'FREE_SPACE_EXTENT' /tmp/free-space.txt || true)'''
+    after = ":"
+    if profile == "transactions-metadata-uuid":
+        after = '''old=$(btrfs inspect-internal dump-super /dev/vda | awk '$1 == "fsid" {print $2}')
+btrfstune -m /dev/vda
+btrfs inspect-internal dump-super /dev/vda > /tmp/super.txt
+grep -E '^(fsid|metadata_uuid|incompat_flags)' /tmp/super.txt
+grep -qw METADATA_UUID /tmp/super.txt
+test "$(awk '$1 == "metadata_uuid" {print $2}' /tmp/super.txt)" = "$old"
+test "$(awk '$1 == "fsid" {print $2}' /tmp/super.txt)" != "$old"
+btrfs check --readonly /dev/vda
+mount -t btrfs -o ro /dev/vda /mnt
+(cd /mnt && sha256sum -c /input/SHA256SUMS)
+umount /mnt'''
+    if profile == "transactions-block-group-tree":
+        after = '''btrfs inspect-internal dump-super /dev/vda | grep -w BLOCK_GROUP_TREE
+echo BTRFS_REFERENCE_GROUP_TREE_ITEMS:$(btrfs inspect-internal dump-tree -t 11 /dev/vda | grep -c ' BLOCK_GROUP_ITEM ')
+test "$(btrfs inspect-internal dump-tree -t extent /dev/vda | grep -c ' BLOCK_GROUP_ITEM ' || true)" = 0'''
+    if profile == "transactions-mixed":
+        fill += '''
+btrfs filesystem df /mnt | grep -F Data+Metadata'''
+        after = '''btrfs inspect-internal dump-super /dev/vda | grep -w MIXED_GROUPS'''
+    if profile == "transactions-space-cache":
+        after = '''btrfs inspect-internal dump-super /dev/vda > /tmp/super.txt
+grep -E '^(generation|cache_generation|compat_ro_flags)' /tmp/super.txt
+test "$(awk '$1 == "cache_generation" {print $2}' /tmp/super.txt)" = \\
+     "$(awk '$1 == "generation" {print $2}' /tmp/super.txt)"
+caches=$(btrfs inspect-internal dump-tree -t root /dev/vda | grep -c 'key (FREE_SPACE UNTYPED' || true)
+echo BTRFS_REFERENCE_SPACE_CACHES:$caches
+test "$caches" -gt 0'''
+    if profile == "transactions-quota":
+        fill += f'''
+btrfs quota enable /mnt
+btrfs qgroup create {QUOTA_GROUP} /mnt
+btrfs qgroup assign --no-rescan 0/$(btrfs inspect-internal rootid /mnt/data) {QUOTA_GROUP} /mnt
+btrfs qgroup assign --no-rescan 0/$(btrfs inspect-internal rootid /mnt/data-snap) {QUOTA_GROUP} /mnt
+btrfs qgroup limit {QUOTA_LIMIT_BYTES} /mnt/data
+btrfs qgroup limit -e {QUOTA_GROUP_LIMIT_BYTES} {QUOTA_GROUP} /mnt
+btrfs filesystem sync /mnt
+btrfs quota rescan -w /mnt
+btrfs qgroup show -pcre --raw /mnt'''
+        after = '''btrfs inspect-internal dump-tree -t quota /dev/vda > /tmp/quota.txt
+grep -c 'QGROUP_INFO' /tmp/quota.txt
+grep -q 'QGROUP_LIMIT' /tmp/quota.txt
+test "$(grep -c 'QGROUP_RELATION' /tmp/quota.txt)" = 4
+grep -A1 'QGROUP_STATUS' /tmp/quota.txt
+! grep -q INCONSISTENT /tmp/quota.txt'''
     init = f'''#!/bin/busybox sh
 set -eu
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
@@ -523,6 +598,7 @@ btrfs filesystem sync /mnt
 cd /
 umount /mnt
 btrfs check --readonly {check_data} /dev/vda
+{after}
 btrfs inspect-internal dump-super /dev/vda | grep '^csum_type'
 btrfs inspect-internal dump-tree -t fs /dev/vda > /tmp/tree.txt
 grep 'compression' /tmp/tree.txt | sort | uniq -c
