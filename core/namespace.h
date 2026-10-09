@@ -143,6 +143,32 @@ enum btrfs_result bt_sv_unlink(struct btrfs_transaction *transaction, struct bt_
 enum btrfs_result bt_sv_link(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     uint64_t directory, const void *name, size_t length, struct bt_key location, uint64_t index,
     struct btrfs_time time);
+/* btrfs_transaction_create; reserve 0 leaves the qgroup reservation to the
+ * caller (a rename's whiteout, which btrfs_rename counts with the rename). */
+enum btrfs_result bt_ns_create(struct btrfs_transaction *transaction, struct btrfs_object_id parent,
+    const void *name, size_t length, const struct btrfs_new_inode *attributes, int reserve,
+    struct btrfs_object_id *result);
+/* Tree items Linux reserves for operations against qgroup limits: a new
+ * name's directory item, index and directory update (or an O_TMPFILE file's
+ * orphan item, after the inode item); btrfs_link for a further name or a
+ * tmpfile's first; btrfs_setxattr_trans; btrfs_fileattr_set. */
+#define BT_NS_ENTRY_ITEMS 3U
+#define BT_NS_ORPHAN_ITEMS 1U
+#define BT_NS_LINK_ITEMS 5U
+#define BT_NS_TMPFILE_LINK_ITEMS 6U
+#define BT_NS_XATTR_ITEMS 2U
+#define BT_NS_FSFLAGS_ITEMS 3U
+
+/* Linux's btrfs_start_transaction charge: items tree nodes reserved against
+ * the qgroup limits of tree (QUOTA_EXCEEDED) until the transaction ends. */
+enum btrfs_result bt_ns_reserve_items(
+    struct btrfs_transaction *transaction, uint64_t tree, uint64_t items);
+/* The items btrfs_new_inode_prepare counts for a new inode in directory: its
+ * inode item, the compression property the directory passes on, and the
+ * directory's entries and update (entries is 3), or an orphan item (1), with
+ * extra items besides. */
+enum btrfs_result bt_ns_reserve_new(struct btrfs_transaction *transaction,
+    struct bt_owned_root *tree, uint64_t directory, uint64_t entries, uint64_t extra);
 enum btrfs_result bt_ns_begin(
     struct btrfs_transaction *transaction, uint64_t tree_id, struct bt_owned_root **tree);
 enum btrfs_result bt_ns_poison(struct btrfs_transaction *transaction, enum btrfs_result error);

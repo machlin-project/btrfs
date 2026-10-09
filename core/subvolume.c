@@ -8,6 +8,9 @@
 #define BT_ROOT_ITEM_INODE_SIZE 3U
 #define BT_ROOT_ITEM_INODE_MODE (BTRFS_MODE_DIRECTORY | 0755U)
 #define BT_PARENT_NAME ".."
+/* btrfs_subvolume_reserve_metadata's qgroup charge against the parent
+ * subvolume: its directory's update and the new or removed entry's items. */
+#define BT_SV_RESERVE_ITEMS 3U
 
 /* A subvolume's UUID tree key: the UUID's two little-endian halves. */
 static struct bt_key
@@ -226,6 +229,9 @@ btrfs_transaction_create_subvolume(struct btrfs_transaction *transaction,
 	if (error == BTRFS_OK) {
 		error = bt_tx_root_id(transaction, &id);
 	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(transaction, parent.tree, BT_SV_RESERVE_ITEMS);
+	}
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -356,6 +362,9 @@ btrfs_transaction_snapshot(struct btrfs_transaction *transaction, uint64_t sourc
 	}
 	if (error == BTRFS_OK) {
 		error = bt_tx_root_id(transaction, &id);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(transaction, parent.tree, BT_SV_RESERVE_ITEMS);
 	}
 	if (error != BTRFS_OK) {
 		return error;
@@ -705,6 +714,11 @@ btrfs_transaction_delete_subvolume(struct btrfs_transaction *transaction,
 	}
 	if (error == BTRFS_OK && bt_u32(dead.item.legacy.refs) == 0) {
 		error = BTRFS_CORRUPT;
+	}
+	/* btrfs_delete_subvolume reserves with the limits enforced; a stub goes
+	 * through rmdir's global reserve. */
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(transaction, parent.tree, BT_SV_RESERVE_ITEMS);
 	}
 	if (error != BTRFS_OK) {
 		return error;

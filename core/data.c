@@ -13,6 +13,16 @@
 /* Tree nodes a queued reference change edits at commit besides checksum
  * leaves: the extent item's leaf and, for a freed extent, its free-space
  * entry; parents are within the commit's own allowance. */
+/* Tree items Linux reserves against qgroup limits for data operations: a
+ * btrfs_truncate step; a growing btrfs_setsize's inode update and, without
+ * NO_HOLES, maybe_insert_hole's; each extent __btrfs_prealloc_file_range
+ * allocates; btrfs_replace_file_extents for a punch, with or without NO_HOLES. */
+#define BT_TRUNCATE_ITEMS 2U
+#define BT_GROW_ITEMS 1U
+#define BT_HOLE_ITEMS 3U
+#define BT_PREALLOC_ITEMS 3U
+#define BT_PUNCH_ITEMS 2U
+#define BT_PUNCH_HOLE_ITEMS 3U
 #define BT_REF_EDIT_NODES 1U
 #define BT_REF_FREE_NODES 1U
 
@@ -1172,6 +1182,20 @@ bt_tx_data_begin(struct btrfs_transaction *transaction, struct btrfs_object_id i
 	return error;
 }
 
+/* Whether the filesystem has NO_HOLES: a hole takes no item. */
+static int
+bt_tx_no_holes(const struct btrfs_transaction *transaction)
+{
+	return (transaction->base->info.incompat_features & BT_FEATURE_NO_HOLES) != 0;
+}
+
+/* Linux's count_max_extents: data extents of up to BT_DATA_EXTENT bytes. */
+static uint64_t
+bt_tx_extent_count(uint64_t bytes)
+{
+	return bytes / BT_DATA_EXTENT + (bytes % BT_DATA_EXTENT != 0 ? 1 : 0);
+}
+
 enum btrfs_result
 btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_object_id id,
     uint64_t offset, const void *bytes, size_t size, struct btrfs_time modified)
@@ -1216,9 +1240,12 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 		return BTRFS_NO_SPACE;
 	}
 	/* btrfs_qgroup_reserve_data: the written sectors count against the
-	 * subvolume's qgroups and every qgroup above them. */
+	 * subvolume's qgroups and every qgroup above them, and so does a node
+	 * for each extent the write may make (btrfs_delalloc_reserve_metadata);
+	 * one reservation holds both, as a refusal releases both on Linux. */
 	error = bt_qgroup_reserve(transaction, id.tree,
-	    (offset + size + sector - 1) / sector * sector - (offset - offset % sector));
+	    (offset + size + sector - 1) / sector * sector - (offset - offset % sector) +
+		bt_tx_extent_count(size) * transaction->base->info.node_size);
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -1303,6 +1330,17 @@ btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_o
 	sector = transaction->base->info.sector_size;
 	old_size = bt_u64(inode.size);
 	edge = size + (sector - size % sector) % sector;
+	/* btrfs_setsize's reservations: each btrfs_truncate step, or the
+	 * growth's inode update and a hole item without NO_HOLES. */
+	if (size != old_size) {
+		error = bt_ns_reserve_items(transaction, id.tree,
+		    size < old_size
+			? BT_TRUNCATE_ITEMS
+			: BT_GROW_ITEMS + (bt_tx_no_holes(transaction) ? 0 : BT_HOLE_ITEMS));
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
 	if (size < old_size && inline_end == 0) {
 		/* Items past the new EOF's sector go from the end in bounded steps;
 		 * each step stores the size reached, a valid shorter file. */
@@ -1832,13 +1870,20 @@ btrfs_transaction_fallocate(struct btrfs_transaction *transaction, struct btrfs_
 	if (!bt_space_data_available(transaction->space, need)) {
 		return BTRFS_NO_SPACE;
 	}
-	/* Allocation and zeroing reserve their sectors as btrfs_fallocate does;
-	 * a punch adds nothing. */
+	/* Allocation and zeroing reserve their sectors as btrfs_fallocate does,
+	 * with each extent's transaction items (__btrfs_prealloc_file_range); a
+	 * punch reserves btrfs_replace_file_extents's items. */
 	if ((mode & BTRFS_FALLOCATE_PUNCH_HOLE) == 0) {
-		error = bt_qgroup_reserve(transaction, id.tree, need);
-		if (error != BTRFS_OK) {
-			return error;
-		}
+		error = bt_qgroup_reserve(transaction, id.tree,
+		    need +
+			bt_tx_extent_count(need) * BT_PREALLOC_ITEMS *
+			    transaction->base->info.node_size);
+	} else {
+		error = bt_ns_reserve_items(transaction, id.tree,
+		    bt_tx_no_holes(transaction) ? BT_PUNCH_ITEMS : BT_PUNCH_HOLE_ITEMS);
+	}
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	env = &transaction->base->env;
 	zeros = env->allocate(env->context, (size_t)sector);

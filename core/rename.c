@@ -6,6 +6,16 @@
  * inodes and for subvolume entries, which may move between subvolumes. */
 #include "namespace.h"
 
+/* Items of Linux's rename reservations: a moved inode's item and references,
+ * a moved subvolume's root references, an old and a new directory item and
+ * index, a replaced inode's update, reference, entries and orphan item, and
+ * an exchange's four entries per object with both parents. */
+#define BT_RN_INODE_ITEMS 3U
+#define BT_RN_SUBVOLUME_ITEMS 4U
+#define BT_RN_ENTRY_ITEMS 4U
+#define BT_RN_REPLACED_ITEMS 5U
+#define BT_RN_EXCHANGE_ITEMS 10U
+
 /* One name of a rename or exchange: a name of an inode in its directory's
  * tree, a subvolume entry, or a stub that a snapshot copied for one. */
 struct bt_rn_side {
@@ -244,6 +254,25 @@ bt_rn_touch(struct btrfs_transaction *transaction, struct bt_rn_side *side, stru
 	return error;
 }
 
+/* Items btrfs_rename and btrfs_rename_exchange count for a moved object's
+ * references: an inode's item and its old and new INODE_REF, or a
+ * subvolume's two old and two new root references. */
+static uint64_t
+bt_rn_reference_items(const struct bt_rn_side *side)
+{
+	return side->is_subvolume ? BT_RN_SUBVOLUME_ITEMS : BT_RN_INODE_ITEMS;
+}
+
+/* btrfs_rename's count without a whiteout: the old parent, the moved
+ * object's references, the old and new entries, a new parent, and a
+ * replaced inode's update, reference, entries and orphan item. */
+static uint64_t
+bt_rn_rename_items(const struct bt_rn_side *source, const struct bt_rn_side *target, int moving)
+{
+	return 1 + bt_rn_reference_items(source) + BT_RN_ENTRY_ITEMS + (moving ? 1 : 0) +
+	    (target->exists ? BT_RN_REPLACED_ITEMS : 0);
+}
+
 static int
 bt_rn_moving(struct btrfs_object_id old_parent, struct btrfs_object_id new_parent)
 {
@@ -259,7 +288,8 @@ bt_rn_moving(struct btrfs_object_id old_parent, struct btrfs_object_id new_paren
 static enum btrfs_result
 bt_rn_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_parent,
     const void *old_name, size_t old_length, struct btrfs_object_id new_parent,
-    const void *new_name, size_t new_length, struct btrfs_time time, int target_open, int *moved)
+    const void *new_name, size_t new_length, struct btrfs_time time, int target_open, int whiteout,
+    int *moved)
 {
 	struct bt_rn_side source;
 	struct bt_rn_side target;
@@ -346,6 +376,16 @@ bt_rn_rename(struct btrfs_transaction *transaction, struct btrfs_object_id old_p
 	if (error == BTRFS_OK) {
 		error = bt_ns_index(transaction, target.tree, new_parent.inode, &index);
 	}
+	/* btrfs_rename's reservation: the old parent (or the whiteout's inode,
+	 * entries and the parent), the moved object's references, the two
+	 * entries, a new parent and a replaced inode. */
+	if (error == BTRFS_OK && whiteout) {
+		error = bt_ns_reserve_new(transaction, source.tree, old_parent.inode,
+		    BT_NS_ENTRY_ITEMS, bt_rn_rename_items(&source, &target, moving) - 1);
+	} else if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(
+		    transaction, old_parent.tree, bt_rn_rename_items(&source, &target, moving));
+	}
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -387,7 +427,7 @@ btrfs_transaction_rename(struct btrfs_transaction *transaction, struct btrfs_obj
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	return bt_rn_rename(transaction, old_parent, old_name, old_length, new_parent, new_name,
-	    new_length, time, target_open, &moved);
+	    new_length, time, target_open, 0, &moved);
 }
 
 /* RENAME_WHITEOUT: the rename, then a whiteout (a character device 0:0
@@ -408,7 +448,7 @@ btrfs_transaction_rename_whiteout(struct btrfs_transaction *transaction,
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	error = bt_rn_rename(transaction, old_parent, old_name, old_length, new_parent, new_name,
-	    new_length, time, target_open, &moved);
+	    new_length, time, target_open, 1, &moved);
 	if (error != BTRFS_OK || !moved) {
 		return error;
 	}
@@ -417,8 +457,7 @@ btrfs_transaction_rename_whiteout(struct btrfs_transaction *transaction,
 	whiteout.uid = uid;
 	whiteout.gid = gid;
 	whiteout.time = time;
-	error =
-	    btrfs_transaction_create(transaction, old_parent, old_name, old_length, &whiteout, &id);
+	error = bt_ns_create(transaction, old_parent, old_name, old_length, &whiteout, 0, &id);
 	return bt_ns_poison(transaction, error);
 }
 
@@ -504,6 +543,13 @@ btrfs_transaction_exchange(struct btrfs_transaction *transaction, struct btrfs_o
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_index(transaction, source.tree, old_parent.inode, &target_index);
+	}
+	/* btrfs_rename_exchange's reservation: per object its entries and parent
+	 * update (one parent fewer in one directory), and its references. */
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(transaction, old_parent.tree,
+		    (moving ? BT_RN_EXCHANGE_ITEMS : BT_RN_EXCHANGE_ITEMS - 1) +
+			bt_rn_reference_items(&source) + bt_rn_reference_items(&target));
 	}
 	if (error != BTRFS_OK) {
 		return error;

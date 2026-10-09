@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "namespace.h"
+#include "qgroup.h"
 
 /* Linux's compression property: a value starting with a codec name (a level
  * may follow), or "no"/"none" to disable compression. */
@@ -1294,6 +1295,14 @@ btrfs_transaction_create(struct btrfs_transaction *transaction, struct btrfs_obj
     const void *name, size_t length, const struct btrfs_new_inode *attributes,
     struct btrfs_object_id *result)
 {
+	return bt_ns_create(transaction, parent, name, length, attributes, 1, result);
+}
+
+enum btrfs_result
+bt_ns_create(struct btrfs_transaction *transaction, struct btrfs_object_id parent, const void *name,
+    size_t length, const struct btrfs_new_inode *attributes, int reserve,
+    struct btrfs_object_id *result)
+{
 	struct bt_owned_root *tree = NULL;
 	struct bt_disk_inode directory;
 	struct bt_new_inode plan;
@@ -1336,6 +1345,11 @@ btrfs_transaction_create(struct btrfs_transaction *transaction, struct btrfs_obj
 	if (error == BTRFS_OK) {
 		error = bt_ns_plan_inode(
 		    transaction, tree, parent.inode, &directory, attributes, &plan);
+	}
+	/* A symlink's target adds its inline extent item. */
+	if (error == BTRFS_OK && reserve) {
+		error = bt_ns_reserve_new(transaction, tree, parent.inode, BT_NS_ENTRY_ITEMS,
+		    type == BTRFS_FT_SYMLINK ? 1 : 0);
 	}
 	if (error != BTRFS_OK) {
 		return error;
@@ -1391,6 +1405,9 @@ btrfs_transaction_create_tmpfile(struct btrfs_transaction *transaction,
 		error = bt_ns_plan_inode(
 		    transaction, tree, parent.inode, &directory, attributes, &plan);
 	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_new(transaction, tree, parent.inode, BT_NS_ORPHAN_ITEMS, 0);
+	}
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -1406,6 +1423,28 @@ btrfs_transaction_create_tmpfile(struct btrfs_transaction *transaction,
 		result->inode = plan.inode;
 	}
 	return bt_ns_poison(transaction, error);
+}
+
+enum btrfs_result
+bt_ns_reserve_items(struct btrfs_transaction *transaction, uint64_t tree, uint64_t items)
+{
+	return bt_qgroup_reserve(transaction, tree, items * transaction->base->info.node_size);
+}
+
+enum btrfs_result
+bt_ns_reserve_new(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, uint64_t entries, uint64_t extra)
+{
+	const struct bt_codec *codec = NULL;
+	enum btrfs_result error;
+
+	/* BTRFS_I(dir)->prop_compress: a property naming a codec. */
+	error = bt_ns_inherited_codec(transaction, tree, directory, 0, &codec);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	return bt_ns_reserve_items(
+	    transaction, tree->root.owner, 1 + (codec != NULL ? 1 : 0) + entries + extra);
 }
 
 /* A new name for an inode, as btrfs_link adds it. A file created with
@@ -1479,6 +1518,10 @@ bt_ns_link(struct btrfs_transaction *transaction, struct btrfs_object_id id,
 	}
 	if (error == BTRFS_OK) {
 		error = bt_ns_index(transaction, tree, parent.inode, &index);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(transaction, parent.tree,
+		    tmpfile ? BT_NS_TMPFILE_LINK_ITEMS : BT_NS_LINK_ITEMS);
 	}
 	if (error != BTRFS_OK) {
 		return error;
@@ -1702,6 +1745,10 @@ bt_ns_xattr(struct btrfs_transaction *transaction, struct btrfs_object_id id, co
 		error =
 		    bt_ns_check_property(&item, value, remove ? 0 : value_length, &codec, &ignore);
 	}
+	/* btrfs_setxattr_trans reserves before it looks for the name. */
+	if (error == BTRFS_OK && !ignore) {
+		error = bt_ns_reserve_items(transaction, id.tree, BT_NS_XATTR_ITEMS);
+	}
 	if (error != BTRFS_OK || ignore) {
 		return error;
 	}
@@ -1822,6 +1869,10 @@ btrfs_transaction_set_fsflags(struct btrfs_transaction *transaction, struct btrf
 		}
 	} else {
 		flags &= ~(BT_INODE_COMPRESS | BT_INODE_NOCOMPRESS);
+	}
+	error = bt_ns_reserve_items(transaction, id.tree, BT_NS_FSFLAGS_ITEMS);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	error = bt_ns_edit_xattr(transaction, tree, id.inode, BT_COMPRESSION_PROPERTY,
 	    bt_ns_length(BT_COMPRESSION_PROPERTY), codec != NULL ? codec->name : NULL,

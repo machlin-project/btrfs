@@ -568,12 +568,32 @@ A snapshot waits while a rescan runs (UNSUPPORTED), and a rescan step cannot
 follow a snapshot in its transaction. Inherited counts would mix with partial
 ones, and this core does not claim Linux's numbers for that case.
 
-Limits are checked before any change as Linux's `qgroup_reserve`: a write
-admits its sector-aligned range and a preallocation or zeroing its new
-extents against the subvolume's qgroup and every qgroup above it; passing a
-referenced or exclusive limit returns QUOTA_EXCEEDED (EDQUOT natively).
-Metadata growth is accounted at commit but not reserved beforehand, as
-Linux's per-item metadata reservation would.
+Limits are checked before any change as Linux's `qgroup_reserve`, against
+the subvolume's qgroup and every qgroup above it; passing a referenced or
+exclusive limit returns QUOTA_EXCEEDED (EDQUOT natively). Reservations hold
+until the transaction ends. Data is reserved as `btrfs_qgroup_reserve_data`
+reserves it:
+
+- a write reserves its sector-aligned range;
+- a preallocation or zeroing reserves its new extents.
+
+Metadata is reserved as `btrfs_start_transaction` charges an operation's tree
+items, a node each:
+
+- a new inode: 4 items, one more under a compression property, one more for
+  a symlink's target; an O_TMPFILE file: 2;
+- a link: 5, or 6 for an O_TMPFILE file's first name;
+- a rename: `btrfs_rename`'s formula, with a whiteout's inode in it; an
+  exchange: `btrfs_rename_exchange`'s formula;
+- an xattr set or removed: 2; inode flags: 3;
+- a write: a node per 128 MiB extent; a shrinking truncation step: 2; growth:
+  1, plus 3 without NO_HOLES;
+- each preallocated 128 MiB extent: 3; a punch: 2, or 3 without NO_HOLES;
+- a subvolume created, snapshotted or deleted: 3 against its parent.
+
+Removals, which Linux charges to the global reserve, and attribute changes,
+which join the running transaction, reserve nothing. A security module's
+inode blob and POSIX ACLs, which add items on Linux, have no counterpart here.
 
 ## Free-space tree
 

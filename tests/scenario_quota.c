@@ -192,6 +192,114 @@ quota_rescan_plan(struct context *context)
 	run_plan(context, &plan);
 }
 
+/* /data's qgroup and the qgroup above it, 1/100. */
+#define QUOTA_DATA_QGROUP UINT64_C(258)
+#define QUOTA_PARENT_QGROUP ((UINT64_C(1) << BT_QGROUP_LEVEL_SHIFT) | 100U)
+/* Nodes Linux charges: a new file, a link, an xattr change, a shrinking
+ * truncation, a preallocated extent, and what the plan leaves free. */
+#define QUOTA_CREATE_NODES 4U
+#define QUOTA_LINK_NODES 5U
+#define QUOTA_XATTR_NODES 2U
+#define QUOTA_TRUNCATE_NODES 2U
+#define QUOTA_PREALLOC_NODES 3U
+#define QUOTA_LEFT_NODES 2U
+
+/* The bytes a qgroup of the fixture may still take under its limits. */
+static uint64_t
+quota_headroom(struct btrfs_fs *fs, uint64_t id)
+{
+	const struct bt_disk_qgroup_info *info;
+	const struct bt_disk_qgroup_limit *limit;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	uint64_t referenced;
+	uint64_t exclusive;
+	uint64_t headroom = UINT64_MAX;
+
+	REQUIRE(bt_find_root(fs, BT_QUOTA_TREE, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	REQUIRE(bt_cursor_seek(&cursor,
+		    (struct bt_key){ .objectid = 0, .type = BT_QGROUP_INFO, .offset = id },
+		    0) == BTRFS_OK &&
+	    bt_cursor_record(&cursor, &record) == BTRFS_OK && record.key.offset == id &&
+	    record.key.type == BT_QGROUP_INFO && record.size == sizeof(*info));
+	info = (const void *)record.data;
+	referenced = bt_u64(info->referenced);
+	exclusive = bt_u64(info->exclusive);
+	REQUIRE(bt_cursor_seek(&cursor,
+		    (struct bt_key){ .objectid = 0, .type = BT_QGROUP_LIMIT, .offset = id },
+		    0) == BTRFS_OK &&
+	    bt_cursor_record(&cursor, &record) == BTRFS_OK && record.key.offset == id &&
+	    record.key.type == BT_QGROUP_LIMIT && record.size == sizeof(*limit));
+	limit = (const void *)record.data;
+	if ((bt_u64(limit->flags) & BT_QGROUP_LIMIT_MAX_REFERENCED) != 0) {
+		REQUIRE(bt_u64(limit->max_referenced) >= referenced);
+		headroom = bt_u64(limit->max_referenced) - referenced;
+	}
+	if ((bt_u64(limit->flags) & BT_QGROUP_LIMIT_MAX_EXCLUSIVE) != 0) {
+		REQUIRE(bt_u64(limit->max_exclusive) >= exclusive);
+		if (bt_u64(limit->max_exclusive) - exclusive < headroom) {
+			headroom = bt_u64(limit->max_exclusive) - exclusive;
+		}
+	}
+	bt_cursor_fini(&cursor);
+	return headroom;
+}
+
+/* Metadata reserved as Linux's btrfs_start_transaction reserves it counts
+ * against limits within a transaction: a preallocation fills /data's
+ * qgroups until two nodes remain; a new file and a link are then refused, an
+ * xattr fits and takes the rest, a shrinking truncation is refused, and an
+ * unlink, which Linux charges to the global reserve, still passes. */
+static void
+quota_metadata_plan(struct context *context)
+{
+	struct btrfs_fs *fs;
+	struct plan plan;
+	uint64_t node;
+	uint64_t sector;
+	uint64_t headroom;
+	uint64_t fill;
+
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	node = fs->info.node_size;
+	sector = fs->info.sector_size;
+	headroom = quota_headroom(fs, QUOTA_DATA_QGROUP);
+	if (quota_headroom(fs, QUOTA_PARENT_QGROUP) < headroom) {
+		headroom = quota_headroom(fs, QUOTA_PARENT_QGROUP);
+	}
+	btrfs_unmount(fs);
+	/* The new file, its preallocation (one sector beyond the range and one
+	 * extent's items) and what remains. */
+	REQUIRE(headroom >
+	    (QUOTA_CREATE_NODES + QUOTA_PREALLOC_NODES + QUOTA_LEFT_NODES) * node + sector);
+	fill = headroom - (QUOTA_CREATE_NODES + QUOTA_PREALLOC_NODES + QUOTA_LEFT_NODES) * node -
+	    sector;
+	REQUIRE(fill % sector == 0 && fill <= BT_DATA_EXTENT - sector);
+	REQUIRE(QUOTA_XATTR_NODES == QUOTA_LEFT_NODES && QUOTA_CREATE_NODES > QUOTA_LEFT_NODES &&
+	    QUOTA_LINK_NODES > QUOTA_LEFT_NODES);
+	plan_init(&plan);
+	/* An unchanged file gives every stage its generation. */
+	plan_file(context, &plan, "/greeting");
+	plan.name = "quota-metadata";
+	plan_create(&plan, 1, "/data/fill", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_fallocate_new(&plan, 1, "/data/fill", 0, 0, fill);
+	plan_create(&plan, 1, "/data/denied", BTRFS_MODE_REGULAR | 0644, NULL);
+	plan_expect_refusal(&plan, 1, BTRFS_QUOTA_EXCEEDED);
+	plan_link(&plan, 1, "/data/fill", "/data/fill-link");
+	plan_expect_refusal(&plan, 1, BTRFS_QUOTA_EXCEEDED);
+	plan_set_xattr(&plan, 1, "/data/fill", "user.fits", "x", 1, 0);
+	plan_truncate_new(&plan, 1, "/data/fill", fill / 2);
+	plan_expect_refusal(&plan, 1, BTRFS_QUOTA_EXCEEDED);
+	plan_unlink(&plan, 1, "/data/fill", 0);
+	expect_absent(&plan, 1, LAST_STAGE, "/data/fill");
+	expect_absent(&plan, 1, LAST_STAGE, "/data/denied");
+	expect_absent(&plan, 1, LAST_STAGE, "/data/fill-link");
+	expect_quota(&plan, 0, LAST_STAGE, 0, QUOTA_GROUPS);
+	run_plan(context, &plan);
+}
+
 /* Steps a maintenance test allows before its work must be done. */
 #define QUOTA_MAINTENANCE_STEPS 1000U
 
@@ -287,4 +395,5 @@ quota_scenarios(struct context *context)
 	quota_drop_plan(context);
 	quota_rescan_plan(context);
 	quota_maintenance(context);
+	quota_metadata_plan(context);
 }
