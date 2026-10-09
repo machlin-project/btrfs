@@ -628,6 +628,8 @@ check_groups(
 	}
 }
 
+const char *const quota_state_names[] = { "consistent", "inconsistent", "rescan" };
+
 /* The quota tree's status item, stamped with the stage's generation, and its
  * qgroup info items. */
 static void
@@ -638,7 +640,7 @@ check_quota(struct btrfs_fs *fs, const struct plan *plan, size_t stage, const st
 	struct bt_record record;
 	struct bt_root root;
 	uint64_t qgroups = 0;
-	int inconsistent = 0;
+	unsigned state = QUOTA_CONSISTENT;
 	enum btrfs_result result;
 
 	REQUIRE(bt_find_root(fs, BT_QUOTA_TREE, &root) == BTRFS_OK);
@@ -649,7 +651,11 @@ check_quota(struct btrfs_fs *fs, const struct plan *plan, size_t stage, const st
 		if (record.key.type == BT_QGROUP_STATUS) {
 			REQUIRE(record.size >= sizeof(*status));
 			status = (const void *)record.data;
-			inconsistent = (bt_u64(status->flags) & BT_QGROUP_STATUS_INCONSISTENT) != 0;
+			state = (bt_u64(status->flags) & BT_QGROUP_STATUS_RESCAN) != 0
+			    ? QUOTA_RESCANNING
+			    : (bt_u64(status->flags) & BT_QGROUP_STATUS_INCONSISTENT) != 0
+			    ? QUOTA_INCONSISTENT
+			    : QUOTA_CONSISTENT;
 			REQUIRE(bt_u64(status->generation) == fs->info.generation);
 		}
 		qgroups += record.key.type == BT_QGROUP_INFO;
@@ -657,9 +663,9 @@ check_quota(struct btrfs_fs *fs, const struct plan *plan, size_t stage, const st
 	}
 	bt_cursor_fini(&cursor);
 	REQUIRE(result == BTRFS_NOT_FOUND && status != NULL);
-	if (inconsistent != (e->links != 0) || qgroups != e->value) {
+	if (state != e->links || qgroups != e->value) {
 		fprintf(stderr, "%s stage %zu: quotas %s with %llu qgroups\n", plan->name, stage,
-		    inconsistent ? "inconsistent" : "consistent", (unsigned long long)qgroups);
+		    quota_state_names[state], (unsigned long long)qgroups);
 		exit(1);
 	}
 }
@@ -1700,7 +1706,26 @@ expect_quota(struct plan *plan, size_t first, size_t last, int inconsistent, uin
 	struct expectation *e = expect(plan, first, last, EXPECT_QUOTA, "/");
 
 	e->value = qgroups;
-	e->links = inconsistent != 0;
+	e->links = inconsistent != 0 ? QUOTA_INCONSISTENT : QUOTA_CONSISTENT;
+}
+
+void
+expect_quota_rescan(struct plan *plan, size_t first, size_t last, uint64_t qgroups)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_QUOTA, "/");
+
+	e->value = qgroups;
+	e->links = QUOTA_RESCANNING;
+}
+
+void
+plan_quota_rescan(struct plan *plan, size_t commit, size_t budget, int done)
+{
+	struct operation *operation =
+	    plan_namespace(plan, commit, OPERATION_QUOTA_RESCAN, "/", NULL);
+
+	operation->offset = budget;
+	operation->flags = done;
 }
 
 void

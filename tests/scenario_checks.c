@@ -806,7 +806,7 @@ exhaustion_commit_test(
 /* Tree nodes a grouped inline rewrite declares. */
 #define GROUPED_REWRITE_NODES 16U
 
-/* The exhaustion test runs one thread: the volume never has to wait. */
+/* Tests that run one thread: the volume never has to wait. */
 static void
 single_lock(void *context)
 {
@@ -828,6 +828,9 @@ single_wake(void *context, const void *channel)
 	(void)channel;
 }
 
+const struct btrfs_volume_locks single_thread_locks = { NULL, single_lock, single_lock, single_wait,
+	single_wake };
+
 /* Grouped operations on full metadata: the volume refuses an operation
  * before its first change, commits the running transaction when it lacks
  * room, and no commit runs out of space; every acknowledged rewrite is on the
@@ -836,8 +839,7 @@ static void
 grouped_exhaustion_test(struct context *context, const struct btrfs_object_id *ids, size_t count,
     const uint8_t *data, size_t size)
 {
-	struct btrfs_volume_locks locks = { NULL, single_lock, single_lock, single_wait,
-		single_wake };
+	struct btrfs_volume_locks locks = single_thread_locks;
 	struct btrfs_volume *volume;
 	struct btrfs_volume_view *view;
 	struct btrfs_transaction *transaction;

@@ -1008,8 +1008,16 @@ btrfs_timespec(struct btrfs_time time)
 	    (uint64_t)BTRFS_FSKIT_COMMIT_SECONDS * NSEC_PER_SEC, NSEC_PER_SEC);
 	dispatch_source_set_event_handler(_committer, ^{
 	  BtrfsVolume *volume = weak;
+	  unsigned step;
+	  int pending = 1;
 
 	  if (volume != nil) {
+		  /* Linux's cleaner and rescan worker, a few bounded steps a tick. */
+		  for (step = 0; step < BTRFS_FSKIT_MAINTENANCE_STEPS && pending; step++) {
+			  if (btrfs_volume_maintain(volume->_volume, &pending) != BTRFS_OK) {
+				  break;
+			  }
+		  }
 		  (void)btrfs_volume_sync(volume->_volume, btrfs_volume_pending(volume->_volume));
 	  }
 	});

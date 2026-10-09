@@ -340,9 +340,11 @@ btrfs_transaction_snapshot(struct btrfs_transaction *transaction, uint64_t sourc
 		error = BTRFS_UNSUPPORTED;
 	}
 	/* With quotas the snapshot is the transaction's first change: its
-	 * accounting starts from the base with only the copy added. */
+	 * accounting starts from the base with only the copy added. Its counts
+	 * are inherited whole, which a rescan's partial counts are not. */
 	if (error == BTRFS_OK && transaction->qgroups != NULL &&
-	    (transaction->changed || bt_mutation_count(transaction->mutation) != 0)) {
+	    (transaction->changed || bt_mutation_count(transaction->mutation) != 0 ||
+		bt_qgroup_rescanning(transaction))) {
 		error = BTRFS_UNSUPPORTED;
 	}
 	if (error == BTRFS_OK &&

@@ -57,6 +57,8 @@ struct qa_state {
 	size_t relation_capacity;
 	uint64_t seen;
 	uint64_t visit;
+	/* A running rescan has counted the extents below this bytenr. */
+	uint64_t progress;
 	int failed;
 };
 
@@ -146,9 +148,15 @@ qa_load(struct qa_state *state, struct bt_root quota)
 		if (record.key.type == BT_QGROUP_STATUS && record.size >= sizeof(*status)) {
 			status = (const void *)record.data;
 			found = 1;
-			if ((bt_u64(status->flags) &
-				(BT_QGROUP_STATUS_INCONSISTENT | BT_QGROUP_STATUS_RESCAN)) != 0 ||
-			    bt_u64(status->generation) != state->fs->info.generation) {
+			/* A running rescan's counts cover the extents below its
+			 * progress exactly, whatever the inconsistent flag says. */
+			if ((bt_u64(status->flags) & BT_QGROUP_STATUS_RESCAN) != 0) {
+				state->progress = bt_u64(status->rescan);
+				state->audit->rescanning = 1;
+			} else if ((bt_u64(status->flags) & BT_QGROUP_STATUS_INCONSISTENT) != 0) {
+				state->audit->skipped = 1;
+			}
+			if (bt_u64(status->generation) != state->fs->info.generation) {
 				state->audit->skipped = 1;
 			}
 		} else if (record.key.type == BT_QGROUP_INFO && record.size == sizeof(*info)) {
@@ -526,6 +534,7 @@ qgroup_audit(const struct btrfs_fs *fs, struct qgroup_audit *audit)
 	memset(&state, 0, sizeof(state));
 	state.fs = fs;
 	state.audit = audit;
+	state.progress = UINT64_MAX;
 	error = bt_find_root(fs, BT_QUOTA_TREE, &quota);
 	if (error == BTRFS_NOT_FOUND) {
 		return 0;
@@ -542,6 +551,9 @@ qgroup_audit(const struct btrfs_fs *fs, struct qgroup_audit *audit)
 		result = qa_implied(&state);
 	}
 	for (i = 0; result == 0 && !audit->skipped && i < state.extent_count; i++) {
+		if (state.extents[i].bytenr >= state.progress) {
+			continue;
+		}
 		root_count = 0;
 		result = qa_roots(
 		    &state, state.extents[i].bytenr, 0, &roots, &root_count, &root_capacity);

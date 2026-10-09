@@ -511,8 +511,16 @@ static void
 btrfs_xnu_commit_tick(thread_call_param_t parameter, thread_call_param_t unused)
 {
 	struct btrfs_xnu_mount *mount = parameter;
+	unsigned step;
+	int pending = 1;
 
 	(void)unused;
+	/* Linux's cleaner and rescan worker, a few bounded steps a tick. */
+	for (step = 0; step < BTRFS_XNU_MAINTENANCE_STEPS && pending; step++) {
+		if (btrfs_volume_maintain(mount->volume, &pending) != BTRFS_OK) {
+			break;
+		}
+	}
 	(void)btrfs_volume_sync(mount->volume, btrfs_volume_pending(mount->volume));
 	lck_mtx_lock(mount->nodes_lock);
 	if (mount->stopping) {

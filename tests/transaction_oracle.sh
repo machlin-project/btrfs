@@ -228,17 +228,19 @@ check_groups() {
         { echo "groups: $chunks chunks, $groups block groups, $system system entries" >&2; return 1; }
 }
 
-# CONSISTENT:QGROUPS: the quota status item (inconsistent or not, stamped with
-# the primary's generation, which Linux requires to keep counting) and the
-# number of qgroup info items; btrfs check verifies the numbers themselves.
+# STATE:QGROUPS: the quota status item, stamped with the primary's generation
+# (which Linux requires to keep counting), in state consistent, inconsistent
+# or rescan (btrfs-progs prints the RESCAN flag as SCANNING), and the number of
+# qgroup info items; btrfs check verifies the numbers themselves.
 check_quota() {
     btrfs inspect-internal dump-tree -t quota /dev/vda > /tmp/quota.txt
     status=$(grep -A1 'key (0 QGROUP_STATUS 0)' /tmp/quota.txt | tail -1)
     flags=$(echo "$status" | awk '{ print $6 }')
     test "$(echo "$status" | awk '{ print $4 }')" = "$(primary_generation)" &&
         case "${1%%:*}" in
-        consistent) test "${flags#*INCONSISTENT}" = "$flags" ;;
-        inconsistent) test "${flags#*INCONSISTENT}" != "$flags" ;;
+        consistent) test "${flags#*INCONSISTENT}" = "$flags" && test "${flags#*SCANNING}" = "$flags" ;;
+        inconsistent) test "${flags#*INCONSISTENT}" != "$flags" && test "${flags#*SCANNING}" = "$flags" ;;
+        rescan) test "${flags#*SCANNING}" != "$flags" ;;
         *) false ;;
         esac &&
         test "$(grep -c 'item [0-9]* key (0 QGROUP_INFO' /tmp/quota.txt || true)" = "${1#*:}" ||

@@ -24,6 +24,8 @@
 #define BTRFS_XNU_ZLIB_LEVEL 3
 /* Seconds between commits of the running transaction (Linux's commit=). */
 #define BTRFS_XNU_COMMIT_SECONDS 5U
+/* Background steps (btrfs_volume_maintain) each commit tick may take. */
+#define BTRFS_XNU_MAINTENANCE_STEPS 16U
 /* Tree nodes one namespace or attribute operation declares when it joins the
  * running transaction, and the file bytes a data write declares per node. */
 #define BTRFS_XNU_OPERATION_NODES 64U

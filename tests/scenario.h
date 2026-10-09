@@ -9,6 +9,7 @@
 #include "references.h"
 #include "space.h"
 #include "transaction.h"
+#include <btrfs/volume.h>
 #include <btrfs/write.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -226,7 +227,8 @@ enum operation_kind {
 	OPERATION_EXCHANGE,
 	OPERATION_RENAME_WHITEOUT,
 	/* FS_IOC_SETFLAGS: flags holds the attribute flags. */
-	OPERATION_SET_FSFLAGS
+	OPERATION_SET_FSFLAGS,
+	OPERATION_QUOTA_RESCAN
 };
 
 /* Operations name objects by path. A path created, renamed or removed by an
@@ -256,6 +258,12 @@ struct operation {
 	 * instead of being evicted at once as the native volume does. */
 	int keep_deferred;
 };
+
+/* The quota status an EXPECT_QUOTA expectation names (its links field), and
+ * the oracle's name for each. */
+enum quota_state { QUOTA_CONSISTENT, QUOTA_INCONSISTENT, QUOTA_RESCANNING };
+
+extern const char *const quota_state_names[];
 
 enum expectation_kind {
 	EXPECT_ABSENT,
@@ -539,9 +547,13 @@ void expect_compressed(struct plan *plan, size_t first, size_t last, const char 
 void expect_extents(struct plan *plan, size_t first, size_t last, const char *path,
     uint32_t regular, uint32_t prealloc, uint64_t distinct);
 void expect_holes(struct plan *plan, size_t first, size_t last, const char *path, uint64_t holes);
-/* The quota status (inconsistent or not, stamped with the stage's generation)
- * and the number of qgroups. */
+/* The quota status (inconsistent or not, stamped with the stage's generation,
+ * without a rescan) and the number of qgroups. */
 void expect_quota(struct plan *plan, size_t first, size_t last, int inconsistent, uint64_t qgroups);
+/* A quota rescan in progress, with the number of qgroups. */
+void expect_quota_rescan(struct plan *plan, size_t first, size_t last, uint64_t qgroups);
+/* A quota rescan step of budget items; done is whether it completes. */
+void plan_quota_rescan(struct plan *plan, size_t commit, size_t budget, int done);
 void expect_bitmaps(struct plan *plan, size_t first, size_t last, const char *path, int bitmaps);
 void expect_groups(
     struct plan *plan, size_t first, size_t last, uint64_t groups, uint32_t system_entries);
@@ -581,6 +593,8 @@ struct btrfs_object_id object(struct btrfs_fs *fs, const char *path);
 void namespace_scenarios(struct context *context);
 void subvolume_scenarios(struct context *context);
 void quota_scenarios(struct context *context);
+/* Volume locks for a test that runs one thread: nothing ever waits. */
+extern const struct btrfs_volume_locks single_thread_locks;
 
 /* Scenario sets. */
 void admission_tests(struct context *context);

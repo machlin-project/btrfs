@@ -112,6 +112,9 @@ struct bt_qgroups {
 	uint8_t status[sizeof(struct bt_disk_qgroup_status) + sizeof(struct bt_le64)];
 	size_t status_size;
 	uint64_t flags;
+	/* A running rescan's progress: extents from this bytenr on are left to
+	 * it. Linux stores it in every status item, 0 without a rescan. */
+	uint64_t progress;
 	/* Off once quotas are inconsistent (Linux's NO_ACCOUNTING). */
 	int accounting;
 	struct bt_key *traced;
@@ -168,6 +171,35 @@ bt_qg_free(const struct btrfs_environment *env, void *items, size_t capacity, si
 	if (items != NULL) {
 		env->release(env->context, items, capacity * size);
 	}
+}
+
+/* The accounting scratch, one slot per qgroup: qgroups reached for one
+ * extent and the traversal queue. */
+static enum btrfs_result
+bt_qg_scratch(struct bt_qgroups *qgroups)
+{
+	const struct btrfs_environment *env = qgroups->env;
+
+	if (qgroups->touched != NULL && qgroups->scratch_capacity >= qgroups->count) {
+		return BTRFS_OK;
+	}
+	bt_qg_free(env, qgroups->touched, qgroups->scratch_capacity, sizeof(*qgroups->touched));
+	bt_qg_free(env, qgroups->queue, qgroups->scratch_capacity, sizeof(*qgroups->queue));
+	qgroups->scratch_capacity = qgroups->count == 0 ? 1 : qgroups->count;
+	qgroups->touched =
+	    env->allocate(env->context, qgroups->scratch_capacity * sizeof(*qgroups->touched));
+	qgroups->queue =
+	    env->allocate(env->context, qgroups->scratch_capacity * sizeof(*qgroups->queue));
+	if (qgroups->touched == NULL || qgroups->queue == NULL) {
+		bt_qg_free(
+		    env, qgroups->touched, qgroups->scratch_capacity, sizeof(*qgroups->touched));
+		bt_qg_free(env, qgroups->queue, qgroups->scratch_capacity, sizeof(*qgroups->queue));
+		qgroups->touched = NULL;
+		qgroups->queue = NULL;
+		qgroups->scratch_capacity = 0;
+		return BTRFS_NO_MEMORY;
+	}
+	return BTRFS_OK;
 }
 
 static enum btrfs_result
@@ -265,12 +297,26 @@ bt_qg_level(uint64_t id)
 	return (uint16_t)(id >> BT_QGROUP_LEVEL_SHIFT);
 }
 
-/* Quotas become inconsistent and accounting stops, as qgroup_mark_inconsistent. */
+/* Quotas become inconsistent, accounting stops and a running rescan is
+ * cancelled, as qgroup_mark_inconsistent. */
 static void
 bt_qg_inconsistent(struct bt_qgroups *qgroups)
 {
-	qgroups->flags |= BT_QGROUP_STATUS_INCONSISTENT;
+	qgroups->flags =
+	    (qgroups->flags | BT_QGROUP_STATUS_INCONSISTENT) & ~BT_QGROUP_STATUS_RESCAN;
 	qgroups->accounting = 0;
+}
+
+/* An inconsistency found while loading: a rescan in progress resumes with
+ * accounting, as qgroup_rescan_init clears what qgroup_mark_inconsistent set. */
+static void
+bt_qg_load_inconsistent(struct bt_qgroups *qgroups)
+{
+	if ((qgroups->flags & BT_QGROUP_STATUS_RESCAN) != 0) {
+		qgroups->flags |= BT_QGROUP_STATUS_INCONSISTENT;
+	} else {
+		bt_qg_inconsistent(qgroups);
+	}
 }
 
 static enum btrfs_result
@@ -293,16 +339,19 @@ bt_qg_record(struct bt_qgroups *qgroups, const struct bt_record *record)
 		qgroups->flags = bt_u64(status->flags);
 		bt_copy(qgroups->status, record->data, record->size);
 		qgroups->status_size = record->size;
-		/* Older versions, simple quotas, a rescan in progress, disabled quotas
-		 * and unknown flags need semantics this writer does not have. */
+		/* Older versions, simple quotas, disabled quotas and unknown flags
+		 * need semantics this writer does not have. */
 		if (bt_u64(status->version) != BT_QGROUP_STATUS_VERSION ||
 		    (qgroups->flags & ~BT_QGROUP_KNOWN_FLAGS) != 0 ||
-		    (qgroups->flags & (BT_QGROUP_STATUS_SIMPLE | BT_QGROUP_STATUS_RESCAN)) != 0 ||
+		    (qgroups->flags & BT_QGROUP_STATUS_SIMPLE) != 0 ||
 		    !(qgroups->flags & BT_QGROUP_STATUS_ON)) {
 			return BTRFS_UNSUPPORTED;
 		}
+		if ((qgroups->flags & BT_QGROUP_STATUS_RESCAN) != 0) {
+			qgroups->progress = bt_u64(status->rescan);
+		}
 		if (bt_u64(status->generation) != qgroups->generation - 1) {
-			bt_qg_inconsistent(qgroups);
+			bt_qg_load_inconsistent(qgroups);
 		}
 		return BTRFS_OK;
 	}
@@ -387,7 +436,7 @@ bt_qg_load(struct btrfs_transaction *transaction, struct bt_qgroups *qgroups)
 	for (i = 0; i < qgroups->count; i++) {
 		/* As btrfs_read_qgroup_config: a qgroup lacking an item is inconsistent. */
 		if (!qgroups->groups[i].info || !qgroups->groups[i].limit) {
-			bt_qg_inconsistent(qgroups);
+			bt_qg_load_inconsistent(qgroups);
 		}
 	}
 	/* Relations naming a missing qgroup are ignored, as Linux ignores them. */
@@ -1247,17 +1296,20 @@ bt_qg_account(struct btrfs_transaction *transaction, struct bt_qgroups *qgroups)
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	qgroups->scratch_capacity = qgroups->count;
-	qgroups->touched = env->allocate(env->context, qgroups->count * sizeof(*qgroups->touched));
-	qgroups->queue = env->allocate(env->context, qgroups->count * sizeof(*qgroups->queue));
-	if (qgroups->count != 0 && (qgroups->touched == NULL || qgroups->queue == NULL)) {
-		return BTRFS_NO_MEMORY;
+	error = bt_qg_scratch(qgroups);
+	if (error != BTRFS_OK) {
+		return error;
 	}
 	bt_qg_view_init(
 	    &before, qgroups, transaction->base, transaction->base->root_tree, extents, 0);
 	bt_qg_view_init(&after, qgroups, view, transaction->roots, transaction->extents.root, 1);
 	bt_qg_inherit(qgroups, transaction->base->info.node_size);
 	for (i = 0; error == BTRFS_OK && qgroups->accounting && i < qgroups->traced_count; i++) {
+		/* A running rescan counts these from a later committed state. */
+		if ((qgroups->flags & BT_QGROUP_STATUS_RESCAN) != 0 &&
+		    qgroups->traced[i].objectid >= qgroups->progress) {
+			continue;
+		}
 		old.count = 0;
 		new.count = 0;
 		error = bt_qg_extent_roots(&before, qgroups->traced[i], &old);
@@ -1291,8 +1343,9 @@ bt_qg_observe(void *context, struct bt_key extent)
 	struct bt_qgroups *qgroups = context;
 	enum btrfs_result error;
 
-	if (!qgroups->accounting ||
-	    (extent.type != BT_EXTENT_ITEM && extent.type != BT_METADATA_ITEM)) {
+	/* Traced while accounting is off too: a rescan started later in the
+	 * transaction accounts them. */
+	if (extent.type != BT_EXTENT_ITEM && extent.type != BT_METADATA_ITEM) {
 		return BTRFS_OK;
 	}
 	error = bt_qg_grow(qgroups->env, (void **)&qgroups->traced, &qgroups->traced_capacity,
@@ -1491,6 +1544,7 @@ bt_qg_store(struct btrfs_transaction *transaction, struct bt_qgroups *qgroups)
 	if (error == BTRFS_OK) {
 		bt_put64(&status->generation, qgroups->generation);
 		bt_put64(&status->flags, qgroups->flags);
+		bt_put64(&status->rescan, qgroups->progress);
 		key = (struct bt_key){ .objectid = 0, .type = BT_QGROUP_STATUS, .offset = 0 };
 		error = bt_tx_edit(transaction, &transaction->quota.root, key, qgroups->status,
 		    qgroups->status_size, BT_REPLACE);
@@ -1511,14 +1565,8 @@ bt_qgroup_commit(struct btrfs_transaction *transaction)
 	if (qgroups->accounting && (qgroups->traced_count != 0 || qgroups->snapshot_target != 0)) {
 		error = bt_qg_account(transaction, qgroups);
 	}
-	if (error == BTRFS_OK && qgroups->queue == NULL && qgroups->count != 0) {
-		qgroups->scratch_capacity = qgroups->count;
-		qgroups->touched =
-		    qgroups->env->allocate(qgroups->env->context, qgroups->count * sizeof(size_t));
-		qgroups->queue =
-		    qgroups->env->allocate(qgroups->env->context, qgroups->count * sizeof(size_t));
-		error =
-		    qgroups->touched == NULL || qgroups->queue == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+	if (error == BTRFS_OK) {
+		error = bt_qg_scratch(qgroups);
 	}
 	for (i = 0; error == BTRFS_OK && i < qgroups->count;) {
 		if (qgroups->groups[i].dropped) {
@@ -1529,6 +1577,147 @@ bt_qgroup_commit(struct btrfs_transaction *transaction)
 	}
 	if (error == BTRFS_OK) {
 		error = bt_qg_store(transaction, qgroups);
+	}
+	return error;
+}
+
+int
+bt_qgroup_rescanning(const struct btrfs_transaction *transaction)
+{
+	return transaction->qgroups != NULL &&
+	    (transaction->qgroups->flags & BT_QGROUP_STATUS_RESCAN) != 0;
+}
+
+int
+btrfs_transaction_quota_rescanning(const struct btrfs_transaction *transaction)
+{
+	return transaction != NULL && bt_qgroup_rescanning(transaction);
+}
+
+/* qgroup_rescan_init and qgroup_rescan_zero_tracking: every qgroup starts
+ * from nothing, and accounting resumes below the progress. */
+static void
+bt_qg_rescan_start(struct bt_qgroups *qgroups)
+{
+	struct bt_qgroup *group;
+	size_t i;
+
+	qgroups->flags |= BT_QGROUP_STATUS_RESCAN;
+	qgroups->progress = 0;
+	qgroups->accounting = 1;
+	for (i = 0; i < qgroups->count; i++) {
+		group = &qgroups->groups[i];
+		group->referenced = 0;
+		group->referenced_compressed = 0;
+		group->exclusive = 0;
+		group->exclusive_compressed = 0;
+		group->dirty = 1;
+	}
+}
+
+/* qgroup_rescan_leaf: each extent of the committed extent tree from the
+ * progress on is counted from the subvolumes reaching it there, as an extent
+ * without old roots. Items are examined until budget is spent and the next
+ * item starts another extent; the progress then follows the last one. */
+static enum btrfs_result
+bt_qg_rescan_scan(
+    struct btrfs_transaction *transaction, struct bt_qgroups *qgroups, size_t budget, int *done)
+{
+	const struct btrfs_environment *env = qgroups->env;
+	struct bt_qgroup_view committed;
+	struct bt_rootset roots = { 0 };
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root extents;
+	uint64_t last = 0;
+	size_t examined = 0;
+	enum btrfs_result error;
+
+	error = bt_find_root(transaction->base, BT_EXTENT_TREE, &extents);
+	if (error == BTRFS_OK) {
+		error = bt_qg_scratch(qgroups);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	bt_qg_view_init(
+	    &committed, qgroups, transaction->base, transaction->base->root_tree, extents, 0);
+	bt_cursor_init(&cursor, transaction->base, extents);
+	error = bt_cursor_seek(
+	    &cursor, (struct bt_key){ .objectid = qgroups->progress, .type = 0, .offset = 0 }, 0);
+	while (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (examined >= budget && record.key.objectid != last) {
+			break;
+		}
+		examined++;
+		last = record.key.objectid;
+		if (record.key.type == BT_EXTENT_ITEM || record.key.type == BT_METADATA_ITEM) {
+			roots.count = 0;
+			error = bt_qg_extent_roots(&committed, record.key, &roots);
+			if (error == BTRFS_OK && roots.count != 0) {
+				qgroups->extent++;
+				qgroups->touched_count = 0;
+				bt_qg_count(qgroups, &roots, 1);
+				bt_qg_update(qgroups, 0, roots.count,
+				    record.key.type == BT_METADATA_ITEM
+					? transaction->base->info.node_size
+					: record.key.offset);
+			}
+		}
+		if (error == BTRFS_OK) {
+			error = bt_cursor_next(&cursor);
+		}
+	}
+	bt_cursor_fini(&cursor);
+	bt_rootset_free(env, &roots);
+	bt_qg_view_fini(&committed);
+	if (error == BTRFS_NOT_FOUND) {
+		/* The scan is complete: every extent is below the progress, and
+		 * the counts are consistent again. */
+		qgroups->progress = UINT64_MAX;
+		qgroups->flags &= ~(BT_QGROUP_STATUS_RESCAN | BT_QGROUP_STATUS_INCONSISTENT);
+		*done = 1;
+		return BTRFS_OK;
+	}
+	if (error == BTRFS_OK) {
+		qgroups->progress = last + 1;
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_transaction_quota_rescan(struct btrfs_transaction *transaction, size_t budget, int *done)
+{
+	struct bt_qgroups *qgroups;
+	enum btrfs_result error;
+
+	if (transaction == NULL || done == NULL || budget == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*done = 0;
+	if (transaction->failure != BTRFS_OK || transaction->finished) {
+		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
+	}
+	qgroups = transaction->qgroups;
+	if (qgroups == NULL) {
+		/* Linux's ENOTCONN: quotas are not enabled. */
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	/* A snapshot's inherited counts are not the scan's; btrfs_qgroup_rescan
+	 * commits before it begins, so a new rescan is the first change. */
+	if (qgroups->snapshot_target != 0 ||
+	    ((qgroups->flags & BT_QGROUP_STATUS_RESCAN) == 0 &&
+		(transaction->changed || bt_mutation_count(transaction->mutation) != 0))) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if ((qgroups->flags & BT_QGROUP_STATUS_RESCAN) == 0) {
+		bt_qg_rescan_start(qgroups);
+	}
+	transaction->changed = 1;
+	error = bt_qg_rescan_scan(transaction, qgroups, budget, done);
+	if (error != BTRFS_OK) {
+		transaction->failure = error;
 	}
 	return error;
 }

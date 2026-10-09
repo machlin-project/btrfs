@@ -205,9 +205,9 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 				    e->mode) < (int)sizeof(argument));
 			detail = argument;
 		} else if (e->kind == EXPECT_QUOTA) {
-			/* consistent or inconsistent:qgroups */
+			/* consistent, inconsistent or rescan:qgroups */
 			REQUIRE(snprintf(argument, sizeof(argument), "%s:%llu",
-				    e->links != 0 ? "inconsistent" : "consistent",
+				    quota_state_names[e->links],
 				    (unsigned long long)e->value) < (int)sizeof(argument));
 			detail = argument;
 		} else if (e->kind == EXPECT_GROUPS) {
@@ -689,6 +689,7 @@ prepare_paths(struct path_table *table, struct btrfs_fs *fs, const struct operat
 		path_prepare(table, fs, operation->path, 1);
 		break;
 	case OPERATION_CLEAN_SUBVOLUMES:
+	case OPERATION_QUOTA_RESCAN:
 		break;
 	case OPERATION_SNAPSHOT:
 		path_prepare(table, fs, operation->path, 0);
@@ -990,6 +991,15 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 		    (cleaned != operation->size || pending != operation->flags)) {
 			fprintf(stderr, "dropped %zu subvolumes (pending %d), expected %zu (%d)\n",
 			    cleaned, pending, operation->size, operation->flags);
+			exit(1);
+		}
+		return result;
+	case OPERATION_QUOTA_RESCAN:
+		result =
+		    btrfs_transaction_quota_rescan(transaction, (size_t)operation->offset, &done);
+		if (result == BTRFS_OK && done != operation->flags) {
+			fprintf(stderr, "quota rescan %s, expected %s\n", done ? "done" : "running",
+			    operation->flags ? "done" : "running");
 			exit(1);
 		}
 		return result;

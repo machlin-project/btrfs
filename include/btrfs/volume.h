@@ -88,6 +88,12 @@ void btrfs_volume_leave(struct btrfs_volume *volume, struct btrfs_transaction *t
  * with commits between them as room requires; the steps' changes are durable
  * after a sync. */
 enum btrfs_result btrfs_volume_evict(struct btrfs_volume *volume, struct btrfs_object_id id);
+/* One bounded step of Linux's background work, joined to the running
+ * transaction as an operation that releases space: the cleaner's drop of
+ * deleted subvolumes and a running quota rescan (begun by Linux or a tool).
+ * *pending reports that work remains; adapters call it from their periodic
+ * commit until it does not, and a read-only volume has none. */
+enum btrfs_result btrfs_volume_maintain(struct btrfs_volume *volume, int *pending);
 /* The generation that will publish an operation applied now; record it
  * between join and leave. */
 uint64_t btrfs_volume_pending(struct btrfs_volume *volume);

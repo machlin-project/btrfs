@@ -503,10 +503,11 @@ ordinary references to the writer, and a group that has one is not removed.
 
 `core/qgroup.c` keeps Linux's full qgroup accounting. Admission loads the
 quota tree whole (at most 65,536 qgroups and relations) and refuses simple
-quotas, a rescan in progress and disabled quotas. A status generation other
-than the base's, or a qgroup without both its info and limit items, makes
-quotas inconsistent and stops accounting, as Linux's mount does; numbers are
-then kept, the status item still follows every commit, and limits still apply.
+quotas and disabled quotas. A status generation other than the base's, or a
+qgroup without both its info and limit items, makes quotas inconsistent and
+stops accounting, as Linux's mount does; numbers are then kept, the status
+item still follows every commit, and limits still apply. A rescan in progress
+resumes instead, as Linux's mount resumes it.
 
 The mutation reports every extent whose references change: the backref
 layer's additions, drops and replacements, new data extents and new or
@@ -548,6 +549,24 @@ shared subtree at level 3 or above makes quotas inconsistent, Linux's default
 its relations at commit (`btrfs_remove_qgroup`); a parent loses its exclusive
 bytes when they are all it referenced, otherwise, and when numbers remain on a
 consistent qgroup, quotas become inconsistent.
+
+A rescan (`btrfs_transaction_quota_rescan`, Linux's `btrfs quota rescan`)
+counts every qgroup again. It begins as its transaction's first change, since
+Linux commits first: every qgroup is zeroed, the status item gains RESCAN, and
+its progress starts at 0. Each step examines a budget of items of the
+committed extent tree from the progress on and counts each extent as
+`qgroup_rescan_leaf` does, from the subvolumes reaching it there, without
+old roots. The progress then follows the last extent examined. A step stops
+only where an extent ends, and the status item records the progress at every
+commit, so a later transaction or a Linux mount resumes there. Every
+transaction accounts the extents below the progress as before. It leaves
+those at or beyond it to the scan, which counts their committed state later.
+At the end of the tree the progress becomes the largest bytenr, and RESCAN
+and INCONSISTENT clear in the same commit. Anything that makes quotas
+inconsistent cancels a running rescan, as `qgroup_mark_inconsistent` does.
+A snapshot waits while a rescan runs (UNSUPPORTED), and a rescan step cannot
+follow a snapshot in its transaction. Inherited counts would mix with partial
+ones, and this core does not claim Linux's numbers for that case.
 
 Limits are checked before any change as Linux's `qgroup_reserve`: a write
 admits its sector-aligned range and a preallocation or zeroing its new
@@ -878,8 +897,8 @@ subtree boundary; the next call, in this or a later transaction, rebuilds the
 path to it. A budget bounds the blocks visited per call and keeps room for
 another leaf's file references; a run of shared children is skipped in one
 step, as in Linux. A fully dropped tree loses its root item and orphan item;
-stale orphan items go. Native writers still have to run the cleaner, as Linux's
-cleaner thread does.
+stale orphan items go. The native volume runs the drop as Linux's cleaner
+thread does, in bounded steps from each commit tick (`btrfs_volume_maintain`).
 
 ## Native writers
 
@@ -902,6 +921,13 @@ leaves the volume usable (for example NO_SPACE), while one that fails after I/O
 makes it read-only for the rest of the mount, since only explicit superblock
 recovery may decide what became durable. A read-write open admits a first
 transaction, so copies needing recovery fail the mount rather than a later write.
+
+`btrfs_volume_maintain` is the background work of Linux's cleaner and rescan
+worker, as one bounded step joined to the running transaction. The step drops
+deleted subvolumes (one release step of tree nodes) and continues a running
+quota rescan, which Linux or a tool began (4,096 extent-tree items). Both
+adapters take up to sixteen steps at each five-second commit tick while work
+remains; a read-only volume has none.
 
 The XNU adapter groups operations ([group commit](GROUP_COMMIT.md)): every
 namespace and attribute operation joins the volume's running transaction and

@@ -122,9 +122,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    Mixed groups, the block-group tree and a metadata UUID are written, a v1
    space cache is left stale for Linux to rebuild (ARCHITECTURE.md, Format
    features), and qgroups are accounted as Linux's full mode accounts them
-   (`core/qgroup.c`, ARCHITECTURE.md, Quotas). Remaining: simple quotas, quota
-   rescans, metadata reservation against qgroup limits, and fixtures with
-   sectors above 4 KiB.
+   (`core/qgroup.c`, ARCHITECTURE.md, Quotas), including rescans. Remaining:
+   simple quotas, metadata reservation against qgroup limits, and fixtures
+   with sectors above 4 KiB.
 5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
    orphan items for open inodes, eviction and orphan cleanup, atomic rename
    (replacement, cross-directory, between names of one inode), xattrs and the
@@ -135,7 +135,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    and directory indexes unique across a mount's transactions; the native volume
    layer attaches them. Subvolumes and snapshots are created and deleted
    (`core/subvolume.c`), and the reader resolves unreferenced subvolume entries
-   to stubs; native writers still need a cleaner. O_TMPFILE files, RENAME_EXCHANGE
+   to stubs; native mounts drop deleted subvolumes and continue a running quota
+   rescan in bounded steps from their commit ticks (`btrfs_volume_maintain`).
+   O_TMPFILE files, RENAME_EXCHANGE
    and RENAME_WHITEOUT follow Linux, subvolume entries rename and exchange
    across subvolumes as Linux moves them, and inode flags change as Linux's
    `FS_IOC_SETFLAGS` (`btrfs_transaction_set_fsflags`; `chflags` natively).

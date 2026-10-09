@@ -380,6 +380,21 @@ enum btrfs_result btrfs_transaction_remove_unused_groups(
  * and orphan item. dropped counts them; pending reports remaining work. */
 enum btrfs_result btrfs_transaction_clean_subvolumes(
     struct btrfs_transaction *transaction, size_t budget, size_t *dropped, int *pending);
+/* Linux's quota rescan (btrfs quota rescan): every qgroup is counted again
+ * from the extents of the committed extent tree, as btrfs_qgroup_rescan_worker
+ * counts them. A new rescan zeroes every qgroup and records its progress in
+ * the quota status item; it must be the transaction's first change, as Linux
+ * commits before it begins (UNSUPPORTED otherwise). Each call examines about
+ * budget extent-tree items from the recorded progress and later transactions
+ * resume there; extents beyond the progress are left to the scan. *done is set
+ * when the scan has covered the tree, which clears the inconsistent flag. A
+ * filesystem without quotas is INVALID_ARGUMENT; a transaction that took a
+ * snapshot is UNSUPPORTED, and so is a snapshot while a rescan runs. Anything
+ * that makes quotas inconsistent cancels a running rescan, as on Linux. */
+enum btrfs_result btrfs_transaction_quota_rescan(
+    struct btrfs_transaction *transaction, size_t budget, int *done);
+/* Whether a quota rescan is in progress, begun here or by Linux. */
+int btrfs_transaction_quota_rescanning(const struct btrfs_transaction *transaction);
 /* Deletes an orphaned inode after its last native reference closes, in steps
  * whose work reaches budget: its data from the end of the file, then its other
  * items and its orphan item. *done is 0 while work remains. */

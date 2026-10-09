@@ -9,10 +9,11 @@
 #define BT_QGROUP_SUBTREE_LEVEL 3U
 
 /* Loads the quota tree of the transaction's base into transaction->qgroups
- * and observes the mutation's extent changes. Admission refuses simple quotas,
- * a running rescan and disabled quotas (UNSUPPORTED). A status generation that
- * is not the base's, or a qgroup missing one of its items, marks quotas
- * inconsistent, which stops accounting as Linux's NO_ACCOUNTING does. */
+ * and observes the mutation's extent changes. Admission refuses simple quotas
+ * and disabled quotas (UNSUPPORTED). A status generation that is not the
+ * base's, or a qgroup missing one of its items, marks quotas inconsistent,
+ * which stops accounting as Linux's NO_ACCOUNTING does, unless a rescan is in
+ * progress: it resumes from its recorded progress, as at Linux's mount. */
 enum btrfs_result bt_qgroup_begin(struct btrfs_transaction *transaction);
 void bt_qgroup_end(struct btrfs_transaction *transaction);
 /* Accounts every observed extent from the subvolume trees reaching it in the
@@ -41,6 +42,8 @@ enum btrfs_result bt_qgroup_snapshot(struct btrfs_transaction *transaction, uint
     uint64_t target, uint64_t source_root, uint64_t copy_root);
 /* A deleted subvolume whose drop completed: its qgroup goes at commit. */
 enum btrfs_result bt_qgroup_dropped(struct btrfs_transaction *transaction, uint64_t subvolume);
+/* Whether a quota rescan is in progress (btrfs_transaction_quota_rescan). */
+int bt_qgroup_rescanning(const struct btrfs_transaction *transaction);
 /* The lowest subvolume id above every level-0 qgroup, or 0 without quotas:
  * Linux never reuses the id of a qgroup that outlived its subvolume. */
 uint64_t bt_qgroup_next_id(const struct btrfs_transaction *transaction);

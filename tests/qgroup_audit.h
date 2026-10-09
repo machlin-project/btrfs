@@ -7,9 +7,11 @@
 struct qgroup_audit {
 	/* Nonzero when the filesystem has a quota tree. */
 	int quotas;
-	/* Nonzero when its status leaves the numbers unchecked: inconsistent, a
-	 * running rescan or a status generation that is not the filesystem's. */
+	/* Nonzero when its status leaves the numbers unchecked: inconsistent
+	 * without a rescan, or a status generation that is not the filesystem's. */
 	int skipped;
+	/* Nonzero during a rescan: only the extents below its progress count. */
+	int rescanning;
 	size_t qgroups;
 	size_t extents;
 	size_t implied;
@@ -22,7 +24,8 @@ struct qgroup_audit {
  * with an implied shared reference from each interior block of a subvolume
  * tree to every block and data extent below it; then referenced and exclusive
  * bytes for each qgroup and every qgroup above it, compared exactly with the
- * stored qgroup items. */
+ * stored qgroup items. During a rescan only the extents below its recorded
+ * progress are counted, as the rescan has counted them. */
 int qgroup_audit(const struct btrfs_fs *fs, struct qgroup_audit *audit);
 
 #endif

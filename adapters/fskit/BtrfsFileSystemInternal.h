@@ -58,6 +58,8 @@ NS_ASSUME_NONNULL_BEGIN
 #define BTRFS_FSKIT_IO_SIZE (128U * 1024U)
 /* The running transaction commits at least this often. */
 #define BTRFS_FSKIT_COMMIT_SECONDS 5U
+/* Background steps (btrfs_volume_maintain) each commit tick may take. */
+#define BTRFS_FSKIT_MAINTENANCE_STEPS 16U
 /* Tree nodes one namespace or attribute operation may change, and the data
  * bytes one more node covers (btrfs_volume_join). */
 #define BTRFS_FSKIT_OPERATION_NODES 64U

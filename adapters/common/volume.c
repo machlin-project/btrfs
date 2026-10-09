@@ -69,6 +69,8 @@ struct btrfs_volume {
 	int released;
 	/* The running transaction released space. */
 	int releasing;
+	/* Deleted subvolumes or a quota rescan may wait for maintenance. */
+	int maintenance;
 };
 
 static enum btrfs_result
@@ -240,6 +242,7 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	volume->issued = 0;
 	volume->failure = BTRFS_OK;
 	volume->writable = writer != NULL;
+	volume->maintenance = volume->writable;
 	volume->writer = 0;
 	if (writer != NULL) {
 		volume->device = *writer;
@@ -762,6 +765,50 @@ btrfs_volume_evict(struct btrfs_volume *volume, struct btrfs_object_id id)
 	volume->locks.unlock(volume->locks.context);
 	if (error == BTRFS_OK) {
 		error = volume_evict(volume, id);
+	}
+	if (volume->running != NULL) {
+		volume_finish(volume);
+	} else {
+		volume->locks.lock(volume->locks.context);
+		volume_give_turn(volume);
+		volume->locks.unlock(volume->locks.context);
+	}
+	return error == BTRFS_OK ? btrfs_volume_failure(volume) : error;
+}
+
+/* Extent-tree items a maintenance step's rescan examines. */
+#define VOLUME_RESCAN_ITEMS 4096U
+
+enum btrfs_result
+btrfs_volume_maintain(struct btrfs_volume *volume, int *pending)
+{
+	size_t dropped = 0;
+	int partial = 0;
+	int done = 1;
+	enum btrfs_result error;
+
+	*pending = 0;
+	if (!volume->writable) {
+		return BTRFS_OK;
+	}
+	volume->locks.lock(volume->locks.context);
+	volume_take_turn(volume);
+	error = volume->failure;
+	volume->locks.unlock(volume->locks.context);
+	if (error == BTRFS_OK && volume->maintenance) {
+		error = volume_room(volume, BTRFS_RELEASE_STEP_NODES, 1);
+		if (error == BTRFS_OK) {
+			error = btrfs_transaction_clean_subvolumes(
+			    volume->running, BTRFS_RELEASE_STEP_NODES, &dropped, &partial);
+			volume->operations++;
+		}
+		if (error == BTRFS_OK && btrfs_transaction_quota_rescanning(volume->running)) {
+			error = btrfs_transaction_quota_rescan(
+			    volume->running, VOLUME_RESCAN_ITEMS, &done);
+		}
+		/* A finished drop may leave another deleted subvolume. */
+		volume->maintenance = error == BTRFS_OK && (partial || dropped != 0 || !done);
+		*pending = volume->maintenance;
 	}
 	if (volume->running != NULL) {
 		volume_finish(volume);
