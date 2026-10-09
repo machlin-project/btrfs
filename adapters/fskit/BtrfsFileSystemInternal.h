@@ -91,8 +91,9 @@ struct btrfs_time btrfs_fskit_now(void);
 }
 @end
 
-@interface BtrfsVolume : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations,
-			     FSVolumeXattrOperations, FSVolumeOpenCloseOperations> {
+@interface BtrfsVolume
+    : FSVolume <FSVolumeOperations, FSVolumeReadWriteOperations, FSVolumeXattrOperations,
+	  FSVolumeOpenCloseOperations, FSVolumePreallocateOperations> {
       @package
 	struct btrfs_volume *_volume;
 	struct btrfs_fskit_cache *_cache;
@@ -190,6 +191,11 @@ struct btrfs_time btrfs_fskit_now(void);
 		      toFile:(FSItem *)item
 		    atOffset:(off_t)offset
 		replyHandler:(void (^)(size_t, NSError *_Nullable))reply;
+- (void)performPreallocateSpaceForItem:(FSItem *)item
+			      atOffset:(off_t)offset
+				length:(size_t)length
+				 flags:(FSPreallocateFlags)flags
+			  replyHandler:(void (^)(size_t, NSError *_Nullable))reply;
 - (void)performSetXattrNamed:(FSFileName *)name
 		      toData:(nullable NSData *)value
 		      onItem:(FSItem *)item

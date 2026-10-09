@@ -912,6 +912,34 @@ plan_truncate_step(struct context *context, struct plan *plan, size_t commit, co
 }
 
 void
+plan_fallocate(struct context *context, struct plan *plan, size_t commit, const char *path,
+    unsigned mode, uint64_t offset, uint64_t length)
+{
+	plan_operation(context, plan, commit, path, OPERATION_FALLOCATE, offset, NULL, 0);
+	plan->operations[commit][plan->operation_count[commit] - 1].size = (size_t)length;
+	plan->operations[commit][plan->operation_count[commit] - 1].flags = (int)mode;
+}
+
+/* The bytes a fallocate leaves: punching and zeroing read as zeros, and
+ * without KEEP_SIZE allocation and zeroing grow the file. */
+static void
+model_fallocate(struct tracked *file, size_t stage, const struct operation *operation)
+{
+	unsigned mode = (unsigned)operation->flags;
+	uint64_t end = operation->offset + operation->size;
+	uint64_t zero_end = end < file->size[stage] ? end : file->size[stage];
+
+	if ((mode & (BTRFS_FALLOCATE_PUNCH_HOLE | BTRFS_FALLOCATE_ZERO_RANGE)) != 0 &&
+	    operation->offset < zero_end) {
+		memset(file->data[stage] + operation->offset, 0,
+		    (size_t)(zero_end - operation->offset));
+	}
+	if ((mode & BTRFS_FALLOCATE_KEEP_SIZE) == 0 && end > file->size[stage]) {
+		model_resize(file, stage, end);
+	}
+}
+
+void
 resolve_bounds(struct btrfs_fs *fs, struct plan *plan, size_t stage)
 {
 	struct tracked *file;
@@ -959,12 +987,14 @@ plan_finish(struct plan *plan)
 		}
 		for (i = 0; i < plan->operation_count[stage]; i++) {
 			operation = &plan->operations[stage][i];
-			if (operation->file == NO_FILE ||
-			    operation->kind > OPERATION_TRUNCATE_STEP) {
+			if (operation->file == NO_FILE || operation->kind > OPERATION_FALLOCATE ||
+			    operation->expected != BTRFS_OK) {
 				continue;
 			}
 			file = &plan->files[operation->file];
-			if (operation->kind == OPERATION_TRUNCATE_STEP) {
+			if (operation->kind == OPERATION_FALLOCATE) {
+				model_fallocate(file, stage, operation);
+			} else if (operation->kind == OPERATION_TRUNCATE_STEP) {
 				/* Only completing the truncation may follow in the plan. */
 				REQUIRE(operation->offset < file->size[stage]);
 				file->bounded[stage] = 1;
@@ -1318,6 +1348,17 @@ void
 plan_truncate_new(struct plan *plan, size_t commit, const char *path, uint64_t size)
 {
 	plan_namespace(plan, commit, OPERATION_TRUNCATE, path, NULL)->offset = size;
+}
+
+void
+plan_fallocate_new(struct plan *plan, size_t commit, const char *path, unsigned mode,
+    uint64_t offset, uint64_t length)
+{
+	struct operation *operation = plan_namespace(plan, commit, OPERATION_FALLOCATE, path, NULL);
+
+	operation->offset = offset;
+	operation->size = (size_t)length;
+	operation->flags = (int)mode;
 }
 
 void

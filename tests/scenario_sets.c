@@ -453,6 +453,77 @@ data_compress_mount_plan(struct context *context)
 	context->writer.compression = BTRFS_COMPRESSION_NONE;
 }
 
+/* fallocate as Linux's btrfs_fallocate makes it on a NO_HOLES filesystem: an
+ * unaligned edge rewrites its sector, the rest of a punched range loses its
+ * extents, zeroed and preallocated ranges become unwritten extents, and a
+ * later write into one is made in place. */
+static void
+fallocate_plans(struct context *context)
+{
+	static uint8_t data[FALLOCATE_WRITE_BYTES];
+	const unsigned punch = BTRFS_FALLOCATE_PUNCH_HOLE | BTRFS_FALLOCATE_KEEP_SIZE;
+	struct plan plan;
+
+	fill_pattern(data, sizeof(data), 61);
+	plan_init(&plan);
+	plan.name = "fallocate-punch";
+	track_data(context, &plan, "big");
+	plan_fallocate(
+	    context, &plan, 1, "/data/big", punch, FALLOCATE_PUNCH_OFFSET, FALLOCATE_PUNCH_BYTES);
+	/* Punching needs KEEP_SIZE and excludes zeroing; other modes and an
+	 * empty range are refused before any change. */
+	plan_fallocate(
+	    context, &plan, 1, "/data/big", BTRFS_FALLOCATE_PUNCH_HOLE, 0, FALLOCATE_GROW_BYTES);
+	plan_expect_refusal(&plan, 1, BTRFS_UNSUPPORTED);
+	plan_fallocate(context, &plan, 1, "/data/big", punch | BTRFS_FALLOCATE_ZERO_RANGE, 0,
+	    FALLOCATE_GROW_BYTES);
+	plan_expect_refusal(&plan, 1, BTRFS_UNSUPPORTED);
+	plan_fallocate(context, &plan, 1, "/data/big", 0, 0, 0);
+	plan_expect_refusal(&plan, 1, BTRFS_INVALID_ARGUMENT);
+	/* Past EOF only the EOF sector is zeroed and the extents to EOF go. */
+	plan_fallocate(
+	    context, &plan, 2, "/data/big", punch, FALLOCATE_TAIL_OFFSET, FALLOCATE_TAIL_BYTES);
+	/* A range that is all hole changes nothing. */
+	plan_fallocate(context, &plan, 2, "/data/big", punch,
+	    FALLOCATE_PUNCH_OFFSET + FALLOCATE_GROW_BYTES, FALLOCATE_GROW_BYTES);
+	expect_extents(&plan, 1, 1, "/data/big", 4, 0, 3);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/big", 5, 0, 4);
+	run_plan(context, &plan);
+
+	plan_init(&plan);
+	plan.name = "fallocate-zero";
+	track_data(context, &plan, "big");
+	plan_fallocate(context, &plan, 1, "/data/big", BTRFS_FALLOCATE_ZERO_RANGE,
+	    FALLOCATE_ZERO_OFFSET, FALLOCATE_ZERO_BYTES);
+	plan_fallocate(context, &plan, 1, "/data/big",
+	    BTRFS_FALLOCATE_ZERO_RANGE | BTRFS_FALLOCATE_KEEP_SIZE,
+	    FALLOCATE_BIG_BYTES + FALLOCATE_BEYOND_GAP, FALLOCATE_BEYOND_BYTES);
+	expect_extents(&plan, 1, LAST_STAGE, "/data/big", 4, 2, 5);
+	expect_flags(&plan, 1, LAST_STAGE, "/data/big", BT_INODE_PREALLOC, BT_INODE_PREALLOC);
+	run_plan(context, &plan);
+
+	plan_init(&plan);
+	plan.name = "fallocate-keep-size";
+	track_data(context, &plan, "small");
+	plan_fallocate(context, &plan, 1, "/data/small", BTRFS_FALLOCATE_KEEP_SIZE,
+	    FALLOCATE_SMALL_BYTES, FALLOCATE_KEEP_BYTES);
+	plan_write(context, &plan, 2, "/data/small", FALLOCATE_INSIDE_OFFSET, data, sizeof(data));
+	expect_extents(&plan, 1, 1, "/data/small", 2, 1, 3);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/small", 3, 2, 3);
+	expect_flags(&plan, 1, LAST_STAGE, "/data/small", BT_INODE_PREALLOC, BT_INODE_PREALLOC);
+	run_plan(context, &plan);
+
+	plan_init(&plan);
+	plan.name = "fallocate-grow";
+	track_data(context, &plan, "small");
+	plan_fallocate(
+	    context, &plan, 1, "/data/small", 0, FALLOCATE_GROW_OFFSET, FALLOCATE_GROW_BYTES);
+	plan_write(context, &plan, 2, "/data/small", FALLOCATE_WRITE_OFFSET, data, sizeof(data));
+	expect_extents(&plan, 1, 1, "/data/small", 2, 1, 3);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/small", 3, 1, 3);
+	run_plan(context, &plan);
+}
+
 void
 data_scenarios(struct context *context)
 {
@@ -555,6 +626,7 @@ data_scenarios(struct context *context)
 	plan_truncate(context, &plan, 1, "/data/small", 3000);
 	run_plan(context, &plan);
 
+	fallocate_plans(context);
 	data_stream_test(context);
 	data_compress_plan(context);
 	data_compress_mount_plan(context);
@@ -626,6 +698,28 @@ holes_scenarios(struct context *context)
 	expect_holes(&plan, 0, 2, "/huge", 1);
 	expect_holes(&plan, 3, LAST_STAGE, "/huge", 2);
 	expect_extents(&plan, 3, LAST_STAGE, "/huge", 1, 0, 1);
+	run_plan(context, &plan);
+
+	/* Without NO_HOLES a punch below EOF leaves a hole item, growth by
+	 * fallocate first covers the gap with one, and zeroing inside a hole
+	 * item splits it around the unwritten extent. */
+	plan_init(&plan);
+	plan.name = "holes-fallocate";
+	track_data(context, &plan, "big");
+	track_data(context, &plan, "small");
+	plan_fallocate(context, &plan, 1, "/data/big",
+	    BTRFS_FALLOCATE_PUNCH_HOLE | BTRFS_FALLOCATE_KEEP_SIZE, FALLOCATE_PUNCH_OFFSET,
+	    FALLOCATE_PUNCH_BYTES);
+	plan_fallocate(
+	    context, &plan, 1, "/data/small", 0, FALLOCATE_GROW_OFFSET, FALLOCATE_GROW_BYTES);
+	plan_fallocate(context, &plan, 2, "/data/small", BTRFS_FALLOCATE_ZERO_RANGE,
+	    FALLOCATE_INSIDE_OFFSET, FALLOCATE_INSIDE_BYTES);
+	expect_holes(&plan, 1, LAST_STAGE, "/data/big", 1);
+	expect_extents(&plan, 1, LAST_STAGE, "/data/big", 4, 0, 3);
+	expect_holes(&plan, 1, 1, "/data/small", 1);
+	expect_extents(&plan, 1, 1, "/data/small", 2, 1, 3);
+	expect_holes(&plan, 2, LAST_STAGE, "/data/small", 2);
+	expect_extents(&plan, 2, LAST_STAGE, "/data/small", 2, 2, 4);
 	run_plan(context, &plan);
 
 	/* In place on DUP data: Linux's preallocated file and a new NODATACOW

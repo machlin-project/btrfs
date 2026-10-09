@@ -53,6 +53,9 @@
 #define FILE_BYTES (300U * 1024U + 123U)
 #define WRITE_PIECE (64U * 1024U + 7U)
 #define TRUNCATED_BYTES (200U * 1024U + 1U)
+/* F_PREALLOCATE's request and the whole sectors it takes past EOF. */
+#define PREALLOCATED_BYTES 100000U
+#define PREALLOCATED_SECTORS_BYTES 102400U
 /* Files of one data sector each that the staging test writes before one
  * barrier; their extents adjoin, so far fewer device writes issue them. */
 #define STAGED_FILES 64U
@@ -778,6 +781,7 @@ write_tests(const char *fixture)
 	__block FSFileName *link = nil;
 	uint64_t offset;
 	uint64_t writes;
+	uint64_t allocated;
 	size_t length;
 	size_t i;
 
@@ -839,6 +843,20 @@ write_tests(const char *fixture)
 		 }];
 	REQUIRE([request wasAttributeConsumed:FSItemAttributeSize] &&
 	    [request wasAttributeConsumed:FSItemAttributeMode]);
+	compare_bytes(volume, file, expected, TRUNCATED_BYTES);
+	/* Preallocation from the physical end keeps the size and the bytes; the
+	 * reply and the allocated size count whole sectors. */
+	allocated = attributes_of(volume, file).allocSize;
+	[volume preallocateSpaceForItem:file
+			       atOffset:0
+				 length:PREALLOCATED_BYTES
+				  flags:FSPreallocateFlagsFromEOF | FSPreallocateFlagsAll
+			   replyHandler:^(size_t done, NSError *replyError) {
+			     REQUIRE(replyError == nil && done == PREALLOCATED_SECTORS_BYTES);
+			   }];
+	attributes = attributes_of(volume, file);
+	REQUIRE(attributes.size == TRUNCATED_BYTES &&
+	    attributes.allocSize == allocated + PREALLOCATED_SECTORS_BYTES);
 	compare_bytes(volume, file, expected, TRUNCATED_BYTES);
 	[volume setXattrNamed:name_of("user.kept")
 		       toData:bytes_of("value")

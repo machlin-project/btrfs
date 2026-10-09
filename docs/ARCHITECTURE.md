@@ -556,6 +556,31 @@ state, which reads those sectors as zero. A NODATACOW overwrite is visible at
 once and may be torn by a crash, as on Linux. Other ranges are copied on
 write.
 
+`btrfs_transaction_fallocate` follows Linux's `btrfs_fallocate`. Allocation
+(mode 0 or KEEP_SIZE) first extends a file whose range starts past EOF with
+holes and rewrites an unaligned EOF sector with its tail cleared
+(`btrfs_cont_expand`, `btrfs_truncate_block`), then makes every hole of the
+range, and data beyond EOF, unwritten: PREALLOC extents of up to 256 MiB, as
+`__btrfs_prealloc_file_range` takes them, counted in the inode's bytes and
+setting its PREALLOC flag; without KEEP_SIZE the size follows them to the
+range's end. ZERO_RANGE keeps what is already unwritten, zeroes written partial
+sectors at its edges in place of rewriting them whole, joins edges in holes to
+the allocation and makes the rest unwritten (`btrfs_zero_range`). PUNCH_HOLE
+(only with KEEP_SIZE) zeroes the partial sectors at its edges, drops the
+coverage between them and, without NO_HOLES, leaves one hole item below EOF
+(`btrfs_punch_hole`, `fill_holes`). Holes are judged as Linux judges them with
+its extent maps cached: runs of gaps and hole items to the next item with data.
+A punch that lies entirely in such a hole changes nothing, not even the times;
+every other call sets the change and modification times (`file_modified`). The
+data space a call may need is checked before its first change. The XNU adapter
+offers `F_PREALLOCATE` (KEEP_SIZE from the physical end; the position hint of
+`F_VOLPOSMODE` is unused) and `F_PUNCHHOLE`, writing cached data first and
+dropping a punched range's cached pages after it; FSKit offers preallocation
+only, since it has no interface to punch holes. `btrfs_seek` finds SEEK_DATA
+and SEEK_HOLE offsets as Linux's `find_desired_extent` does without delayed
+allocation; the XNU adapter answers the kernel's SEEK_HOLE and SEEK_DATA
+controls with it after applying the file's cached writes.
+
 Compression follows Linux's `inode_need_compress` and `compress_file_range`.
 NODATACOW, NODATASUM and NOCOMPRESS files are never compressed. Otherwise a
 file's `btrfs.compression` property names the codec; without one, the COMPRESS

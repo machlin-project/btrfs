@@ -29,11 +29,19 @@ list_names() {
 }
 
 # Each name of a directory with its inode number, or "-" for an object of
-# another subvolume (another device), sorted; native walks list the same.
+# another subvolume (another device), sorted; native walks list the same,
+# without the volume metadata directories macOS services own at the root
+# (tests/mounted_walk.c).
 root_device=$(stat -c '%d' /mnt)
 inode_lines() {
     directory=$1
     list_names "$directory" | while IFS= read -r name; do
+        if [ "$directory" = /mnt/. ]; then
+            case "$name" in
+            .fseventsd|.Spotlight-V100|.Trashes|.TemporaryItems|.DocumentRevisions-V100)
+                continue ;;
+            esac
+        fi
         set -- $(stat -c '%d %i' -- "$directory/$name")
         if [ "$1" = "$root_device" ]; then
             printf '%s\t%s\n' "$name" "$2"

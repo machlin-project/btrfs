@@ -56,12 +56,17 @@ enum random_kind {
 	RANDOM_REFUSAL,
 	RANDOM_EXCHANGE,
 	RANDOM_WHITEOUT,
+	RANDOM_FALLOCATE,
 	RANDOM_KINDS
 };
 
 /* Weights of the operation kinds, in random_kind order. */
-static const unsigned random_weights[RANDOM_KINDS] = { 9, 4, 3, 4, 6, 7, 5, 2, 12, 4, 4, 1, 4, 2,
-	2 };
+static const unsigned random_weights[RANDOM_KINDS] = { 9, 4, 3, 4, 6, 7, 5, 2, 12, 4, 4, 1, 4, 2, 2,
+	3 };
+/* Allocation and zeroing; a punch entirely within a hole leaves the times,
+ * which this model, holding bytes and not extents, cannot predict. */
+static const unsigned random_fallocate_modes[] = { 0, BTRFS_FALLOCATE_KEEP_SIZE,
+	BTRFS_FALLOCATE_ZERO_RANGE, BTRFS_FALLOCATE_ZERO_RANGE | BTRFS_FALLOCATE_KEEP_SIZE };
 
 struct model_inode {
 	int live;
@@ -762,6 +767,42 @@ random_truncate(struct model *model, struct plan *plan)
 }
 
 static int
+random_fallocate(struct model *model, struct plan *plan)
+{
+	char path[RANDOM_PATH];
+	uint32_t inode = model_pick_inode(model, BTRFS_MODE_REGULAR);
+	struct model_inode *file;
+	unsigned mode;
+	size_t offset;
+	size_t length;
+	size_t end;
+
+	if (inode == MODEL_NONE) {
+		return 0;
+	}
+	file = &model->inodes[inode];
+	mode = random_fallocate_modes[model_below(
+	    model, sizeof(random_fallocate_modes) / sizeof(random_fallocate_modes[0]))];
+	offset = model_below(model, (uint32_t)(file->size + MODEL_GROWTH));
+	length = 1 + model_below(model, MODEL_WRITE_LIMIT);
+	end = offset + length;
+	if (end > MODEL_FILE_LIMIT) {
+		return 0;
+	}
+	model_path(model, inode, path, sizeof(path));
+	model_privileges(model, plan, inode, path);
+	plan_fallocate_new(plan, model->commit, path, mode, offset, length);
+	if ((mode & BTRFS_FALLOCATE_ZERO_RANGE) != 0 && offset < file->size) {
+		memset(file->data + offset, 0, (end < file->size ? end : file->size) - offset);
+	}
+	if ((mode & BTRFS_FALLOCATE_KEEP_SIZE) == 0 && end > file->size) {
+		model_resize(file, end);
+	}
+	file->modify_seconds = model->now;
+	return 1;
+}
+
+static int
 random_attributes(struct model *model, struct plan *plan)
 {
 	char path[RANDOM_PATH];
@@ -929,6 +970,8 @@ random_operation(struct model *model, struct plan *plan, enum random_kind kind)
 		return random_write(model, plan);
 	case RANDOM_TRUNCATE:
 		return random_truncate(model, plan);
+	case RANDOM_FALLOCATE:
+		return random_fallocate(model, plan);
 	case RANDOM_ATTRIBUTES:
 		return random_attributes(model, plan);
 	case RANDOM_CLEAN:

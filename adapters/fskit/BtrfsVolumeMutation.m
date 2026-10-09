@@ -495,6 +495,74 @@ reply(attributes, btrfs_fskit_error(error));
 	reply(error == BTRFS_OK ? length : 0, btrfs_fskit_error(error));
 }
 
+/* F_PREALLOCATE: unwritten extents from the physical end of the file, which
+ * FSKit asks for in every call, keeping its size, as Linux's fallocate with
+ * KEEP_SIZE; all of the space or none. */
+- (void)performPreallocateSpaceForItem:(FSItem *)item
+			      atOffset:(off_t)offset
+				length:(size_t)length
+				 flags:(FSPreallocateFlags)flags
+			  replyHandler:(void (^)(size_t, NSError *))reply
+{
+	BtrfsItem *owned = (BtrfsItem *)item;
+	struct btrfs_volume_view *view;
+	struct btrfs_info info;
+	struct btrfs_inode inode;
+	struct btrfs_object_id identity;
+	struct btrfs_time now = btrfs_fskit_now();
+	const struct btrfs_fs *fs;
+	uint64_t sector;
+	uint64_t start;
+	uint64_t amount;
+	enum btrfs_result error = _writable ? BTRFS_OK : BTRFS_READ_ONLY;
+
+	if (error == BTRFS_OK && offset < 0) {
+		error = BTRFS_INVALID_ARGUMENT;
+	}
+	if (error == BTRFS_OK) {
+		error = [self refreshItem:owned];
+	}
+	if (error != BTRFS_OK || length == 0) {
+		reply(0, btrfs_fskit_error(error));
+		return;
+	}
+	fs = btrfs_volume_read(_volume, &view);
+	btrfs_get_info(fs, &info);
+	btrfs_volume_unread(_volume, view);
+	sector = info.sector_size;
+	[_itemLock lock];
+	inode = owned->inode;
+	[_itemLock unlock];
+	identity = inode.id;
+	start = (flags & FSPreallocateFlagsFromEOF) != 0
+	    ? inode.size + (sector - inode.size % sector) % sector
+	    : (uint64_t)offset;
+	amount = (uint64_t)length + (sector - (uint64_t)length % sector) % sector;
+	error = [self
+	    changeWithNodes:BTRFS_FSKIT_OPERATION_NODES
+		      first:owned
+		     second:nil
+		  operation:^enum btrfs_result(struct btrfs_transaction *transaction) {
+		    enum btrfs_result result = btrfs_transaction_fallocate(
+			transaction, identity, BTRFS_FALLOCATE_KEEP_SIZE, start, amount, now);
+
+		    /* Set-id bits or a capability need the decision a writer
+		     * without CAP_FSETID makes; the refusal changed nothing. */
+		    if (result == BTRFS_UNSUPPORTED) {
+			    result = btrfs_transaction_drop_privileges(transaction, identity, now);
+			    if (result == BTRFS_OK) {
+				    result = btrfs_transaction_fallocate(transaction, identity,
+					BTRFS_FALLOCATE_KEEP_SIZE, start, amount, now);
+			    }
+		    }
+		    return result;
+		  }];
+	if (error == BTRFS_OK) {
+		(void)[self refreshItem:owned];
+	}
+	reply(error == BTRFS_OK ? (size_t)amount : 0, btrfs_fskit_error(error));
+}
+
 /* Only user.* names on regular files and directories, as Linux allows them. */
 - (void)performSetXattrNamed:(FSFileName *)name
 		      toData:(NSData *)value

@@ -15,6 +15,7 @@
 #include <sys/buf.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
+#include <sys/ioccom.h>
 #include <sys/kauth.h>
 #include <sys/malloc.h>
 #include <sys/mount.h>
@@ -34,6 +35,10 @@ static const char btrfs_xnu_capability[] = "security.capability";
  * unprivileged caller removes. */
 #define BTRFS_XNU_SET_ID ((uint32_t)(S_ISUID | S_ISGID))
 #define BTRFS_XNU_SGID_EXECUTE ((uint32_t)(S_ISGID | S_IXGRP))
+/* XNU's controls for lseek's SEEK_HOLE and SEEK_DATA (FSIOC_FIOSEEKHOLE and
+ * FSIOC_FIOSEEKDATA in bsd/sys/fsctl.h), which the KPI headers do not export. */
+#define BTRFS_XNU_FIOSEEKHOLE _IOWR('A', 16, off_t)
+#define BTRFS_XNU_FIOSEEKDATA _IOWR('A', 17, off_t)
 
 /* Starts an operation that changes at most nodes tree nodes: alone in its own
  * transaction, or in the running one. */
@@ -458,6 +463,162 @@ btrfs_xnu_truncate(struct btrfs_xnu_node *node, vnode_t vnode, uint64_t size, vf
 	}
 	lck_mtx_unlock(node->write_lock);
 	return error;
+}
+
+/* fallocate for F_PREALLOCATE and F_PUNCHHOLE. Cached data reaches the
+ * transaction first; after a punch the range's cached pages go, so that reads
+ * see the zeros the running transaction now holds. */
+static int
+btrfs_xnu_fallocate(struct btrfs_xnu_node *node, vnode_t vnode, unsigned mode, uint64_t offset,
+    uint64_t length, vfs_context_t context)
+{
+	struct btrfs_transaction *transaction = NULL;
+	struct btrfs_time now;
+	enum btrfs_result result;
+	uint64_t end;
+	int punch = (mode & BTRFS_FALLOCATE_PUNCH_HOLE) != 0;
+	int error;
+
+	error = btrfs_xnu_settle_privileges(node, context);
+	if (error != 0) {
+		return error;
+	}
+	btrfs_xnu_now(&now);
+	lck_mtx_lock(node->write_lock);
+	error = btrfs_xnu_push_data(vnode, 1);
+	if (error == 0) {
+		error = btrfs_xnu_error(punch
+			? btrfs_xnu_begin_releasing(
+			      node->mount, BTRFS_XNU_OPERATION_NODES, &transaction)
+			: btrfs_xnu_begin(node->mount, BTRFS_XNU_OPERATION_NODES, &transaction));
+	}
+	if (error == 0) {
+		result = node->privileged
+		    ? btrfs_transaction_keep_privileges(transaction, node->inode.id)
+		    : btrfs_transaction_drop_privileges(transaction, node->inode.id, now);
+		if (result == BTRFS_OK) {
+			result = btrfs_transaction_fallocate(
+			    transaction, node->inode.id, mode, offset, length, now);
+		}
+		error = btrfs_xnu_finish(node->mount, transaction, result, node, NULL);
+	}
+	if (error == 0 && punch) {
+		end = length > UINT64_MAX - offset - PAGE_SIZE ? UINT64_MAX : offset + length;
+		end = end - end % PAGE_SIZE + (end % PAGE_SIZE != 0 ? PAGE_SIZE : 0);
+		(void)ubc_msync(vnode, (off_t)(offset - offset % PAGE_SIZE),
+		    (off_t)(end < (uint64_t)INT64_MAX ? end : (uint64_t)INT64_MAX), NULL,
+		    UBC_INVALIDATE);
+	}
+	if (error == 0) {
+		lck_mtx_lock(node->mount->nodes_lock);
+		node->modified = now;
+		lck_mtx_unlock(node->mount->nodes_lock);
+	}
+	lck_mtx_unlock(node->write_lock);
+	return error;
+}
+
+/* F_PREALLOCATE: unwritten extents from the physical end of the file, which
+ * keep its size, as Linux's fallocate with KEEP_SIZE. The position hint of
+ * F_VOLPOSMODE is not used; the space is allocated whole or not at all. */
+int
+btrfs_xnu_preallocate(void *arguments)
+{
+	struct vnop_allocate_args *args = arguments;
+	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+	uint64_t sector = node->mount->info.sector_size;
+	uint64_t start;
+	uint64_t length;
+	int error;
+
+	*args->a_bytesallocated = 0;
+	if (vnode_vtype(args->a_vp) != VREG) {
+		return vnode_vtype(args->a_vp) == VDIR ? EISDIR : EINVAL;
+	}
+	if (!btrfs_volume_writable(node->mount->volume)) {
+		return EROFS;
+	}
+	if (args->a_length < 0) {
+		return EINVAL;
+	}
+	if (args->a_length == 0) {
+		return 0;
+	}
+	lck_mtx_lock(node->mount->nodes_lock);
+	start = node->size + (sector - node->size % sector) % sector;
+	lck_mtx_unlock(node->mount->nodes_lock);
+	length = (uint64_t)args->a_length;
+	length += (sector - length % sector) % sector;
+	error = btrfs_xnu_fallocate(
+	    node, args->a_vp, BTRFS_FALLOCATE_KEEP_SIZE, start, length, args->a_context);
+	if (error == 0) {
+		*args->a_bytesallocated = (off_t)length;
+	}
+	return error;
+}
+
+/* lseek's SEEK_HOLE and SEEK_DATA: cached writes are applied first, so that
+ * the volume's newest state holds every byte of the file. */
+static int
+btrfs_xnu_seek(struct btrfs_xnu_node *node, vnode_t vnode, off_t *offset, int hole)
+{
+	const struct btrfs_fs *fs = NULL;
+	struct btrfs_volume_view *view = NULL;
+	struct btrfs_inode inode;
+	uint64_t result = 0;
+	enum btrfs_result found;
+	int error;
+
+	if (vnode_vtype(vnode) != VREG) {
+		return vnode_vtype(vnode) == VDIR ? EISDIR : EINVAL;
+	}
+	/* As Linux, a negative offset searches from the start. */
+	error = btrfs_xnu_push_data(vnode, 1);
+	if (error == 0) {
+		error = btrfs_xnu_read_inode(node, &fs, &view, &inode);
+	}
+	if (error != 0) {
+		return error;
+	}
+	found = btrfs_seek(fs, &inode, *offset < 0 ? 0 : (uint64_t)*offset, hole, &result);
+	btrfs_volume_unread(node->mount->volume, view);
+	if (found == BTRFS_NOT_FOUND) {
+		return ENXIO;
+	}
+	if (found == BTRFS_OK) {
+		*offset = (off_t)result;
+	}
+	return btrfs_xnu_error(found);
+}
+
+/* F_PUNCHHOLE: the range reads as zeros and its extents go; the size stays.
+ * SEEK_HOLE and SEEK_DATA arrive here as file system controls too. */
+int
+btrfs_xnu_ioctl(void *arguments)
+{
+	struct vnop_ioctl_args *args = arguments;
+	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+	const fpunchhole_t *hole = (const fpunchhole_t *)(void *)args->a_data;
+
+	if (args->a_command == BTRFS_XNU_FIOSEEKHOLE || args->a_command == BTRFS_XNU_FIOSEEKDATA) {
+		return btrfs_xnu_seek(node, args->a_vp, (off_t *)(void *)args->a_data,
+		    args->a_command == BTRFS_XNU_FIOSEEKHOLE);
+	}
+	if (args->a_command != F_PUNCHHOLE) {
+		return ENOTTY;
+	}
+	if (vnode_vtype(args->a_vp) != VREG) {
+		return vnode_vtype(args->a_vp) == VDIR ? EISDIR : EINVAL;
+	}
+	if (!btrfs_volume_writable(node->mount->volume)) {
+		return EROFS;
+	}
+	if (hole->fp_offset < 0 || hole->fp_length <= 0) {
+		return EINVAL;
+	}
+	return btrfs_xnu_fallocate(node, args->a_vp,
+	    BTRFS_FALLOCATE_PUNCH_HOLE | BTRFS_FALLOCATE_KEEP_SIZE, (uint64_t)hole->fp_offset,
+	    (uint64_t)hole->fp_length, args->a_context);
 }
 
 int

@@ -137,6 +137,8 @@ int btrfs_xnu_remove(void *arguments);
 int btrfs_xnu_rmdir(void *arguments);
 int btrfs_xnu_rename(void *arguments);
 int btrfs_xnu_setattr(void *arguments);
+int btrfs_xnu_preallocate(void *arguments);
+int btrfs_xnu_ioctl(void *arguments);
 int btrfs_xnu_write(void *arguments);
 int btrfs_xnu_setxattr(void *arguments);
 int btrfs_xnu_removexattr(void *arguments);

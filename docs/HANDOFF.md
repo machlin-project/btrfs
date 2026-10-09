@@ -103,8 +103,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    with checksums, holes, preallocated and compressed input, inline conversion
    and snapshot-safe frees (`core/data.c`, `core/csum.c`), in place into
    preallocated and unshared NODATACOW extents, with hole items on filesystems
-   without NO_HOLES and both copies of DUP data. Remaining: a 64 KiB-sector
-   fixture, an fallocate operation, an inode-flags operation (`chattr`) and a
+   without NO_HOLES and both copies of DUP data, and fallocate as Linux's
+   `btrfs_fallocate` (allocation, zeroing and punching; `F_PREALLOCATE` and
+   `F_PUNCHHOLE` natively). Remaining: a 64 KiB-sector
+   fixture, an inode-flags operation (`chattr`) and a
    compressor in the kernel adapter. New data is written as its extents are
    created, and files compress on write as Linux decides.
 4. **Finish allocation features.** The free-space tree is verified and kept in
@@ -153,6 +155,7 @@ is destroyed. `accept` is legal only after successful durable publication;
 
 `tests/mounted_write.c` (run by `tests/run_macos.py` in both commit modes)
 requires exclusive create, unaligned overwrite, mmap/pread/pwrite coherence,
+`F_PREALLOCATE` and `F_PUNCHHOLE` (sizes, contents and allocated blocks),
 shrink/grow zeroing, metadata/xattr mutations, links, rename replacement,
 cross-directory rename, nonempty-directory failure, open-unlink lifetime,
 file/directory fsync, remount persistence, concurrent append/rename, set-id

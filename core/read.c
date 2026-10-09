@@ -568,3 +568,109 @@ btrfs_read(const struct btrfs_fs *fs, const struct btrfs_inode *inode, uint64_t 
 	}
 	return error;
 }
+
+enum btrfs_result
+btrfs_seek(const struct btrfs_fs *fs, const struct btrfs_inode *inode, uint64_t offset, int hole,
+    uint64_t *result)
+{
+	const struct bt_disk_extent *extent;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key;
+	uint64_t length;
+	uint64_t end;
+	uint64_t start = offset;
+	uint64_t last_end;
+	uint64_t steps;
+	int found = 0;
+	int unwritten;
+	enum btrfs_result error;
+
+	if (fs == NULL || inode == NULL || result == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if ((inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR) {
+		return (inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_DIRECTORY ? BTRFS_IS_DIRECTORY
+									       : BTRFS_UNSUPPORTED;
+	}
+	if (inode->size == 0 || offset >= inode->size) {
+		return BTRFS_NOT_FOUND;
+	}
+	/* Linux's shortcut: without preallocation, bytes that equal the size
+	 * leave no hole before the end. */
+	if (hole && (inode->flags & BT_INODE_PREALLOC) == 0 &&
+	    inode->allocated_bytes == inode->size) {
+		*result = inode->size;
+		return BTRFS_OK;
+	}
+	last_end = offset - offset % fs->info.sector_size;
+	error = bt_inode_cursor(fs, inode, &cursor);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	key = (struct bt_key){
+		.objectid = inode->id.inode, .type = BT_EXTENT_DATA, .offset = offset
+	};
+	error = bt_cursor_seek(&cursor, key, 1);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+	}
+	if (error == BTRFS_NOT_FOUND ||
+	    (error == BTRFS_OK &&
+		(record.key.objectid != key.objectid || record.key.type != key.type))) {
+		error = bt_cursor_seek(&cursor, key, 0);
+	}
+	for (steps = 0; error == BTRFS_OK && !found && start < inode->size; steps++) {
+		if (steps == BT_MAX_TREE_ITEMS) {
+			error = BTRFS_UNSUPPORTED;
+			break;
+		}
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.objectid != key.objectid || record.key.type != key.type) {
+			break;
+		}
+		error = bt_extent_length(fs, &record, inode, &length);
+		if (error != BTRFS_OK) {
+			break;
+		}
+		end = record.key.offset + length;
+		if (end > start) {
+			/* A gap before the item is a hole without an item. */
+			if (last_end < record.key.offset && hole) {
+				start = start == offset ? offset : last_end;
+				found = 1;
+				break;
+			}
+			extent = (const void *)record.data;
+			unwritten = extent->header.type == BT_EXTENT_PREALLOC ||
+			    (extent->header.type == BT_EXTENT_REGULAR &&
+				bt_u64(extent->disk_bytenr) == 0);
+			if (unwritten && hole) {
+				start = start == offset ? offset : record.key.offset;
+				found = 1;
+				break;
+			}
+			if (!unwritten && !hole) {
+				start = record.key.offset > offset ? record.key.offset : offset;
+				found = 1;
+				break;
+			}
+			start = end;
+			last_end = end;
+		}
+		error = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	if (error != BTRFS_OK && error != BTRFS_NOT_FOUND) {
+		return error;
+	}
+	/* What follows the last item up to the size is a hole. */
+	if (!found && !hole) {
+		start = inode->size;
+	}
+	if (!hole && start >= inode->size) {
+		return BTRFS_NOT_FOUND;
+	}
+	*result = start < inode->size ? start : inode->size;
+	return BTRFS_OK;
+}

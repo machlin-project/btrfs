@@ -1906,6 +1906,19 @@ btrfs_timespec(struct btrfs_time time)
 	[self performSetAttributes:newAttributes onItem:item replyHandler:reply];
 }
 
+- (void)preallocateSpaceForItem:(FSItem *)item
+		       atOffset:(off_t)offset
+			 length:(size_t)length
+			  flags:(FSPreallocateFlags)flags
+		   replyHandler:(void (^)(size_t, NSError *))reply
+{
+	[self performPreallocateSpaceForItem:item
+				    atOffset:offset
+				      length:length
+				       flags:flags
+				replyHandler:reply];
+}
+
 - (void)writeContents:(NSData *)contents
 	       toFile:(FSItem *)item
 	     atOffset:(off_t)offset

@@ -18,6 +18,8 @@
 #define BT_INLINE_WRITE_LIMIT 2048U
 /* Linux's limit on one uncompressed data extent. */
 #define BT_DATA_EXTENT (UINT64_C(128) * 1024 * 1024)
+/* Largest extent one preallocation step asks for, as __btrfs_prealloc_file_range. */
+#define BT_PREALLOC_EXTENT (UINT64_C(256) * 1024 * 1024)
 /* A commit merges physically contiguous node copies into writes of at most
  * this many bytes. */
 #define BT_WRITE_RUN (256U * 1024U)

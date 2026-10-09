@@ -183,6 +183,17 @@ inspect(struct btrfs_fs *fs, int argc, char **argv)
 	if (error != BTRFS_OK) {
 		return error;
 	}
+	if (strcmp(argv[0], "seek") == 0) {
+		if (argc < 4 || (strcmp(argv[2], "data") != 0 && strcmp(argv[2], "hole") != 0)) {
+			return BTRFS_INVALID_ARGUMENT;
+		}
+		error = btrfs_seek(
+		    fs, &inode, strtoull(argv[3], NULL, 0), strcmp(argv[2], "hole") == 0, &offset);
+		if (error == BTRFS_OK) {
+			printf("%" PRIu64 "\n", offset);
+		}
+		return error;
+	}
 	if (strcmp(argv[0], "stat") == 0) {
 		printf("{\"tree\":%" PRIu64 ",\"inode\":%" PRIu64 ",\"size\":%" PRIu64
 		       ",\"allocated\":%" PRIu64
@@ -367,7 +378,7 @@ main(int argc, char **argv)
 	}
 	if (argc - argument < 2) {
 		fprintf(stderr,
-		    "Usage: btrfs-inspect [--tree ID] IMAGE info|stat|ls|cat|xattr|listxattr "
+		    "Usage: btrfs-inspect [--tree ID] IMAGE info|stat|ls|cat|xattr|listxattr|seek "
 		    "[PATH] [ARGS]\n       btrfs-inspect [--tree ID] IMAGE walk [--data]\n       "
 		    "btrfs-inspect IMAGE recover [--apply] [--acknowledged "
 		    "GENERATION]\n       btrfs-inspect IMAGE replay [--apply]\n");

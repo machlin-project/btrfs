@@ -73,6 +73,7 @@ hexadecimal):
 .build/btrfs-inspect IMAGE replay
 .build/btrfs-inspect IMAGE replay --apply
 .build/btrfs-inspect IMAGE walk --data
+.build/btrfs-inspect IMAGE seek PATH data|hole OFFSET
 ```
 
 `tree-log-replay` (`tests/check_log_replay.py`) replays copies of the `logs`
@@ -507,10 +508,14 @@ status alone does not.
 Attach a disposable copy as an ordinary user with
 `hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage IMAGE`
 (add `-readonly` for the read suite); Disk Arbitration mounts it through the
-module at `/Volumes/LABEL`. Run `btrfs-mounted-test MOUNT` and, as root,
-`btrfs-mounted-write-test write MOUNT --skip-set-id`, then detach, attach again
-and run `verify` with the same flag; the skip names the set-id group, a recorded
-failure on FSKit 26.x (see ARCHITECTURE.md), and the manifest omits its files.
+module at `/Volumes/LABEL`. Run `btrfs-mounted-test MOUNT --no-seek-hole` (FSKit
+26.x has no interface for SEEK_HOLE; the option accepts a refusal or no holes
+before the end, as POSIX allows) and, as root,
+`btrfs-mounted-write-test write MOUNT --skip-set-id --no-punch-hole`, then
+detach, attach again and run `verify` with the same flags; the first skip names
+the set-id group, a recorded failure on FSKit 26.x (see ARCHITECTURE.md), and
+the manifest omits its files; the second requires `F_PUNCHHOLE` to be refused,
+since FSKit has no interface for it, and expects the block it would punch.
 `diskutil unmount` is refused while Spotlight holds the volume root; `hdiutil
 detach` unmounts it. Check the written image with Linux as for the XNU runs.
 

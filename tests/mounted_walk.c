@@ -9,7 +9,10 @@
  * subvolume (its Btrfs inode number) and "-" for an object in another
  * subvolume. Linux computes the same digest from its own inode numbers and
  * devices. A directory whose path or names the manifest cannot carry is
- * checked but not listed. */
+ * checked but not listed. The volume metadata directories macOS services
+ * create and remove at the root on their own schedule (fseventsd purges its
+ * log directory while the volume is mounted) are left out of the walk;
+ * tests/native_oracle.sh leaves out the same names. */
 #define _DARWIN_C_SOURCE
 #include <CommonCrypto/CommonDigest.h>
 #include <dirent.h>
@@ -217,6 +220,22 @@ print_listing(struct walk *walk, const char *path, size_t count, bool listable)
 	printf("inodes\t%s\t%s\n", path, hex);
 }
 
+/* Directories macOS services own at a volume's root. */
+static bool
+volume_metadata(const char *name)
+{
+	static const char *const names[] = { ".fseventsd", ".Spotlight-V100", ".Trashes",
+		".TemporaryItems", ".DocumentRevisions-V100" };
+	size_t i;
+
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		if (strcmp(name, names[i]) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 walk_directory(struct walk *walk, const struct directory *current)
 {
@@ -252,6 +271,9 @@ walk_directory(struct walk *walk, const struct directory *current)
 			REQUIRE(
 			    !dot_dot && (current->depth == 0 || entry->d_ino == current->parent));
 			dot_dot = true;
+			continue;
+		}
+		if (current->depth == 0 && volume_metadata(entry->d_name)) {
 			continue;
 		}
 		REQUIRE(fstatat(file, entry->d_name, &status, AT_SYMLINK_NOFOLLOW) == 0);

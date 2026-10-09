@@ -582,6 +582,40 @@ bt_tx_codec(struct btrfs_transaction *transaction, struct bt_owned_root *tree, u
 	return BTRFS_OK;
 }
 
+/* The extent item of a new data extent at logical of size bytes, with the
+ * file's one data reference, as the extent's space is accounted used. */
+static enum btrfs_result
+bt_tx_extent_item(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    uint64_t ino, uint64_t position, uint64_t logical, uint64_t size)
+{
+	struct {
+		struct bt_disk_extent_item item;
+		uint8_t type;
+		struct bt_disk_data_ref reference;
+	} wire;
+	struct bt_key key = { .objectid = logical, .type = BT_EXTENT_ITEM, .offset = size };
+	enum btrfs_result error;
+
+	_Static_assert(sizeof(wire) ==
+		sizeof(struct bt_disk_extent_item) + 1 + sizeof(struct bt_disk_data_ref),
+	    "inline data reference layout");
+	error = bt_space_change_used(transaction->space, logical, size, 1);
+	if (error == BTRFS_OK) {
+		bt_zero(&wire, sizeof(wire));
+		bt_put64(&wire.item.refs, 1);
+		bt_put64(&wire.item.generation, transaction->base->info.generation + 1);
+		bt_put64(&wire.item.flags, BT_EXTENT_FLAG_DATA);
+		wire.type = BT_EXTENT_DATA_REF;
+		bt_put64(&wire.reference.root, tree->root.owner);
+		bt_put64(&wire.reference.objectid, ino);
+		bt_put64(&wire.reference.offset, position);
+		bt_put32(&wire.reference.count, 1);
+		error = bt_tx_edit(
+		    transaction, &transaction->extents.root, key, &wire, sizeof(wire), BT_INSERT);
+	}
+	return error;
+}
+
 /* One new extent at logical: its disk bytes (compressed or not), extent item
  * with the file's data reference, checksums of the stored bytes, and the file
  * extent item covering [position, position + length). */
@@ -590,38 +624,14 @@ bt_tx_extent(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     const struct bt_disk_inode *inode, uint64_t ino, uint64_t position, uint64_t length,
     uint64_t logical, const uint8_t *stored, uint64_t stored_size, enum btrfs_compression codec)
 {
-	struct {
-		struct bt_disk_extent_item item;
-		uint8_t type;
-		struct bt_disk_data_ref reference;
-	} wire;
 	struct bt_disk_extent file;
 	struct bt_key key;
 	uint64_t generation = transaction->base->info.generation + 1;
 	enum btrfs_result error;
 
-	_Static_assert(sizeof(wire) ==
-		sizeof(struct bt_disk_extent_item) + 1 + sizeof(struct bt_disk_data_ref),
-	    "inline data reference layout");
 	error = bt_tx_write_data(transaction, logical, stored, stored_size);
 	if (error == BTRFS_OK) {
-		error = bt_space_change_used(transaction->space, logical, stored_size, 1);
-	}
-	if (error == BTRFS_OK) {
-		bt_zero(&wire, sizeof(wire));
-		bt_put64(&wire.item.refs, 1);
-		bt_put64(&wire.item.generation, generation);
-		bt_put64(&wire.item.flags, BT_EXTENT_FLAG_DATA);
-		wire.type = BT_EXTENT_DATA_REF;
-		bt_put64(&wire.reference.root, tree->root.owner);
-		bt_put64(&wire.reference.objectid, ino);
-		bt_put64(&wire.reference.offset, position);
-		bt_put32(&wire.reference.count, 1);
-		key = (struct bt_key){
-			.objectid = logical, .type = BT_EXTENT_ITEM, .offset = stored_size
-		};
-		error = bt_tx_edit(
-		    transaction, &transaction->extents.root, key, &wire, sizeof(wire), BT_INSERT);
+		error = bt_tx_extent_item(transaction, tree, ino, position, logical, stored_size);
 	}
 	if (error == BTRFS_OK && !(bt_u64(inode->flags) & BT_INODE_NODATASUM_FLAG)) {
 		error = bt_csum_insert(transaction->mutation, &transaction->checksums.root, logical,
@@ -1335,6 +1345,496 @@ btrfs_transaction_truncate(struct btrfs_transaction *transaction, struct btrfs_o
 	}
 	if (error == BTRFS_OK) {
 		error = bt_tx_store_inode(transaction, tree, id.inode, &inode, size, modified);
+	}
+	if (error != BTRFS_OK) {
+		transaction->failure = error;
+	}
+	return error;
+}
+
+/* What btrfs_get_extent maps at a sector: nothing written (no item, or a hole
+ * item), unwritten (preallocated) or written data. */
+enum bt_mapping { BT_MAP_HOLE, BT_MAP_PREALLOC, BT_MAP_WRITTEN };
+
+/* The mapping at the sector position and where it ends, as btrfs_get_extent
+ * gives it with its extent maps cached: an item with data covering position
+ * ends where it does (an inline extent at the end of its sector); a hole,
+ * made of gaps and hole items, runs to the next item with data, or without
+ * one to UINT64_MAX. */
+static enum btrfs_result
+bt_tx_mapping(struct btrfs_transaction *transaction, const struct bt_owned_root *tree, uint64_t ino,
+    uint64_t position, enum bt_mapping *kind, uint64_t *end)
+{
+	struct bt_file_item item;
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t cursor = position;
+	uint64_t steps;
+	int found = 0;
+	int inline_item;
+	enum btrfs_result error;
+
+	*kind = BT_MAP_HOLE;
+	*end = UINT64_MAX;
+	for (steps = 0; steps < BT_MAX_TREE_ITEMS; steps++) {
+		error = bt_tx_file_item(transaction, tree, ino, cursor, UINT64_MAX, &item, &found);
+		if (error != BTRFS_OK || !found) {
+			return error;
+		}
+		/* A gap runs to the item. */
+		cursor = item.key.offset > cursor ? item.key.offset : cursor;
+		inline_item = item.extent.header.type == BT_EXTENT_INLINE;
+		if (!inline_item && bt_u64(item.extent.disk_bytenr) == 0) {
+			cursor = item.end;
+			continue;
+		}
+		if (cursor != position) {
+			*end = cursor;
+		} else if (inline_item) {
+			*kind = BT_MAP_WRITTEN;
+			*end = item.end + (sector - item.end % sector) % sector;
+		} else {
+			*kind = item.extent.header.type == BT_EXTENT_PREALLOC ? BT_MAP_PREALLOC
+									      : BT_MAP_WRITTEN;
+			*end = item.end;
+		}
+		return BTRFS_OK;
+	}
+	return BTRFS_UNSUPPORTED;
+}
+
+/* find_first_non_hole: when [*start, *start + *length) begins in a hole, the
+ * range moves past it (*hole); *length 0 then means it was all hole. */
+static enum btrfs_result
+bt_tx_skip_hole(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    uint64_t ino, uint64_t *start, uint64_t *length, int *hole)
+{
+	enum bt_mapping kind;
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t end;
+	enum btrfs_result error;
+
+	*hole = 0;
+	error = bt_tx_mapping(transaction, tree, ino, *start - *start % sector, &kind, &end);
+	if (error == BTRFS_OK && kind == BT_MAP_HOLE) {
+		*hole = 1;
+		*length = end > *start + *length ? 0 : *start + *length - end;
+		*start = end;
+	}
+	return error;
+}
+
+/* btrfs_truncate_block: an unaligned edge rewrites its sector with part of it
+ * zeroed: [from, from + length), or with length 0 the rest of the sector
+ * (front: the sector's start up to from). zeros holds a sector of zeros. */
+static enum btrfs_result
+bt_tx_zero_block(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, uint64_t from, uint64_t length, int front,
+    const uint8_t *zeros)
+{
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t block = from - from % sector;
+	uint64_t offset = from % sector;
+
+	if (offset == 0 && length % sector == 0) {
+		return BTRFS_OK;
+	}
+	if (front) {
+		return bt_tx_rewrite(transaction, tree, inode, ino, block, block + sector, block,
+		    zeros, (size_t)offset, bt_u64(inode->size));
+	}
+	if (length == 0 || length > sector - offset) {
+		length = sector - offset;
+	}
+	return bt_tx_rewrite(transaction, tree, inode, ino, block, block + sector, from, zeros,
+	    (size_t)length, bt_u64(inode->size));
+}
+
+/* An unwritten extent at logical for [position, position + size), as
+ * insert_prealloc_file_extent stores it: the extent item with the file's data
+ * reference and a PREALLOC file extent item; no data and no checksums. */
+static enum btrfs_result
+bt_tx_prealloc_extent(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t ino, uint64_t position, uint64_t logical, uint64_t size)
+{
+	struct bt_disk_extent file;
+	struct bt_key key = { .objectid = ino, .type = BT_EXTENT_DATA, .offset = position };
+	enum btrfs_result error;
+
+	error = bt_tx_extent_item(transaction, tree, ino, position, logical, size);
+	if (error == BTRFS_OK) {
+		bt_zero(&file, sizeof(file));
+		bt_put64(&file.header.generation, transaction->base->info.generation + 1);
+		bt_put64(&file.header.ram_bytes, size);
+		file.header.type = BT_EXTENT_PREALLOC;
+		bt_put64(&file.disk_bytenr, logical);
+		bt_put64(&file.disk_bytes, size);
+		bt_put64(&file.length, size);
+		error = bt_tx_edit(transaction, &tree->root, key, &file, sizeof(file), BT_INSERT);
+	}
+	return error;
+}
+
+/* __btrfs_prealloc_file_range over the sectors [start, end): unwritten
+ * extents of up to BT_PREALLOC_EXTENT bytes replace the coverage they take
+ * and count in the inode's bytes; without KEEP_SIZE the size follows them,
+ * up to limit. */
+static enum btrfs_result
+bt_tx_prealloc(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, uint64_t start, uint64_t end, unsigned mode,
+    uint64_t limit)
+{
+	uint64_t position;
+	uint64_t want;
+	uint64_t logical;
+	uint64_t size = 0;
+	uint64_t removed = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (position = start; error == BTRFS_OK && position < end; position += size) {
+		want = end - position < BT_PREALLOC_EXTENT ? end - position : BT_PREALLOC_EXTENT;
+		error = bt_space_reserve_data(transaction->space, want, &logical, &size);
+		if (error == BTRFS_OK) {
+			error = bt_tx_drop_range(
+			    transaction, tree, ino, position, position + size, &removed);
+		}
+		if (error == BTRFS_OK) {
+			error =
+			    bt_tx_prealloc_extent(transaction, tree, ino, position, logical, size);
+		}
+		if (error == BTRFS_OK && bt_u64(inode->nbytes) < removed) {
+			error = BTRFS_CORRUPT;
+		}
+		if (error != BTRFS_OK) {
+			break;
+		}
+		bt_put64(&inode->nbytes, bt_u64(inode->nbytes) - removed + size);
+		bt_put64(&inode->flags, bt_u64(inode->flags) | BT_INODE_PREALLOC);
+		if (!(mode & BTRFS_FALLOCATE_KEEP_SIZE) && limit > bt_u64(inode->size) &&
+		    position + size > bt_u64(inode->size)) {
+			bt_put64(&inode->size, position + size < limit ? position + size : limit);
+		}
+	}
+	return error;
+}
+
+/* btrfs_fallocate_update_isize. */
+static void
+bt_tx_fallocate_size(struct bt_disk_inode *inode, unsigned mode, uint64_t end)
+{
+	if (!(mode & BTRFS_FALLOCATE_KEEP_SIZE) && end > bt_u64(inode->size)) {
+		bt_put64(&inode->size, end);
+	}
+}
+
+/* btrfs_zero_range, after btrfs_fallocate's own steps. */
+static enum btrfs_result
+bt_tx_zero_range(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, unsigned mode, uint64_t offset, uint64_t length,
+    const uint8_t *zeros)
+{
+	enum bt_mapping kind;
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t limit = offset + length;
+	uint64_t alloc_start = offset - offset % sector;
+	uint64_t alloc_end = limit + (sector - limit % sector) % sector;
+	uint64_t end;
+	enum btrfs_result error;
+
+	error = bt_tx_mapping(transaction, tree, ino, alloc_start, &kind, &end);
+	if (error == BTRFS_OK && kind == BT_MAP_PREALLOC) {
+		/* What is already unwritten stays; only the rest is zeroed. */
+		if (end >= limit) {
+			bt_tx_fallocate_size(inode, mode, limit);
+			return BTRFS_OK;
+		}
+		alloc_start = end;
+		offset = alloc_start;
+		length = limit - offset;
+	}
+	if (error == BTRFS_OK && offset / sector == (limit - 1) / sector) {
+		error = bt_tx_mapping(transaction, tree, ino, alloc_start, &kind, &end);
+		if (error != BTRFS_OK || kind == BT_MAP_PREALLOC) {
+			bt_tx_fallocate_size(inode, mode, limit);
+			return error;
+		}
+		if (length < sector && kind != BT_MAP_HOLE) {
+			error = bt_tx_zero_block(
+			    transaction, tree, inode, ino, offset, length, 0, zeros);
+			bt_tx_fallocate_size(inode, mode, limit);
+			return error;
+		}
+		alloc_start = offset - offset % sector;
+		alloc_end = alloc_start + sector;
+	} else if (error == BTRFS_OK) {
+		alloc_start = offset + (sector - offset % sector) % sector;
+		alloc_end = limit - limit % sector;
+		/* An unaligned edge in a hole joins the allocation; written data
+		 * there is zeroed in place of it; unwritten data reads zeros. */
+		if (offset % sector != 0) {
+			error = bt_tx_mapping(
+			    transaction, tree, ino, offset - offset % sector, &kind, &end);
+			if (error == BTRFS_OK && kind == BT_MAP_HOLE) {
+				alloc_start = offset - offset % sector;
+			} else if (error == BTRFS_OK && kind == BT_MAP_WRITTEN) {
+				error = bt_tx_zero_block(
+				    transaction, tree, inode, ino, offset, 0, 0, zeros);
+			}
+		}
+		if (error == BTRFS_OK && limit % sector != 0) {
+			error = bt_tx_mapping(
+			    transaction, tree, ino, limit - limit % sector, &kind, &end);
+			if (error == BTRFS_OK && kind == BT_MAP_HOLE) {
+				alloc_end = limit + (sector - limit % sector);
+			} else if (error == BTRFS_OK && kind == BT_MAP_WRITTEN) {
+				error = bt_tx_zero_block(
+				    transaction, tree, inode, ino, limit, 0, 1, zeros);
+			}
+		}
+	}
+	if (error == BTRFS_OK && alloc_start < alloc_end) {
+		error = bt_tx_prealloc(
+		    transaction, tree, inode, ino, alloc_start, alloc_end, mode, limit);
+	}
+	if (error == BTRFS_OK) {
+		bt_tx_fallocate_size(inode, mode, limit);
+	}
+	return error;
+}
+
+/* btrfs_fallocate for allocation and zeroing: a range starting past EOF first
+ * extends the file with holes (btrfs_cont_expand), one ending past it clears
+ * the EOF sector's tail; then the holes of the range, and data beyond EOF,
+ * become unwritten extents. */
+static enum btrfs_result
+bt_tx_allocate(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, unsigned mode, uint64_t offset, uint64_t length,
+    const uint8_t *zeros)
+{
+	enum bt_mapping kind;
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t size = bt_u64(inode->size);
+	uint64_t limit = offset + length;
+	uint64_t alloc_start = offset - offset % sector;
+	uint64_t alloc_end = limit + (sector - limit % sector) % sector;
+	uint64_t position;
+	uint64_t next;
+	uint64_t end;
+	uint64_t steps;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (alloc_start > size || limit > size) {
+		error = bt_tx_zero_block(transaction, tree, inode, ino, size, 0, 0, zeros);
+	}
+	if (error == BTRFS_OK && alloc_start > size) {
+		error = bt_tx_expand(transaction, tree, inode, ino, size, alloc_start);
+	}
+	if (error != BTRFS_OK || (mode & BTRFS_FALLOCATE_ZERO_RANGE) != 0) {
+		return error == BTRFS_OK
+		    ? bt_tx_zero_range(transaction, tree, inode, ino, mode, offset, length, zeros)
+		    : error;
+	}
+	for (position = alloc_start, steps = 0; error == BTRFS_OK && position < alloc_end;
+	    position = next, steps++) {
+		if (steps == BT_MAX_TREE_ITEMS) {
+			return BTRFS_UNSUPPORTED;
+		}
+		error = bt_tx_mapping(transaction, tree, ino, position, &kind, &end);
+		next = end < alloc_end ? end : alloc_end;
+		next += (sector - next % sector) % sector;
+		if (error == BTRFS_OK &&
+		    (kind == BT_MAP_HOLE || (position >= size && kind != BT_MAP_PREALLOC))) {
+			error = bt_tx_prealloc(
+			    transaction, tree, inode, ino, position, next, mode, limit);
+		}
+	}
+	if (error == BTRFS_OK) {
+		bt_tx_fallocate_size(inode, mode, limit);
+	}
+	return error;
+}
+
+/* Data bytes an allocation may take: the holes it fills and data beyond EOF
+ * it replaces, and the EOF sector it may rewrite. */
+static enum btrfs_result
+bt_tx_allocate_need(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    uint64_t ino, uint64_t size, uint64_t offset, uint64_t length, uint64_t *need)
+{
+	enum bt_mapping kind;
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t limit = offset + length;
+	uint64_t alloc_end = limit + (sector - limit % sector) % sector;
+	uint64_t position;
+	uint64_t next;
+	uint64_t end;
+	uint64_t steps;
+	enum btrfs_result error = BTRFS_OK;
+
+	*need = sector;
+	for (position = offset - offset % sector, steps = 0;
+	    error == BTRFS_OK && position < alloc_end; position = next, steps++) {
+		if (steps == BT_MAX_TREE_ITEMS) {
+			return BTRFS_UNSUPPORTED;
+		}
+		error = bt_tx_mapping(transaction, tree, ino, position, &kind, &end);
+		next = end < alloc_end ? end : alloc_end;
+		next += (sector - next % sector) % sector;
+		if (kind == BT_MAP_HOLE || (position >= size && kind != BT_MAP_PREALLOC)) {
+			*need += next - position;
+		}
+	}
+	return error;
+}
+
+/* btrfs_punch_hole, once [offset, offset + length) was found to start past
+ * any hole at original. */
+static enum btrfs_result
+bt_tx_punch(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct bt_disk_inode *inode, uint64_t ino, uint64_t original, uint64_t offset, uint64_t length,
+    const uint8_t *zeros)
+{
+	struct bt_disk_extent hole;
+	struct bt_key key = { .objectid = ino, .type = BT_EXTENT_DATA };
+	uint64_t sector = transaction->base->info.sector_size;
+	uint64_t size = bt_u64(inode->size);
+	uint64_t eof = size + (sector - size % sector) % sector;
+	uint64_t lock_start = offset + (sector - offset % sector) % sector;
+	uint64_t lock_end = (offset + length) - (offset + length) % sector;
+	uint64_t tail_start;
+	uint64_t tail_length;
+	uint64_t removed = 0;
+	int hole_found = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	/* Within one sector only that sector's part is zeroed. */
+	if (offset / sector == (offset + length - 1) / sector && length < sector) {
+		return offset < eof
+		    ? bt_tx_zero_block(transaction, tree, inode, ino, offset, length, 0, zeros)
+		    : BTRFS_OK;
+	}
+	if (offset < eof) {
+		error = bt_tx_zero_block(transaction, tree, inode, ino, offset, 0, 0, zeros);
+	}
+	/* Unless the start already moved past a hole, look again after the
+	 * zeroed sector. */
+	if (error == BTRFS_OK && offset == original) {
+		length = offset + length - lock_start;
+		offset = lock_start;
+		error = bt_tx_skip_hole(transaction, tree, ino, &offset, &length, &hole_found);
+		if (error != BTRFS_OK || (hole_found && length == 0)) {
+			return error;
+		}
+		lock_start = offset;
+	}
+	tail_start = lock_end;
+	tail_length = error == BTRFS_OK ? offset + length - tail_start : 0;
+	if (tail_length != 0) {
+		error =
+		    bt_tx_skip_hole(transaction, tree, ino, &tail_start, &tail_length, &hole_found);
+		if (error == BTRFS_OK && !hole_found && tail_start + tail_length < eof) {
+			error = bt_tx_zero_block(
+			    transaction, tree, inode, ino, tail_start + tail_length, 0, 1, zeros);
+		}
+	}
+	if (error != BTRFS_OK || lock_end <= lock_start) {
+		return error;
+	}
+	error = bt_tx_drop_range(transaction, tree, ino, lock_start, lock_end, &removed);
+	if (error == BTRFS_OK && bt_u64(inode->nbytes) < removed) {
+		error = BTRFS_CORRUPT;
+	}
+	if (error == BTRFS_OK) {
+		bt_put64(&inode->nbytes, bt_u64(inode->nbytes) - removed);
+	}
+	/* fill_holes: without NO_HOLES, a punch below EOF leaves a hole item. */
+	if (error == BTRFS_OK && lock_start < eof &&
+	    (transaction->base->info.incompat_features & BT_FEATURE_NO_HOLES) == 0) {
+		bt_zero(&hole, sizeof(hole));
+		bt_put64(&hole.header.generation, transaction->base->info.generation + 1);
+		bt_put64(&hole.header.ram_bytes, lock_end - lock_start);
+		hole.header.type = BT_EXTENT_REGULAR;
+		bt_put64(&hole.length, lock_end - lock_start);
+		key.offset = lock_start;
+		error = bt_tx_edit(transaction, &tree->root, key, &hole, sizeof(hole), BT_INSERT);
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_transaction_fallocate(struct btrfs_transaction *transaction, struct btrfs_object_id id,
+    unsigned mode, uint64_t offset, uint64_t length, struct btrfs_time now)
+{
+	const struct btrfs_environment *env;
+	struct bt_owned_root *tree;
+	struct bt_disk_inode inode;
+	uint8_t *zeros = NULL;
+	uint64_t sector;
+	uint64_t limit;
+	uint64_t inline_end;
+	uint64_t original = offset;
+	uint64_t need = 0;
+	int hole = 0;
+	enum btrfs_result error;
+
+	if (transaction == NULL || length == 0 || now.nanoseconds >= 1000000000U) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if ((mode &
+		~(BTRFS_FALLOCATE_KEEP_SIZE | BTRFS_FALLOCATE_PUNCH_HOLE |
+		    BTRFS_FALLOCATE_ZERO_RANGE)) != 0 ||
+	    ((mode & BTRFS_FALLOCATE_PUNCH_HOLE) != 0 &&
+		(mode & (BTRFS_FALLOCATE_KEEP_SIZE | BTRFS_FALLOCATE_ZERO_RANGE)) !=
+		    BTRFS_FALLOCATE_KEEP_SIZE)) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if (offset > BT_FILE_SIZE_LIMIT || length > BT_FILE_SIZE_LIMIT - offset) {
+		return BTRFS_RANGE;
+	}
+	error = bt_tx_data_begin(transaction, id, &tree, &inode, &inline_end);
+	/* An append-only file may only gain space. */
+	if (error == BTRFS_OK && (bt_u64(inode.flags) & BT_INODE_APPEND) != 0 &&
+	    (mode & ~BTRFS_FALLOCATE_KEEP_SIZE) != 0) {
+		error = BTRFS_NOT_PERMITTED;
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	sector = transaction->base->info.sector_size;
+	limit = offset + length;
+	if ((mode & BTRFS_FALLOCATE_PUNCH_HOLE) != 0) {
+		/* A punch entirely within a hole changes nothing, not even times. */
+		error = bt_tx_skip_hole(transaction, tree, id.inode, &offset, &length, &hole);
+		if (error != BTRFS_OK || (hole && length == 0)) {
+			return error;
+		}
+		need = 2 * sector;
+	} else if ((mode & BTRFS_FALLOCATE_ZERO_RANGE) != 0) {
+		need = limit + (sector - limit % sector) % sector - (offset - offset % sector) +
+		    3 * sector;
+	} else {
+		error = bt_tx_allocate_need(
+		    transaction, tree, id.inode, bt_u64(inode.size), offset, length, &need);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	bt_tx_hold_metadata(transaction);
+	if (!bt_space_data_available(transaction->space, need)) {
+		return BTRFS_NO_SPACE;
+	}
+	env = &transaction->base->env;
+	zeros = env->allocate(env->context, (size_t)sector);
+	if (zeros == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	bt_zero(zeros, (size_t)sector);
+	error = (mode & BTRFS_FALLOCATE_PUNCH_HOLE) != 0
+	    ? bt_tx_punch(transaction, tree, &inode, id.inode, original, offset, length, zeros)
+	    : bt_tx_allocate(transaction, tree, &inode, id.inode, mode, offset, length, zeros);
+	env->release(env->context, zeros, (size_t)sector);
+	/* file_modified, and each step after it: change and modification times. */
+	if (error == BTRFS_OK) {
+		error =
+		    bt_tx_store_inode(transaction, tree, id.inode, &inode, bt_u64(inode.size), now);
 	}
 	if (error != BTRFS_OK) {
 		transaction->failure = error;

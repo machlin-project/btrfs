@@ -883,7 +883,8 @@ static struct vnodeopv_entry_desc btrfs_xnu_operations[] = {
 	{ &vnop_write_desc, btrfs_xnu_write }, { &vnop_setattr_desc, btrfs_xnu_setattr },
 	{ &vnop_link_desc, btrfs_xnu_link }, { &vnop_symlink_desc, btrfs_xnu_symlink },
 	{ &vnop_remove_desc, btrfs_xnu_remove }, { &vnop_rmdir_desc, btrfs_xnu_rmdir },
-	{ &vnop_rename_desc, btrfs_xnu_rename }, { NULL, NULL }
+	{ &vnop_rename_desc, btrfs_xnu_rename }, { &vnop_allocate_desc, btrfs_xnu_preallocate },
+	{ &vnop_ioctl_desc, btrfs_xnu_ioctl }, { NULL, NULL }
 };
 
 struct vnodeopv_desc btrfs_xnu_vnodeops = { &btrfs_xnu_dispatch, btrfs_xnu_operations };

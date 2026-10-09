@@ -36,6 +36,9 @@ struct worker {
 	int error;
 };
 
+/* A mount without hole reporting (FSKit 26.x has no interface for it). */
+static bool no_seek_hole;
+
 static void *
 read_worker(void *context)
 {
@@ -219,6 +222,55 @@ check_data(int root)
 	free(bytes);
 }
 
+/* lseek(SEEK_DATA or SEEK_HOLE) from offset on path, as Linux answers it;
+ * expected -1 is ENXIO. Without hole reporting a mount may refuse the call
+ * or report the whole file as data, as POSIX allows. */
+static void
+check_seek(int root, const char *path, int whence, off_t offset, off_t expected)
+{
+	struct stat status;
+	off_t result;
+	int file;
+
+	file = openat(root, path, O_RDONLY);
+	REQUIRE(file >= 0 && fstat(file, &status) == 0);
+	errno = 0;
+	result = lseek(file, offset, whence);
+	if (no_seek_hole) {
+		REQUIRE((result == -1 &&
+			    (errno == ENOTSUP || errno == ENOTTY || errno == EINVAL ||
+				errno == ENXIO)) ||
+		    (whence == SEEK_DATA && result == offset) ||
+		    (whence == SEEK_HOLE && result == status.st_size));
+	} else if (expected < 0) {
+		REQUIRE(result == -1 && errno == ENXIO);
+	} else {
+		REQUIRE(result == expected);
+	}
+	REQUIRE(close(file) == 0);
+}
+
+/* The sectors Linux wrote are data, never-written and preallocated ranges
+ * holes, the end of a file its last hole. */
+static void
+check_holes(int root)
+{
+	check_seek(root, "sparse", SEEK_DATA, 0, 0);
+	check_seek(root, "sparse", SEEK_HOLE, 0, 4096);
+	check_seek(root, "sparse", SEEK_DATA, 4096, 7340032);
+	check_seek(root, "sparse", SEEK_HOLE, 7340032, 7344128);
+	check_seek(root, "sparse", SEEK_DATA, 7344128, -1);
+	check_seek(root, "sparse", SEEK_HOLE, 8388607, 8388607);
+	check_seek(root, "sparse", SEEK_HOLE, 8388608, -1);
+	check_seek(root, "preallocated", SEEK_DATA, 0, -1);
+	check_seek(root, "preallocated", SEEK_HOLE, 0, 0);
+	check_seek(root, "huge", SEEK_DATA, 0, -1);
+	check_seek(root, "huge", SEEK_HOLE, INT64_C(17179869190), INT64_C(17179869190));
+	check_seek(root, "greeting", SEEK_DATA, 0, 0);
+	check_seek(root, "greeting", SEEK_HOLE, 0, 23);
+	check_seek(root, "greeting", SEEK_DATA, 23, -1);
+}
+
 static void
 check_permission(int root, uid_t uid, gid_t gid, bool allowed)
 {
@@ -252,8 +304,10 @@ main(int argc, char **argv)
 	int root;
 	int result;
 
-	if (argc != 2 || geteuid() != 0) {
-		fprintf(stderr, "usage (guest root): btrfs-mounted-test MOUNTPOINT\n");
+	no_seek_hole = argc == 3 && strcmp(argv[2], "--no-seek-hole") == 0;
+	if ((argc != 2 && !no_seek_hole) || geteuid() != 0) {
+		fprintf(
+		    stderr, "usage (guest root): btrfs-mounted-test MOUNTPOINT [--no-seek-hole]\n");
 		return 2;
 	}
 	root = open(argv[1], O_RDONLY | O_DIRECTORY);
@@ -262,6 +316,7 @@ main(int argc, char **argv)
 	check_identity(root);
 	check_directory(root);
 	check_data(root);
+	check_holes(root);
 	check_permission(root, 1001, 1002, true);
 	check_permission(root, 1003, 1003, false);
 	for (i = 0; i < WORKER_COUNT; i++) {
@@ -282,7 +337,8 @@ main(int argc, char **argv)
 	}
 	REQUIRE(result == -1 && errno == EROFS);
 	REQUIRE(close(root) == 0);
-	puts("mounted Btrfs: namespace, identity, xattrs, permission, mmap, holes, concurrent "
-	     "reads, EROFS PASS");
+	printf("mounted Btrfs: namespace, identity, xattrs, permission, mmap, holes, %s, "
+	       "concurrent reads, EROFS PASS\n",
+	    no_seek_hole ? "hole reporting SKIPPED" : "SEEK_DATA and SEEK_HOLE");
 	return 0;
 }

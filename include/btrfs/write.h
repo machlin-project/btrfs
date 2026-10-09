@@ -172,6 +172,29 @@ enum btrfs_result btrfs_transaction_write(struct btrfs_transaction *transaction,
 enum btrfs_result btrfs_transaction_truncate(struct btrfs_transaction *transaction,
     struct btrfs_object_id id, uint64_t size, struct btrfs_time modified, size_t budget, int *done);
 
+/* Linux's fallocate modes (FALLOC_FL_*), with Linux's values. */
+#define BTRFS_FALLOCATE_KEEP_SIZE 0x01U
+#define BTRFS_FALLOCATE_PUNCH_HOLE 0x02U
+#define BTRFS_FALLOCATE_ZERO_RANGE 0x10U
+
+/* fallocate of a regular file as Linux's btrfs_fallocate. Mode 0 or
+ * KEEP_SIZE preallocates the holes of [offset, offset + length) (and data
+ * beyond EOF) as unwritten extents, which read as zeros and are written in
+ * place later, and without KEEP_SIZE grows the file to offset + length.
+ * PUNCH_HOLE (only with KEEP_SIZE) drops the range's coverage, zeroing the
+ * partial sectors at its edges, and leaves hole items below EOF without
+ * NO_HOLES. ZERO_RANGE (optionally with KEEP_SIZE) makes the range read as
+ * zeros: written partial sectors are zeroed, the rest becomes unwritten
+ * extents. Times change as Linux's file_modified changes them, except for a
+ * punch entirely within a hole, which changes nothing. Other modes and
+ * combinations are UNSUPPORTED; append-only files take only allocation
+ * (NOT_PERMITTED otherwise); length 0 is INVALID_ARGUMENT; an end beyond the
+ * file size limit is RANGE. The data space the operation may need is checked
+ * before any change (NO_SPACE). */
+enum btrfs_result btrfs_transaction_fallocate(struct btrfs_transaction *transaction,
+    struct btrfs_object_id id, unsigned mode, uint64_t offset, uint64_t length,
+    struct btrfs_time now);
+
 /* A new inode's attributes: mode includes the file type; credentials and
  * set-id inheritance are the caller's authorization decision. device is the
  * Linux kernel's dev_t (MAJOR << 20 | MINOR) of a character or block device.

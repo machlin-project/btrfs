@@ -39,6 +39,15 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
     def stat(path: str) -> dict:
         return json.loads(run("stat", path))
 
+    def seek(path: str, whence: str, offset: int) -> int | None:
+        """The offset btrfs-inspect seeks to, or None for ENXIO."""
+        result = subprocess.run([str(tool), "--tree", "5", str(image), "seek", path, whence,
+                                 str(offset)], capture_output=True, timeout=60)
+        if result.returncode != 0:
+            assert result.stderr.strip() == b"not found", (path, whence, offset, result.stderr)
+            return None
+        return int(result.stdout)
+
     info = json.loads(run("info"))
     assert info["node_size"] == manifest["node_size"] and info["sector_size"] == 4096
     assert info["checksum_type"] == CHECKSUM_TYPES[manifest.get("checksum", "crc32c")]
@@ -80,6 +89,19 @@ def check(tool: Path, image: Path, manifest: dict) -> int:
     assert run("cat", "huge", "17179869180", "64") == bytes(11)
     assert run("cat", os.fsdecode(b"raw-\xff")) == b"raw name\n"
     cases += 6
+    # lseek's SEEK_DATA and SEEK_HOLE as Linux answers them: the sectors Linux
+    # wrote are data, never-written and preallocated ranges holes, the end of
+    # the file the last hole; at or past the size there is nothing.
+    for path, whence, offset, expected in [
+            ("sparse", "data", 0, 0), ("sparse", "hole", 0, 4096),
+            ("sparse", "data", 4096, 7340032), ("sparse", "hole", 7340032, 7344128),
+            ("sparse", "data", 7344128, None), ("sparse", "hole", 8388607, 8388607),
+            ("sparse", "hole", 8388608, None), ("preallocated", "data", 0, None),
+            ("preallocated", "hole", 0, 0), ("huge", "data", 0, None),
+            ("huge", "hole", 17179869190, 17179869190), ("greeting", "data", 0, 0),
+            ("greeting", "hole", 0, 23), ("greeting", "data", 23, None)]:
+        assert seek(path, whence, offset) == expected, (path, whence, offset)
+        cases += 1
     assert run("cat", "subvol/value") == b"subvolume changed\n"
     assert run("cat", "snapshot/value") == b"snapshot original\n"
     sub = stat("subvol")

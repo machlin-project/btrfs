@@ -96,6 +96,25 @@
 #define NOCOW_PREALLOC_SECOND 16384U
 #define NOCOW_PREALLOC_SECOND_BYTES 16384U
 #define NOCOW_OTHER_INODE UINT64_C(999999)
+/* The fallocate scenarios: an unaligned range across sectors of /data/big,
+ * a range past /data/small's EOF and a write into what it preallocated. */
+#define FALLOCATE_PUNCH_OFFSET 41060U
+#define FALLOCATE_PUNCH_BYTES 20480U
+#define FALLOCATE_TAIL_OFFSET 1000000U
+#define FALLOCATE_TAIL_BYTES 1000000U
+#define FALLOCATE_ZERO_OFFSET 5000U
+#define FALLOCATE_ZERO_BYTES 30000U
+#define FALLOCATE_BEYOND_GAP 100U
+#define FALLOCATE_BEYOND_BYTES 10000U
+#define FALLOCATE_KEEP_BYTES 50000U
+#define FALLOCATE_GROW_OFFSET 100000U
+#define FALLOCATE_GROW_BYTES 4096U
+#define FALLOCATE_WRITE_OFFSET 102400U
+#define FALLOCATE_WRITE_BYTES 100U
+#define FALLOCATE_INSIDE_OFFSET 20000U
+#define FALLOCATE_INSIDE_BYTES 10000U
+#define FALLOCATE_BIG_BYTES (1024U * 1024U)
+#define FALLOCATE_SMALL_BYTES 10000U
 /* The holes scenarios on transactions-holes: see tests/scenario_sets.c. */
 #define HOLES_WRITE_BYTES 16384U
 #define HOLES_SMALL_SIZE (1024U * 1024U + 5U)
@@ -182,6 +201,8 @@ enum operation_kind {
 	/* One bounded truncation step: offset is the size sought, size the
 	 * budget. */
 	OPERATION_TRUNCATE_STEP,
+	/* fallocate: offset and size are the range, flags the mode. */
+	OPERATION_FALLOCATE,
 	OPERATION_CREATE,
 	OPERATION_LINK,
 	OPERATION_UNLINK,
@@ -438,6 +459,9 @@ void plan_unlink(struct plan *plan, size_t commit, const char *path, int open);
 void plan_unlink_deferred(struct plan *plan, size_t commit, const char *path);
 void plan_truncate_step(struct context *context, struct plan *plan, size_t commit, const char *path,
     uint64_t size, size_t budget);
+/* fallocate of a tracked file with Linux's mode bits. */
+void plan_fallocate(struct context *context, struct plan *plan, size_t commit, const char *path,
+    unsigned mode, uint64_t offset, uint64_t length);
 /* Fixes the stage sizes bounded truncation steps decided, from the committed
  * stage fs, after checking the bounds and prefix. */
 void resolve_bounds(struct btrfs_fs *fs, struct plan *plan, size_t stage);
@@ -455,6 +479,9 @@ void plan_set_attributes(struct plan *plan, size_t commit, const char *path, uns
 void plan_privileges(struct plan *plan, size_t commit, const char *path, int keep);
 void plan_expect_refusal(struct plan *plan, size_t commit, enum btrfs_result result);
 void plan_truncate_new(struct plan *plan, size_t commit, const char *path, uint64_t size);
+/* fallocate of a file the plan models through expectations. */
+void plan_fallocate_new(struct plan *plan, size_t commit, const char *path, unsigned mode,
+    uint64_t offset, uint64_t length);
 void plan_subvolume(struct plan *plan, size_t commit, const char *path);
 void plan_delete_subvolume(struct plan *plan, size_t commit, const char *path);
 /* Runs the cleaner with budget; it must drop dropped subvolumes and leave

@@ -236,6 +236,14 @@ enum btrfs_result btrfs_directory_inode(
  * read in place is zeroed). */
 enum btrfs_result btrfs_read(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
     uint64_t offset, void *buffer, size_t length, size_t *completed);
+/* lseek's SEEK_HOLE (hole nonzero) and SEEK_DATA from offset, as Linux's
+ * btrfs_seek_data_hole finds them: preallocated ranges and hole items are
+ * holes, written and inline extents data, and the end of the file the last
+ * hole. *result is the found offset, never past the size; NOT_FOUND (Linux's
+ * ENXIO) at or past the size, or for SEEK_DATA without data from offset on.
+ * Data cached by an adapter and not yet applied is not seen. */
+enum btrfs_result btrfs_seek(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
+    uint64_t offset, int hole, uint64_t *result);
 /* A NULL buffer queries length. RANGE reports required size without partial data.
  * list_xattrs returns packed NUL-terminated raw Linux names. No policy translation. */
 enum btrfs_result btrfs_get_xattr(const struct btrfs_fs *fs, const struct btrfs_inode *inode,
