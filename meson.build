@@ -102,6 +102,9 @@ endif
 logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
+relocation_test = executable('btrfs-relocation-test', 'tests/relocation.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [volume, posix, core], dependencies: [zlib, zstd])
 volume_test = executable('btrfs-volume-test', 'tests/volume.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
 full_volume_test = executable('btrfs-full-volume-test', 'tests/full_volume.c',
@@ -150,6 +153,9 @@ if fixtures != ''
     '--fixtures', fixtures], timeout: 300, suite: 'images')
   test('tree-log-replay-faults', replay_test, args: [join_paths(fixtures, 'logs.raw')],
     timeout: 1800, suite: 'images')
+  # A balance Linux left unmerged: readable, refused for writing.
+  test('interrupted-balance', relocation_test, args: [join_paths(fixtures, 'relocation.raw'),
+    join_paths(fixtures, 'relocation.expected.tsv')], timeout: 300, suite: 'images')
   test('linux-crash-states', logwrites_test, args: [join_paths(fixtures, 'logwrites.log'),
     join_paths(fixtures, 'logwrites-data.raw')], timeout: 600, suite: 'images')
   test('verity-reads', verity_test, args: [join_paths(fixtures, 'transactions-verity.raw')],
@@ -303,7 +309,7 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-verity.raw'),
     join_paths(fixtures, 'sectors-16k.raw'), join_paths(fixtures, 'transactions-16k.raw'),
     join_paths(fixtures, 'transactions-twins.raw'),
-    join_paths(fixtures, 'transactions-16k-twins.raw')],
+    join_paths(fixtures, 'transactions-16k-twins.raw'), join_paths(fixtures, 'relocation.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

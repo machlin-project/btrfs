@@ -50,7 +50,9 @@ namespace audits check every committed state.
 Explicit superblock recovery resolves torn or disagreeing copies without rolling
 back an acknowledged generation, and a Linux tree log left by fsync without a
 commit is replayed as Linux's mount replays it; writable mounts do both before
-they open, while read-only mounts refuse a pending log and write nothing. Linux agrees with the recorded outcome of
+they open, while read-only mounts refuse a pending log and write nothing. A
+balance stopped by a crash reads normally but is refused for writing until a
+Linux read-write mount merges its relocation trees. Linux agrees with the recorded outcome of
 reordered and torn crash states on twelve profiles, including namespace facts
 and its own cleanup of the orphans left. The XNU adapter writes through the
 unified buffer cache with grouped or synchronous commits; FSKit's block resource

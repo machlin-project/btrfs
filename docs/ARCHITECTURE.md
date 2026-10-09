@@ -50,6 +50,19 @@ multiple devices and pending logs have explicit results. Unknown read-only
 compatible bits are admissible to the immutable reader only; transaction admission
 rejects them until their write semantics are implemented.
 
+A balance stopped by a crash leaves relocation trees in the root tree (root
+items keyed TREE_RELOC, -8, one per file tree being relocated). Linux merges
+them only on a read-write mount (`btrfs_recover_relocation`), and until then its
+CoW of a file tree updates the tree's relocation tree too
+(`btrfs_reloc_cow_block`); neither is implemented here. Such a volume reads as
+any other: a relocation tree's blocks keep their file tree's owner (Linux's CoW
+and `btrfs_copy_root` only set the RELOC flag), so the reader requires file-tree
+owners below it, and the independent audit expects the full backref whose
+parent is the relocation root itself that `btrfs_alloc_tree_block` gives it.
+Writable admission refuses the volume (UNSUPPORTED) before any write, natively
+as well; a Linux read-write mount merges the trees. A balance item is not
+interpreted: Linux resumes the balance at its next read-write mount.
+
 The superblock bootstraps SYSTEM chunks. The chunk-tree scan validates full
 mapping records and reconciles the bootstrap copies exactly before publication.
 Chunk ranges cannot overlap logically; DUP copies cannot alias one another.

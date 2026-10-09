@@ -64,6 +64,17 @@ bt_node_items(const struct btrfs_fs *fs, const uint8_t *block)
 	return BTRFS_OK;
 }
 
+/* Snapshot blocks can retain the originating subvolume's owner. A relocation
+ * tree is a copy of a file tree whose blocks keep their file tree's owner:
+ * Linux's CoW and btrfs_copy_root only set the RELOC flag in them. */
+static int
+bt_owner_matches(struct bt_root root, uint64_t owner)
+{
+	return root.owner == BT_OWNER_ANY ||
+	    (bt_file_tree(root.owner) || root.owner == BT_TREE_RELOC ? bt_file_tree(owner)
+								     : owner == root.owner);
+}
+
 /* built is nonzero only for a transaction's own nodes, which its editor built
  * in memory: their identity and item count are checked here, their items when
  * the transaction seals them, and their checksum when they are written. */
@@ -90,9 +101,7 @@ bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *
 		return BTRFS_CORRUPT;
 	}
 	owner = bt_u64(header->owner);
-	/* Snapshot blocks can retain the originating subvolume's owner. */
-	if (root.owner != BT_OWNER_ANY &&
-	    (bt_file_tree(root.owner) ? !bt_file_tree(owner) : owner != root.owner)) {
+	if (!bt_owner_matches(root, owner)) {
 		return BTRFS_CORRUPT;
 	}
 	count = bt_count(block);
@@ -100,14 +109,6 @@ bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *
 		return BTRFS_CORRUPT;
 	}
 	return built ? BTRFS_OK : bt_node_items(fs, block);
-}
-
-/* Snapshot blocks can retain the originating subvolume's owner. */
-static int
-bt_owner_matches(struct bt_root root, uint64_t owner)
-{
-	return root.owner == BT_OWNER_ANY ||
-	    (bt_file_tree(root.owner) ? bt_file_tree(owner) : owner == root.owner);
 }
 
 /* The shared cache holds only nodes committed in this view. */

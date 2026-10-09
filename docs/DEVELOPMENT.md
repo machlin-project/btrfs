@@ -344,6 +344,44 @@ property on each file, and writes every twin in steps (`dd` at an offset, then
 step's bytes uncompressed in `twins/steps` and the steps in
 `twins/manifest.tsv`.
 
+## Interrupted balance
+
+`tests/prepare_relocation_linux.py` builds the `relocation` fixture in three
+phases on a 512 MiB image (16 KiB nodes, DUP metadata). `create` writes 300
+files of 64 KiB and 200 inline files into a subvolume, snapshots it, adds 100
+files to the top level, commits and prints the manifest (path, size, SHA-256 of
+every regular file), then starts `btrfs balance start --full-balance` and polls
+the committed root tree on the device (after `blockdev --flushbufs`) until it
+holds a TREE_RELOC root item, and powers off with
+`echo o > /proc/sysrq-trigger`. `expect`, on a clone, requires the relocation
+trees, runs `btrfs check --readonly`, mounts read-only (Linux merges only on a
+read-write mount) and prints the manifest; `recover`, on another clone, mounts
+read-write with `skip_balance`, which merges them, prints the manifest and
+requires that no relocation tree remains and `btrfs check --readonly` passes.
+Use a staged root of its own (`root-reloc`, `root` without `input`,
+`transaction` or `init`) while an oracle prepares archives in `root`:
+
+```sh
+for phase in create expect recover; do
+  python3 ../btrfs/tests/prepare_relocation_linux.py --root artifacts/btrfs-reference/root-reloc \
+    --phase $phase --archive artifacts/btrfs-reference/relocation-$phase.cpio
+done
+python3 -c "from pathlib import Path; f=Path('../btrfs/artifacts/fixtures/relocation.raw').open('xb'); f.truncate(512 << 20); f.close()"
+.cache/linux-reference/linux-vm .cache/linux-reference/Image \
+  artifacts/btrfs-reference/relocation-create.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/fixtures/relocation.raw > ../btrfs/logs/linux-reloc-create.log 2>&1
+grep '^BTRFS_RELOC_MANIFEST:' ../btrfs/logs/linux-reloc-create.log | \
+  sed 's/^BTRFS_RELOC_MANIFEST://' | tr -d '\r' > ../btrfs/artifacts/fixtures/relocation.expected.tsv
+```
+
+Require `BTRFS_RELOC_CREATED`, then run `expect` and `recover` the same way on
+APFS clones of the image and require `BTRFS_RELOC_EXPECT_PASS` and
+`BTRFS_RELOC_RECOVER_PASS` with manifests equal to the expected one.
+`interrupted-balance` (`tests/relocation.c`) reads every file of the manifest,
+runs the reference and namespace audits and requires writable admission and a
+writable native volume to fail with UNSUPPORTED without a write or a flush.
+
 ## Linux-written crash states
 
 `tests/prepare_logwrites_linux.py` builds a payload that records every write of a

@@ -391,6 +391,11 @@ expect_tree(struct audit_state *state, uint64_t child, uint64_t parent, uint64_t
 	if (extent != NULL && (extent->flags & BT_EXTENT_FLAG_FULL_BACKREF)) {
 		reference.type = BT_SHARED_BLOCK_REF;
 		reference.parent = parent;
+	} else if (parent == 0 && owner == BT_TREE_RELOC) {
+		/* Linux's btrfs_alloc_tree_block gives a relocation tree's root
+		 * a full backref whose parent is the root itself. */
+		reference.type = BT_SHARED_BLOCK_REF;
+		reference.parent = child;
 	} else {
 		reference.type = BT_TREE_BLOCK_REF;
 		reference.root = owner;

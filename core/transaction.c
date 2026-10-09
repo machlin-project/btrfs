@@ -40,6 +40,32 @@ bt_tx_root(const struct btrfs_fs *fs, uint64_t owner, struct bt_owned_root *root
 	return error;
 }
 
+/* Whether the root tree holds a relocation tree: a balance stopped by a crash
+ * between creating relocation trees and merging them. Linux's read-write mount
+ * merges them (btrfs_recover_relocation), and until then its CoW of the file
+ * trees updates them too (btrfs_reloc_cow_block); neither is implemented. */
+static enum btrfs_result
+bt_tx_relocating(const struct btrfs_fs *fs, int *relocating)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { .objectid = BT_TREE_RELOC, .type = BT_ROOT_ITEM, .offset = 0 };
+	enum btrfs_result error;
+
+	*relocating = 0;
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	error = bt_cursor_seek(&cursor, key, 0);
+	if (error == BTRFS_OK) {
+		error = bt_cursor_record(&cursor, &record);
+	}
+	if (error == BTRFS_OK) {
+		*relocating =
+		    record.key.objectid == BT_TREE_RELOC && record.key.type == BT_ROOT_ITEM;
+	}
+	bt_cursor_fini(&cursor);
+	return error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
+}
+
 /* Every superblock copy Linux maintains must be intact and agree with the
  * mounted primary. A disagreement is an unresolved earlier publication; a new
  * commit could otherwise overwrite blocks still referenced by a newer copy. */
@@ -105,6 +131,7 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	uint64_t free_space = BT_COMPAT_RO_FREE_SPACE_TREE | BT_COMPAT_RO_FREE_SPACE_TREE_VALID;
 	uint64_t maintained = free_space | BT_COMPAT_RO_BLOCK_GROUP_TREE | BT_COMPAT_RO_VERITY;
 	uint64_t readonly;
+	int relocating;
 
 	if (result == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
@@ -128,6 +155,14 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 		base->info.node_size != base->info.sector_size) ||
 	    !(base->info.incompat_features & BT_FEATURE_SKINNY_METADATA) ||
 	    base->info.generation == UINT64_MAX) {
+		return BTRFS_UNSUPPORTED;
+	}
+	/* An unmerged balance needs Linux's relocation recovery first. */
+	error = bt_tx_relocating(base, &relocating);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	if (relocating) {
 		return BTRFS_UNSUPPORTED;
 	}
 	/* Quotas are accounted (core/qgroup.c) once the mutation exists. */
