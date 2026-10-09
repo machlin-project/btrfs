@@ -108,9 +108,11 @@ is destroyed. `accept` is legal only after successful durable publication;
    `F_PUNCHHOLE` natively). The kernel adapter compresses with the kernel's
    deflate and the shared freestanding Zstd encoder. New data is written as
    its extents are created, and files compress on write as Linux decides.
-   fs-verity files are verified on every read (`core/verity.c`). Remaining: a
-   64 KiB-sector fixture, writes on volumes with fs-verity files and enabling
-   fs-verity.
+   fs-verity files are verified on every read, keep their data on writable
+   volumes, and fs-verity is enabled in bounded steps whose interruption orphan
+   cleanup undoes, as Linux does (`core/verity.c`). Remaining: a 64 KiB-sector
+   fixture, and LXNU's FS_IOC_ENABLE_VERITY and keyring policy for builtin
+   signatures.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
    siblings, and data and metadata chunks grow from unallocated device space

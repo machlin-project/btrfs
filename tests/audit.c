@@ -48,10 +48,12 @@ main(int argc, char **argv)
 		} else {
 			printf("%s: %zu file trees (%zu deleted), %zu inodes, %zu names (%zu "
 			       "extended), %zu subvolume entries, %zu root references, %zu "
-			       "collision items, %zu xattrs, %zu orphans, %zu hole items PASS\n",
+			       "collision items, %zu xattrs, %zu orphans, %zu hole items, %zu "
+			       "fs-verity items PASS\n",
 			    argv[i], names.trees, names.dead_trees, names.inodes, names.names,
 			    names.extended_names, names.subvolume_entries, names.subvolume_refs,
-			    names.collisions, names.xattrs, names.orphans, names.hole_items);
+			    names.collisions, names.xattrs, names.orphans, names.hole_items,
+			    names.verity_items);
 		}
 		if (qgroup_audit(fs, &qgroups) != 0) {
 			fprintf(stderr, "%s: qgroups: %s\n", argv[i], qgroups.failure);

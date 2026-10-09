@@ -224,6 +224,11 @@ enum btrfs_result bt_tx_shrink(struct btrfs_transaction *transaction, struct bt_
 void bt_tx_release_data(struct btrfs_transaction *transaction);
 /* A write or truncation of a regular file needs a settled privilege decision
  * when it has set-id bits Linux removes or a file capability. */
+/* Reads existing bytes of a file as this transaction sees them; bytes past
+ * EOF read zero (core/data.c). */
+enum btrfs_result bt_tx_read(struct btrfs_transaction *transaction,
+    const struct bt_owned_root *tree, uint64_t inode, uint64_t offset, uint8_t *buffer,
+    size_t length);
 enum btrfs_result bt_tx_privileges_settled(struct btrfs_transaction *transaction,
     struct bt_owned_root *tree, uint64_t inode, const struct bt_disk_inode *item);
 

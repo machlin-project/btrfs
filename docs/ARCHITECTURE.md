@@ -534,8 +534,40 @@ FS_IOC_READ_VERITY_METADATA with ENOTTY, so the reader offers no metadata
 reads. Builtin signatures are kept but not verified, as Linux without
 `CONFIG_FS_VERITY_BUILTIN_SIGNATURES` treats them; a keyring policy belongs to
 the native layer. Both adapters refuse to open a verity file for writing
-(EPERM), as `fsverity_file_open` does. The writer does not yet admit volumes
-with VERITY.
+(EPERM), as `fsverity_file_open` does.
+
+The writer admits volumes with VERITY. A verity file keeps its data: writes,
+inline replacement, truncation and fallocate return NOT_PERMITTED (Linux's
+EPERM from `fsverity_file_open` and `fsverity_prepare_setattr`), while names,
+xattrs, modes and inode flags change as for any file, and deletion takes its
+fs-verity items with its other items.
+
+Enabling follows FS_IOC_ENABLE_VERITY and Linux's Btrfs operations, in
+transactions the caller commits as it goes:
+`btrfs_transaction_verity_begin` refuses in `fsverity_ioctl_enable`'s order
+(the block size, the salt and signature sizes, write access to an immutable
+file, a read-only subvolume, an append-only file, the type, the hash algorithm
+and tree shape, then EXISTS for a verity file) and adds an orphan item, as
+`btrfs_begin_enable_verity` does, keeping one the file has. Each
+`btrfs_transaction_verity_step` first drops what an earlier enable left, then
+hashes a budget of data blocks from the transaction's view and stores every
+tree block they complete at its place in the tree, in items of at most 2 KiB
+(`write_merkle_tree_block`). `btrfs_transaction_verity_finish` stores the
+remaining partial blocks, then the size item and the descriptor (with its
+signature) in items of at most 2 KiB, sets RO_VERITY without changing the
+inode's times or version, deletes the orphan item of a linked file and sets
+the VERITY feature, as `btrfs_end_enable_verity` does; a file whose size or
+generation changed since begin is STALE. `btrfs_transaction_verity_abort` is
+`rollback_verity`. Each item is reserved against qgroup limits as Linux's
+per-item transactions reserve it. Trees deeper than eight levels or of more
+than 2^23 blocks are refused (EFBIG), the latter for every block size, so that
+each Linux page size opens the file. The caller keeps the data unchanged
+between begin and finish, as Linux's `deny_write_access` does, and refuses a
+second enable of the file (EBUSY). An enable cut short by a crash leaves tree
+items and an orphan item on a linked file; orphan cleanup deletes the inode's
+fs-verity items before that orphan item, as `btrfs_orphan_cleanup` calls
+`btrfs_drop_verity_items`. The native adapters have no interface that enables
+fs-verity; LXNU's FS_IOC_ENABLE_VERITY belongs to the XNU fork.
 
 ## Quotas
 

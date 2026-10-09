@@ -103,7 +103,7 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	int mapped;
 	enum btrfs_result error;
 	uint64_t free_space = BT_COMPAT_RO_FREE_SPACE_TREE | BT_COMPAT_RO_FREE_SPACE_TREE_VALID;
-	uint64_t maintained = free_space | BT_COMPAT_RO_BLOCK_GROUP_TREE;
+	uint64_t maintained = free_space | BT_COMPAT_RO_BLOCK_GROUP_TREE | BT_COMPAT_RO_VERITY;
 	uint64_t readonly;
 
 	if (result == NULL) {
@@ -114,9 +114,10 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	    environment->flush == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	/* The free-space and block-group trees are maintained; other read-only
-	 * features are not. Linux keeps a block-group tree only beside a valid
-	 * free-space tree and NO_HOLES. */
+	/* The free-space and block-group trees are maintained, and fs-verity
+	 * files keep their data; other read-only features are not supported.
+	 * Linux keeps a block-group tree only beside a valid free-space tree and
+	 * NO_HOLES. */
 	readonly = base->info.readonly_features;
 	if ((readonly & ~maintained) != 0 ||
 	    ((readonly & free_space) != 0 && (readonly & free_space) != free_space) ||
@@ -465,7 +466,8 @@ btrfs_transaction_write_inline(struct btrfs_transaction *transaction, struct btr
 	    bt_u64(inode.sequence) == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
 	}
-	if ((bt_u64(inode.flags) & (BT_INODE_IMMUTABLE | BT_INODE_APPEND)) != 0) {
+	if ((bt_u64(inode.flags) & (BT_INODE_IMMUTABLE | BT_INODE_APPEND | BT_INODE_RO_VERITY)) !=
+	    0) {
 		return BTRFS_NOT_PERMITTED;
 	}
 	error = bt_tx_privileges_settled(transaction, tree, id.inode, &inode);

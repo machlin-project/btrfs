@@ -42,6 +42,11 @@ struct inode_record {
 	uint64_t inode;
 	uint64_t size;
 	uint64_t nbytes;
+	uint64_t flags;
+	/* VERITY_DESC and VERITY_MERKLE items, and whether the descriptor's
+	 * size item (VERITY_DESC offset 0) is among them. */
+	uint64_t verity_items;
+	int verity_size;
 	uint32_t mode;
 	uint32_t links;
 	uint32_t names;
@@ -396,7 +401,18 @@ collect(struct tree_state *state, struct bt_root root)
 				inode->nbytes = bt_u64(item->nbytes);
 				inode->mode = bt_u32(item->mode);
 				inode->links = bt_u32(item->links);
+				inode->flags = bt_u64(item->flags);
 				inode->first_gap = UINT64_MAX;
+				break;
+			case BT_VERITY_DESC_ITEM:
+			case BT_VERITY_MERKLE_ITEM:
+				inode = find_inode(state, record.key.objectid);
+				if (inode != NULL) {
+					inode->verity_items++;
+					inode->verity_size |=
+					    record.key.type == BT_VERITY_DESC_ITEM &&
+					    record.key.offset == 0;
+				}
 				break;
 			case BT_INODE_REF:
 				result = inode_refs(state, &record);
@@ -516,9 +532,12 @@ check_inodes(struct tree_state *state)
 	size_t i;
 
 	qsort(state->orphans, state->orphan_count, sizeof(*state->orphans), compare_values);
+	/* A linked inode keeps an orphan item only while fs-verity is being
+	 * enabled on it, which Linux does for regular files alone. */
 	for (i = 0; i < state->orphan_count; i++) {
 		inode = find_inode(state, state->orphans[i]);
-		if (inode == NULL || inode->links != 0 ||
+		if (inode == NULL ||
+		    (inode->links != 0 && (inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR) ||
 		    (i > 0 && state->orphans[i - 1] == state->orphans[i])) {
 			return fail(state, "orphan item for inode %llu",
 			    (unsigned long long)state->orphans[i]);
@@ -566,6 +585,19 @@ check_inodes(struct tree_state *state)
 				    (unsigned long long)inode->size);
 			}
 		}
+		/* fs-verity items belong to a regular file that has fs-verity, with
+		 * its descriptor, or to one an enable or its cleanup has not
+		 * finished (its orphan item). */
+		if ((inode->flags & BT_INODE_RO_VERITY) != 0
+			? (inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR ||
+			    !inode->verity_size
+			: inode->verity_items != 0 && !inode->orphan) {
+			return fail(state, "inode %llu has %llu fs-verity items, flags 0x%llx",
+			    (unsigned long long)inode->inode,
+			    (unsigned long long)inode->verity_items,
+			    (unsigned long long)inode->flags);
+		}
+		state->audit->verity_items += inode->verity_items;
 		if ((inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_DIRECTORY) {
 			if (inode->names > 1) {
 				return fail(state, "directory %llu has %u names",

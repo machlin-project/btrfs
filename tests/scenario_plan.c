@@ -670,6 +670,50 @@ check_quota(struct btrfs_fs *fs, const struct plan *plan, size_t stage, const st
 	}
 }
 
+/* The fs-verity digest the reader reports and the inode's VERITY_DESC and
+ * VERITY_MERKLE items. */
+static void
+check_verity(struct btrfs_fs *fs, const struct plan *plan, size_t stage,
+    const struct expectation *e, const struct btrfs_inode *inode)
+{
+	struct bt_root root;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { .objectid = inode->id.inode, .type = BT_VERITY_DESC_ITEM };
+	uint8_t digest[BTRFS_VERITY_DIGEST_MAX];
+	uint64_t items = 0;
+	size_t length;
+	unsigned algorithm;
+	enum btrfs_result result;
+
+	result = btrfs_verity_digest(fs, inode, &algorithm, digest, sizeof(digest), &length);
+	if (e->size == 0 ? result != BTRFS_NOT_FOUND
+			 : result != BTRFS_OK || algorithm != e->mode || length != e->size ||
+		    memcmp(digest, e->bytes, length) != 0) {
+		expectation_failed(plan, stage, e, "fs-verity digest");
+	}
+	REQUIRE(bt_find_root(fs, inode->id.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	result = bt_cursor_seek(&cursor, key, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != inode->id.inode ||
+		    record.key.type > BT_VERITY_MERKLE_ITEM) {
+			break;
+		}
+		items++;
+		result = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND);
+	if (items != e->value) {
+		fprintf(stderr, "%s stage %zu: %s has %llu fs-verity items, expected %llu\n",
+		    plan->name, stage, e->path, (unsigned long long)items,
+		    (unsigned long long)e->value);
+		exit(1);
+	}
+}
+
 static void
 check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, size_t crash_commit,
     const struct expectation *e)
@@ -792,6 +836,15 @@ check_expectation(struct btrfs_fs *fs, const struct plan *plan, size_t stage, si
 		return;
 	case EXPECT_QUOTA:
 		check_quota(fs, plan, stage, e);
+		return;
+	case EXPECT_VERITY:
+		check_verity(fs, plan, stage, e, &inode);
+		return;
+	case EXPECT_COMPAT_RO:
+		btrfs_get_info(fs, &info);
+		if ((info.readonly_features & e->value) != e->value) {
+			expectation_failed(plan, stage, e, "read-only compatible feature");
+		}
 		return;
 	default:
 		REQUIRE(0);
@@ -1493,6 +1546,12 @@ expect_current(struct context *context, struct plan *plan, size_t first, size_t 
 	free(bytes);
 }
 
+uint8_t *
+fixture_bytes(struct context *context, const char *path, size_t *size)
+{
+	return read_file(plan_mount(context), path, size);
+}
+
 void
 expect_symlink(struct plan *plan, size_t first, size_t last, const char *path, const char *target)
 {
@@ -1726,6 +1785,48 @@ plan_quota_rescan(struct plan *plan, size_t commit, size_t budget, int done)
 
 	operation->offset = budget;
 	operation->flags = done;
+}
+
+void
+plan_verity(struct plan *plan, size_t commit, const char *path, enum verity_mode mode,
+    unsigned algorithm, uint32_t block_size, const void *salt, size_t salt_size,
+    size_t signature_size, size_t budget, size_t stop)
+{
+	struct operation *operation = plan_namespace(plan, commit, OPERATION_VERITY, path, NULL);
+
+	operation_data(operation, salt, salt_size);
+	operation->flags = (int)mode;
+	operation->mode = algorithm;
+	operation->uid = block_size;
+	operation->gid = (uint32_t)signature_size;
+	operation->offset = budget;
+	operation->device = stop;
+	operation->target = malloc(signature_size + 1);
+	REQUIRE(operation->target != NULL);
+	fill_pattern((uint8_t *)operation->target, signature_size, (unsigned)commit);
+	operation->target[signature_size] = '\0';
+}
+
+void
+expect_verity(struct plan *plan, size_t first, size_t last, const char *path, unsigned algorithm,
+    const uint8_t *digest, size_t digest_size, uint64_t items)
+{
+	struct expectation *e = expect(plan, first, last, EXPECT_VERITY, path);
+
+	e->mode = algorithm;
+	e->value = items;
+	e->size = digest != NULL ? digest_size : 0;
+	if (e->size != 0) {
+		e->bytes = malloc(e->size);
+		REQUIRE(e->bytes != NULL);
+		memcpy(e->bytes, digest, e->size);
+	}
+}
+
+void
+expect_compat_ro(struct plan *plan, size_t first, size_t last, uint64_t features)
+{
+	expect(plan, first, last, EXPECT_COMPAT_RO, "/")->value = features;
 }
 
 void

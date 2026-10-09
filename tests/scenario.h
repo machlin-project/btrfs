@@ -228,8 +228,17 @@ enum operation_kind {
 	OPERATION_RENAME_WHITEOUT,
 	/* FS_IOC_SETFLAGS: flags holds the attribute flags. */
 	OPERATION_SET_FSFLAGS,
-	OPERATION_QUOTA_RESCAN
+	OPERATION_QUOTA_RESCAN,
+	/* FS_IOC_ENABLE_VERITY: flags is the enum verity_mode, mode the hash
+	 * algorithm, uid the block size, data the salt, target gid bytes of
+	 * signature, offset the blocks of each step and device the blocks an
+	 * interrupted enable hashes. */
+	OPERATION_VERITY
 };
+
+/* An fs-verity enable finished, interrupted after some steps (as by a crash,
+ * leaving its items and orphan item to cleanup), or rolled back. */
+enum verity_mode { VERITY_ENABLE, VERITY_INTERRUPT, VERITY_ROLLBACK };
 
 /* Operations name objects by path. A path created, renamed or removed by an
  * earlier operation of the same commit resolves to that result; other paths
@@ -287,7 +296,12 @@ enum expectation_kind {
 	EXPECT_HOLES,
 	EXPECT_BITMAPS,
 	EXPECT_GROUPS,
-	EXPECT_QUOTA
+	EXPECT_QUOTA,
+	/* The file's fs-verity digest (bytes, none when size is 0) of
+	 * algorithm mode, and value VERITY_DESC and VERITY_MERKLE items. */
+	EXPECT_VERITY,
+	/* The read-only compatible features in value are set. */
+	EXPECT_COMPAT_RO
 };
 
 /* A namespace fact that holds in stages first..last. bytes are file contents,
@@ -515,6 +529,8 @@ void expect_file(
 void expect_text(struct plan *plan, size_t first, size_t last, const char *path, const char *text);
 void expect_current(struct context *context, struct plan *plan, size_t first, size_t last,
     const char *path, const char *source);
+/* The fixture's bytes of a file, allocated. */
+uint8_t *fixture_bytes(struct context *context, const char *path, size_t *size);
 void expect_symlink(
     struct plan *plan, size_t first, size_t last, const char *path, const char *target);
 void expect_same(struct plan *plan, size_t first, size_t last, const char *path, const char *other);
@@ -554,6 +570,20 @@ void expect_quota(struct plan *plan, size_t first, size_t last, int inconsistent
 void expect_quota_rescan(struct plan *plan, size_t first, size_t last, uint64_t qgroups);
 /* A quota rescan step of budget items; done is whether it completes. */
 void plan_quota_rescan(struct plan *plan, size_t commit, size_t budget, int done);
+/* FS_IOC_ENABLE_VERITY in steps of budget blocks; an interrupted enable stops
+ * after stop blocks. signature_size bytes of a pattern are its signature. */
+void plan_verity(struct plan *plan, size_t commit, const char *path, enum verity_mode mode,
+    unsigned algorithm, uint32_t block_size, const void *salt, size_t salt_size,
+    size_t signature_size, size_t budget, size_t stop);
+/* digest NULL: the file has no fs-verity. */
+void expect_verity(struct plan *plan, size_t first, size_t last, const char *path,
+    unsigned algorithm, const uint8_t *digest, size_t digest_size, uint64_t items);
+void expect_compat_ro(struct plan *plan, size_t first, size_t last, uint64_t features);
+/* The digest and items fs-verity gives data enabled with these parameters,
+ * from tests/scenario_verity.c's model. */
+void expect_verity_model(struct plan *plan, size_t first, size_t last, const char *path,
+    unsigned algorithm, uint32_t block_size, const void *salt, size_t salt_size,
+    const uint8_t *data, size_t size);
 void expect_bitmaps(struct plan *plan, size_t first, size_t last, const char *path, int bitmaps);
 void expect_groups(
     struct plan *plan, size_t first, size_t last, uint64_t groups, uint32_t system_entries);
@@ -594,6 +624,7 @@ void namespace_scenarios(struct context *context);
 void subvolume_scenarios(struct context *context);
 void quota_scenarios(struct context *context);
 void squota_scenarios(struct context *context);
+void verity_scenarios(struct context *context);
 /* Volume locks for a test that runs one thread: nothing ever waits. */
 extern const struct btrfs_volume_locks single_thread_locks;
 

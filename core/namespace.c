@@ -312,6 +312,18 @@ bt_ns_inode(struct btrfs_transaction *transaction, const struct bt_owned_root *t
 	return error;
 }
 
+enum btrfs_result
+bt_ns_present(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    struct bt_key key, int *present)
+{
+	size_t length;
+	enum btrfs_result error;
+
+	error = bt_mutation_find(transaction->mutation, tree->root, key, NULL, 0, &length);
+	*present = error == BTRFS_OK || error == BTRFS_RANGE;
+	return error == BTRFS_NOT_FOUND || error == BTRFS_RANGE ? BTRFS_OK : error;
+}
+
 /* An inode named by a directory entry must exist. */
 enum btrfs_result
 bt_ns_named_inode(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
@@ -995,6 +1007,7 @@ bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	struct bt_key orphan = { BT_ORPHAN_OBJECTID, inode, BT_ORPHAN_ITEM };
 	uint32_t links;
 	int done = 0;
+	int present = 0;
 	enum btrfs_result error;
 
 	error = bt_ns_named_inode(transaction, tree, inode, &item);
@@ -1019,11 +1032,17 @@ bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 		    (struct btrfs_object_id){ tree->root.owner, inode };
 	}
 	error = bt_ns_store(transaction, tree, inode, &item, time);
+	/* The orphan item of a regular file whose fs-verity enable has not
+	 * finished serves the unlink too, as btrfs_orphan_add accepts EEXIST. */
 	if (error == BTRFS_OK && links == 1) {
+		error = bt_ns_present(transaction, tree, orphan, &present);
+	}
+	if (error == BTRFS_OK && links == 1 && present &&
+	    (bt_u32(item.mode) & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR) {
+		error = BTRFS_CORRUPT;
+	}
+	if (error == BTRFS_OK && links == 1 && !present) {
 		error = bt_tx_edit(transaction, &tree->root, orphan, NULL, 0, BT_INSERT);
-		if (error == BTRFS_EXISTS) {
-			error = BTRFS_CORRUPT;
-		}
 	}
 	return error;
 }
@@ -1953,6 +1972,37 @@ btrfs_transaction_take_deferred(struct btrfs_transaction *transaction, struct bt
 }
 
 enum btrfs_result
+bt_ns_drop_verity(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
+    size_t budget, int *done)
+{
+	struct bt_key first = { .objectid = inode, .type = BT_VERITY_DESC_ITEM };
+	struct bt_key key;
+	size_t start = bt_tx_work(transaction);
+	uint64_t steps;
+	int found;
+	enum btrfs_result error = BTRFS_OK;
+
+	*done = 0;
+	for (steps = 0; error == BTRFS_OK; steps++) {
+		if (steps == BT_MAX_TREE_ITEMS) {
+			return BTRFS_UNSUPPORTED;
+		}
+		if (bt_tx_work(transaction) - start >= budget) {
+			break;
+		}
+		error = bt_ns_neighbor(transaction, tree, first, 0, &key, &found);
+		if (error != BTRFS_OK || !found || key.objectid != inode ||
+		    key.type > BT_VERITY_MERKLE_ITEM) {
+			*done = error == BTRFS_OK;
+			break;
+		}
+		error = bt_tx_edit(transaction, &tree->root, key, NULL, 0, BT_DELETE);
+		transaction->changed = 1;
+	}
+	return error;
+}
+
+enum btrfs_result
 btrfs_transaction_clean_orphans(struct btrfs_transaction *transaction, uint64_t tree_id,
     size_t budget, size_t *cleaned, int *pending)
 {
@@ -1992,8 +2042,11 @@ btrfs_transaction_clean_orphans(struct btrfs_transaction *transaction, uint64_t 
 			error = BTRFS_CORRUPT;
 			break;
 		}
-		/* As btrfs_orphan_cleanup: an inode without links is deleted; the
-		 * orphan item of a missing or still linked inode only goes away. */
+		/* As btrfs_orphan_cleanup: an inode without links is deleted. A
+		 * still linked inode loses the fs-verity items of an enable that
+		 * never finished, and then its orphan item, which a truncation
+		 * of a kernel before 3.12 may also have left; a missing inode's
+		 * orphan item only goes away. */
 		done = 1;
 		error = bt_ns_inode(transaction, tree, key.offset, &item);
 		if (error == BTRFS_OK && bt_u32(item.links) == 0) {
@@ -2003,6 +2056,10 @@ btrfs_transaction_clean_orphans(struct btrfs_transaction *transaction, uint64_t 
 			if (error == BTRFS_OK && done) {
 				(*cleaned)++;
 			}
+		} else if (error == BTRFS_OK) {
+			edited = 1;
+			error = bt_ns_drop_verity(transaction, tree, key.offset,
+			    budget - (bt_tx_work(transaction) - start), &done);
 		} else if (error == BTRFS_NOT_FOUND) {
 			error = BTRFS_OK;
 		}

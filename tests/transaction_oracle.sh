@@ -94,6 +94,22 @@ check_flags() {
     test -n "$flags" && test $((flags & ${2%%:*})) -eq $((${2#*:}))
 }
 
+# ALGORITHM:DIGEST|none: fsverity measure's digest of the path, which Linux
+# computes from the descriptor it validates at open, or no fs-verity (ENODATA).
+check_verity() {
+    if [ "$2" = none ]; then
+        ! fsverity measure "$1" > /dev/null 2>&1
+    else
+        test "$(fsverity measure "$1" | cut -d' ' -f1)" = "$2"
+    fi
+}
+
+# MASK: the superblock's read-only compatible features include MASK.
+check_compat_ro() {
+    flags=$(btrfs inspect-internal dump-super /dev/vda | awk '$1 == "compat_ro_flags" { print $2 }')
+    test -n "$flags" && test $((flags & $1)) -eq $(($1))
+}
+
 # inode|extended: the path's name is held by its inode's INODE_REF item for
 # the parent directory, or by an INODE_EXTREF item naming that parent.
 check_reference() {
@@ -308,8 +324,15 @@ check_namespace() {
         bitmaps) check_bitmaps "$target" "$arg" ;;
         groups) check_groups "$arg" ;;
         quota) check_quota "$arg" ;;
+        verity) check_verity "$target" "$arg" ;;
+        compat_ro) check_compat_ro "$arg" ;;
         *) false ;;
-        esac || { echo "Namespace check failed: $kind $path"; exit 1; }
+        esac || {
+            echo "Namespace check failed: $kind $path"
+            # What Linux reports for the path, beside the expected argument.
+            echo "Expected: $arg; Linux: $(stat -c '%f:%u:%g:%h:%i' "$target" 2>&1)"
+            exit 1
+        }
     done < "$1/namespace.tsv"
 }
 

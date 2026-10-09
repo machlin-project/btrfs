@@ -141,16 +141,18 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 	static const char *const kinds[] = { "absent", "file", "dir", "symlink", "same", "xattr",
 		"noxattr", "stat", "device", "flags", "feature", "times", "reference", "subvolume",
 		"subvolumes", "deleted", "compressed", "extents", "holes", "bitmaps", "groups",
-		"quota" };
+		"quota", "verity", "compat_ro" };
 	const struct expectation *e;
 	char payload[64];
-	char argument[64];
+	char argument[160];
 	const char *detail;
 	FILE *manifest;
 	size_t stage;
 	size_t i;
+	size_t j;
 
-	_Static_assert(sizeof(kinds) / sizeof(kinds[0]) == EXPECT_QUOTA + 1, "expectation kinds");
+	_Static_assert(
+	    sizeof(kinds) / sizeof(kinds[0]) == EXPECT_COMPAT_RO + 1, "expectation kinds");
 	(void)context;
 	manifest = export_open(exporter, "namespace.tsv");
 	for (i = 0; i < plan->expectation_count; i++) {
@@ -208,6 +210,22 @@ export_namespace(struct context *context, const struct plan *plan, struct export
 			/* consistent, inconsistent or rescan:qgroups */
 			REQUIRE(snprintf(argument, sizeof(argument), "%s:%llu",
 				    quota_state_names[e->links],
+				    (unsigned long long)e->value) < (int)sizeof(argument));
+			detail = argument;
+		} else if (e->kind == EXPECT_VERITY) {
+			/* fsverity measure's ALGORITHM:DIGEST, or none */
+			strcpy(argument, "none");
+			if (e->size != 0) {
+				strcpy(argument,
+				    e->mode == BTRFS_VERITY_HASH_SHA512 ? "sha512:" : "sha256:");
+				for (j = 0; j < e->size; j++) {
+					snprintf(
+					    argument + strlen(argument), 3, "%02x", e->bytes[j]);
+				}
+			}
+			detail = argument;
+		} else if (e->kind == EXPECT_COMPAT_RO) {
+			REQUIRE(snprintf(argument, sizeof(argument), "0x%llx",
 				    (unsigned long long)e->value) < (int)sizeof(argument));
 			detail = argument;
 		} else if (e->kind == EXPECT_GROUPS) {
@@ -772,6 +790,44 @@ clean_all_orphans(struct btrfs_transaction *transaction, uint64_t tree, size_t *
 	return result;
 }
 
+/* FS_IOC_ENABLE_VERITY in one transaction: begin, steps of the operation's
+ * budget, and a finish; or steps up to the stop and no more, the build
+ * dropped as by a crash; or steps and a rollback. */
+static enum btrfs_result
+enable_verity(struct btrfs_transaction *transaction, struct btrfs_object_id id,
+    const struct operation *operation)
+{
+	struct btrfs_verity_parameters parameters = { .algorithm = operation->mode,
+		.block_size = operation->uid,
+		.salt = operation->data,
+		.salt_size = operation->size,
+		.signature = operation->target,
+		.signature_size = operation->gid };
+	struct btrfs_verity_build *build = NULL;
+	uint64_t hashed = 0;
+	int done = 0;
+	enum btrfs_result result;
+
+	result = btrfs_transaction_verity_begin(transaction, id, &parameters, &build);
+	while (result == BTRFS_OK && !done &&
+	    !(operation->flags == VERITY_INTERRUPT && hashed >= operation->device)) {
+		result = btrfs_transaction_verity_step(
+		    transaction, build, (size_t)operation->offset, &done);
+		hashed += operation->offset;
+	}
+	if (result == BTRFS_OK && operation->flags == VERITY_ENABLE) {
+		result = btrfs_transaction_verity_finish(transaction, build);
+	} else if (result == BTRFS_OK && operation->flags == VERITY_ROLLBACK) {
+		done = 0;
+		while (result == BTRFS_OK && !done) {
+			result = btrfs_transaction_verity_abort(
+			    transaction, build, BTRFS_RELEASE_STEP_NODES, &done);
+		}
+	}
+	btrfs_verity_build_free(build);
+	return result;
+}
+
 /* As the native volume does after each operation, the inodes an operation
  * left to eviction steps are evicted at once. */
 static enum btrfs_result
@@ -1003,6 +1059,9 @@ execute(struct btrfs_transaction *transaction, struct path_table *table,
 			exit(1);
 		}
 		return result;
+	case OPERATION_VERITY:
+		return enable_verity(
+		    transaction, path_object(table, operation->path, 0, NULL), operation);
 	case OPERATION_REMOVE_GROUPS:
 		result = btrfs_transaction_remove_unused_groups(transaction, &cleaned);
 		if (result == BTRFS_OK && cleaned != operation->size) {

@@ -42,11 +42,13 @@ NAMESPACE_ARGUMENT = {
     "holes": re.compile(r"^[0-9]+$"),
     "bitmaps": re.compile(r"^[01]$"),
     "groups": re.compile(r"^[0-9]+:[0-9]+$"),
-    "quota": re.compile(r"^(consistent|inconsistent|rescan):[0-9]+$")}
+    "quota": re.compile(r"^(consistent|inconsistent|rescan):[0-9]+$"),
+    "verity": re.compile(r"^(none|sha256:[0-9a-f]{64}|sha512:[0-9a-f]{128})$"),
+    "compat_ro": re.compile(r"^0x[0-9a-f]+$")}
 PAYLOAD_KINDS = {"file", "symlink", "dir", "xattr", "subvolumes"}
 # Facts that may name the top-level directory itself.
 ROOT_KINDS = {"dir", "stat", "xattr", "noxattr", "flags", "times", "feature", "subvolume",
-              "subvolumes", "deleted", "groups", "quota"}
+              "subvolumes", "deleted", "groups", "quota", "compat_ro"}
 
 
 def safe_path(path):

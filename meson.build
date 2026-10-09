@@ -53,7 +53,8 @@ transaction_test = executable('btrfs-transaction-test', 'tests/transaction.c',
   'tests/scenario_device.c', 'tests/scenario_plan.c', 'tests/scenario_run.c',
   'tests/scenario_sets.c', 'tests/scenario_namespace.c', 'tests/scenario_checks.c',
   'tests/scenario_random.c', 'tests/scenario_subvolume.c', 'tests/scenario_quota.c',
-  'tests/references.c', 'tests/namespace_audit.c', 'tests/qgroup_audit.c',
+  'tests/scenario_verity.c', 'tests/references.c', 'tests/namespace_audit.c',
+  'tests/qgroup_audit.c',
   include_directories: inc, link_with: [volume, posix, codec, core], dependencies: [zlib, zstd])
 reference_audit = executable('btrfs-reference-audit', 'tests/audit.c', 'tests/references.c',
   'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
@@ -238,6 +239,19 @@ if fixtures != ''
   test('squota-transactions', transaction_test,
     args: ['--squota', join_paths(fixtures, 'transactions-squota.raw')], timeout: 600,
     suite: 'images')
+  # fs-verity: Linux's verity files keep their data, enables store the tree
+  # and descriptor as Linux does, and the first enable sets the feature.
+  test('inline-transactions-verity', transaction_test,
+    args: [join_paths(fixtures, 'transactions-verity.raw')], timeout: 300, suite: 'images')
+  test('data-extents-verity', transaction_test,
+    args: ['--data', join_paths(fixtures, 'transactions-verity.raw')], timeout: 900,
+    suite: 'images')
+  test('verity-transactions', transaction_test,
+    args: ['--verity', join_paths(fixtures, 'transactions-verity.raw')], timeout: 900,
+    suite: 'images')
+  test('verity-feature', transaction_test,
+    args: ['--verity', join_paths(fixtures, 'transactions.raw')], timeout: 300,
+    suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
     suite: 'images')
@@ -264,7 +278,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-mixed.raw'),
     join_paths(fixtures, 'transactions-space-cache.raw'),
     join_paths(fixtures, 'transactions-quota.raw'),
-    join_paths(fixtures, 'transactions-squota.raw')],
+    join_paths(fixtures, 'transactions-squota.raw'),
+    join_paths(fixtures, 'transactions-verity.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

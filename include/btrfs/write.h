@@ -407,10 +407,62 @@ enum btrfs_result btrfs_transaction_evict(
 enum btrfs_result btrfs_transaction_take_deferred(
     struct btrfs_transaction *transaction, struct btrfs_object_id *id);
 /* Deletes the orphaned unlinked inodes of a tree, as Linux does at mount, with
- * work up to budget; an orphan item of an inode that still has names, or of a
- * missing inode, is dropped. *pending reports that orphans remain. */
+ * work up to budget; an orphan item of an inode that still has names goes
+ * with the fs-verity items of an enable that never finished, and that of a
+ * missing inode is dropped. *pending reports that orphans remain. */
 enum btrfs_result btrfs_transaction_clean_orphans(struct btrfs_transaction *transaction,
     uint64_t tree, size_t budget, size_t *cleaned, int *pending);
+
+/* FS_IOC_ENABLE_VERITY's arguments (struct fsverity_enable_arg): a hash
+ * algorithm (BTRFS_VERITY_HASH_*), a Merkle tree block size (a power of two
+ * from 1 KiB up to the sector size), a salt of at most 32 bytes and an
+ * optional builtin signature, stored and not verified. */
+struct btrfs_verity_parameters {
+	unsigned algorithm;
+	uint32_t block_size;
+	const void *salt;
+	size_t salt_size;
+	const void *signature;
+	size_t signature_size;
+};
+/* An fs-verity enable in progress: the tree blocks it is filling. */
+struct btrfs_verity_build;
+/* Begins enabling fs-verity on a regular file, refusing as Linux's
+ * fsverity_ioctl_enable does: INVALID_ARGUMENT for a block size that is not
+ * a power of two, RANGE for a salt or signature too large (EMSGSIZE),
+ * NOT_PERMITTED for an immutable file, READ_ONLY in a read-only subvolume,
+ * NOT_PERMITTED for an append-only file, IS_DIRECTORY or INVALID_ARGUMENT for
+ * other types, INVALID_ARGUMENT for another algorithm or block size, RANGE for
+ * a tree deeper than eight levels or of more than 2^23 blocks (EFBIG), and
+ * EXISTS for a file with fs-verity. A builtin signature is stored, not
+ * verified: the caller checks it against its keyring first, as Linux's
+ * fsverity_verify_signature does (ENOKEY with an empty keyring). Then, as
+ * btrfs_begin_enable_verity, an orphan item marks the enable until it finishes; a mount's orphan
+ * cleanup drops what an enable left. The caller authorizes write access, holds the file open as the
+ * ioctl's descriptor does, keeps its data unchanged (Linux's deny_write_access) and refuses a
+ * second enable of the file (EBUSY) until finish or abort, which may come in later transactions of
+ * the mount. The build's storage comes from, and must not outlive, the base environment's
+ * allocator. */
+enum btrfs_result btrfs_transaction_verity_begin(struct btrfs_transaction *transaction,
+    struct btrfs_object_id id, const struct btrfs_verity_parameters *parameters,
+    struct btrfs_verity_build **build);
+/* Drops fs-verity items an earlier enable left, then hashes up to budget data
+ * blocks and stores each Merkle tree block they complete in VERITY_MERKLE
+ * items, as btrfs_write_merkle_tree_block does; *done once all data is
+ * hashed. Each item counts against qgroup limits. */
+enum btrfs_result btrfs_transaction_verity_step(struct btrfs_transaction *transaction,
+    struct btrfs_verity_build *build, size_t budget, int *done);
+/* Stores the remaining tree blocks and the descriptor, then marks the inode
+ * RO_VERITY, deletes its orphan item and sets the VERITY read-only feature, as
+ * btrfs_end_enable_verity does. STALE when the file changed size or identity
+ * since begin; the build then needs btrfs_transaction_verity_abort. */
+enum btrfs_result btrfs_transaction_verity_finish(
+    struct btrfs_transaction *transaction, struct btrfs_verity_build *build);
+/* Linux's rollback_verity: deletes the fs-verity items stored so far with
+ * work up to budget and then the orphan item; *done once both are gone. */
+enum btrfs_result btrfs_transaction_verity_abort(struct btrfs_transaction *transaction,
+    struct btrfs_verity_build *build, size_t budget, int *done);
+void btrfs_verity_build_free(struct btrfs_verity_build *build);
 enum btrfs_result btrfs_transaction_commit(struct btrfs_transaction *transaction);
 /* Commits and returns an independently owned, immutable view of the published
  * state, without mounting the device again. tree has btrfs_mount's meaning.

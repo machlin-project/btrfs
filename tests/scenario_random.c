@@ -38,7 +38,7 @@
 #define MODEL_FLAGS                                                                                \
 	(BT_INODE_SYNC | BT_INODE_IMMUTABLE | BT_INODE_APPEND | BT_INODE_NODUMP |                  \
 	    BT_INODE_NOATIME | BT_INODE_DIRSYNC | BT_INODE_NODATACOW | BT_INODE_NODATASUM |        \
-	    BT_INODE_COMPRESS | BT_INODE_NOCOMPRESS)
+	    BT_INODE_COMPRESS | BT_INODE_NOCOMPRESS | BT_INODE_RO_VERITY)
 
 static const unsigned random_attribute_flags[] = { BTRFS_FS_SYNC_FL, BTRFS_FS_NODUMP_FL,
 	BTRFS_FS_NOATIME_FL, BTRFS_FS_DIRSYNC_FL };
@@ -77,12 +77,18 @@ enum random_kind {
 	RANDOM_FSFLAGS,
 	RANDOM_SUBVOLUME,
 	RANDOM_DROP,
+	RANDOM_VERITY,
 	RANDOM_KINDS
 };
 
 /* Weights of the operation kinds, in random_kind order. */
 static const unsigned random_weights[RANDOM_KINDS] = { 9, 4, 3, 4, 6, 7, 5, 2, 12, 4, 4, 1, 4, 2, 2,
-	3, 3, 2, 1 };
+	3, 3, 2, 1, 2 };
+/* fs-verity enables: either hash, 1 KiB or 4 KiB tree blocks, and a salt or
+ * none, in steps of up to RANDOM_VERITY_STEP blocks. */
+static const uint8_t random_verity_salt[] = { 0x5a, 0x17, 0xc3 };
+static const uint32_t random_verity_blocks[] = { 1024, 4096 };
+#define RANDOM_VERITY_STEP 8U
 /* Allocation and zeroing; a punch entirely within a hole leaves the times,
  * which this model, holding bytes and not extents, cannot predict. */
 static const unsigned random_fallocate_modes[] = { 0, BTRFS_FALLOCATE_KEEP_SIZE,
@@ -111,6 +117,11 @@ struct model_inode {
 	int stub;
 	int64_t access_seconds;
 	int64_t modify_seconds;
+	/* fs-verity, once enabled, with its hash, tree block size and salt. */
+	int verity;
+	unsigned verity_algorithm;
+	uint32_t verity_block;
+	int verity_salted;
 	uint8_t *data;
 	size_t size;
 	char target[MODEL_TARGET + 1];
@@ -857,6 +868,69 @@ random_remove_xattr(struct model *model, struct plan *plan)
 	return 1;
 }
 
+/* A data change of a verity file, refused (EPERM): kind is the write,
+ * truncation (to offset) or preallocation (of length bytes at offset). */
+static int
+model_verity_refusal(struct model *model, struct plan *plan, const char *path,
+    enum operation_kind kind, size_t offset, size_t length)
+{
+	uint8_t *bytes;
+
+	if (kind == OPERATION_WRITE) {
+		bytes = malloc(length);
+		REQUIRE(bytes != NULL);
+		model_fill(model, bytes, length);
+		plan_write_new(plan, model->commit, path, offset, bytes, length);
+		free(bytes);
+	} else if (kind == OPERATION_TRUNCATE) {
+		plan_truncate_new(plan, model->commit, path, offset);
+	} else {
+		plan_fallocate_new(plan, model->commit, path, 0, offset, length);
+	}
+	plan_expect_refusal(plan, model->commit, BTRFS_NOT_PERMITTED);
+	return 1;
+}
+
+/* FS_IOC_ENABLE_VERITY on a regular file in steps: refused for an immutable
+ * or append-only file (EPERM) and a verity file (EEXIST). */
+static int
+random_verity(struct model *model, struct plan *plan)
+{
+	char path[RANDOM_PATH];
+	uint32_t inode = model_pick_inode(model, BTRFS_MODE_REGULAR);
+	struct model_inode *file;
+	unsigned algorithm;
+	uint32_t block;
+	int salted;
+
+	if (inode == MODEL_NONE) {
+		return 0;
+	}
+	file = &model->inodes[inode];
+	algorithm = model_below(model, 2) ? BTRFS_VERITY_HASH_SHA512 : BTRFS_VERITY_HASH_SHA256;
+	block = random_verity_blocks[model_below(model, 2)];
+	salted = (int)model_below(model, 2);
+	model_path(model, inode, path, sizeof(path));
+	plan_verity(plan, model->commit, path, VERITY_ENABLE, algorithm, block,
+	    salted ? random_verity_salt : NULL, salted ? sizeof(random_verity_salt) : 0, 0,
+	    1 + model_below(model, RANDOM_VERITY_STEP), 0);
+	if ((file->flags & (BT_INODE_IMMUTABLE | BT_INODE_APPEND)) != 0) {
+		plan_expect_refusal(plan, model->commit, BTRFS_NOT_PERMITTED);
+		return 1;
+	}
+	if (file->verity) {
+		plan_expect_refusal(plan, model->commit, BTRFS_EXISTS);
+		return 1;
+	}
+	file->verity = 1;
+	file->verity_algorithm = algorithm;
+	file->verity_block = block;
+	file->verity_salted = salted;
+	file->flags |= BT_INODE_RO_VERITY;
+	file->flags_seen = 1;
+	return 1;
+}
+
 static int
 random_write(struct model *model, struct plan *plan)
 {
@@ -877,6 +951,9 @@ random_write(struct model *model, struct plan *plan)
 		return 0;
 	}
 	model_path(model, inode, path, sizeof(path));
+	if (file->verity) {
+		return model_verity_refusal(model, plan, path, OPERATION_WRITE, offset, size);
+	}
 	model_privileges(model, plan, inode, path);
 	bytes = malloc(size);
 	REQUIRE(bytes != NULL);
@@ -905,6 +982,9 @@ random_truncate(struct model *model, struct plan *plan)
 	file = &model->inodes[inode];
 	size = model_below(model, (uint32_t)(file->size + MODEL_GROWTH));
 	model_path(model, inode, path, sizeof(path));
+	if (file->verity) {
+		return model_verity_refusal(model, plan, path, OPERATION_TRUNCATE, size, 0);
+	}
 	model_privileges(model, plan, inode, path);
 	plan_truncate_new(plan, model->commit, path, size);
 	model_resize(file, size);
@@ -936,6 +1016,9 @@ random_fallocate(struct model *model, struct plan *plan)
 		return 0;
 	}
 	model_path(model, inode, path, sizeof(path));
+	if (file->verity) {
+		return model_verity_refusal(model, plan, path, OPERATION_FALLOCATE, offset, length);
+	}
 	model_privileges(model, plan, inode, path);
 	plan_fallocate_new(plan, model->commit, path, mode, offset, length);
 	if ((mode & BTRFS_FALLOCATE_ZERO_RANGE) != 0 && offset < file->size) {
@@ -1664,6 +1747,8 @@ random_operation(struct model *model, struct plan *plan, enum random_kind kind)
 		return random_subvolume(model, plan);
 	case RANDOM_DROP:
 		return random_drop(model, plan);
+	case RANDOM_VERITY:
+		return random_verity(model, plan);
 	case RANDOM_CLEAN:
 		return random_clean(model, plan);
 	case RANDOM_REFUSAL:
@@ -1735,6 +1820,13 @@ model_expect(const struct model *model, struct plan *plan, size_t stage)
 		switch (model_type(inode)) {
 		case BTRFS_MODE_REGULAR:
 			expect_file(plan, stage, stage, path, inode->data, inode->size);
+			if (inode->verity) {
+				expect_verity_model(plan, stage, stage, path,
+				    inode->verity_algorithm, inode->verity_block,
+				    inode->verity_salted ? random_verity_salt : NULL,
+				    inode->verity_salted ? sizeof(random_verity_salt) : 0,
+				    inode->data, inode->size);
+			}
 			break;
 		case BTRFS_MODE_SYMLINK:
 			expect_symlink(plan, stage, stage, path, inode->target);

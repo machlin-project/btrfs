@@ -6,6 +6,7 @@
  * tree blocks up to the descriptor's root hash; the tree blocks one read has
  * verified stay in use, one per level, as Linux's verified-block marks do. */
 #include "encode.h"
+#include "namespace.h"
 #include "verity.h"
 
 /* File bytes one verification pass reads: whole blocks of every tree block
@@ -14,6 +15,17 @@
 #define BT_VERITY_LOG_SHA256 5U
 #define BT_VERITY_LOG_SHA512 6U
 #define BT_VERITY_LOG_BLOCK_LIMIT 31U
+/* File bytes one enable step reads at a time. */
+#define BT_VERITY_BUILD_WINDOW (64U * 1024U)
+/* Linux refuses a tree of more blocks when they are smaller than a page
+ * (EFBIG); enables here refuse it for every block size, so that each page size
+ * opens their files. */
+#define BT_VERITY_TREE_BLOCKS_MAX (UINT64_C(1) << 23)
+#define BT_VERITY_SIGNATURE_MAX                                                                    \
+	(BT_VERITY_DESCRIPTOR_MAX - sizeof(struct bt_disk_verity_descriptor))
+/* Items Linux's end_enable_verity and rollback_verity reserve for the inode
+ * update and the orphan item. */
+#define BT_VERITY_FINAL_ITEMS 2U
 
 struct bt_verity_reader {
 	struct bt_verity verity;
@@ -396,4 +408,500 @@ btrfs_verity_digest(const struct btrfs_fs *fs, const struct btrfs_inode *inode, 
 	bt_sha2_final(&hash, digest);
 	bt_verity_close(fs, reader);
 	return BTRFS_OK;
+}
+
+struct btrfs_verity_build {
+	struct bt_verity verity;
+	struct btrfs_object_id id;
+	uint64_t generation;
+	uint64_t position;
+	/* The next block of each tree level, and the hash bytes pending in each
+	 * level's block; level `levels` is the root hash. */
+	uint64_t next[BT_VERITY_LEVELS_MAX];
+	size_t filled[BT_VERITY_LEVELS_MAX + 1];
+	/* One block per tree level, then the data window. */
+	uint8_t *blocks;
+	size_t blocks_size;
+	/* The descriptor followed by the builtin signature. */
+	uint8_t *descriptor;
+	size_t descriptor_size;
+	/* Items an earlier enable left are gone. */
+	int cleared;
+	/* A step or finish failed: only abort remains. */
+	enum btrfs_result failure;
+	void *(*allocate)(void *context, size_t size);
+	void (*release)(void *context, void *allocation, size_t size);
+	void *context;
+};
+
+/* Linux's write_key_bytes: bytes from offset in items of at most 2 KiB, each
+ * reserved against qgroup limits as its own transaction is. */
+static enum btrfs_result
+bt_verity_store(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t inode,
+    uint8_t type, uint64_t offset, const uint8_t *bytes, size_t length)
+{
+	struct bt_key key = { .objectid = inode, .type = type };
+	size_t count;
+	size_t done;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (done = 0; done < length && error == BTRFS_OK; done += count) {
+		count = length - done < BT_VERITY_ITEM_BYTES ? length - done : BT_VERITY_ITEM_BYTES;
+		key.offset = offset + done;
+		error = bt_ns_reserve_items(transaction, tree->root.owner, 1);
+		if (error == BTRFS_OK) {
+			error = bt_tx_edit(
+			    transaction, &tree->root, key, bytes + done, count, BT_INSERT);
+			transaction->changed = 1;
+		}
+	}
+	return error == BTRFS_EXISTS ? BTRFS_CORRUPT : error;
+}
+
+static size_t
+bt_verity_items(size_t length)
+{
+	return (length + BT_VERITY_ITEM_BYTES - 1U) / BT_VERITY_ITEM_BYTES;
+}
+
+static uint8_t *
+bt_verity_level(struct btrfs_verity_build *build, unsigned level)
+{
+	return level == build->verity.levels
+	    ? build->verity.descriptor.root_hash
+	    : build->blocks + (size_t)level * build->verity.block_size;
+}
+
+/* Linux's hash_one_block: the hash of a block joins level's pending block;
+ * the root takes exactly one. */
+static enum btrfs_result
+bt_verity_add_hash(struct btrfs_verity_build *build, unsigned level, const uint8_t *block)
+{
+	size_t room =
+	    level == build->verity.levels ? build->verity.digest_size : build->verity.block_size;
+
+	if (build->filled[level] + build->verity.digest_size > room) {
+		return BTRFS_CORRUPT;
+	}
+	bt_verity_hash(&build->verity, block, bt_verity_level(build, level) + build->filled[level]);
+	build->filled[level] += build->verity.digest_size;
+	return BTRFS_OK;
+}
+
+/* A level's pending block, zero-padded, joins the level above and is stored
+ * at its place in the tree (write_merkle_tree_block). */
+static enum btrfs_result
+bt_verity_flush(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    struct btrfs_verity_build *build, unsigned level)
+{
+	const struct bt_verity *verity = &build->verity;
+	uint8_t *block = bt_verity_level(build, level);
+	enum btrfs_result error;
+
+	bt_zero(block + build->filled[level], verity->block_size - build->filled[level]);
+	error = bt_verity_add_hash(build, level + 1, block);
+	if (error == BTRFS_OK) {
+		error = bt_verity_store(transaction, tree, build->id.inode, BT_VERITY_MERKLE_ITEM,
+		    (verity->level_start[level] + build->next[level]) << verity->log_block, block,
+		    verity->block_size);
+	}
+	if (error == BTRFS_OK) {
+		build->next[level]++;
+		build->filled[level] = 0;
+	}
+	return error;
+}
+
+static unsigned
+bt_verity_log2(uint32_t value)
+{
+	unsigned log = 0;
+
+	while ((UINT32_C(1) << log) < value) {
+		log++;
+	}
+	return log;
+}
+
+void
+btrfs_verity_build_free(struct btrfs_verity_build *build)
+{
+	if (build == NULL) {
+		return;
+	}
+	if (build->blocks != NULL) {
+		build->release(build->context, build->blocks, build->blocks_size);
+	}
+	if (build->descriptor != NULL) {
+		build->release(build->context, build->descriptor, build->descriptor_size);
+	}
+	build->release(build->context, build, sizeof(*build));
+}
+
+/* fsverity_ioctl_enable's and fsverity_init_merkle_tree_params's refusals of
+ * the parameters for a file of size bytes. */
+static enum btrfs_result
+bt_verity_check_parameters(const struct btrfs_transaction *transaction,
+    const struct btrfs_verity_parameters *parameters, uint64_t size, struct bt_verity *verity)
+{
+	struct bt_disk_verity_descriptor *descriptor = &verity->descriptor;
+	enum btrfs_result error;
+
+	bt_zero(verity, sizeof(*verity));
+	if ((parameters->algorithm != BTRFS_VERITY_HASH_SHA256 &&
+		parameters->algorithm != BTRFS_VERITY_HASH_SHA512) ||
+	    parameters->block_size < (UINT32_C(1) << BT_VERITY_LOG_BLOCK_MIN) ||
+	    parameters->block_size > transaction->base->info.sector_size) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	descriptor->version = BT_VERITY_VERSION;
+	descriptor->hash_algorithm = (uint8_t)parameters->algorithm;
+	descriptor->log_blocksize = (uint8_t)bt_verity_log2(parameters->block_size);
+	descriptor->salt_size = (uint8_t)parameters->salt_size;
+	bt_put32(&descriptor->sig_size, (uint32_t)parameters->signature_size);
+	bt_put64(&descriptor->data_size, size);
+	if (parameters->salt_size != 0) {
+		bt_copy(descriptor->salt, parameters->salt, parameters->salt_size);
+	}
+	error = bt_verity_parameters(verity, transaction->base->info.sector_size);
+	if (error == BTRFS_OK &&
+	    (verity->tree_size >> verity->log_block) > BT_VERITY_TREE_BLOCKS_MAX) {
+		error = BTRFS_CORRUPT;
+	}
+	/* Only the depth and size of the tree remain to refuse (EFBIG). */
+	return error == BTRFS_CORRUPT ? BTRFS_RANGE : error;
+}
+
+enum btrfs_result
+btrfs_transaction_verity_begin(struct btrfs_transaction *transaction, struct btrfs_object_id id,
+    const struct btrfs_verity_parameters *parameters, struct btrfs_verity_build **result)
+{
+	struct btrfs_verity_build *build;
+	struct bt_owned_root view;
+	struct bt_owned_root *tree = NULL;
+	struct bt_disk_inode item;
+	struct bt_key orphan = {
+		.objectid = BT_ORPHAN_OBJECTID, .type = BT_ORPHAN_ITEM, .offset = id.inode
+	};
+	const struct btrfs_environment *environment;
+	uint32_t type;
+	int present;
+	enum btrfs_result error;
+
+	if (result != NULL) {
+		*result = NULL;
+	}
+	if (transaction == NULL || parameters == NULL || result == NULL ||
+	    (parameters->salt == NULL && parameters->salt_size != 0) ||
+	    (parameters->signature == NULL && parameters->signature_size != 0)) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (parameters->block_size == 0 ||
+	    (parameters->block_size & (parameters->block_size - 1U)) != 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (parameters->salt_size > BT_VERITY_SALT_MAX ||
+	    parameters->signature_size > BT_VERITY_SIGNATURE_MAX) {
+		return BTRFS_RANGE;
+	}
+	if (transaction->failure != BTRFS_OK || transaction->finished) {
+		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
+	}
+	/* Write permission first: an immutable file refuses it (EPERM) before
+	 * a read-only subvolume does (EROFS). */
+	error = bt_tx_tree_view(transaction, id.tree, &view);
+	if (error == BTRFS_OK) {
+		error = bt_ns_inode(transaction, &view, id.inode, &item);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	if (bt_ns_immutable(&item)) {
+		return BTRFS_NOT_PERMITTED;
+	}
+	error = bt_ns_begin(transaction, id.tree, &tree);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	type = bt_u32(item.mode) & BTRFS_MODE_TYPE;
+	if ((bt_u64(item.flags) & BT_INODE_APPEND) != 0) {
+		return BTRFS_NOT_PERMITTED;
+	}
+	if (type != BTRFS_MODE_REGULAR) {
+		return type == BTRFS_MODE_DIRECTORY ? BTRFS_IS_DIRECTORY : BTRFS_INVALID_ARGUMENT;
+	}
+	environment = &transaction->base->env;
+	build = environment->allocate(environment->context, sizeof(*build));
+	if (build == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	bt_zero(build, sizeof(*build));
+	build->allocate = environment->allocate;
+	build->release = environment->release;
+	build->context = environment->context;
+	error =
+	    bt_verity_check_parameters(transaction, parameters, bt_u64(item.size), &build->verity);
+	if (error == BTRFS_OK && (bt_u64(item.flags) & BT_INODE_RO_VERITY) != 0) {
+		error = BTRFS_EXISTS;
+	}
+	if (error == BTRFS_OK) {
+		build->blocks_size = (size_t)build->verity.levels * build->verity.block_size +
+		    BT_VERITY_BUILD_WINDOW;
+		build->blocks = build->allocate(build->context, build->blocks_size);
+		build->descriptor_size =
+		    sizeof(build->verity.descriptor) + parameters->signature_size;
+		build->descriptor = build->allocate(build->context, build->descriptor_size);
+		if (build->blocks == NULL || build->descriptor == NULL) {
+			error = BTRFS_NO_MEMORY;
+		}
+	}
+	/* btrfs_begin_enable_verity's orphan item. */
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(transaction, id.tree, BT_NS_ORPHAN_ITEMS);
+	}
+	if (error != BTRFS_OK) {
+		btrfs_verity_build_free(build);
+		return error;
+	}
+	if (parameters->signature_size != 0) {
+		bt_copy(build->descriptor + sizeof(build->verity.descriptor), parameters->signature,
+		    parameters->signature_size);
+	}
+	build->id = id;
+	build->generation = bt_u64(item.generation);
+	/* An orphan item the file already has (O_TMPFILE, unlinked while open,
+	 * or an older enable) stays, as btrfs_orphan_add accepts EEXIST. */
+	error = bt_ns_present(transaction, tree, orphan, &present);
+	if (error == BTRFS_OK && !present) {
+		error = bt_tx_edit(transaction, &tree->root, orphan, NULL, 0, BT_INSERT);
+		transaction->changed = 1;
+	}
+	if (error != BTRFS_OK) {
+		btrfs_verity_build_free(build);
+		return bt_ns_poison(transaction, error);
+	}
+	*result = build;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+btrfs_transaction_verity_step(struct btrfs_transaction *transaction,
+    struct btrfs_verity_build *build, size_t budget, int *done)
+{
+	struct bt_owned_root *tree = NULL;
+	const struct bt_verity *verity;
+	uint64_t size;
+	uint8_t *window;
+	size_t blocks = 0;
+	size_t length;
+	size_t i;
+	unsigned level;
+	int cleared;
+	enum btrfs_result error;
+
+	if (done != NULL) {
+		*done = 0;
+	}
+	if (transaction == NULL || build == NULL || done == NULL || budget == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (build->failure != BTRFS_OK) {
+		return build->failure;
+	}
+	error = bt_ns_begin(transaction, build->id.tree, &tree);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	verity = &build->verity;
+	size = bt_u64(verity->descriptor.data_size);
+	window = build->blocks + (size_t)verity->levels * verity->block_size;
+	/* btrfs_begin_enable_verity drops what an earlier enable left. */
+	if (!build->cleared) {
+		error = bt_ns_drop_verity(transaction, tree, build->id.inode, budget, &cleared);
+		build->cleared = error == BTRFS_OK && cleared;
+	}
+	while (error == BTRFS_OK && build->cleared && blocks < budget && build->position < size) {
+		length = BT_VERITY_BUILD_WINDOW / verity->block_size;
+		length = (budget - blocks < length ? budget - blocks : length) * verity->block_size;
+		if (length > size - build->position) {
+			length = (size_t)(size - build->position + verity->block_size - 1U) &
+			    ~(size_t)(verity->block_size - 1U);
+		}
+		error =
+		    bt_tx_read(transaction, tree, build->id.inode, build->position, window, length);
+		for (i = 0; error == BTRFS_OK && i < length; i += verity->block_size) {
+			error = bt_verity_add_hash(build, 0, window + i);
+			for (level = 0; error == BTRFS_OK && level < verity->levels &&
+			    build->filled[level] + verity->digest_size > verity->block_size;
+			    level++) {
+				error = bt_verity_flush(transaction, tree, build, level);
+			}
+			blocks++;
+		}
+		build->position += length;
+	}
+	if (error != BTRFS_OK) {
+		build->failure = error;
+		return bt_ns_poison(transaction, error);
+	}
+	*done = build->cleared && build->position >= size;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+btrfs_transaction_verity_finish(
+    struct btrfs_transaction *transaction, struct btrfs_verity_build *build)
+{
+	struct bt_owned_root *tree = NULL;
+	struct bt_disk_inode item;
+	struct bt_disk_verity_item size_item;
+	struct bt_verity check;
+	struct bt_key key = { .objectid = build != NULL ? build->id.inode : 0,
+		.type = BT_INODE_ITEM };
+	struct bt_key orphan = { .objectid = BT_ORPHAN_OBJECTID,
+		.type = BT_ORPHAN_ITEM,
+		.offset = build != NULL ? build->id.inode : 0 };
+	const struct bt_verity *verity;
+	uint64_t items = 0;
+	unsigned level;
+	int present = 0;
+	enum btrfs_result error;
+
+	if (transaction == NULL || build == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (build->failure != BTRFS_OK) {
+		return build->failure;
+	}
+	verity = &build->verity;
+	if (!build->cleared || build->position < bt_u64(verity->descriptor.data_size)) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_ns_begin(transaction, build->id.tree, &tree);
+	if (error == BTRFS_OK) {
+		error = bt_ns_inode(transaction, tree, build->id.inode, &item);
+		error = error == BTRFS_NOT_FOUND ? BTRFS_STALE : error;
+	}
+	if (error == BTRFS_OK &&
+	    (bt_u64(item.size) != bt_u64(verity->descriptor.data_size) ||
+		bt_u64(item.generation) != build->generation ||
+		(bt_u32(item.mode) & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR)) {
+		error = BTRFS_STALE;
+	}
+	if (error == BTRFS_OK && (bt_u64(item.flags) & BT_INODE_RO_VERITY) != 0) {
+		error = BTRFS_EXISTS;
+	}
+	/* The last tree blocks, the size item, the descriptor, and the inode
+	 * update with the orphan item. */
+	for (level = 0; level < verity->levels; level++) {
+		items += build->filled[level] != 0 ? bt_verity_items(verity->block_size) : 0;
+	}
+	items += 1 + bt_verity_items(build->descriptor_size) + BT_VERITY_FINAL_ITEMS;
+	if (error == BTRFS_OK) {
+		error = bt_ns_reserve_items(transaction, build->id.tree, items);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	for (level = 0; error == BTRFS_OK && level < verity->levels; level++) {
+		if (build->filled[level] != 0) {
+			error = bt_verity_flush(transaction, tree, build, level);
+		}
+	}
+	if (error == BTRFS_OK && bt_u64(verity->descriptor.data_size) != 0 &&
+	    build->filled[verity->levels] != verity->digest_size) {
+		error = BTRFS_CORRUPT;
+	}
+	/* fsverity_create_info validates the descriptor once more. */
+	check = *verity;
+	if (error == BTRFS_OK) {
+		error = bt_verity_parameters(&check, transaction->base->info.sector_size);
+	}
+	bt_zero(&size_item, sizeof(size_item));
+	bt_put64(&size_item.size, build->descriptor_size);
+	bt_copy(build->descriptor, &verity->descriptor, sizeof(verity->descriptor));
+	if (error == BTRFS_OK) {
+		error = bt_verity_store(transaction, tree, build->id.inode, BT_VERITY_DESC_ITEM, 0,
+		    (const uint8_t *)&size_item, sizeof(size_item));
+	}
+	if (error == BTRFS_OK) {
+		error = bt_verity_store(transaction, tree, build->id.inode, BT_VERITY_DESC_ITEM,
+		    BT_VERITY_DESCRIPTOR_OFFSET, build->descriptor, build->descriptor_size);
+	}
+	/* btrfs_update_inode with the flag: no time or version changes. */
+	if (error == BTRFS_OK) {
+		bt_put64(&item.flags, bt_u64(item.flags) | BT_INODE_RO_VERITY);
+		bt_put64(&item.transid, bt_ns_transid(transaction));
+		error = bt_tx_edit(transaction, &tree->root, key, &item, sizeof(item), BT_REPLACE);
+	}
+	/* del_orphan: an inode without links keeps the orphan item of its
+	 * unlink or O_TMPFILE; a missing one (ENOENT) is no error. */
+	if (error == BTRFS_OK && bt_u32(item.links) != 0) {
+		error = bt_ns_present(transaction, tree, orphan, &present);
+	}
+	if (error == BTRFS_OK && bt_u32(item.links) != 0 && present) {
+		error = bt_tx_edit(transaction, &tree->root, orphan, NULL, 0, BT_DELETE);
+	}
+	if (error == BTRFS_OK) {
+		bt_put64(&transaction->super.compat_ro,
+		    bt_u64(transaction->super.compat_ro) | BT_COMPAT_RO_VERITY);
+		transaction->changed = 1;
+		build->failure = BTRFS_READ_ONLY;
+		return BTRFS_OK;
+	}
+	build->failure = error;
+	return bt_ns_poison(transaction, error);
+}
+
+enum btrfs_result
+btrfs_transaction_verity_abort(struct btrfs_transaction *transaction,
+    struct btrfs_verity_build *build, size_t budget, int *done)
+{
+	struct bt_owned_root *tree = NULL;
+	struct bt_disk_inode item;
+	struct bt_key key = { .objectid = build != NULL ? build->id.inode : 0,
+		.type = BT_INODE_ITEM };
+	struct bt_key orphan = { .objectid = BT_ORPHAN_OBJECTID,
+		.type = BT_ORPHAN_ITEM,
+		.offset = build != NULL ? build->id.inode : 0 };
+	int present = 0;
+	enum btrfs_result error;
+
+	if (done != NULL) {
+		*done = 0;
+	}
+	if (transaction == NULL || build == NULL || done == NULL || budget == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	error = bt_ns_begin(transaction, build->id.tree, &tree);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	error = bt_ns_drop_verity(transaction, tree, build->id.inode, budget, done);
+	/* rollback_verity clears the flag in an inode update and deletes the
+	 * orphan item as del_orphan does; an inode deleted meanwhile took its
+	 * orphan item with it. */
+	if (error == BTRFS_OK && *done) {
+		error = bt_ns_inode(transaction, tree, build->id.inode, &item);
+		if (error == BTRFS_OK) {
+			bt_put64(&item.flags, bt_u64(item.flags) & ~BT_INODE_RO_VERITY);
+			bt_put64(&item.transid, bt_ns_transid(transaction));
+			error = bt_tx_edit(
+			    transaction, &tree->root, key, &item, sizeof(item), BT_REPLACE);
+			transaction->changed = 1;
+			if (error == BTRFS_OK && bt_u32(item.links) != 0) {
+				error = bt_ns_present(transaction, tree, orphan, &present);
+			}
+			if (error == BTRFS_OK && bt_u32(item.links) != 0 && present) {
+				error = bt_tx_edit(
+				    transaction, &tree->root, orphan, NULL, 0, BT_DELETE);
+			}
+		} else if (error == BTRFS_NOT_FOUND) {
+			error = BTRFS_OK;
+		}
+	}
+	if (error == BTRFS_OK && *done) {
+		build->failure = BTRFS_READ_ONLY;
+	}
+	return error == BTRFS_OK ? BTRFS_OK : bt_ns_poison(transaction, error);
 }

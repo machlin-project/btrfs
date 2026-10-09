@@ -39,6 +39,7 @@ main(int argc, char **argv)
 	int subvolumes = 0;
 	int quotas = 0;
 	int simple_quotas = 0;
+	int verity = 0;
 	int kernel_codecs = 0;
 	uint32_t random_first = 0;
 	uint32_t random_count = 0;
@@ -76,6 +77,8 @@ main(int argc, char **argv)
 			quotas = 1;
 		} else if (strcmp(argv[i], "--squota") == 0) {
 			simple_quotas = 1;
+		} else if (strcmp(argv[i], "--verity") == 0) {
+			verity = 1;
 		} else if (strcmp(argv[i], "--kernel-codecs") == 0) {
 			kernel_codecs = 1;
 		} else if ((strcmp(argv[i], "--random") == 0 ||
@@ -154,6 +157,9 @@ main(int argc, char **argv)
 	}
 	if (quotas) {
 		quota_scenarios(context);
+	}
+	if (verity) {
+		verity_scenarios(context);
 	}
 	if (random_count != 0) {
 		random_scenarios(context, random_first, random_count, random_quick);

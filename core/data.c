@@ -205,8 +205,7 @@ bt_tx_view(
 	return BTRFS_OK;
 }
 
-/* Reads existing bytes as this transaction sees them; bytes past EOF read zero. */
-static enum btrfs_result
+enum btrfs_result
 bt_tx_read(struct btrfs_transaction *transaction, const struct bt_owned_root *tree, uint64_t inode,
     uint64_t offset, uint8_t *buffer, size_t length)
 {
@@ -248,7 +247,9 @@ bt_tx_inode(struct btrfs_transaction *transaction, struct bt_owned_root *tree, u
 		    ? BTRFS_IS_DIRECTORY
 		    : BTRFS_UNSUPPORTED;
 	}
-	if ((bt_u64(item->flags) & BT_INODE_IMMUTABLE) != 0) {
+	/* Immutable files, and fs-verity files, which Linux opens for reading
+	 * only and never resizes (fsverity_prepare_setattr), keep their data. */
+	if ((bt_u64(item->flags) & (BT_INODE_IMMUTABLE | BT_INODE_RO_VERITY)) != 0) {
 		return BTRFS_NOT_PERMITTED;
 	}
 	if (bt_u64(item->sequence) == UINT64_MAX) {

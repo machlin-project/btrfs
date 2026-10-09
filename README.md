@@ -34,8 +34,9 @@ creates, links, unlinks (with
 orphans for open files), renames and sets xattrs, the compression property and
 inode flags (as `chattr`), in any writable subvolume or snapshot, many
 operations per transaction; it creates, snapshots, renames and deletes
-subvolumes and drops deleted ones as Linux's cleaner does. It writes
-filesystems with mixed groups, a block-group tree or a metadata UUID, leaves a
+subvolumes and drops deleted ones as Linux's cleaner does, and enables
+fs-verity as FS_IOC_ENABLE_VERITY does, keeping verity files' data unchanged.
+It writes filesystems with mixed groups, a block-group tree or a metadata UUID, leaves a
 v1 space cache stale for Linux to rebuild, and accounts full and simple quotas
 as Linux does: it rescans qgroups and refuses operations past their limits
 (EDQUOT). Native mounts finish Linux's background drops and rescans. It

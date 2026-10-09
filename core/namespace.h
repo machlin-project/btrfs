@@ -132,6 +132,13 @@ enum btrfs_result bt_ns_remove_entry(struct btrfs_transaction *transaction,
     const struct bt_entry *entry, struct btrfs_time time);
 enum btrfs_result bt_ns_release(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     uint64_t inode, int open, struct btrfs_time time);
+/* Whether tree has an item at key, without an edit that would fail. */
+enum btrfs_result bt_ns_present(struct btrfs_transaction *transaction,
+    const struct bt_owned_root *tree, struct bt_key key, int *present);
+/* Linux's btrfs_drop_verity_items: deletes an inode's VERITY_DESC and
+ * VERITY_MERKLE items with work up to budget; *done once none remain. */
+enum btrfs_result bt_ns_drop_verity(struct btrfs_transaction *transaction,
+    struct bt_owned_root *tree, uint64_t inode, size_t budget, int *done);
 /* Subvolume entries (core/subvolume.c): resolving one (INVALID_ARGUMENT for
  * another name), removing it with its root references, and adding one with
  * them for location, a subvolume's root item key. */

@@ -235,15 +235,24 @@ the VM operator. Prepared paths relative to lab are:
 | Cached APK packages | `artifacts/btrfs-reference/packages` |
 
 The initrd needs BusyBox, musl, `mkfs.btrfs`, `btrfs`, `setfattr`, `getfattr`, and
-their dynamic dependencies. The staged root uses the lab reference BusyBox,
-musl, zlib and Zstd; additional Alpine v3.22 AArch64 main APKs are btrfs-progs,
+their dynamic dependencies. The staged root uses BusyBox and musl from the lab's
+pinned `initramfs-virt`, the lab reference Zstd and main's zlib 1.3.2 (the
+repository replaced the lab's pinned r0 with r1); additional Alpine v3.22
+AArch64 main APKs are btrfs-progs,
 eudev-libs, libblkid, libuuid, lzo, libeconf, attr and libattr. Extract packages
 into the disposable root with symlinks preserved. The metadata-UUID profile also
 needs `btrfstune` from btrfs-progs-extra of the same version, checked against the
 APKINDEX checksum, placed at `root/sbin/btrfstune` (its other programs need
 libraries the root does not carry). Do not copy dependencies into
 tracked driver sources. Standard `unsquashfs` or the sibling ext4 test extractor
-can extract the matching module archive. Put these modules in `root/modules/`:
+can extract the matching module archive. The kernel, initramfs and module archive come from
+`alpine-netboot-3.22.5-aarch64.tar.gz` (extracted to `netboot-3.22.5/`), whose
+`vmlinuz-virt` and `initramfs-virt` must match the digests of the lab's
+`config/linux-reference.json` and whose `modloop-virt` the ext4 project's
+`tests/run_linux_quota.py` pins; `Image` is the gzip payload of
+`vmlinuz-virt`'s EFI zboot wrapper, and both runners are built from lab
+`scripts/linux-vm.swift` and signed with `config/linux-vm.entitlements`, as
+`scripts/test-linux-reference.py` does. Put these modules in `root/modules/`:
 
 ```text
 virtio_blk.ko xor-neon.ko xor.ko raid6_pq.ko crc32c_generic.ko libcrc32c.ko
@@ -578,6 +587,7 @@ oracle's guest script is `tests/transaction_oracle.sh`.
 | `data-*` (`--data`) | Unaligned overwrite of a reflinked extent, append, holes and past-EOF writes, preallocation, zlib, NODATASUM, inline conversion, truncation, snapshot overwrites, overlapping writes; compression on write by property (128 KiB zlib extents, incompressible data, compressed and plain inline files, an overwrite splitting a compressed extent, truncation) and by the zstd mount option (ZSTD feature, `no` property, NODATASUM); `release-*`: a file rewritten as 128 extents shrinks by one release step, committed as an exact prefix whose size the committed state decides within its bounds, then completes, and its unlink leaves an orphan that the next commit's cleanup finishes |
 | `namespace-*` (`--namespace`) | Every object type with inherited flags and data, 100 names splitting leaves; appends to, cuts from and renames within colliding DIR_ITEM and xattr items; hard links (across directories, to a device, beside extended references); names beyond a full INODE_REF item in new INODE_EXTREF items, a colliding one and one Linux wrote, unlinked from packed and last entries, renamed into and out of the INODE_REF item and across directories, and an INODE_EXTREF item filled to the largest item; unlinks of shared and last data references; renames across directories, over files, over an empty directory and between names of one inode; open unlinks left as orphans, eviction and orphan cleanup; the largest xattr; a subvolume tree; compression properties and their inheritance; a DIR_ITEM filled to the largest item; zstd by an inherited property; writes in place into Linux's preallocated file (item split) and into an unshared NODATACOW extent, copied on write once a snapshot shares it or another reference exists; 200 one-sector files of which every other one is removed, converting their block group to bitmaps (`fst-bitmaps`); O_TMPFILE files inheriting COMPRESS, linked in or left as orphans for cleanup, with both linking refusals; RENAME_EXCHANGE of files across directories and of a file with two names and a directory, a no-op between two names of one inode and a directory refused below itself; RENAME_WHITEOUT leaving 0:0 whiteouts, also over a replaced target; inode flags as `chattr` sets them on a file, a directory and a symlink, NOCOW on an empty and a written file, COMPR and NOCOMP with their property, and an immutable file refusing a write until its flag goes, with four refusals (`fsflags`) |
 | `squota-*` (`--squota`, on `transactions-squota`) | Simple quotas: a subvolume and its snapshot inside `/data` joining 1/100, the subvolume deleted and dropped while the snapshot keeps extents it owns (its qgroup stays); a snapshot into the top level after another change, joining no qgroup, whose writes count for it; a shared extent freed last by the snapshot and taken back from its owner; an extent from before simple quotas freed without effect; a rescan (INVALID_ARGUMENT) and a preallocation past the limit (QUOTA_EXCEEDED) refused; two snapshots dropped with their qgroups. Every state's numbers equal the audit's count of each extent from the enabling generation for its owner, and every such data extent names its owner |
+| `verity-*` (`--verity`, on `transactions-verity`; on `transactions` only `verity-feature`) | fs-verity: writes, an inline write, truncation, preallocation and punching of Linux's verity files refused (NOT_PERMITTED), a second enable refused (EXISTS) and enables refused in Linux's order (READ_ONLY in read-only subvolumes, IS_DIRECTORY, INVALID_ARGUMENT for a symlink, block sizes and an unknown algorithm, RANGE for the salt and signature sizes, NOT_PERMITTED for immutable and append-only files); a rename, a link, an xattr, inode flags and an unlink of verity files; enables of new, empty, NODATACOW and Zstd files and of Linux's files, the inline one through its second name, with SHA-256 and SHA-512, 1 KiB and 4 KiB blocks, salts, a signature and steps of 1 to 64 blocks, after which writes and a second enable are refused; two enables interrupted after storing some tree blocks, whose items and orphan items orphan cleanup drops, then an enable and a rollback; on a volume without fs-verity, the first enable sets the feature. Every state's digests and item counts equal a model that builds the tree one level at a time, and every file reads through its verification |
 | `quota-*` (`--quota`, on `transactions-quota`) | A new subvolume's qgroup, deleted and dropped with it; a snapshot into the top level and one inside its own source (each its transaction's first change), then files on both sides; a snapshot of a subvolume in 1/100, which leaves quotas inconsistent as Linux does; a snapshot after another change (UNSUPPORTED) and a preallocation past the referenced limit (QUOTA_EXCEEDED), refused before any change beside a write that fits; two shared snapshots dropped, one leaving 1/100; a quota rescan begun after such a snapshot with partial steps, writes between them and a snapshot waiting for it, then finished (`quota-rescan`), the native volume's maintenance finishing a drop and a rescan; and metadata reservations against a nearly full qgroup within one transaction (`quota-metadata`). Every audited state's qgroup numbers equal the independent count of `tests/qgroup_audit.c`, which computes them as `btrfs check` does, during a rescan over the extents below its progress |
 | `subvolume-*` (`--subvolume`) | Subvolumes at the top level, in a directory and in another subvolume, inheriting the parent subvolume's compression property; writable and read-only snapshots of a subvolume, of the multi-level top level, of a read-only snapshot and of a snapshot, edited on either side; copied subvolume entries as stubs; deletion of subvolumes, snapshots and a stub entry; the cleaner resuming a partial drop across commits, and fully dropping a subvolume whose leaves a snapshot shares and an unshared one with data; subvolume entries renamed within and across directories and subvolumes, over an empty directory, and exchanged with each other and with inodes, with Linux's refusals (`subvolume-rename`) |
 | `random-N` (`--random FIRST COUNT`, `--random-quick FIRST COUNT`) | Seeded differential sequences: 24 operations in three commits drawn from create of every type, link, unlink, rename (also over files and between names of one inode), xattr set/remove, write, truncation, attribute changes, inode flags as `FS_IOC_SETFLAGS` sets them (with the compression property, inheritance and an immutable file refusing a write), subvolumes (created, snapshotted and deleted as a commit's first operation, renamed and exchanged across subvolumes, dropped by the cleaner, with stubs and read-only snapshots), orphan cleanup and expected refusals under `/fuzz`, over a name pool with real CRC32C collisions, plus RENAME_EXCHANGE and RENAME_WHITEOUT; a separate model predicts each stage's namespace facts |
@@ -665,7 +675,7 @@ for `transactions-grow`, `--data --holes` for `transactions-holes`,
 `--convert` for `transactions-convert`, `--groups` for `transactions` and
 `transactions-dup`, `--namespace` or `--subvolume` for
 `transactions-namespace`, `--quota` for `transactions-quota`, `--squota` for
-`transactions-squota`, and
+`transactions-squota`, `--verity` for `transactions-verity` and `transactions`, and
 `--data --kernel-codecs` for `transactions-data` with the kernel adapter's
 encoders writing its compressed extents. Reader
 profiles with a free-space tree (`plain`, `small-nodes`) also run the default
@@ -682,8 +692,9 @@ contents (`stages.tsv`), and one sector-run list per case plus the superblock
 writes this implementation's recovery chose. Namespace scenarios add
 `namespace.tsv`: per stage, absent paths, file contents, exact sorted directory
 listings with their sizes, symlink targets, hard-link identity, xattr values and
-absence, mode/owner/link counts, device numbers, inode flags, incompat features
-whether INODE_REF or INODE_EXTREF holds a name, how many of a file's regular and
+absence, mode/owner/link counts, device numbers, inode flags, incompat and
+read-only compatible features, fs-verity digests (or their absence, as
+`fsverity measure` reports them), whether INODE_REF or INODE_EXTREF holds a name, how many of a file's regular and
 inline extents a codec compressed, a file's regular and preallocated extent
 items and distinct disk extents, a subvolume's read-only flag and
 snapshot source, the list of subvolumes and the number of deleted ones waiting

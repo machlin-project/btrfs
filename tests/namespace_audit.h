@@ -16,6 +16,7 @@ struct namespace_audit {
 	size_t xattrs;
 	size_t orphans;
 	size_t hole_items;
+	size_t verity_items;
 	char failure[256];
 };
 
@@ -24,7 +25,9 @@ struct namespace_audit {
  * extended reference) with matching index, inode and type; link counts equal
  * the names of each inode; a directory's size is twice the length of its
  * names; inodes without links have orphan items and orphan items name such
- * inodes; every inode item key belongs to an existing inode. Like btrfs
+ * inodes, or regular files whose fs-verity enable has not finished; fs-verity
+ * items belong to a regular file with fs-verity and its descriptor, or to such
+ * an enable; every inode item key belongs to an existing inode. Like btrfs
  * check, the file extents of a regular file or symlink do not overlap and
  * count its bytes, and without NO_HOLES they cover it below its size. */
 int namespace_audit(const struct btrfs_fs *fs, struct namespace_audit *audit);
