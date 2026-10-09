@@ -119,6 +119,10 @@ struct btrfs_fs {
 	struct btrfs_inode root_inode;
 	uint8_t metadata_uuid[BTRFS_UUID_SIZE], device_uuid[BTRFS_UUID_SIZE];
 	uint64_t device_id, device_size;
+	/* The root and level of a pending tree log, admitted only for its replay;
+	 * zero otherwise. */
+	uint64_t log_root;
+	uint8_t log_level;
 	/* Joins the lanes of a node CRC32C (node_size - BT_CSUM_SIZE bytes). */
 	struct bt_crc_shift node_crc;
 	/* Sorted by logical address; chunk_capacity entries are allocated. */
@@ -213,6 +217,10 @@ int bt_cache_extent_get(struct btrfs_cache *cache, const struct bt_extent_key *k
 void bt_cache_extent_put(
     struct btrfs_cache *cache, const struct bt_extent_key *key, int verified, const void *bytes);
 
+/* Keeps a function's frame out of its caller's, so that each frame stays
+ * within the kernel's per-frame stack bound. */
+#define BT_NOINLINE __attribute__((noinline))
+
 /* A freestanding C implementation still provides memcpy, memmove, memset and
  * memcmp (and so does the kernel); the builtins let the compiler inline small
  * fixed sizes and call the platform's tuned routines otherwise. */
@@ -282,8 +290,15 @@ uint64_t bt_super_offset(unsigned mirror);
 int bt_super_present(uint64_t device_size, unsigned mirror);
 enum btrfs_result bt_super_check(const struct bt_disk_super *super, uint64_t offset);
 int bt_super_same(const struct bt_disk_super *a, const struct bt_disk_super *b);
+/* Linux's fsync writes its tree log's root into the primary alone: a copy
+ * agrees with a primary naming a log when it names none and every other
+ * field but its own offset and checksum is the primary's. */
+int bt_super_same_but_log(const struct bt_disk_super *copy, const struct bt_disk_super *primary);
+/* logged admits a pending tree log, recorded in log_root and log_level, for
+ * its replay; any other mount refuses it (RECOVERY_REQUIRED). */
 enum btrfs_result bt_mount_super(const struct btrfs_environment *environment,
-    const struct bt_disk_super *super, uint64_t offset, uint64_t tree, struct btrfs_fs **result);
+    const struct bt_disk_super *super, uint64_t offset, uint64_t tree, int logged,
+    struct btrfs_fs **result);
 /* Index of the first chunk at or after logical; chunk_count if none. */
 size_t bt_chunk_position(const struct btrfs_fs *fs, uint64_t logical);
 /* Index of the chunk holding logical; chunk_count if none. */

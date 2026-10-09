@@ -662,9 +662,19 @@ refusal_tests(void)
 	NSProgress *progress;
 	NSError *error = nil;
 
-	/* A full check and formatting are refused through the task, not
-	 * synchronously. */
+	/* A full check, a repair without a writable load and formatting are
+	 * refused through the task, not synchronously. */
 	options.taskOptions = @[ @"-n" ];
+	task.done = dispatch_semaphore_create(0);
+	progress = [filesystem startCheckWithTask:(FSTask *)task
+					  options:(FSTaskOptions *)options
+					    error:&error];
+	REQUIRE(progress != nil && error == nil);
+	REQUIRE(dispatch_semaphore_wait(
+		    task.done, dispatch_time(DISPATCH_TIME_NOW, 10 * (int64_t)NSEC_PER_SEC)) == 0);
+	REQUIRE(task.error.code == ENOTSUP);
+	options.taskOptions = @[ @"-y" ];
+	task = [TestTask new];
 	task.done = dispatch_semaphore_create(0);
 	progress = [filesystem startCheckWithTask:(FSTask *)task
 					  options:(FSTaskOptions *)options

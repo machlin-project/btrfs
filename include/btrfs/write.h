@@ -46,8 +46,11 @@ struct btrfs_recovery_report {
 
 /* Explicit, exclusive superblock recovery; mount never selects a mirror. Chooses
  * the newest checksum-valid copy and requires equal-generation copies to agree.
- * It never selects a generation below acknowledged (STALE), a pending tree log
- * (UNSUPPORTED) or a copy of another filesystem (CORRUPT). When copies disagree,
+ * It never selects a generation below acknowledged (STALE), a tree log outside
+ * the primary copy (UNSUPPORTED) or a copy of another filesystem (CORRUPT). A
+ * selected primary may name a pending tree log, which Linux's fsync writes to
+ * the primary alone: equal copies then name none, the copies recovery rewrites
+ * name none either, and btrfs_replay_log replays the log. When copies disagree,
  * it first opens the selection's chunk, root, extent and device trees and its
  * allocation map. A NULL writer only inspects and then returns RECOVERY_REQUIRED.
  * With a writer, each disagreeing copy is rewritten from the selected copy, which
@@ -56,6 +59,36 @@ struct btrfs_recovery_report {
 enum btrfs_result btrfs_recover_supers(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, uint64_t acknowledged,
     struct btrfs_recovery_report *report);
+
+struct btrfs_replay_report {
+	/* The committed generation whose tree log was replayed. */
+	uint64_t generation;
+	/* Subvolume logs replayed, and the items each pass applied. */
+	uint64_t logs;
+	uint64_t inodes;
+	uint64_t names;
+	uint64_t unlinked;
+	uint64_t extents;
+	/* Logged data extents the replay allocated in the extent tree. */
+	uint64_t allocated;
+	/* Inodes left without a name; orphan cleanup removes them. */
+	uint64_t orphans;
+};
+
+/* Explicit, exclusive tree-log replay, as Linux performs when it mounts a
+ * filesystem whose primary superblock names a log: what fsync made durable
+ * after the last commit is applied in one transaction, whose commit names no
+ * log. The superblock copies must otherwise agree with the primary. Log
+ * blocks and the data extents they reference stay out of allocation until
+ * that commit. NOT_FOUND when no log is pending; nothing is written unless
+ * every log item replays. A NULL writer replays without committing, writes
+ * nothing and then returns RECOVERY_REQUIRED. Read-only mounts never replay:
+ * they keep returning RECOVERY_REQUIRED. now stamps the directories the
+ * replay changes. Afterwards, orphan cleanup removes inodes the log left
+ * without a name. */
+enum btrfs_result btrfs_replay_log(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, struct btrfs_time now,
+    struct btrfs_replay_report *report);
 
 /* Current admission: any of Linux's four checksum algorithms, skinny metadata,
  * SINGLE/DUP, no free-space cache tree, quotas or mixed groups. At least two

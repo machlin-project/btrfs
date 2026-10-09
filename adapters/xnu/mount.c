@@ -385,30 +385,56 @@ btrfs_xnu_cache_unlock(void *context)
 	lck_mtx_unlock(((struct btrfs_xnu_mount *)context)->cache_lock);
 }
 
-/* Superblock copies left disagreeing by an interrupted publication make a
- * writable open fail (RECOVERY_REQUIRED): a commit from the primary could reuse
- * blocks a newer copy references. A read-write mount, which asked to write,
- * resolves them by explicit recovery to the newest complete root set, which is
- * never older than an acknowledged commit, and opens again. A read-only mount
- * (writer NULL) never writes. */
+/* Rounds of replay or recovery before a writable open: superblock recovery
+ * may leave the log of the primary it selects pending, for one replay. */
+#define BTRFS_XNU_OPEN_ROUNDS 2U
+
+/* A pending tree log, or superblock copies left disagreeing by an interrupted
+ * publication, make a writable open fail (RECOVERY_REQUIRED). A read-write
+ * mount, which asked to write, replays a log as Linux's mount does, committing
+ * what fsync made durable. Without a log, or when copies disagree, it resolves
+ * them by explicit recovery to the newest complete root set, which is never
+ * older than an acknowledged commit, since a commit from the primary could
+ * reuse blocks a newer copy references. Then it opens again. A read-only
+ * mount (writer NULL) never writes and keeps refusing. */
 static enum btrfs_result
 btrfs_xnu_open_volume(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_volume_locks *locks,
     struct btrfs_volume **volume)
 {
 	struct btrfs_recovery_report report;
+	struct btrfs_replay_report replay;
+	struct btrfs_time now;
+	unsigned round;
 	enum btrfs_result result;
 
 	result = btrfs_volume_open(environment, writer, locks, 0, volume);
-	if (result != BTRFS_RECOVERY_REQUIRED || writer == NULL) {
-		return result;
+	for (round = 0;
+	    result == BTRFS_RECOVERY_REQUIRED && writer != NULL && round < BTRFS_XNU_OPEN_ROUNDS;
+	    round++) {
+		btrfs_xnu_now(&now);
+		result = btrfs_replay_log(environment, writer, now, &replay);
+		if (result != BTRFS_NOT_FOUND) {
+			printf("machlin_btrfs: tree-log replay after generation %llu: %llu logs, "
+			       "%llu inodes, %llu names, %llu unlinked, %llu extents, %llu "
+			       "orphans: %s\n",
+			    (unsigned long long)replay.generation, (unsigned long long)replay.logs,
+			    (unsigned long long)replay.inodes, (unsigned long long)replay.names,
+			    (unsigned long long)replay.unlinked, (unsigned long long)replay.extents,
+			    (unsigned long long)replay.orphans, btrfs_result_string(result));
+		}
+		if (result == BTRFS_NOT_FOUND || result == BTRFS_RECOVERY_REQUIRED) {
+			result = btrfs_recover_supers(environment, writer, 0, &report);
+			printf("machlin_btrfs: superblock recovery selected generation %llu, "
+			       "rewrote %u copies: %s\n",
+			    (unsigned long long)report.generation, report.rewritten,
+			    btrfs_result_string(result));
+		}
+		if (result == BTRFS_OK) {
+			result = btrfs_volume_open(environment, writer, locks, 0, volume);
+		}
 	}
-	result = btrfs_recover_supers(environment, writer, 0, &report);
-	printf("machlin_btrfs: superblock recovery selected generation %llu, rewrote %u "
-	       "copies: %s\n",
-	    (unsigned long long)report.generation, report.rewritten, btrfs_result_string(result));
-	return result == BTRFS_OK ? btrfs_volume_open(environment, writer, locks, 0, volume)
-				  : result;
+	return result;
 }
 
 int

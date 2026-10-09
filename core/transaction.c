@@ -48,9 +48,15 @@ bt_tx_copies(struct btrfs_transaction *transaction)
 	const struct bt_disk_super *copy;
 	uint64_t offset;
 	unsigned mirror;
+	int logged = transaction->base->log_root != 0;
 	enum btrfs_result error;
 
 	transaction->copies = 0;
+	if (logged &&
+	    (bt_u64(transaction->original_super.log_root) != transaction->base->log_root ||
+		transaction->original_super.log_level != transaction->base->log_level)) {
+		return BTRFS_STALE;
+	}
 	for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
 		if (!bt_super_present(transaction->base->device_size, mirror)) {
 			continue;
@@ -68,7 +74,9 @@ bt_tx_copies(struct btrfs_transaction *transaction)
 			}
 		}
 		if (bt_super_check(copy, offset) != BTRFS_OK ||
-		    !bt_super_same(copy, &transaction->original_super)) {
+		    !(mirror != 0 && logged
+			    ? bt_super_same_but_log(copy, &transaction->original_super)
+			    : bt_super_same(copy, &transaction->original_super))) {
 			return BTRFS_RECOVERY_REQUIRED;
 		}
 		transaction->copies++;
@@ -1088,6 +1096,9 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 			transaction->super.chunk_level = transaction->chunks.level;
 			/* A v1 free-space cache is advisory and has not been maintained. */
 			bt_put64(&transaction->super.cache_generation, UINT64_MAX);
+			/* A commit names no tree log: a pending one was replayed. */
+			bt_put64(&transaction->super.log_root, 0);
+			transaction->super.log_level = 0;
 			bt_tx_backup(transaction);
 			return bt_mutation_seal(transaction->mutation);
 		}

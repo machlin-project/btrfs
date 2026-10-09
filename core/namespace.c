@@ -68,7 +68,7 @@ bt_ns_hash(const void *name, size_t length)
 }
 
 /* Linux's btrfs_extref_hash seeds CRC32C with the parent's number. */
-static uint64_t
+uint64_t
 bt_ns_extref_hash(uint64_t directory, const void *name, size_t length)
 {
 	return bt_crc32c((uint32_t)directory, name, length);
@@ -171,7 +171,7 @@ bt_ns_dir_find(const struct bt_packed *packed, const void *name, size_t length, 
 }
 
 /* Finds name among packed INODE_REF entries: index, name length and name. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_ref_find(const struct bt_packed *packed, const void *name, size_t length, size_t *offset,
     uint64_t *index)
 {
@@ -201,7 +201,7 @@ bt_ns_ref_find(const struct bt_packed *packed, const void *name, size_t length, 
 
 /* Finds directory's name among packed INODE_EXTREF entries: parent, index,
  * name length and name. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_extref_find(const struct bt_packed *packed, uint64_t directory, const void *name,
     size_t length, size_t *offset, uint64_t *index)
 {
@@ -773,7 +773,7 @@ bt_ns_room(struct btrfs_transaction *transaction, struct bt_owned_root *tree, ui
 
 /* Adds inode's back reference for name in directory where bt_ns_ref_place
  * puts it. */
-static enum btrfs_result
+enum btrfs_result
 bt_ns_add_ref(struct btrfs_transaction *transaction, struct bt_owned_root *tree, uint64_t directory,
     const void *name, size_t length, uint64_t inode, uint64_t index)
 {

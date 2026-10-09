@@ -44,28 +44,55 @@ btrfs_fskit_flags(uint64_t flags)
 	return result;
 }
 
-/* Superblock copies left disagreeing by an interrupted publication make a
- * writable open fail (RECOVERY_REQUIRED): a commit from the primary could reuse
- * blocks a newer copy references. A writable volume resolves them by explicit
- * recovery to the newest complete root set, never older than an acknowledged
- * commit, and opens again. A read-only volume (writer NULL) never writes. */
+/* Rounds of replay or recovery before a writable open: superblock recovery
+ * may leave the log of the primary it selects pending, for one replay. */
+#define BTRFS_FSKIT_OPEN_ROUNDS 2U
+
+/* A pending tree log, or superblock copies left disagreeing by an interrupted
+ * publication, make a writable open fail (RECOVERY_REQUIRED). A writable
+ * volume replays a log as Linux's mount does, committing what fsync made
+ * durable. Without a log, or when copies disagree, it resolves them by
+ * explicit recovery to the newest complete root set, never older than an
+ * acknowledged commit, since a commit from the primary could reuse blocks a
+ * newer copy references. Then it opens again. A read-only volume (writer
+ * NULL) never writes and keeps refusing. */
 static enum btrfs_result
 btrfs_fskit_open_volume(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_volume_locks *locks,
     struct btrfs_volume **volume)
 {
 	struct btrfs_recovery_report report;
+	struct btrfs_replay_report replay;
+	unsigned round;
 	enum btrfs_result result;
 
 	result = btrfs_volume_open(environment, writer, locks, 0, volume);
-	if (result != BTRFS_RECOVERY_REQUIRED || writer == NULL) {
-		return result;
+	for (round = 0;
+	    result == BTRFS_RECOVERY_REQUIRED && writer != NULL && round < BTRFS_FSKIT_OPEN_ROUNDS;
+	    round++) {
+		result = btrfs_replay_log(environment, writer, btrfs_fskit_now(), &replay);
+		if (result != BTRFS_NOT_FOUND) {
+			NSLog(
+			    @"machlinbtrfs: tree-log replay after generation %llu: %llu logs, %llu "
+			    @"inodes, %llu names, %llu unlinked, %llu extents, %llu orphans: %s",
+			    (unsigned long long)replay.generation, (unsigned long long)replay.logs,
+			    (unsigned long long)replay.inodes, (unsigned long long)replay.names,
+			    (unsigned long long)replay.unlinked, (unsigned long long)replay.extents,
+			    (unsigned long long)replay.orphans, btrfs_result_string(result));
+		}
+		if (result == BTRFS_NOT_FOUND || result == BTRFS_RECOVERY_REQUIRED) {
+			result = btrfs_recover_supers(environment, writer, 0, &report);
+			NSLog(
+			    @"machlinbtrfs: superblock recovery selected generation %llu, rewrote "
+			    @"%u copies: %s",
+			    (unsigned long long)report.generation, report.rewritten,
+			    btrfs_result_string(result));
+		}
+		if (result == BTRFS_OK) {
+			result = btrfs_volume_open(environment, writer, locks, 0, volume);
+		}
 	}
-	result = btrfs_recover_supers(environment, writer, 0, &report);
-	NSLog(@"machlinbtrfs: superblock recovery selected generation %llu, rewrote %u copies: %s",
-	    (unsigned long long)report.generation, report.rewritten, btrfs_result_string(result));
-	return result == BTRFS_OK ? btrfs_volume_open(environment, writer, locks, 0, volume)
-				  : result;
+	return result;
 }
 
 NSError *
@@ -1923,10 +1950,21 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 {
 	BtrfsVolume *volume;
 	NSProgress *progress;
+	BOOL quick = [options.taskOptions containsObject:@"-q"];
+	BOOL repair = [options.taskOptions containsObject:@"-y"] ||
+	    [options.taskOptions containsObject:@"-p"];
 
 	(void)error;
-	/* A quick check admits only clean media; it is not an fsck repair. */
-	if (![options.taskOptions containsObject:@"-q"]) {
+	@synchronized(self) {
+		volume = _volume;
+	}
+	/* A quick check admits only clean media. There is no fsck repair: a
+	 * repair request (after a quick check found a pending tree log) succeeds
+	 * only on a volume whose writable load already did what a Linux mount
+	 * does, replaying the log and resolving superblock copies, and that is
+	 * then admitted as a quick check would admit it. */
+	if (!quick && !(repair && volume != nil && volume.writable)) {
+		NSLog(@"machlinbtrfs: check refused for options %@", options.taskOptions);
 		return btrfs_fskit_refusal(task,
 		    [NSError errorWithDomain:NSPOSIXErrorDomain
 					code:ENOTSUP
@@ -1934,9 +1972,6 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 					    NSLocalizedDescriptionKey :
 						@"Only a quick read-only check is supported."
 				    }]);
-	}
-	@synchronized(self) {
-		volume = _volume;
 	}
 	if (volume == nil) {
 		return btrfs_fskit_refusal(
@@ -1989,6 +2024,15 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 			environment.release = btrfs_resource_release;
 			environment.decompress = btrfs_resource_decompress;
 			error = btrfs_mount(&environment, 0, &fs);
+			/* A volume whose mount first needs recovery, as a pending tree
+			 * log does, is still recognized: its load decides, refusing
+			 * read-only and replaying when writable. */
+			if (error == BTRFS_RECOVERY_REQUIRED) {
+				error = btrfs_identify(&environment, &info);
+			} else if (error == BTRFS_OK) {
+				btrfs_get_info(fs, &info);
+				btrfs_unmount(fs);
+			}
 		}
 	}
 	if (error != BTRFS_OK) {
@@ -1996,7 +2040,6 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 		    btrfs_fskit_error(error == BTRFS_NOT_BTRFS ? BTRFS_OK : error));
 		return;
 	}
-	btrfs_get_info(fs, &info);
 	name = [[NSString alloc] initWithBytes:info.label
 					length:strnlen(info.label, BTRFS_LABEL_SIZE)
 				      encoding:NSUTF8StringEncoding];
@@ -2005,7 +2048,6 @@ btrfs_fskit_refusal(FSTask *task, NSError *error)
 	}
 	uuid = [[NSUUID alloc] initWithUUIDBytes:info.uuid];
 	identifier = [[FSContainerIdentifier alloc] initWithUUID:uuid];
-	btrfs_unmount(fs);
 	/* Disk Arbitration rejects a usable-but-limited result; whether the
 	 * volume accepts changes is decided at load. */
 	reply([FSProbeResult usableProbeResultWithName:name containerID:identifier], nil);

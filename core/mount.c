@@ -8,7 +8,7 @@ bt_power_of_two(uint32_t value)
 }
 
 static enum btrfs_result
-bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t offset)
+bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t offset, int logged)
 {
 	uint64_t flags;
 	uint64_t incompat;
@@ -27,9 +27,15 @@ bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t
 	if ((flags & BT_SUPER_ERROR) != 0) {
 		return BTRFS_CORRUPT;
 	}
-	if (bt_u64(super->log_root) != 0) {
+	/* A pending tree log is admitted only by its replay. */
+	if (bt_u64(super->log_root) != 0 && !logged) {
 		return BTRFS_RECOVERY_REQUIRED;
 	}
+	if (bt_u64(super->log_root) != 0 && super->log_level >= BT_MAX_LEVEL) {
+		return BTRFS_CORRUPT;
+	}
+	fs->log_root = bt_u64(super->log_root);
+	fs->log_level = super->log_level;
 	fs->info.generation = bt_u64(super->generation);
 	fs->info.total_bytes = bt_u64(super->total_bytes);
 	fs->info.used_bytes = bt_u64(super->used_bytes);
@@ -142,7 +148,7 @@ bt_load_chunks(struct btrfs_fs *fs)
 
 enum btrfs_result
 bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk_super *super,
-    uint64_t offset, uint64_t tree, struct btrfs_fs **result)
+    uint64_t offset, uint64_t tree, int logged, struct btrfs_fs **result)
 {
 	struct btrfs_fs *fs;
 	struct btrfs_object_id id;
@@ -156,7 +162,7 @@ bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk
 	bt_zero(fs, sizeof(*fs));
 	fs->env = *environment;
 	fs->cache_limit = UINT64_MAX;
-	error = bt_super_decode(fs, super, offset);
+	error = bt_super_decode(fs, super, offset, logged);
 	if (error == BTRFS_OK) {
 		fs->chunks = environment->allocate(
 		    environment->context, BT_INITIAL_CHUNKS * sizeof(*fs->chunks));
@@ -223,7 +229,7 @@ btrfs_mount(const struct btrfs_environment *environment, uint64_t tree, struct b
 	}
 	error = environment->read(environment->context, BT_SUPER_OFFSET, super, sizeof(*super));
 	if (error == BTRFS_OK) {
-		error = bt_mount_super(environment, super, BT_SUPER_OFFSET, tree, result);
+		error = bt_mount_super(environment, super, BT_SUPER_OFFSET, tree, 0, result);
 	}
 	environment->release(environment->context, super, sizeof(*super));
 	return error;
@@ -250,6 +256,44 @@ btrfs_get_info(const struct btrfs_fs *fs, struct btrfs_info *info)
 	if (fs != NULL && info != NULL) {
 		*info = fs->info;
 	}
+}
+
+enum btrfs_result
+btrfs_identify(const struct btrfs_environment *environment, struct btrfs_info *info)
+{
+	struct bt_disk_super *super;
+	enum btrfs_result error;
+
+	if (environment == NULL || environment->read == NULL || environment->allocate == NULL ||
+	    environment->release == NULL || info == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	bt_zero(info, sizeof(*info));
+	if (environment->size_bytes < BT_SUPER_OFFSET + BT_SUPER_SIZE) {
+		return BTRFS_NOT_BTRFS;
+	}
+	super = environment->allocate(environment->context, sizeof(*super));
+	if (super == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	error = environment->read(environment->context, BT_SUPER_OFFSET, super, sizeof(*super));
+	if (error == BTRFS_OK) {
+		error = bt_super_check(super, BT_SUPER_OFFSET);
+	}
+	if (error == BTRFS_OK) {
+		bt_copy(info->uuid, super->fsid, BTRFS_UUID_SIZE);
+		bt_copy(info->label, super->label, BTRFS_LABEL_SIZE);
+		info->generation = bt_u64(super->generation);
+		info->total_bytes = bt_u64(super->total_bytes);
+		info->used_bytes = bt_u64(super->used_bytes);
+		info->incompat_features = bt_u64(super->incompat);
+		info->readonly_features = bt_u64(super->compat_ro);
+		info->sector_size = bt_u32(super->sector_size);
+		info->node_size = bt_u32(super->node_size);
+		info->checksum_type = bt_u16(super->checksum_type);
+	}
+	environment->release(environment->context, super, sizeof(*super));
+	return error;
 }
 
 enum btrfs_result

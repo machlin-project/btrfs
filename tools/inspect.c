@@ -4,6 +4,148 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Directory depth and path length the walk command follows. */
+#define WALK_DEPTH 256U
+#define WALK_PATH 4096U
+#define WALK_BUFFER (1024U * 1024U)
+
+static void
+print_hex(const uint8_t *bytes, size_t length)
+{
+	size_t i;
+
+	for (i = 0; i < length; i++) {
+		printf("%02x", bytes[i]);
+	}
+}
+
+/* One JSON line for inode at path: its attributes, xattrs and, with data, a
+ * regular file's or symlink's bytes; names and bytes are hexadecimal. */
+static enum btrfs_result
+walk_print(struct btrfs_fs *fs, const struct btrfs_inode *inode, const char *path, int data,
+    uint8_t *buffer, uint8_t *value)
+{
+	uint32_t type = inode->mode & BTRFS_MODE_TYPE;
+	uint64_t offset = 0;
+	size_t names;
+	size_t length;
+	size_t position;
+	size_t name_length;
+	enum btrfs_result error;
+
+	error = btrfs_list_xattrs(fs, inode, buffer, WALK_BUFFER, &names);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	printf("{\"path\":\"");
+	print_hex((const uint8_t *)path, strlen(path));
+	printf("\",\"tree\":%" PRIu64 ",\"inode\":%" PRIu64 ",\"mode\":%u,\"uid\":%u,\"gid\":%u"
+	       ",\"links\":%u,\"size\":%" PRIu64 ",\"allocated\":%" PRIu64 ",\"mtime\":%" PRId64
+	       ",\"xattrs\":[",
+	    inode->id.tree, inode->id.inode, inode->mode, inode->uid, inode->gid, inode->links,
+	    inode->size, inode->allocated_bytes, inode->modify_time.seconds);
+	for (position = 0; position < names; position += name_length + 1) {
+		name_length = strnlen((const char *)buffer + position, names - position);
+		error = btrfs_get_xattr(
+		    fs, inode, buffer + position, name_length, value, WALK_BUFFER, &length);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		printf("%s[\"", position == 0 ? "" : ",");
+		print_hex(buffer + position, name_length);
+		printf("\",\"");
+		print_hex(value, length);
+		printf("\"]");
+	}
+	printf("]");
+	if (data && (type == BTRFS_MODE_REGULAR || type == BTRFS_MODE_SYMLINK)) {
+		printf(",\"data\":\"");
+		while (offset < inode->size) {
+			error = btrfs_read(fs, inode, offset, buffer, WALK_BUFFER, &length);
+			if (error != BTRFS_OK) {
+				return error;
+			}
+			if (length == 0) {
+				return BTRFS_CORRUPT;
+			}
+			print_hex(buffer, length);
+			offset += length;
+		}
+		printf("\"");
+	}
+	printf("}\n");
+	return BTRFS_OK;
+}
+
+/* Every path below directory, depth first in directory index order. */
+static enum btrfs_result
+walk(struct btrfs_fs *fs, const struct btrfs_inode *directory, char *path, size_t length,
+    unsigned depth, int data, uint8_t *buffer, uint8_t *value)
+{
+	struct btrfs_directory *stream;
+	struct btrfs_dir_entry entry;
+	struct btrfs_inode inode;
+	uint64_t cookie = 0;
+	enum btrfs_result error;
+
+	if (depth == WALK_DEPTH) {
+		return BTRFS_UNSUPPORTED;
+	}
+	error = btrfs_directory_open(fs, directory, cookie, &stream);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	while ((error = btrfs_directory_next(stream, &entry, &cookie)) == BTRFS_OK) {
+		if (length + 1 + entry.name_length >= WALK_PATH) {
+			error = BTRFS_UNSUPPORTED;
+			break;
+		}
+		path[length] = '/';
+		memcpy(path + length + 1, entry.name, entry.name_length);
+		path[length + 1 + entry.name_length] = '\0';
+		error = btrfs_directory_inode(stream, &entry, &inode);
+		if (error == BTRFS_OK) {
+			error = walk_print(fs, &inode, path, data, buffer, value);
+		}
+		if (error == BTRFS_OK && (inode.mode & BTRFS_MODE_TYPE) == BTRFS_MODE_DIRECTORY) {
+			error = walk(fs, &inode, path, length + 1 + entry.name_length, depth + 1,
+			    data, buffer, value);
+		}
+		path[length] = '\0';
+		if (error != BTRFS_OK) {
+			break;
+		}
+	}
+	btrfs_directory_close(stream);
+	return error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
+}
+
+static enum btrfs_result
+walk_tree(struct btrfs_fs *fs, int data)
+{
+	struct btrfs_inode root;
+	char *path = malloc(WALK_PATH);
+	uint8_t *buffer = malloc(WALK_BUFFER);
+	uint8_t *value = malloc(WALK_BUFFER);
+	enum btrfs_result error = BTRFS_NO_MEMORY;
+
+	if (path != NULL && buffer != NULL && value != NULL) {
+		strcpy(path, ".");
+		error = btrfs_root(fs, &root);
+		if (error == BTRFS_OK) {
+			error = walk_print(fs, &root, path, data, buffer, value);
+		}
+		if (error == BTRFS_OK) {
+			error = walk(fs, &root, path, 1, 0, data, buffer, value);
+		}
+	}
+	free(path);
+	free(buffer);
+	free(value);
+	return error;
+}
 
 static enum btrfs_result
 inspect(struct btrfs_fs *fs, int argc, char **argv)
@@ -30,6 +172,9 @@ inspect(struct btrfs_fs *fs, int argc, char **argv)
 		    info.generation, info.sector_size, info.node_size, info.checksum_type,
 		    info.default_tree);
 		return BTRFS_OK;
+	}
+	if (strcmp(argv[0], "walk") == 0) {
+		return walk_tree(fs, argc >= 2 && strcmp(argv[1], "--data") == 0);
 	}
 	if (argc < 2) {
 		return BTRFS_INVALID_ARGUMENT;
@@ -157,6 +302,52 @@ recover(const char *path, int argc, char **argv)
 	return error == BTRFS_OK ? 0 : error == BTRFS_RECOVERY_REQUIRED ? 3 : 1;
 }
 
+/* Explicit tree-log replay, never implied by any other command. Without
+ * --apply the log is replayed without a commit and nothing is written; exit
+ * status 3 then means it replays and is pending, 4 that no log is pending. */
+static int
+replay(const char *path, int argc, char **argv)
+{
+	struct btrfs_replay_report report;
+	struct btrfs_write_environment writer;
+	struct btrfs_image image;
+	struct btrfs_time now = { 0 };
+	struct timespec clock;
+	int apply = argc == 1 && strcmp(argv[0], "--apply") == 0;
+	enum btrfs_result error;
+
+	if (argc != 0 && !apply) {
+		fprintf(stderr, "Usage: btrfs-inspect IMAGE replay [--apply]\n");
+		return 2;
+	}
+	if ((apply ? btrfs_image_open_writable(path, &image) : btrfs_image_open(path, &image)) !=
+	    0) {
+		perror("open image");
+		return 1;
+	}
+	if (clock_gettime(CLOCK_REALTIME, &clock) == 0) {
+		now.seconds = clock.tv_sec;
+		now.nanoseconds = (uint32_t)clock.tv_nsec;
+	}
+	btrfs_image_writer(&image, &writer);
+	error = btrfs_replay_log(&image.environment, apply ? &writer : NULL, now, &report);
+	printf("{\"result\":\"%s\",\"apply\":%s,\"generation\":%" PRIu64 ",\"logs\":%" PRIu64
+	       ",\"inodes\":%" PRIu64 ",\"names\":%" PRIu64 ",\"unlinked\":%" PRIu64
+	       ",\"extents\":%" PRIu64 ",\"allocated\":%" PRIu64 ",\"orphans\":%" PRIu64 "}\n",
+	    btrfs_result_string(error), apply ? "true" : "false", report.generation, report.logs,
+	    report.inodes, report.names, report.unlinked, report.extents, report.allocated,
+	    report.orphans);
+	btrfs_image_close(&image);
+	if (image.live_allocations != 0 || image.live_bytes != 0) {
+		fprintf(stderr, "allocation leak\n");
+		return 1;
+	}
+	return error == BTRFS_OK	       ? 0
+	    : error == BTRFS_RECOVERY_REQUIRED ? 3
+	    : error == BTRFS_NOT_FOUND	       ? 4
+					       : 1;
+}
+
 /* Node cache for one command; the image does not change while it runs. */
 #define INSPECT_CACHE_BYTES (16U * 1024U * 1024U)
 
@@ -177,12 +368,16 @@ main(int argc, char **argv)
 	if (argc - argument < 2) {
 		fprintf(stderr,
 		    "Usage: btrfs-inspect [--tree ID] IMAGE info|stat|ls|cat|xattr|listxattr "
-		    "[PATH] [ARGS]\n       btrfs-inspect IMAGE recover [--apply] [--acknowledged "
-		    "GENERATION]\n");
+		    "[PATH] [ARGS]\n       btrfs-inspect [--tree ID] IMAGE walk [--data]\n       "
+		    "btrfs-inspect IMAGE recover [--apply] [--acknowledged "
+		    "GENERATION]\n       btrfs-inspect IMAGE replay [--apply]\n");
 		return 2;
 	}
 	if (strcmp(argv[argument + 1], "recover") == 0) {
 		return recover(argv[argument], argc - argument - 2, argv + argument + 2);
+	}
+	if (strcmp(argv[argument + 1], "replay") == 0) {
+		return replay(argv[argument], argc - argument - 2, argv + argument + 2);
 	}
 	if (btrfs_image_open(argv[argument], &image) != 0) {
 		perror("open image");

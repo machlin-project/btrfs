@@ -16,7 +16,8 @@ full-filesystem `fsync` asks, when memory or metadata pressure requires it, or a
 unmount. Namespace calls return before their transaction commits; POSIX makes
 them durable only through `fsync` of the object or its directory, or `sync`.
 Linux makes a single `fsync` cheap with the tree log, which this implementation
-neither writes nor replays (a pending log is refused at admission). Metadata
+replays (a writable mount replays a pending log before it opens) but does not
+write: its fsync commits. Metadata
 space is reserved when an operation starts, so the commit itself does not run
 out of space; ENOSPC there aborts the transaction and turns the filesystem
 read-only.

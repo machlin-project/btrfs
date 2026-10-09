@@ -36,7 +36,9 @@ rules, data checksum items, block-group accounting, root items and superblock
 copies with three persistence barriers. Independent reference, checksum and
 namespace audits check every committed state.
 Explicit superblock recovery resolves torn or disagreeing copies without rolling
-back an acknowledged generation. Linux agrees with the recorded outcome of
+back an acknowledged generation, and a Linux tree log left by fsync without a
+commit is replayed as Linux's mount replays it; writable mounts do both before
+they open, while read-only mounts refuse a pending log and write nothing. Linux agrees with the recorded outcome of
 reordered and torn crash states on twelve profiles, including namespace facts
 and its own cleanup of the orphans left. The XNU adapter writes through the
 unified buffer cache with grouped or synchronous commits; FSKit's block resource

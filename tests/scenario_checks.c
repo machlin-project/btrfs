@@ -83,6 +83,7 @@ copy_tests(struct context *context)
 	struct bt_disk_super *secondary;
 	struct bt_disk_super *damage;
 	struct btrfs_recovery_report report;
+	struct btrfs_replay_report replay;
 	struct btrfs_fs *fs;
 	struct device *device = context->device;
 	uint64_t generation = context->base_generation;
@@ -193,14 +194,37 @@ copy_tests(struct context *context)
 	    device->count == 1);
 	truncate_writes(device, 0);
 
-	/* Choosing a copy without the pending log would drop fsynced data. */
+	/* Choosing a copy without the pending log would drop fsynced data:
+	 * recovery keeps the primary naming it, as Linux's fsync leaves the
+	 * copies, and leaves the log to replay, which refuses one naming another
+	 * tree's node. */
 	*damage = *primary;
 	bt_put64(&damage->log_root, bt_u64(primary->root));
 	bt_super_seal(damage, BT_SUPER_OFFSET);
 	synthetic(context, BT_SUPER_OFFSET, damage, sizeof(*damage));
+	REQUIRE(btrfs_recover_supers(&context->env, &context->writer, 0, &report) == BTRFS_OK &&
+	    report.selected == 0 && report.rewritten == 0 && device->count == 1);
+	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_RECOVERY_REQUIRED);
+	REQUIRE(btrfs_replay_log(&context->env, &context->writer, (struct btrfs_time){ 0 },
+		    &replay) == BTRFS_CORRUPT &&
+	    device->count == 1);
+
+	/* A torn secondary beside it is rewritten without the log. */
+	*damage = *secondary;
+	((uint8_t *)damage)[DEVICE_SECTOR * 3] ^= 1;
+	synthetic(context, bt_super_offset(1), damage, sizeof(*damage));
+	REQUIRE(btrfs_recover_supers(&context->env, &context->writer, 0, &report) == BTRFS_OK &&
+	    report.selected == 0 && report.rewritten == 1 && device->count == 3);
+	super_copy(context, 1, damage);
+	REQUIRE(bt_u64(damage->log_root) == 0 && bt_super_same(damage, secondary));
+
+	/* A log named outside the primary is not Linux's. */
+	bt_put64(&damage->log_root, bt_u64(primary->root));
+	bt_super_seal(damage, bt_super_offset(1));
+	synthetic(context, bt_super_offset(1), damage, sizeof(*damage));
 	REQUIRE(btrfs_recover_supers(&context->env, &context->writer, 0, &report) ==
 		BTRFS_UNSUPPORTED &&
-	    device->count == 1);
+	    device->count == 4);
 	truncate_writes(device, 0);
 	REQUIRE(context->image.live_allocations == 0);
 	free(damage);

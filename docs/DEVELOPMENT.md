@@ -61,6 +61,31 @@ RECOVERY_REQUIRED; `tests/check_recovery.py` exercises it on a copy):
 .build/btrfs-inspect IMAGE recover --apply --acknowledged GENERATION
 ```
 
+Explicit tree-log replay of an image: without `--apply` the log is replayed
+without a commit and nothing is written (exit 3: a log is pending and replays,
+4: no log is pending); `--apply` commits the replay. Superblock copies that
+disagree beyond the log fields need `recover --apply` first. `walk [--data]`
+prints one JSON line per path below the mounted tree's root (attributes,
+xattrs and, with `--data`, file and symlink bytes, all names and bytes in
+hexadecimal):
+
+```sh
+.build/btrfs-inspect IMAGE replay
+.build/btrfs-inspect IMAGE replay --apply
+.build/btrfs-inspect IMAGE walk --data
+```
+
+`tree-log-replay` (`tests/check_log_replay.py`) replays copies of the `logs`
+and `logs-many` fixtures through `btrfs-inspect` and compares the walked
+namespace with the manifest Linux printed after its own replay; it also
+refuses malformed logs and recovers disagreeing copies before replay.
+`tree-log-replay-faults` (`tests/replay.c`) fails every allocation, read, write
+and barrier of a replay of `logs` in turn, and cuts power after every write,
+then requires the adapters' sequence (replay, superblock recovery, open) to
+reach the namespace of an uninterrupted replay. Run it on `logs-many` by hand
+(`.build/btrfs-replay-test artifacts/fixtures/logs-many.raw`, about 17 minutes
+with sanitizers).
+
 `btrfs-bench IMAGE [--cache MiB] [--write [--durable]]` measures per-operation
 wall and process CPU time, backend reads, read bytes and allocations for
 sequential and random reads, lookups, directory streams with and without inode
@@ -292,6 +317,52 @@ audits, a transaction admission and full reads of every file; at each mark the
 synced files must be exact. Replaying the whole log must reproduce the final
 device image byte for byte. The inputs are generated deterministically on both
 sides, so no input file is shipped.
+
+## Linux tree logs
+
+`tests/prepare_log_linux.py` builds payloads in three phases. `create` formats
+`/dev/vda` (the `logs` profile: 16 KiB nodes, DUP metadata; `logs-many`: 4 KiB
+nodes, single metadata), mounts with `commit=3600`, commits a base with `sync`,
+then makes fsync durable: a new file, an append, an overwrite, a truncation, a
+rename, an unlink with its directory fsynced, a new hard link, an xattr set and
+removed, a removed hard link, ten removed directory entries, a preallocation,
+mode and ownership changes, an append in a subvolume, an fsynced file removed
+again, a symlink and a new directory; `logs-many` adds a 2,000-entry directory
+and a file with 64 one-byte overwrites. It then powers off with
+`echo o > /proc/sysrq-trigger`, so the image keeps a pending log. `expect`
+requires the log, lets Linux replay it by mounting a disposable copy, and prints
+the manifest (every path with its number, mode, owner, links, size, content
+hash, regular files' mtime and xattrs). `verify` requires no pending log, runs
+`btrfs check --readonly`, prints the same manifest, writes a file and checks
+again. From the absolute lab directory, with `p` set to `logs` or `logs-many`
+and `S` a private scratch directory:
+
+```sh
+python3 ../btrfs/tests/prepare_log_linux.py --root artifacts/btrfs-reference/root \
+  --phase create --profile $p --archive artifacts/btrfs-reference/$p-create.cpio
+python3 -c "from pathlib import Path; f=Path('../btrfs/artifacts/fixtures/$p.raw').open('xb'); f.truncate(256 << 20); f.close()"
+.cache/linux-reference/linux-vm .cache/linux-reference/Image \
+  artifacts/btrfs-reference/$p-create.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/fixtures/$p.raw > ../btrfs/logs/linux-log-create-$p.log 2>&1
+cp -n artifacts/btrfs-reference/$p-create.json ../btrfs/artifacts/fixtures/$p.json
+cp -n ../btrfs/artifacts/fixtures/$p.raw $S/$p-expect.raw
+python3 ../btrfs/tests/prepare_log_linux.py --root artifacts/btrfs-reference/root \
+  --phase expect --archive artifacts/btrfs-reference/$p-expect.cpio
+.cache/linux-reference/linux-vm .cache/linux-reference/Image \
+  artifacts/btrfs-reference/$p-expect.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  $S/$p-expect.raw > ../btrfs/logs/linux-log-expect-$p.log 2>&1
+grep '^BTRFS_LOG_MANIFEST:' ../btrfs/logs/linux-log-expect-$p.log | \
+  sed 's/^BTRFS_LOG_MANIFEST://' > ../btrfs/artifacts/fixtures/$p.expected.tsv
+```
+
+Require `BTRFS_LOG_CREATED:$p`, then `BTRFS_LOG_PENDING` and
+`BTRFS_LOG_EXPECT_PASS`. The manifest keeps the serial console's CRLF line
+ends; the checks read it line by line. To verify an image this implementation
+replayed, run the `verify` phase on a copy of it the same way and require
+`BTRFS_LOG_VERIFY_PASS`; its manifest must equal the expected one, apart from
+`.fseventsd` and the root directory's size after a macOS writable mount.
 
 ## Fuzzing and concurrency
 
@@ -735,6 +806,24 @@ with the manifest's line count and
 mode, owner, links, listings, inode numbers of the mounted subvolume and the
 subvolume boundary, symlink, xattr, mtime, absent names), then a Linux
 read-write mount, write, `btrfs check` again and no orphan item left.
+
+### Native tree-log replay
+
+`run_macos.py` does not drive replay yet; the accepted runs followed these
+steps on each pending-log fixture, copied into the guest under a new name and
+checked by hash. Through the loaded module: attach with `hdiutil attach
+-nomount`, require `mount_machlin_btrfs DEVICE MOUNT` (read-only) to fail with
+the image unchanged, mount with `-w`, take a native manifest (path, kind,
+`stat -f '%i %Lp %u %g %l %z %m'`, SHA-256 or link target) and run
+`btrfs-mounted-walk-test`, unmount and detach. Through installed FSKit: require
+`hdiutil attach -readonly` to report no mountable file system with the image
+unchanged, then attach read-write, which Disk Arbitration mounts after its
+repair request, and take the same manifest and walk. Copy each image back,
+compare the manifest with `artifacts/fixtures/*.expected.tsv` (macOS adds
+`.fseventsd` and the root's native number is 2), and run the Linux `verify`
+phase on a copy. The kernel's replay line is in the unified log
+(`log show --predicate 'eventMessage CONTAINS "tree-log replay"'`); the
+kernel message buffer is too small to keep it.
 
 ### Native power cuts
 

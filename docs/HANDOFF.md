@@ -22,7 +22,7 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require thirty-seven passing test processes on macOS (thirty-six elsewhere) and
+Require fifty passing test processes on macOS (forty-nine elsewhere) and
 all seven reader profiles (367 contracts). Thirteen writable images are required
 by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
@@ -36,7 +36,9 @@ collisions, extended references, compression properties) and
 `transactions-holes` (no NO_HOLES, DUP data), `transactions-convert` (1 GiB with
 a free-space tree whose conversions Linux measured) and `transactions-copies`
 (257 GiB sparse, three superblock copies); the Linux crash-state test needs the
-recorded `logwrites.log` and `logwrites-data.raw`. Missing fixtures
+recorded `logwrites.log` and `logwrites-data.raw`, and the replay tests the
+pending-log images `logs` and `logs-many` with the manifests Linux printed
+after replaying them (`*.expected.tsv`). Missing fixtures
 are failures. Recreate them in a disposable Linux VM using DEVELOPMENT.md, which
 also describes the exported crash cases and the two-disk Linux oracle.
 
@@ -54,7 +56,8 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Private tree editor | Path CoW; insert/replace/upsert/delete; variable-item splits including three leaves; root growth and collapse; poisoned failures | `core/mutable.c`, `tests/mutable.c` |
 | Reservation allocator | Extent-map and block-group reconciliation, physical alias/super-stripe exclusion, pinned committed allocations, bounded free gaps | `core/space.c` |
 | Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission, reference/accounting fixed point, root/backup updates, three barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
-| Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, log/foreign-copy refusal, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
+| Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, foreign-copy and non-primary-log refusal, a primary's log kept for replay, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
+| Tree-log replay | Linux's log passes in one transaction through a G+1 log view: withheld log blocks and logged extents, inode overwrite rules, directory and xattr deletions, names, back references, file extents with references, allocation and checksums, link-count fixups with orphans | `core/replay.c`, `include/btrfs/write.h`, `tests/replay.c` |
 | Free-space tree | Verification against the extent tree, logged allocation changes applied in the fixed point, extents and bitmaps | `core/fst.c`, `core/space.c` |
 | File data / checksums | CoW writes and truncation, drop-extents splitting, data written as extents are created, compression on write, inline small files, private read view, checksum items | `core/data.c`, `core/csum.c` |
 | Namespace mutations / audit | Create of every type, link, unlink with orphans, rename with replacement, packed collision items, xattrs and the compression property; independent namespace audit | `core/namespace.c`, `tests/namespace_audit.c` |
@@ -80,8 +83,12 @@ is destroyed. `accept` is legal only after successful durable publication;
    (`btrfs-inspect IMAGE recover`), and crash states Linux wrote (recorded
    with dm-log-writes, replayed and recovered here). Read-write native mounts
    recover disagreeing superblock copies before they open, and both adapters
-   pass native power cuts; read-only mounts write nothing. Remaining: tree-log
-   replay. Extend every new writer feature with scenarios in `tests/scenario_*.c`,
+   pass native power cuts; read-only mounts write nothing. Linux tree logs are
+   replayed in one transaction (`core/replay.c`) as Linux's mount does, and
+   writable mounts replay before they open; malformed logs, faults, power cuts
+   and Linux's checks of the replayed images pass. Remaining: writing a tree
+   log for fsync, which needs its own writer, a full-commit fallback and Linux
+   replaying the logs written here. Extend every new writer feature with scenarios in `tests/scenario_*.c`,
    add its operations to the randomized model in `tests/scenario_random.c`, and
    export both to the Linux oracle.
 2. **Extend shared references.** CoW of shared blocks follows Linux's
@@ -236,7 +243,8 @@ the current sector-tear model permits every superblock copy to tear if their
 writes share one unbarriered epoch.
 Do not cancel reference additions/drops without preserving snapshot and
 FULL_BACKREF transitions.
-Tree-log fsync needs a separate replay and power-cut design. Hardware CRC uses
+Writing a tree log for fsync needs its own writer, power-cut model and a Linux
+oracle that replays logs written here; replay already follows Linux. Hardware CRC uses
 general registers; arm64e kernel builds enforce `-mgeneral-regs-only`, since
 the adapter does not own SIMD state even for compiler-generated copies.
 

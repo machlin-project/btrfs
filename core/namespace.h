@@ -62,6 +62,18 @@ int bt_ns_frozen(const struct bt_disk_inode *item);
 size_t bt_ns_length(const char *text);
 uint64_t bt_ns_hash(const void *name, size_t length);
 enum btrfs_result bt_ns_name(const void *name, size_t length);
+/* The INODE_EXTREF key offset of a name in directory. */
+uint64_t bt_ns_extref_hash(uint64_t directory, const void *name, size_t length);
+/* Finds a name among packed INODE_REF entries, or directory's name among
+ * packed INODE_EXTREF entries: its offset and index; NOT_FOUND when absent. */
+enum btrfs_result bt_ns_ref_find(const struct bt_packed *packed, const void *name, size_t length,
+    size_t *offset, uint64_t *index);
+enum btrfs_result bt_ns_extref_find(const struct bt_packed *packed, uint64_t directory,
+    const void *name, size_t length, size_t *offset, uint64_t *index);
+/* Adds inode's back reference for name in directory: its INODE_REF item while
+ * that has room, else an INODE_EXTREF item, as btrfs_insert_inode_ref does. */
+enum btrfs_result bt_ns_add_ref(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
+    uint64_t directory, const void *name, size_t length, uint64_t inode, uint64_t index);
 size_t bt_ns_item_limit(const struct btrfs_transaction *transaction);
 uint64_t bt_ns_transid(const struct btrfs_transaction *transaction);
 enum btrfs_result bt_ns_neighbor(struct btrfs_transaction *transaction,

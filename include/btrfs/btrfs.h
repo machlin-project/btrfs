@@ -201,6 +201,12 @@ enum btrfs_result btrfs_mount(
     const struct btrfs_environment *environment, uint64_t tree, struct btrfs_fs **result);
 void btrfs_unmount(struct btrfs_fs *fs);
 void btrfs_get_info(const struct btrfs_fs *fs, struct btrfs_info *info);
+/* The identity the primary superblock records once its checksum and offset
+ * verify, without mounting: what a probe needs to recognize a volume whose
+ * mount first requires recovery (RECOVERY_REQUIRED, as a pending tree log
+ * does). default_tree is 0; nothing beyond the superblock is read. */
+enum btrfs_result btrfs_identify(
+    const struct btrfs_environment *environment, struct btrfs_info *info);
 enum btrfs_result btrfs_root(const struct btrfs_fs *fs, struct btrfs_inode *inode);
 enum btrfs_result btrfs_get_inode(
     const struct btrfs_fs *fs, struct btrfs_object_id id, struct btrfs_inode *inode);

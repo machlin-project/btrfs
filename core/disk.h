@@ -61,6 +61,9 @@ struct bt_le64 {
 #define BT_CSUM_OBJECTID (UINT64_MAX - UINT64_C(9))
 #define BT_LAST_FREE_OBJECTID (UINT64_MAX - UINT64_C(255))
 #define BT_ORPHAN_OBJECTID (UINT64_MAX - UINT64_C(4))
+/* Owner of every tree-log block, and the objectid of each subvolume log's
+ * root item in the log root tree. */
+#define BT_TREE_LOG_OBJECTID (UINT64_MAX - UINT64_C(5))
 #define BT_DIR_START_INDEX UINT64_C(2)
 #define BT_INODE_NODATACOW (UINT64_C(1) << 1)
 #define BT_INODE_NOCOMPRESS (UINT64_C(1) << 3)
@@ -116,6 +119,8 @@ enum bt_item_type {
 	BT_INODE_EXTREF = 13,
 	BT_XATTR_ITEM = 24,
 	BT_ORPHAN_ITEM = 48,
+	BT_DIR_LOG_ITEM = 60,
+	BT_DIR_LOG_INDEX = 72,
 	BT_DIR_ITEM = 84,
 	BT_DIR_INDEX = 96,
 	BT_EXTENT_DATA = 108,
@@ -305,6 +310,12 @@ struct bt_disk_inode_extref {
 	struct bt_le64 parent;
 	struct bt_le64 index;
 	struct bt_le16 name_length;
+};
+
+/* A DIR_LOG_INDEX item: the log is authoritative for directory index keys
+ * from the item's key offset to end. */
+struct bt_disk_dir_log {
+	struct bt_le64 end;
 };
 
 struct bt_disk_root_ref {

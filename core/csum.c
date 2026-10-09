@@ -95,9 +95,11 @@ bt_csum_exists(struct bt_mutation *mutation, struct bt_root checksums, uint64_t 
 	return bt_csum_find(mutation, checksums, logical, logical + length, &item, exists);
 }
 
-enum btrfs_result
-bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t logical,
-    const uint8_t *data, uint64_t length)
+/* Inserts the checksums of [logical, logical + length) in items of at most
+ * Linux's per-item count: computed from data, or copied from sums. */
+static enum btrfs_result
+bt_csum_store(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t logical,
+    const uint8_t *data, const uint8_t *sums, uint64_t length)
 {
 	const struct btrfs_fs *view = bt_mutation_view(mutation);
 	struct bt_csum_item existing;
@@ -135,7 +137,10 @@ bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t
 		count = (length - done) / sector < bt_csum_item_limit(view)
 		    ? (size_t)((length - done) / sector)
 		    : bt_csum_item_limit(view);
-		for (i = 0; i < count; i += batch) {
+		if (sums != NULL) {
+			bt_copy(buffer, sums + (size_t)(done / sector) * size, count * size);
+		}
+		for (i = 0; sums == NULL && i < count; i += batch) {
 			batch = count - i < limit ? count - i : limit;
 			bt_checksum_sectors(
 			    view, data + done + i * sector, batch, buffer + i * size);
@@ -145,6 +150,20 @@ bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t
 	}
 	view->env.release(view->env.context, buffer, view->info.node_size);
 	return error;
+}
+
+enum btrfs_result
+bt_csum_insert(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t logical,
+    const uint8_t *data, uint64_t length)
+{
+	return bt_csum_store(mutation, checksums, logical, data, NULL, length);
+}
+
+enum btrfs_result
+bt_csum_insert_sums(struct bt_mutation *mutation, struct bt_root *checksums, uint64_t logical,
+    const uint8_t *sums, uint64_t length)
+{
+	return bt_csum_store(mutation, checksums, logical, NULL, sums, length);
 }
 
 enum btrfs_result

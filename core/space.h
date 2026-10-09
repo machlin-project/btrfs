@@ -67,6 +67,11 @@ enum btrfs_result bt_space_reserve_exact(
     struct bt_space *space, uint64_t length, uint64_t *logical);
 enum btrfs_result bt_space_change_used(
     struct bt_space *space, uint64_t address, uint64_t size, int allocate);
+/* Takes [logical, logical + length) out of allocation for the rest of the
+ * transaction without accounting it, loading its chunk first: the blocks of a
+ * tree log, which no extent item describes, and data extents a log references
+ * until its replay accounts them. */
+enum btrfs_result bt_space_withhold(struct bt_space *space, uint64_t logical, uint64_t length);
 uint64_t bt_space_used(const struct bt_space *space, size_t chunk);
 size_t bt_space_change_count(const struct bt_space *space);
 const struct bt_space_change *bt_space_change(const struct bt_space *space, size_t index);

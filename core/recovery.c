@@ -5,7 +5,8 @@
 
 /* Opens the selected copy as a complete committed state: chunk tree, root tree,
  * checksum and top-level roots (through mount), then the device tree root and the
- * extent tree with its block-group accounting. File trees are not scrubbed. */
+ * extent tree with its block-group accounting. File trees are not scrubbed, nor
+ * a tree log the selected primary names: its replay follows recovery. */
 static enum btrfs_result
 bt_recovery_validate(
     const struct btrfs_environment *environment, const struct bt_disk_super *super, uint64_t offset)
@@ -20,7 +21,8 @@ bt_recovery_validate(
 
 	/* A candidate may still be refused; its nodes never enter the cache. */
 	uncached.cache = NULL;
-	error = bt_mount_super(&uncached, super, offset, BTRFS_TOP_LEVEL_TREE, &fs);
+	error = bt_mount_super(
+	    &uncached, super, offset, BTRFS_TOP_LEVEL_TREE, bt_u64(super->log_root) != 0, &fs);
 	if (error != BTRFS_OK) {
 		return error;
 	}
@@ -57,6 +59,7 @@ bt_recovery_select(const struct bt_disk_super *copies, struct btrfs_recovery_rep
 	struct btrfs_super_copy *copy;
 	unsigned best = BTRFS_SUPER_COPIES;
 	unsigned i;
+	int logged;
 
 	for (i = 0; i < BTRFS_SUPER_COPIES; i++) {
 		copy = &report->copies[i];
@@ -75,6 +78,11 @@ bt_recovery_select(const struct bt_disk_super *copies, struct btrfs_recovery_rep
 		return BTRFS_CORRUPT;
 	}
 	selected = &copies[best];
+	logged = bt_u64(selected->log_root) != 0;
+	/* Linux writes a tree log into the primary copy alone. */
+	if (logged && best != 0) {
+		return BTRFS_UNSUPPORTED;
+	}
 	report->selected = best;
 	report->generation = report->copies[best].generation;
 	/* The selection fixes the device size and with it the set of copies Linux
@@ -93,15 +101,18 @@ bt_recovery_select(const struct bt_disk_super *copies, struct btrfs_recovery_rep
 		if (copy->status != BTRFS_OK) {
 			continue;
 		}
-		/* Copies of another filesystem or a pending tree log are never resolved by
-		 * choosing one: replay is unsupported and a foreign copy is ambiguous. */
+		/* A copy of another filesystem is ambiguous, and a log outside the
+		 * selected primary is not Linux's. */
 		if (!bt_equal(copies[i].fsid, selected->fsid, sizeof(selected->fsid))) {
 			return BTRFS_CORRUPT;
 		}
-		if (copy->generation == report->generation && bt_u64(copies[i].log_root) != 0) {
+		if (i != best && copy->generation == report->generation &&
+		    bt_u64(copies[i].log_root) != 0) {
 			return BTRFS_UNSUPPORTED;
 		}
-		copy->current = bt_super_same(&copies[i], selected);
+		copy->current = i == best ||
+		    (logged ? bt_super_same_but_log(&copies[i], selected)
+			    : bt_super_same(&copies[i], selected));
 		if (copy->generation == report->generation && !copy->current) {
 			return BTRFS_CORRUPT;
 		}
@@ -183,6 +194,8 @@ btrfs_recover_supers(const struct btrfs_environment *environment,
 			continue;
 		}
 		*output = copies[report->selected];
+		bt_put64(&output->log_root, 0);
+		output->log_level = 0;
 		bt_super_seal(output, copy->offset);
 		error = writer->write(writer->context, copy->offset, output, sizeof(*output));
 		report->rewritten++;

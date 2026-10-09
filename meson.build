@@ -11,7 +11,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/inode.c', 'core/directory.c', 'core/parent.c', 'core/read.c', 'core/xattr.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/subvolume.c', 'core/drop.c',
-  'core/group.c', 'core/cache.c', 'core/checksum.c')
+  'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -62,6 +62,8 @@ mutable_test = executable('btrfs-mutable-test', 'tests/mutable.c', include_direc
   link_with: core)
 test('private-cow-trees', mutable_test, suite: 'core', timeout: 180)
 adversarial = executable('btrfs-adversarial', 'tests/adversarial.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
+replay_test = executable('btrfs-replay-test', 'tests/replay.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 identity_test = executable('btrfs-identity-test', 'tests/identity.c', include_directories: inc,
   link_with: identity)
@@ -139,6 +141,10 @@ if fixtures != ''
     '--tool', inspect, '--fixtures', fixtures], timeout: 300, suite: 'images')
   test('explicit-recovery', py, args: [files('tests/check_recovery.py'), '--tool', inspect,
     '--fixture', join_paths(fixtures, 'transactions.raw')], timeout: 120, suite: 'images')
+  test('tree-log-replay', py, args: [files('tests/check_log_replay.py'), '--tool', inspect,
+    '--fixtures', fixtures], timeout: 300, suite: 'images')
+  test('tree-log-replay-faults', replay_test, args: [join_paths(fixtures, 'logs.raw')],
+    timeout: 1800, suite: 'images')
   test('linux-crash-states', logwrites_test, args: [join_paths(fixtures, 'logwrites.log'),
     join_paths(fixtures, 'logwrites-data.raw')], timeout: 600, suite: 'images')
   test('malformed-faults-and-io-budgets', adversarial,

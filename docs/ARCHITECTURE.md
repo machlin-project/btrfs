@@ -40,7 +40,8 @@ The owner supplies a fixed-size resource that remains unchanged for the mount
 lifetime. Exact-read callbacks either fill the entire requested range or fail;
 the core checks bounds first. Allocate/release are paired with exact sizes.
 The read environment has no write operation. Mount, mirror fallback, reads and unmount
-cannot repair media or replay a pending tree log.
+cannot repair media or replay a pending tree log; a filesystem with one is
+refused (RECOVERY_REQUIRED) rather than shown without its fsynced changes.
 
 Only the primary superblock is admitted. Automatic selection of an older mirror
 could silently roll back acknowledged data and is not a mount fallback. Unknown
@@ -890,8 +891,12 @@ Mount reads only the primary, so a torn primary fails as CORRUPT and an older
 mirror is never silently chosen. `btrfs_recover_supers` is the explicit,
 exclusive recovery operation, matching `btrfs rescue super-recover`: it selects
 the newest checksum-valid copy, requires same-generation copies to agree, and
-refuses a selection below the caller's acknowledged generation (STALE), a pending
-tree log (UNSUPPORTED) or a copy with another filesystem identity (CORRUPT).
+refuses a selection below the caller's acknowledged generation (STALE), a tree
+log named outside the primary (UNSUPPORTED) or a copy with another filesystem
+identity (CORRUPT). Linux's fsync writes the log root into the primary alone, so
+a selected primary may name a log: a same-generation copy that differs only by
+naming none agrees with it, rewritten copies name none, and the log stays for
+replay.
 Before writing, it opens the selection's chunk, root, checksum, top-level, device
 and extent trees and allocation map; file trees are not scrubbed. It rewrites
 only disagreeing copies, never the selected source, followed by one barrier.
@@ -911,12 +916,70 @@ before it opens, without an acknowledged generation: the newest checksum-valid
 copy names a complete tree, since the first barrier precedes every copy, and
 every acknowledged commit wrote all copies, so the selection is never older than
 one. Opening from the primary instead could reuse blocks a newer copy references.
-A read-only mount reads the primary and writes nothing. Neither adapter replays
-a tree log; the reader refuses filesystems that have one. Both adapters pass
-native power-cut acceptance; FSKit dirty-page coherence remains open. Backup
+A read-only mount reads the primary and writes nothing; one with a pending tree
+log is refused. A read-write mount replays the log first (next section). Both
+adapters pass native power-cut acceptance; FSKit dirty-page coherence remains open. Backup
 roots are rotating recovery hints, not permanently pinned snapshots. See
 ACCEPTANCE.md for the exact crash oracle scope and HANDOFF.md for the remaining
 writable-mount requirements.
+
+## Tree-log replay
+
+Linux makes an `fsync` durable without a commit: it writes the changed items into
+a tree log per subvolume and only the primary superblock, which then names the
+log root tree, while the transaction stays open. A crash before the next commit
+leaves committed trees without those changes. Linux replays the log when it
+mounts (`btrfs_recover_log_trees`). Here `btrfs_replay_log` is the explicit
+recovery operation that does the same, in one transaction; the reader never
+does.
+
+`core/replay.c` reads the log through a separate view one generation beyond the
+committed one (log blocks carry generation G+1 and owner TREE_LOG), outside the
+shared node cache, in Linux's passes:
+
+1. Pin. Every log block and every data extent a logged file extent references
+   is withheld from allocation for the transaction (`bt_space_withhold`): no
+   extent item describes them, so the free-space tree shows them free.
+2. Inodes. A logged INODE_ITEM replaces the subvolume's under Linux's overwrite
+   rules (an existing item keeps its byte count, a directory its size), after
+   the xattrs the log no longer has and the index entries its DIR_LOG_INDEX
+   ranges no longer list are removed; a regular file is truncated to its logged
+   size. An inode logged without links (a tmpfile) is skipped entirely.
+3. Names. A logged DIR_INDEX entry is added unless its name and index already
+   match; conflicting entries are unlinked; a name whose back reference is also
+   logged waits for it.
+4. Everything else, in key order: xattrs; INODE_REF and INODE_EXTREF items,
+   linking each name after dropping conflicting names, then unlinking the
+   subvolume's names the logged item lacks; file extents, which replace the
+   range they cover, add a reference to an existing extent item or allocate a
+   missing one (`btrfs_alloc_logged_file_extent`), and carry the log's
+   checksums into the checksum tree.
+5. Link counts. Each inode whose names changed gets the number of its
+   INODE_REF and INODE_EXTREF names, highest inode first; one left with none
+   loses its directory entries if it is a directory and gets an orphan item for
+   the orphan cleanup that follows at open.
+
+The commit names no log. Its copies are published as every commit's are, so a
+cut after the secondaries leaves the replayed generation there beside the
+primary still naming the log; superblock recovery then selects the replayed
+generation. Logs (`BT_REPLAY_TREES`), recomputed inodes (`BT_REPLAY_FIXUPS`),
+log nodes (`BT_REPLAY_NODES`) and every scan have explicit bounds. Malformed log
+records are CORRUPT and nothing is written unless every item replays; without
+a writer the replay runs without a commit and returns RECOVERY_REQUIRED. A
+logged directory entry naming a subvolume root is UNSUPPORTED: Linux never
+writes one, since creating or deleting a subvolume makes the directory's next
+fsync a full commit. Quotas are not admitted, so no quota accounting is replayed.
+
+A writable adapter open that returns RECOVERY_REQUIRED replays a pending log;
+without one, or when copies disagree beyond the log fields, it runs superblock
+recovery; then it opens again, for at most two rounds, since recovery may leave
+the selected primary's log for replay. Orphan cleanup follows at open. The FSKit
+probe recognizes a volume whose mount needs recovery (`btrfs_identify`, from the
+verified superblock alone). Disk Arbitration's quick check, which loads it
+read-only, then fails; its repair request (`-y` or `-p`) succeeds only after a
+writable load has replayed, and admits the volume as a quick check would; no
+other full check is offered. Read-only attachments and mounts are refused and
+write nothing.
 
 ## Primary format references
 

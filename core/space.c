@@ -187,6 +187,29 @@ bt_space_gap(struct bt_space *space, struct bt_gaps *list, uint64_t start, uint6
 	return BTRFS_OK;
 }
 
+/* Removes [start, end) from list's ranges, splitting one that holds it. */
+static enum btrfs_result
+bt_space_carve(struct bt_space *space, struct bt_gaps *list, uint64_t start, uint64_t end)
+{
+	uint64_t old_end;
+	size_t i;
+	enum btrfs_result error;
+
+	error = bt_gaps_own(&space->fs->env, list);
+	for (i = 0; error == BTRFS_OK && i < list->count; i++) {
+		if (start < list->items[i].end && end > list->items[i].start) {
+			old_end = list->items[i].end;
+			if (start <= list->items[i].start) {
+				list->items[i].start = end < old_end ? end : old_end;
+			} else {
+				list->items[i].end = start;
+				error = bt_space_gap(space, list, end, old_end);
+			}
+		}
+	}
+	return error;
+}
+
 /* Exclude every physical superblock's whole stripe of one chunk from
  * allocation, including each DUP mapping. Extent trees do not describe these
  * reserved stripes. */
@@ -196,20 +219,12 @@ bt_space_exclude(struct bt_space *space, const struct bt_chunk *chunk, struct bt
 	uint64_t physical;
 	uint64_t start;
 	uint64_t end;
-	uint64_t old_end;
-	size_t i;
 	unsigned mirror;
 	unsigned copy;
-	enum btrfs_result error;
+	enum btrfs_result error = BTRFS_OK;
 
-	if (list != NULL) {
-		error = bt_gaps_own(&space->fs->env, list);
-		if (error != BTRFS_OK) {
-			return error;
-		}
-	}
-	for (copy = 0; list != NULL && copy < chunk->mirrors; copy++) {
-		for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
+	for (copy = 0; list != NULL && error == BTRFS_OK && copy < chunk->mirrors; copy++) {
+		for (mirror = 0; error == BTRFS_OK && mirror < BT_SUPER_MIRRORS; mirror++) {
 			physical = bt_super_offset(mirror) & ~(BT_STRIPE_LENGTH - 1);
 			if (physical + BT_STRIPE_LENGTH <= chunk->physical[copy] ||
 			    physical >= chunk->physical[copy] + chunk->length) {
@@ -220,24 +235,10 @@ bt_space_exclude(struct bt_space *space, const struct bt_chunk *chunk, struct bt
 							      : 0);
 			end = physical + BT_STRIPE_LENGTH - chunk->physical[copy];
 			end = chunk->logical + (end < chunk->length ? end : chunk->length);
-			for (i = 0; i < list->count; i++) {
-				if (start < list->items[i].end && end > list->items[i].start) {
-					old_end = list->items[i].end;
-					if (start <= list->items[i].start) {
-						list->items[i].start =
-						    end < old_end ? end : old_end;
-					} else {
-						list->items[i].end = start;
-						error = bt_space_gap(space, list, end, old_end);
-						if (error != BTRFS_OK) {
-							return error;
-						}
-					}
-				}
-			}
+			error = bt_space_carve(space, list, start, end);
 		}
 	}
-	return BTRFS_OK;
+	return error;
 }
 
 static enum btrfs_result
@@ -1537,6 +1538,30 @@ bt_space_change_used(struct bt_space *space, uint64_t address, uint64_t size, in
 		space->used[i] = allocate ? space->used[i] + size : space->used[i] - size;
 	}
 	return error;
+}
+
+enum btrfs_result
+bt_space_withhold(struct bt_space *space, uint64_t logical, uint64_t length)
+{
+	const struct bt_chunk *chunk;
+	struct bt_gaps *list;
+	size_t i = bt_chunk_containing(space->fs, logical);
+	enum btrfs_result error = BTRFS_OK;
+
+	if (i == space->fs->chunk_count) {
+		return BTRFS_CORRUPT;
+	}
+	chunk = &space->fs->chunks[i];
+	list = bt_space_class(space, chunk);
+	if (list == NULL || length == 0 || length > chunk->logical + chunk->length - logical) {
+		return BTRFS_CORRUPT;
+	}
+	/* Only a loaded chunk tells free from used bytes, as Linux caches the
+	 * block group before it excludes a logged extent. */
+	if (!space->loaded[i]) {
+		error = bt_space_load_chunk(space, i);
+	}
+	return error == BTRFS_OK ? bt_space_carve(space, list, logical, logical + length) : error;
 }
 
 uint64_t
