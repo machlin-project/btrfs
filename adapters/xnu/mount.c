@@ -446,13 +446,16 @@ btrfs_xnu_cache_unlock(void *context)
 }
 
 /* Rounds of replay or recovery before a writable open: superblock recovery
- * may leave the log of the primary it selects pending, for one replay. */
-#define BTRFS_XNU_OPEN_ROUNDS 2U
+ * may leave the log of the primary it selects pending, for one replay, and
+ * relocation recovery follows the log. */
+#define BTRFS_XNU_OPEN_ROUNDS 3U
 
-/* A pending tree log, or superblock copies left disagreeing by an interrupted
- * publication, make a writable open fail (RECOVERY_REQUIRED). A read-write
- * mount, which asked to write, replays a log as Linux's mount does, committing
- * what fsync made durable. Without a log, or when copies disagree, it resolves
+/* A pending tree log, relocation trees of a balance a crash interrupted, or
+ * superblock copies left disagreeing by an interrupted publication make a
+ * writable open fail (RECOVERY_REQUIRED). A read-write mount, which asked to
+ * write, replays a log as Linux's mount does, committing what fsync made
+ * durable, and then merges and drops relocation trees as Linux's
+ * btrfs_recover_relocation does. Without either, or when copies disagree, it resolves
  * them by explicit recovery to the newest complete root set, which is never
  * older than an acknowledged commit, since a commit from the primary could
  * reuse blocks a newer copy references. Then it opens again. A read-only
@@ -464,6 +467,7 @@ btrfs_xnu_open_volume(const struct btrfs_environment *environment,
 {
 	struct btrfs_recovery_report report;
 	struct btrfs_replay_report replay;
+	struct btrfs_relocation_report relocation;
 	struct btrfs_time now;
 	unsigned round;
 	enum btrfs_result result;
@@ -482,6 +486,24 @@ btrfs_xnu_open_volume(const struct btrfs_environment *environment,
 			    (unsigned long long)replay.inodes, (unsigned long long)replay.names,
 			    (unsigned long long)replay.unlinked, (unsigned long long)replay.extents,
 			    (unsigned long long)replay.orphans, btrfs_result_string(result));
+		}
+		/* As Linux's read-write mount: after the log, a balance a crash
+		 * interrupted is merged and dropped. */
+		if (result == BTRFS_NOT_FOUND) {
+			result = btrfs_recover_relocation(environment, writer, &relocation);
+			if (result != BTRFS_NOT_FOUND) {
+				printf(
+				    "machlin_btrfs: relocation recovery after generation %llu: "
+				    "%llu trees, %llu merged, %llu dropped, %llu orphans in %llu "
+				    "commits: %s\n",
+				    (unsigned long long)relocation.generation,
+				    (unsigned long long)relocation.trees,
+				    (unsigned long long)relocation.merged,
+				    (unsigned long long)relocation.dropped,
+				    (unsigned long long)relocation.orphans,
+				    (unsigned long long)relocation.commits,
+				    btrfs_result_string(result));
+			}
 		}
 		if (result == BTRFS_NOT_FOUND || result == BTRFS_RECOVERY_REQUIRED) {
 			result = btrfs_recover_supers(environment, writer, 0, &report);

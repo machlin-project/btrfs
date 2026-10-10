@@ -30,6 +30,12 @@ struct bt_mutable_node {
 	struct bt_shadow shadows[2];
 	uint8_t *bytes;
 	uint64_t address;
+	/* The tree the node belongs to; a relocation tree's nodes keep the
+	 * owner of the file tree they copy in their header. */
+	uint64_t tree;
+	/* The node's parent, for nodes bt_mutation_set_child copied below a
+	 * parent; zero otherwise and for a root. */
+	uint64_t parent;
 	uint64_t original;
 	uint64_t original_owner;
 	uint64_t original_generation;
@@ -107,7 +113,7 @@ bt_mut_root(struct bt_mutable_node *node)
 
 	root.address = node->address;
 	root.generation = bt_u64(header->generation);
-	root.owner = bt_u64(header->owner);
+	root.owner = node->tree;
 	root.level = header->level;
 	return root;
 }
@@ -328,10 +334,18 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 	node->original_generation = original == 0 ? 0 : bt_u64(header->generation);
 	node->original_flags = original == 0 ? 0 : bt_u64(header->flags);
 	node->original_level = header->level;
+	node->tree = root.owner;
 	bt_put64(&header->bytenr, address);
-	bt_put64(&header->owner, root.owner);
 	bt_put64(&header->generation, mutation->view.info.generation);
-	bt_put64(&header->flags, BT_HEADER_WRITTEN | BT_HEADER_MIXED_BACKREF);
+	/* As btrfs_force_cow_block: a relocation tree's copy keeps its owner
+	 * and carries the RELOC flag; any other copy is owned by its tree. */
+	if (root.owner == BT_TREE_RELOC && original != 0) {
+		bt_put64(
+		    &header->flags, BT_HEADER_WRITTEN | BT_HEADER_RELOC | BT_HEADER_MIXED_BACKREF);
+	} else {
+		bt_put64(&header->owner, root.owner);
+		bt_put64(&header->flags, BT_HEADER_WRITTEN | BT_HEADER_MIXED_BACKREF);
+	}
 	header->level = root.level;
 	if (original != 0) {
 		bt_mut_adopt_layout(mutation, node);
@@ -369,7 +383,7 @@ bt_mut_cow(struct bt_mutation *mutation, struct bt_root root, struct bt_mutable_
 	node = bt_mut_find_node(mutation, root.address);
 	if (node != NULL) {
 		if (node->discarded || bt_mut_header(node)->level != root.level ||
-		    bt_u64(bt_mut_header(node)->owner) != root.owner ||
+		    node->tree != root.owner ||
 		    bt_u64(bt_mut_header(node)->generation) != root.generation) {
 			return BTRFS_CORRUPT;
 		}
@@ -1096,6 +1110,77 @@ failed:
 }
 
 enum btrfs_result
+bt_mutation_set_child(struct bt_mutation *mutation, struct bt_root *root, struct bt_key key,
+    uint8_t level, uint64_t address, uint64_t generation, uint64_t *old_address,
+    uint64_t *old_generation)
+{
+	struct bt_mutable_node *path[BT_MAX_LEVEL];
+	uint32_t slots[BT_MAX_LEVEL];
+	struct bt_mutable_node *node;
+	struct bt_disk_pointer *pointers;
+	struct bt_root current;
+	uint8_t top;
+	uint8_t at;
+	enum btrfs_result error;
+
+	if (mutation == NULL || root == NULL || old_address == NULL || old_generation == NULL ||
+	    level == 0 || root->level >= BT_MAX_LEVEL || level > root->level || address == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (mutation->sealed || mutation->failure != BTRFS_OK) {
+		return mutation->failure == BTRFS_OK ? BTRFS_READ_ONLY : mutation->failure;
+	}
+	error = bt_mut_unheld(mutation);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	current = *root;
+	top = current.level;
+	/* At most BT_MAX_LEVEL nodes, one per level from the root down. */
+	for (at = top;; at--) {
+		error = bt_mut_cow(mutation, current, &node);
+		if (error != BTRFS_OK) {
+			goto failed;
+		}
+		if (bt_mut_header(node)->level != at || bt_mut_count(node) == 0) {
+			error = BTRFS_CORRUPT;
+			goto failed;
+		}
+		path[at] = node;
+		slots[at] = bt_mut_slot(node, key, 1);
+		if (at == level) {
+			break;
+		}
+		pointers = (void *)(bt_mut_header(node) + 1);
+		current.address = bt_u64(pointers[slots[at]].bytenr);
+		current.generation = bt_u64(pointers[slots[at]].generation);
+		current.level = at - 1;
+	}
+	pointers = (void *)(bt_mut_header(path[level]) + 1);
+	if (bt_key_compare(bt_key_decode(&pointers[slots[level]].key), key) != 0) {
+		error = BTRFS_CORRUPT;
+		goto failed;
+	}
+	*old_address = bt_u64(pointers[slots[level]].bytenr);
+	*old_generation = bt_u64(pointers[slots[level]].generation);
+	bt_put64(&pointers[slots[level]].bytenr, address);
+	bt_put64(&pointers[slots[level]].generation, generation);
+	path[level]->checksum_valid = 0;
+	for (at = level + 1; at <= top; at++) {
+		pointers = (void *)(bt_mut_header(path[at]) + 1);
+		bt_put64(&pointers[slots[at]].bytenr, path[at - 1]->address);
+		bt_put64(&pointers[slots[at]].generation, mutation->view.info.generation);
+		path[at]->checksum_valid = 0;
+		path[at - 1]->parent = path[at]->address;
+	}
+	*root = bt_mut_root(path[top]);
+	return BTRFS_OK;
+failed:
+	mutation->failure = error;
+	return error;
+}
+
+enum btrfs_result
 bt_mutation_edit(struct bt_mutation *mutation, struct bt_root *root, struct bt_key key,
     const void *value, size_t length, enum bt_edit edit)
 {
@@ -1244,8 +1329,9 @@ bt_mut_find_private(struct bt_mutation *mutation, struct bt_root root, struct bt
 		count = bt_mut_count(node);
 		stride = root.level == 0 ? sizeof(*items) : sizeof(*pointers);
 		if (node->discarded || header->level != root.level ||
-		    (bt_file_tree(root.owner) ? !bt_file_tree(bt_u64(header->owner))
-					      : bt_u64(header->owner) != root.owner) ||
+		    (bt_file_tree(root.owner) || root.owner == BT_TREE_RELOC
+			    ? !bt_file_tree(bt_u64(header->owner))
+			    : bt_u64(header->owner) != root.owner) ||
 		    bt_u64(header->generation) != root.generation ||
 		    root.generation != mutation->view.info.generation ||
 		    !bt_equal(header->fsid, mutation->view.metadata_uuid, BTRFS_UUID_SIZE) ||
@@ -1385,7 +1471,8 @@ bt_mutation_block(struct bt_mutation *mutation, size_t index, struct bt_mutated_
 	}
 	block->address = node->address;
 	block->original_address = node->original;
-	block->owner = bt_u64(header->owner);
+	block->owner = node->tree;
+	block->parent = node->parent;
 	block->original_owner = node->original_owner;
 	block->original_generation = node->original_generation;
 	block->original_flags = node->original_flags;
@@ -1481,7 +1568,7 @@ bt_mutation_destroy(struct bt_mutation *mutation)
 			/* The published buffer outlives the transaction in the cache.
 			 * Transfer at destruction, after every private view has retired. */
 			bt_cache_take(env->cache, bt_mut_root(node), mutation->view.info.node_size,
-			    &node->bytes, bt_mut_root(node).owner, env);
+			    &node->bytes, bt_u64(bt_mut_header(node)->owner), env);
 		}
 		if (node->bytes != NULL) {
 			env->release(env->context, node->bytes, mutation->view.info.node_size);

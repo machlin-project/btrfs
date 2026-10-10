@@ -123,6 +123,10 @@ struct btrfs_fs {
 	 * zero otherwise. */
 	uint64_t log_root;
 	uint8_t log_level;
+	/* Nonzero for the mount of relocation recovery
+	 * (btrfs_recover_relocation), whose transactions may edit a volume
+	 * holding relocation trees and its data relocation tree. */
+	int relocation;
 	/* Joins the lanes of a node CRC32C (node_size - BT_CSUM_SIZE bytes). */
 	struct bt_crc_shift node_crc;
 	/* Sorted by logical address; chunk_capacity entries are allocated. */

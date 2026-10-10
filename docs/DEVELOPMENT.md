@@ -379,8 +379,29 @@ Require `BTRFS_RELOC_CREATED`, then run `expect` and `recover` the same way on
 APFS clones of the image and require `BTRFS_RELOC_EXPECT_PASS` and
 `BTRFS_RELOC_RECOVER_PASS` with manifests equal to the expected one.
 `interrupted-balance` (`tests/relocation.c`) reads every file of the manifest,
-runs the reference and namespace audits and requires writable admission and a
-writable native volume to fail with UNSUPPORTED without a write or a flush.
+runs the reference and namespace audits, requires writable admission and a
+writable native volume to need recovery (RECOVERY_REQUIRED) without a write or
+a flush, recovers the image on an overlay that records every write and
+barrier, and recovers again every state a crash leaves at those barriers.
+
+The `record` phase writes the same files through dm-log-writes
+(`/dev/mapper/logged` logs `/dev/vda`, 512 MiB, into `/dev/vdb`, 1 GiB), marks
+`filled`, prints the manifest, runs a full balance to its end, marks `balanced`
+and unmounts; run it with `linux-vm-external` and the two images
+`relocation-log-data.raw` and `relocation-log.raw`, and require
+`BTRFS_RELOC_RECORD_PASS` and the same manifest as the fixture's.
+`interrupted-balance-states` (`tests/relocation_log.c`) replays every durable
+point between the marks, recovers each state and merges each state waiting
+for a merge in single swaps to check every crash state of those steps. Given
+an export directory as a fourth argument, it writes the first states waiting
+for a merge as crash and ours images and one state holding a merge's
+progress as partial and steps images. Run `recover` on clones of the crash
+and partial images and `verify` on clones of the ours images; then
+`btrfs-relocation-log-test --compare LINUX OURS` requires the same leaves in
+every file tree after Linux's recovery and this one. The `verify` phase
+requires no relocation tree and no data relocation orphan, runs
+`btrfs check --readonly`, mounts read-write with `skip_balance`, prints the
+manifest, writes a file, unmounts and checks again.
 
 ## Linux-written crash states
 

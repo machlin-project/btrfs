@@ -32,7 +32,10 @@ struct bt_mutation_observer {
 struct bt_mutated_block {
 	uint64_t address;
 	uint64_t original_address;
+	/* The tree the block belongs to; parent is the parent
+	 * bt_mutation_set_child copied it below, zero otherwise. */
 	uint64_t owner;
+	uint64_t parent;
 	uint64_t original_owner;
 	uint64_t original_generation;
 	uint64_t original_flags;
@@ -57,6 +60,14 @@ enum btrfs_result bt_mutation_edit(struct bt_mutation *mutation, struct bt_root 
  * other cases retain delete/insert semantics. value must not borrow a node. */
 enum btrfs_result bt_mutation_rekey(struct bt_mutation *mutation, struct bt_root *root,
     struct bt_key old_key, struct bt_key new_key, const void *value, size_t length);
+/* Replaces the child pointer for key at level (above 0) of root's tree, whose
+ * slot key must equal key, with address and generation, copying the path
+ * from the root on write; old reports the pointer replaced. The tree's shape
+ * does not change. Copies of a relocation tree (BT_TREE_RELOC) keep their
+ * file tree's owner and carry the RELOC flag, as Linux's CoW leaves them. */
+enum btrfs_result bt_mutation_set_child(struct bt_mutation *mutation, struct bt_root *root,
+    struct bt_key key, uint8_t level, uint64_t address, uint64_t generation, uint64_t *old_address,
+    uint64_t *old_generation);
 /* A new tree root owned by owner: with copy, a copy of source's node (a
  * snapshot's root, with the same items and child pointers); otherwise an
  * empty leaf whose header identifies this filesystem as source's does. */

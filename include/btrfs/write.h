@@ -95,6 +95,34 @@ enum btrfs_result btrfs_replay_log(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, struct btrfs_time now,
     struct btrfs_replay_report *report);
 
+struct btrfs_relocation_report {
+	/* The committed generation recovery started from, and the relocation
+	 * trees it found there. */
+	uint64_t generation;
+	uint64_t trees;
+	/* Relocation trees merged into their file trees, and dropped. */
+	uint64_t merged;
+	uint64_t dropped;
+	/* Orphan inodes of the data relocation tree removed. */
+	uint64_t orphans;
+	/* Transactions committed. */
+	uint64_t commits;
+};
+
+/* Explicit, exclusive recovery of a balance a crash interrupted, as Linux's
+ * btrfs_recover_relocation performs it at a read-write mount: relocation
+ * trees still waiting for their merge are merged into their file trees, every
+ * relocation tree is then dropped, and the data relocation tree's orphan
+ * inodes are removed, in bounded transactions that each commit a state
+ * Linux's recovery resumes from. Writable admission returns
+ * RECOVERY_REQUIRED while relocation trees remain. NOT_FOUND when nothing is
+ * left to recover; a NULL writer only inspects and returns RECOVERY_REQUIRED
+ * when something is. A pending tree log must be replayed first
+ * (btrfs_replay_log); a volume with quotas is UNSUPPORTED. A balance item
+ * stays: Linux resumes the balance at its next read-write mount. */
+enum btrfs_result btrfs_recover_relocation(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, struct btrfs_relocation_report *report);
+
 /* Current admission: any of Linux's four checksum algorithms, skinny metadata,
  * SINGLE/DUP, no free-space cache tree, quotas or mixed groups. At least two
  * superblock copies must exist and agree with the mounted primary; otherwise

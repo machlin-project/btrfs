@@ -41,9 +41,10 @@ bt_tx_root(const struct btrfs_fs *fs, uint64_t owner, struct bt_owned_root *root
 }
 
 /* Whether the root tree holds a relocation tree: a balance stopped by a crash
- * between creating relocation trees and merging them. Linux's read-write mount
- * merges them (btrfs_recover_relocation), and until then its CoW of the file
- * trees updates them too (btrfs_reloc_cow_block); neither is implemented. */
+ * between creating relocation trees and dropping them. Linux's read-write
+ * mount merges and drops them (btrfs_recover_relocation), and so does
+ * btrfs_recover_relocation here (core/relocation.c), whose mount alone may
+ * edit such a volume. */
 static enum btrfs_result
 bt_tx_relocating(const struct btrfs_fs *fs, int *relocating)
 {
@@ -157,13 +158,13 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	    base->info.generation == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
 	}
-	/* An unmerged balance needs Linux's relocation recovery first. */
+	/* An unmerged balance needs relocation recovery first. */
 	error = bt_tx_relocating(base, &relocating);
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	if (relocating) {
-		return BTRFS_UNSUPPORTED;
+	if (relocating && !base->relocation) {
+		return BTRFS_RECOVERY_REQUIRED;
 	}
 	/* Quotas are accounted (core/qgroup.c) once the mutation exists. */
 	bt_zero(&quota, sizeof(quota));
@@ -294,7 +295,8 @@ bt_tx_tree(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned
 			return transaction->trees[i].read_only ? BTRFS_READ_ONLY : BTRFS_OK;
 		}
 	}
-	if (!bt_file_tree(tree)) {
+	/* Relocation recovery also cleans the data relocation tree's orphans. */
+	if (!bt_file_tree(tree) && !(tree == BT_DATA_RELOC_TREE && transaction->base->relocation)) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	if (transaction->tree_count == BT_TRANSACTION_TREES) {
@@ -305,6 +307,40 @@ bt_tx_tree(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned
 	if (error == BTRFS_OK) {
 		transaction->tree_count++;
 		*result = owned;
+	}
+	return error;
+}
+
+/* bt_tx_tree for relocation recovery's merge, which edits read-only snapshots
+ * as Linux's relocation does; their root items keep the read-only flag. */
+enum btrfs_result
+bt_tx_tree_merge(
+    struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root **result)
+{
+	struct bt_owned_root *owned;
+	size_t i;
+	enum btrfs_result error;
+
+	if (!bt_file_tree(tree)) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	for (i = 0; i < transaction->tree_count; i++) {
+		if (transaction->trees[i].root.owner == tree) {
+			transaction->trees[i].read_only = 0;
+			*result = &transaction->trees[i];
+			return BTRFS_OK;
+		}
+	}
+	if (transaction->tree_count == BT_TRANSACTION_TREES) {
+		return BTRFS_UNSUPPORTED;
+	}
+	owned = &transaction->trees[transaction->tree_count];
+	error = bt_tx_root(transaction->base, tree, owned);
+	if (error == BTRFS_OK || error == BTRFS_READ_ONLY) {
+		owned->read_only = 0;
+		transaction->tree_count++;
+		*result = owned;
+		error = BTRFS_OK;
 	}
 	return error;
 }
@@ -646,6 +682,95 @@ bt_tx_children(struct btrfs_transaction *transaction, const uint8_t *node, uint6
  * other tree adds references from its root for the copy. An unshared block with
  * parent-named children converts them back. The old block then loses this tree's
  * reference and is freed only with its last one. */
+/* update_ref_for_cow and btrfs_force_cow_block for a block of the relocation
+ * tree a merge step edits. Its blocks use parent references: a copy's
+ * children are referenced by the copy, keyed references of an original are
+ * its owner's, and the original loses the reference its new parent (the root
+ * itself, for the root) holds; it is freed only with its last reference. */
+static enum btrfs_result
+bt_tx_release_relocation(
+    struct btrfs_transaction *transaction, const struct bt_mutated_block *block)
+{
+	const struct bt_disk_root *item = &transaction->relocation.item.legacy;
+	struct bt_root original = { block->original_address, block->original_generation,
+		BT_TREE_RELOC, block->original_level };
+	struct bt_key extent = { .objectid = block->original_address,
+		.type = BT_METADATA_ITEM,
+		.offset = block->original_level };
+	struct bt_backref reference;
+	uint64_t refs = 1;
+	uint64_t flags = BT_EXTENT_FLAG_FULL_BACKREF;
+	int root = block->original_address == bt_u64(item->bytenr);
+	int freed = 0;
+	int replaced = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (!transaction->relocating ||
+	    block->original_flags >> BT_HEADER_BACKREF_SHIFT !=
+		BT_HEADER_MIXED_BACKREF >> BT_HEADER_BACKREF_SHIFT) {
+		return BTRFS_UNSUPPORTED;
+	}
+	/* btrfs_block_can_be_shared: not the root, and from before the last
+	 * snapshot or written by relocation. */
+	if (!root &&
+	    (block->original_generation <= bt_u64(item->last_snapshot) ||
+		(block->original_flags & BT_HEADER_RELOC) != 0)) {
+		error = bt_backref_release_tree(transaction->mutation, &transaction->extents.root,
+		    extent, 0, NULL, &refs, &flags, &freed, &replaced);
+		if (error == BTRFS_OK && refs == 0) {
+			error = BTRFS_CORRUPT;
+		}
+	}
+	if (error == BTRFS_OK && block->original_owner == BT_TREE_RELOC &&
+	    !(flags & BT_EXTENT_FLAG_FULL_BACKREF)) {
+		error = BTRFS_CORRUPT;
+	}
+	if (error == BTRFS_OK) {
+		error = bt_tree_read(transaction->base, original, transaction->original);
+	}
+	if (error == BTRFS_OK && refs > 1 && !(flags & BT_EXTENT_FLAG_FULL_BACKREF)) {
+		error = bt_tx_children(
+		    transaction, transaction->original, block->original_address, 1, 0, 1);
+		if (error == BTRFS_OK) {
+			error = bt_tx_children(transaction, transaction->original,
+			    block->original_address, 0, block->original_owner, 0);
+		}
+		if (error == BTRFS_OK) {
+			error = bt_tx_children(
+			    transaction, transaction->original, block->address, 1, 0, 1);
+		}
+		if (error == BTRFS_OK) {
+			error = bt_backref_set_flags(transaction->mutation,
+			    &transaction->extents.root, extent, BT_EXTENT_FLAG_FULL_BACKREF);
+		}
+	} else if (error == BTRFS_OK && refs > 1) {
+		error = bt_tx_children(transaction, transaction->original, block->address, 1, 0, 1);
+	} else if (error == BTRFS_OK && (flags & BT_EXTENT_FLAG_FULL_BACKREF) != 0) {
+		error = bt_tx_children(transaction, transaction->original, block->address, 1, 0, 1);
+		if (error == BTRFS_OK) {
+			error = bt_tx_children(
+			    transaction, transaction->original, block->original_address, 1, 0, 0);
+		}
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	bt_zero(&reference, sizeof(reference));
+	reference.parent = root ? block->original_address : block->parent;
+	if (reference.parent == 0) {
+		return BTRFS_CORRUPT;
+	}
+	error = bt_backref_drop(
+	    transaction->mutation, &transaction->extents.root, extent, &reference, 1, &freed);
+	if (error == BTRFS_OK && freed != (refs == 1)) {
+		error = BTRFS_CORRUPT;
+	}
+	return error == BTRFS_OK && freed
+	    ? bt_space_change_used(
+		  transaction->space, block->original_address, transaction->base->info.node_size, 0)
+	    : error;
+}
+
 static enum btrfs_result
 bt_tx_release(struct btrfs_transaction *transaction, const struct bt_mutated_block *block,
     const struct bt_root *replacement, int *replaced)
@@ -664,6 +789,10 @@ bt_tx_release(struct btrfs_transaction *transaction, const struct bt_mutated_blo
 	int freed;
 	enum btrfs_result error;
 
+	*replaced = 0;
+	if (block->owner == BT_TREE_RELOC) {
+		return bt_tx_release_relocation(transaction, block);
+	}
 	if (block->original_flags >> BT_HEADER_BACKREF_SHIFT !=
 	    BT_HEADER_MIXED_BACKREF >> BT_HEADER_BACKREF_SHIFT) {
 		return BTRFS_UNSUPPORTED;
@@ -784,6 +913,15 @@ bt_tx_account(struct btrfs_transaction *transaction)
 			bt_put64(&item.extent.flags, BT_EXTENT_FLAG_TREE);
 			item.reference.type = BT_TREE_BLOCK_REF;
 			bt_put64(&item.reference.offset, block.owner);
+			/* btrfs_alloc_tree_block: a relocation tree's block is
+			 * referenced by its parent, the root by itself. */
+			if (block.owner == BT_TREE_RELOC) {
+				bt_put64(&item.extent.flags,
+				    BT_EXTENT_FLAG_TREE | BT_EXTENT_FLAG_FULL_BACKREF);
+				item.reference.type = BT_SHARED_BLOCK_REF;
+				bt_put64(&item.reference.offset,
+				    block.parent != 0 ? block.parent : block.address);
+			}
 			error = bt_tx_edit(transaction, &transaction->extents.root, key, &item,
 			    sizeof(item), BT_INSERT);
 			if (error == BTRFS_OK) {
@@ -814,6 +952,17 @@ bt_tx_account(struct btrfs_transaction *transaction)
 		}
 	}
 	return BTRFS_OK;
+}
+
+enum btrfs_result
+bt_tx_settle(struct btrfs_transaction *transaction)
+{
+	enum btrfs_result error = bt_tx_account(transaction);
+
+	if (error != BTRFS_OK) {
+		transaction->failure = error;
+	}
+	return error;
 }
 
 static enum btrfs_result

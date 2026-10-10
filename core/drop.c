@@ -6,7 +6,11 @@
  * (the UPDATE_BACKREF stage), so the other owners keep valid references. An
  * unshared block is entered, its children handled, and then freed with the
  * file extents of a leaf. Progress is the key of the next child at a level:
- * the root item keeps it between transactions. */
+ * the root item keeps it between transactions. Relocation trees whose merge
+ * finished are dropped the same way, as clean_dirty_subvols does with
+ * btrfs_drop_snapshot(reloc_root, 0, 1): shared blocks only lose this tree's
+ * reference, qgroups are not traced (a relocation tree counts for none), and
+ * only the root item goes. */
 #include "transaction.h"
 #include "qgroup.h"
 
@@ -26,6 +30,7 @@ struct bt_drop {
 	int stage;
 	int shared_level;
 	int update_ref;
+	int relocation;
 	struct bt_key update_progress;
 	size_t visited;
 };
@@ -281,9 +286,11 @@ bt_drop_down(struct bt_drop *drop, int *skip)
 		if (drop->stage == BT_DROP_REFERENCE) {
 			/* The subtree stays with its other trees: its extents leave this
 			 * tree's qgroup (do_walk_down's btrfs_qgroup_trace_subtree). */
-			error = bt_qgroup_trace_subtree(drop->transaction,
-			    (struct bt_root){
-				address, generation, drop->dead.root.owner, (uint8_t)(level - 1) });
+			error = drop->relocation
+			    ? BTRFS_OK
+			    : bt_qgroup_trace_subtree(drop->transaction,
+				  (struct bt_root){ address, generation, drop->dead.root.owner,
+				      (uint8_t)(level - 1) });
 			if (error == BTRFS_OK) {
 				error = bt_drop_parent(drop, level, &parent);
 			}
@@ -514,6 +521,48 @@ bt_drop_find(struct btrfs_transaction *transaction, struct bt_owned_root *dead, 
 	}
 }
 
+/* The first relocation tree with refs 0 (a merge finished, or its file tree
+ * is gone); *live reports one that still waits for its merge. */
+static enum btrfs_result
+bt_drop_find_relocation(
+    struct btrfs_transaction *transaction, struct bt_owned_root *dead, int *found, int *live)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { .objectid = BT_TREE_RELOC, .type = BT_ROOT_ITEM, .offset = 0 };
+	uint64_t steps;
+	enum btrfs_result error;
+
+	*found = 0;
+	*live = 0;
+	bt_cursor_init(&cursor, bt_mutation_view(transaction->mutation), transaction->roots);
+	error = bt_cursor_seek(&cursor, key, 0);
+	for (steps = 0; error == BTRFS_OK; steps++) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.objectid != BT_TREE_RELOC || record.key.type != BT_ROOT_ITEM) {
+			break;
+		}
+		if (steps == BT_MAX_TREE_ITEMS || record.size != sizeof(dead->item)) {
+			error = BTRFS_UNSUPPORTED;
+			break;
+		}
+		if (bt_u32(((const struct bt_disk_root *)record.data)->refs) != 0) {
+			*live = 1;
+		} else if (!*found) {
+			bt_copy(&dead->item, record.data, record.size);
+			dead->size = record.size;
+			dead->key = record.key;
+			dead->root = (struct bt_root){ bt_u64(dead->item.legacy.bytenr),
+				bt_u64(dead->item.legacy.generation), BT_TREE_RELOC,
+				dead->item.legacy.level };
+			*found = 1;
+		}
+		error = bt_cursor_next(&cursor);
+	}
+	bt_cursor_fini(&cursor);
+	return error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
+}
+
 static void
 bt_drop_release(struct bt_drop *drop)
 {
@@ -543,7 +592,7 @@ bt_drop_tree(struct bt_drop *drop, size_t budget, int *finished)
 	*finished = 0;
 	drop->stage = BT_DROP_REFERENCE;
 	drop->shared_level = -1;
-	drop->update_ref = 1;
+	drop->update_ref = !drop->relocation;
 	error = bt_drop_resume(drop);
 	while (error == BTRFS_OK) {
 		error = bt_drop_walk_down(drop);
@@ -572,12 +621,12 @@ bt_drop_tree(struct bt_drop *drop, size_t budget, int *finished)
 		*finished = 1;
 		error = bt_tx_edit(
 		    transaction, &transaction->roots, drop->dead.key, NULL, 0, BT_DELETE);
-		if (error == BTRFS_OK) {
+		if (error == BTRFS_OK && !drop->relocation) {
 			error = bt_tx_edit(
 			    transaction, &transaction->roots, orphan, NULL, 0, BT_DELETE);
 		}
 		/* btrfs_qgroup_cleanup_dropped_subvolume: the qgroup goes too. */
-		if (error == BTRFS_OK) {
+		if (error == BTRFS_OK && !drop->relocation) {
 			error = bt_qgroup_dropped(transaction, drop->dead.root.owner);
 		}
 	} else {
@@ -588,11 +637,13 @@ bt_drop_tree(struct bt_drop *drop, size_t budget, int *finished)
 	return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
 }
 
-enum btrfs_result
-btrfs_transaction_clean_subvolumes(
-    struct btrfs_transaction *transaction, size_t budget, size_t *dropped, int *pending)
+/* Drops deleted subvolumes, or merged relocation trees, until none remains or
+ * the budget is spent. */
+static enum btrfs_result
+bt_drop_run(struct btrfs_transaction *transaction, size_t budget, int relocation, size_t *dropped,
+    int *pending, int *live)
 {
-	const struct btrfs_environment *env;
+	const struct btrfs_environment *env = &transaction->base->env;
 	struct bt_drop *drop = NULL;
 	size_t spent = 0;
 	unsigned level;
@@ -600,17 +651,13 @@ btrfs_transaction_clean_subvolumes(
 	int finished = 1;
 	enum btrfs_result error = BTRFS_OK;
 
-	if (transaction == NULL || dropped == NULL || pending == NULL || budget == 0) {
-		return BTRFS_INVALID_ARGUMENT;
-	}
 	*dropped = 0;
 	*pending = 0;
-	if (transaction->failure != BTRFS_OK || transaction->finished) {
-		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
-	}
-	env = &transaction->base->env;
+	*live = 0;
 	while (error == BTRFS_OK && finished && spent < budget) {
-		error = bt_drop_find(transaction, &transaction->dropping, &found);
+		error = relocation
+		    ? bt_drop_find_relocation(transaction, &transaction->dropping, &found, live)
+		    : bt_drop_find(transaction, &transaction->dropping, &found);
 		if (error != BTRFS_OK || !found) {
 			break;
 		}
@@ -620,6 +667,7 @@ btrfs_transaction_clean_subvolumes(
 			bt_zero(drop, sizeof(*drop));
 			drop->transaction = transaction;
 			drop->dead = transaction->dropping;
+			drop->relocation = relocation;
 		}
 		for (level = 0; error == BTRFS_OK && level <= drop->dead.root.level; level++) {
 			drop->nodes[level] =
@@ -642,7 +690,10 @@ btrfs_transaction_clean_subvolumes(
 	if (error == BTRFS_OK) {
 		*pending = !finished;
 		if (finished) {
-			error = bt_drop_find(transaction, &transaction->dropping, &found);
+			error = relocation
+			    ? bt_drop_find_relocation(
+				  transaction, &transaction->dropping, &found, live)
+			    : bt_drop_find(transaction, &transaction->dropping, &found);
 			*pending = error == BTRFS_OK && found;
 		}
 	}
@@ -650,4 +701,31 @@ btrfs_transaction_clean_subvolumes(
 		transaction->failure = error;
 	}
 	return error;
+}
+
+enum btrfs_result
+btrfs_transaction_clean_subvolumes(
+    struct btrfs_transaction *transaction, size_t budget, size_t *dropped, int *pending)
+{
+	int live = 0;
+
+	if (transaction == NULL || dropped == NULL || pending == NULL || budget == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*dropped = 0;
+	*pending = 0;
+	if (transaction->failure != BTRFS_OK || transaction->finished) {
+		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
+	}
+	return bt_drop_run(transaction, budget, 0, dropped, pending, &live);
+}
+
+enum btrfs_result
+bt_drop_relocation(
+    struct btrfs_transaction *transaction, size_t budget, size_t *dropped, int *pending, int *live)
+{
+	if (transaction->failure != BTRFS_OK || transaction->finished) {
+		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
+	}
+	return bt_drop_run(transaction, budget, 1, dropped, pending, live);
 }

@@ -12,7 +12,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/rename.c', 'core/subvolume.c', 'core/drop.c',
   'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c',
-  'core/verity.c', 'core/heuristic.c')
+  'core/verity.c', 'core/heuristic.c', 'core/relocation.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -105,6 +105,9 @@ logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
 relocation_test = executable('btrfs-relocation-test', 'tests/relocation.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd])
+relocation_log_test = executable('btrfs-relocation-log-test', 'tests/relocation_log.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
 volume_test = executable('btrfs-volume-test', 'tests/volume.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
 full_volume_test = executable('btrfs-full-volume-test', 'tests/full_volume.c',
@@ -154,8 +157,14 @@ if fixtures != ''
   test('tree-log-replay-faults', replay_test, args: [join_paths(fixtures, 'logs.raw')],
     timeout: 1800, suite: 'images')
   # A balance Linux left unmerged: readable, refused for writing.
+  # A balance Linux left unmerged, and every crash state of a recorded
+  # balance: readable, recovered as Linux's mount recovers them.
   test('interrupted-balance', relocation_test, args: [join_paths(fixtures, 'relocation.raw'),
-    join_paths(fixtures, 'relocation.expected.tsv')], timeout: 300, suite: 'images')
+    join_paths(fixtures, 'relocation.expected.tsv')], timeout: 600, suite: 'images')
+  test('interrupted-balance-states', relocation_log_test,
+    args: [join_paths(fixtures, 'relocation-log.raw'),
+      join_paths(fixtures, 'relocation-log-data.raw'),
+      join_paths(fixtures, 'relocation.expected.tsv')], timeout: 3600, suite: 'images')
   test('linux-crash-states', logwrites_test, args: [join_paths(fixtures, 'logwrites.log'),
     join_paths(fixtures, 'logwrites-data.raw')], timeout: 600, suite: 'images')
   test('verity-reads', verity_test, args: [join_paths(fixtures, 'transactions-verity.raw')],

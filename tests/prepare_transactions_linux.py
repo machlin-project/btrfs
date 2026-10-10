@@ -203,7 +203,10 @@ def main():
             .replace("@NAMESPACE_CHECKS@", str(namespace_checks)))
     (root / "init").write_text(init)
     (root / "init").chmod(0o755)
-    paths = subprocess.run(["find", ".", "-print"], cwd=root, check=True, capture_output=True).stdout
+    # The oracle reads no fixture inputs: what other preparers staged in a
+    # shared root stays out of its archive, which the guest unpacks in memory.
+    paths = subprocess.run(["find", ".", "-path", "./input", "-prune", "-o", "-print"],
+                           cwd=root, check=True, capture_output=True).stdout
     archive.parent.mkdir(parents=True, exist_ok=True)
     with archive.open("wb") as output:
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root,

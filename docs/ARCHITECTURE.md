@@ -51,17 +51,45 @@ compatible bits are admissible to the immutable reader only; transaction admissi
 rejects them until their write semantics are implemented.
 
 A balance stopped by a crash leaves relocation trees in the root tree (root
-items keyed TREE_RELOC, -8, one per file tree being relocated). Linux merges
-them only on a read-write mount (`btrfs_recover_relocation`), and until then its
-CoW of a file tree updates the tree's relocation tree too
-(`btrfs_reloc_cow_block`); neither is implemented here. Such a volume reads as
-any other: a relocation tree's blocks keep their file tree's owner (Linux's CoW
-and `btrfs_copy_root` only set the RELOC flag), so the reader requires file-tree
-owners below it, and the independent audit expects the full backref whose
+items keyed TREE_RELOC, -8, one per file tree being relocated) and relocated
+copies in an orphan inode of the data relocation tree (-9). A relocation
+tree's blocks keep their file tree's owner (Linux's CoW and `btrfs_copy_root`
+only set the RELOC flag), so the reader requires file-tree owners below a
+TREE_RELOC root, and the independent audit expects the full backref whose
 parent is the relocation root itself that `btrfs_alloc_tree_block` gives it.
-Writable admission refuses the volume (UNSUPPORTED) before any write, natively
-as well; a Linux read-write mount merges the trees. A balance item is not
-interpreted: Linux resumes the balance at its next read-write mount.
+Writable admission requires recovery (RECOVERY_REQUIRED) while relocation
+trees remain, and `btrfs_recover_relocation` (`core/relocation.c`) performs
+Linux's `btrfs_recover_relocation`; native writable opens run it after the
+tree-log replay, as Linux's mount does. A relocation tree still waiting for its
+merge (refs above 0) is merged as `merge_reloc_root` merges it:
+`walk_down_reloc_tree` finds the lowest relocated block (newer than the
+tree's last snapshot), `replace_path` follows the file tree along its key and
+swaps the first pointer whose block is no newer than the last snapshot and
+matches at the same level and key, `walk_up_reloc_tree` moves on, and the
+position is recorded in the relocation root item's drop progress, so Linux
+resumes a merge begun here and the reverse. A swap copies both paths
+(`bt_mutation_set_child`), applies the copies' reference changes at once
+(`bt_tx_settle`, as each CoW does in Linux) and then moves the four
+references `replace_path` moves. Copies of relocation-tree blocks follow
+Linux's rules for that tree: they keep their owner and carry the RELOC flag,
+use full backrefs naming their parent (the root itself), convert their
+originals' references as `update_ref_for_cow` does for relocation trees, with
+keyed references by the block's owner as `__btrfs_mod_ref` names them, and
+release the reference their new parent holds. A finished merge sets the
+relocation root's refs to 0 (`insert_dirty_subvol`); one whose file tree is
+gone or being deleted is marked so directly (`mark_garbage_root`). Relocation
+trees with refs 0 are then dropped as `clean_dirty_subvols` drops them
+(`btrfs_drop_snapshot(reloc_root, 0, 1)`: shared blocks only lose this
+tree's reference, no qgroup is traced, only the root item goes), and the data
+relocation tree's orphan inodes are removed as `btrfs_orphan_cleanup` removes
+them. Each transaction does a bounded step and commits. Volumes with quotas
+are UNSUPPORTED: Linux's merge records swapped subtrees for its qgroups
+(`btrfs_qgroup_add_swapped_blocks`), which is not implemented. Linux's merge
+also copies the file tree's root after the last swap, to move a relocated
+root out of the block group being relocated; this one does not, which leaves
+an equivalent tree. A pending tree log together with relocation trees needs
+Linux's mount. A balance item is not interpreted: Linux resumes the balance at
+its next read-write mount.
 
 The superblock bootstraps SYSTEM chunks. The chunk-tree scan validates full
 mapping records and reconciles the bootstrap copies exactly before publication.

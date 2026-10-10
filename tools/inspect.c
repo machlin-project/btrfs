@@ -369,6 +369,45 @@ replay(const char *path, int argc, char **argv)
 					       : 1;
 }
 
+/* Explicit recovery of an interrupted balance, never implied by any other
+ * command. Without --apply nothing is written; exit status 3 then means
+ * relocation trees or data relocation orphans are pending, 4 that none is. */
+static int
+relocate(const char *path, int argc, char **argv)
+{
+	struct btrfs_relocation_report report;
+	struct btrfs_write_environment writer;
+	struct btrfs_image image;
+	int apply = argc == 1 && strcmp(argv[0], "--apply") == 0;
+	enum btrfs_result error;
+
+	if (argc != 0 && !apply) {
+		fprintf(stderr, "Usage: btrfs-inspect IMAGE relocate [--apply]\n");
+		return 2;
+	}
+	if ((apply ? btrfs_image_open_writable(path, &image) : btrfs_image_open(path, &image)) !=
+	    0) {
+		perror("open image");
+		return 1;
+	}
+	btrfs_image_writer(&image, &writer);
+	error = btrfs_recover_relocation(&image.environment, apply ? &writer : NULL, &report);
+	printf("{\"result\":\"%s\",\"apply\":%s,\"generation\":%" PRIu64 ",\"trees\":%" PRIu64
+	       ",\"merged\":%" PRIu64 ",\"dropped\":%" PRIu64 ",\"orphans\":%" PRIu64
+	       ",\"commits\":%" PRIu64 "}\n",
+	    btrfs_result_string(error), apply ? "true" : "false", report.generation, report.trees,
+	    report.merged, report.dropped, report.orphans, report.commits);
+	btrfs_image_close(&image);
+	if (image.live_allocations != 0 || image.live_bytes != 0) {
+		fprintf(stderr, "allocation leak\n");
+		return 1;
+	}
+	return error == BTRFS_OK	       ? 0
+	    : error == BTRFS_RECOVERY_REQUIRED ? 3
+	    : error == BTRFS_NOT_FOUND	       ? 4
+					       : 1;
+}
+
 /* Node cache for one command; the image does not change while it runs. */
 #define INSPECT_CACHE_BYTES (16U * 1024U * 1024U)
 
@@ -391,7 +430,8 @@ main(int argc, char **argv)
 		    "Usage: btrfs-inspect [--tree ID] IMAGE info|stat|ls|cat|xattr|listxattr|seek "
 		    "[PATH] [ARGS]\n       btrfs-inspect [--tree ID] IMAGE walk [--data]\n       "
 		    "btrfs-inspect IMAGE recover [--apply] [--acknowledged "
-		    "GENERATION]\n       btrfs-inspect IMAGE replay [--apply]\n");
+		    "GENERATION]\n       btrfs-inspect IMAGE replay [--apply]\n       "
+		    "btrfs-inspect IMAGE relocate [--apply]\n");
 		return 2;
 	}
 	if (strcmp(argv[argument + 1], "recover") == 0) {
@@ -399,6 +439,9 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[argument + 1], "replay") == 0) {
 		return replay(argv[argument], argc - argument - 2, argv + argument + 2);
+	}
+	if (strcmp(argv[argument + 1], "relocate") == 0) {
+		return relocate(argv[argument], argc - argument - 2, argv + argument + 2);
 	}
 	if (btrfs_image_open(argv[argument], &image) != 0) {
 		perror("open image");

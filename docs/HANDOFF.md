@@ -95,10 +95,13 @@ is destroyed. `accept` is legal only after successful durable publication;
    `update_ref_for_cow` with inline and keyed references (`core/backref.c`), and
    the independent audit in `tests/references.c` checks every committed state.
    Deleted subvolumes are dropped as `btrfs_drop_snapshot` does (`core/drop.c`).
-   Relocation trees a crashed balance left are read and audited, and
-   writable admission refuses them (`tests/relocation.c`). Remaining:
-   merging them as `btrfs_recover_relocation` does, and balance itself; data
-   reference edits from file writes must join the same
+   Relocation trees a crashed balance left are read, audited and recovered
+   as `btrfs_recover_relocation` does (`core/relocation.c`: merge, drop, data
+   relocation orphans), checked against every crash state of a recorded
+   balance and against Linux's own recovery (`tests/relocation.c`,
+   `tests/relocation_log.c`). Remaining: recovery with quotas (swapped
+   subtrees for qgroups) and balance itself; data reference edits from file
+   writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
 3. **Extend file data.** `btrfs_transaction_write`/`_truncate` write CoW data

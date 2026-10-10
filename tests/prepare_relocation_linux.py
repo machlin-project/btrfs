@@ -16,6 +16,16 @@ merges the relocation trees as btrfs_recover_relocation does, print the
 manifest, unmount, require that no relocation tree remains and run
 `btrfs check --readonly`.
 
+record: write the same files through dm-log-writes (/dev/mapper/logged logs
+/dev/vda into /dev/vdb), mark them `filled`, print the manifest, run a full
+balance to its end, mark `balanced` and unmount; every state a crash could
+leave during the balance can then be replayed from the log.
+
+verify: on an image this implementation recovered, require that no relocation
+tree and no data relocation orphan remains and that `btrfs check --readonly`
+passes, mount read-write with skip_balance, print the manifest, unmount and
+check again.
+
 The manifest names every regular file below the mount with its size and
 SHA-256, one line each, sorted by path.
 """
@@ -27,6 +37,7 @@ from pathlib import Path
 import subprocess
 
 DEVICE_BYTES = 512 << 20
+LOG_BYTES = 1 << 30
 NODE_SIZE = 16384
 # Files of DATA_BYTES each, cut from the random input at distinct offsets, in
 # the subvolume (shared with its snapshot) and the top level; small ones are
@@ -70,14 +81,17 @@ relocation_trees() {
     btrfs inspect-internal dump-tree -t root /dev/vda 2>/dev/null |
         grep -c 'key (TREE_RELOC ROOT_ITEM' || true
 }
+
+relocation_orphans() {
+    btrfs inspect-internal dump-tree -t data_reloc /dev/vda |
+        grep -c 'key (ORPHAN ORPHAN_ITEM' || true
+}
 """
 
 
-def create_init() -> str:
-    return PRELUDE + MANIFEST + f"""
-mkfs.btrfs --version
-mkfs.btrfs -f -s 4096 -n {NODE_SIZE} -m dup -d single -L machlin-btrfs /dev/vda
-mount -t btrfs -o noatime /dev/vda /mnt
+def fill() -> str:
+    """Files in the top level, a subvolume and its snapshot, committed."""
+    return f"""
 btrfs subvolume create /mnt/sv > /dev/null
 mkdir /mnt/sv/data /mnt/sv/small /mnt/top
 i=0
@@ -99,6 +113,15 @@ while [ "$i" -lt {TOP_FILES} ]; do
     i=$((i + 1))
 done
 sync
+"""
+
+
+def create_init() -> str:
+    return PRELUDE + MANIFEST + f"""
+mkfs.btrfs --version
+mkfs.btrfs -f -s 4096 -n {NODE_SIZE} -m dup -d single -L machlin-btrfs /dev/vda
+mount -t btrfs -o noatime /dev/vda /mnt
+{fill()}
 manifest
 test "$(relocation_trees)" = 0
 btrfs balance start --full-balance /mnt > /tmp/balance.txt 2>&1 &
@@ -154,12 +177,62 @@ poweroff -f
 """
 
 
+def record_init() -> str:
+    # dm-log-writes needs its modules; no discards, which a replay would have
+    # to zero.
+    prelude = PRELUDE.replace("for module in $(cat /modules/order); do",
+                              "for module in $(cat /modules/order) dm-mod dm-log-writes; do")
+    return prelude + MANIFEST + f"""
+test "$(blockdev --getsize64 /dev/vda)" = {DEVICE_BYTES}
+test "$(blockdev --getsize64 /dev/vdb)" = {LOG_BYTES}
+dmsetup create logged --table "0 $(blockdev --getsz /dev/vda) log-writes /dev/vda /dev/vdb"
+mark() {{
+    dmsetup message logged 0 mark "$1"
+}}
+mkfs.btrfs -f -K -s 4096 -n {NODE_SIZE} -m dup -d single -L machlin-btrfs /dev/mapper/logged
+mark mkfs
+mount -t btrfs -o noatime,nodiscard /dev/mapper/logged /mnt
+{fill()}
+mark filled
+manifest
+btrfs balance start --full-balance /mnt
+sync
+mark balanced
+umount /mnt
+mark unmounted
+dmsetup remove logged
+btrfs check --readonly /dev/vda
+echo BTRFS_RELOC_RECORD_PASS
+trap - EXIT
+poweroff -f
+"""
+
+
+def verify_init() -> str:
+    return PRELUDE + MANIFEST + """
+test "$(relocation_trees)" = 0
+test "$(relocation_orphans)" = 0
+btrfs inspect-internal dump-tree -t root /dev/vda | grep -E 'key \\((TREE_RELOC|BALANCE)' || true
+btrfs check --readonly /dev/vda
+mount -t btrfs -o noatime,skip_balance /dev/vda /mnt
+manifest
+printf 'after relocation recovery\\n' > /mnt/after-recovery
+sync
+umount /mnt
+btrfs check --readonly /dev/vda
+echo BTRFS_RELOC_VERIFY_PASS
+trap - EXIT
+poweroff -f
+"""
+
+
 def prepare(root: Path, phase: str, archive: Path) -> None:
     inputs = root / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     for name, data in INPUTS.items():
         (inputs / name).write_bytes(data)
-    init = {"create": create_init, "expect": expect_init, "recover": recover_init}[phase]()
+    init = {"create": create_init, "expect": expect_init, "recover": recover_init,
+            "record": record_init, "verify": verify_init}[phase]()
     (root / "init").write_text(init)
     (root / "init").chmod(0o755)
     paths = subprocess.run(["find", ".", "-print"], cwd=root, check=True,
@@ -168,8 +241,8 @@ def prepare(root: Path, phase: str, archive: Path) -> None:
     with archive.open("xb") as output:
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root, input=paths,
                        stdout=output, check=True)
-    if phase == "create":
-        report = {"device_bytes": DEVICE_BYTES, "node_size": NODE_SIZE}
+    if phase in ("create", "record"):
+        report = {"device_bytes": DEVICE_BYTES, "log_bytes": LOG_BYTES, "node_size": NODE_SIZE}
         archive.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
 
 
@@ -177,7 +250,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True,
                         help="Disposable staged Alpine initrd root")
-    parser.add_argument("--phase", choices=("create", "expect", "recover"), required=True)
+    parser.add_argument("--phase", choices=("create", "expect", "recover", "record", "verify"),
+                        required=True)
     parser.add_argument("--archive", type=Path, required=True)
     args = parser.parse_args()
     prepare(args.root.resolve(), args.phase, args.archive.resolve())

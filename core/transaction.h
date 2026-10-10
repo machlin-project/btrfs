@@ -128,6 +128,10 @@ struct btrfs_transaction {
 	uint64_t next_root;
 	/* The deleted subvolume the cleaner works on. */
 	struct bt_owned_root dropping;
+	/* The relocation tree a merge step edits (relocating set): its copies
+	 * follow Linux's reference rules for relocation trees. */
+	struct bt_owned_root relocation;
+	int relocating;
 	size_t free_space_applied;
 	size_t chunks_published;
 	int has_free_space;
@@ -237,5 +241,25 @@ enum btrfs_result bt_tx_read(struct btrfs_transaction *transaction,
     size_t length);
 enum btrfs_result bt_tx_privileges_settled(struct btrfs_transaction *transaction,
     struct bt_owned_root *tree, uint64_t inode, const struct bt_disk_inode *item);
+
+/* Drops relocation trees whose merge finished (refs 0) until none remains or
+ * the budget is spent (core/drop.c); *live reports one still waiting for its
+ * merge. */
+enum btrfs_result bt_drop_relocation(
+    struct btrfs_transaction *transaction, size_t budget, size_t *dropped, int *pending, int *live);
+
+/* Applies the reference changes of every block copied so far, as Linux does
+ * at each CoW, so that explicit reference edits may follow. */
+enum btrfs_result bt_tx_settle(struct btrfs_transaction *transaction);
+
+/* A file tree for relocation recovery's merge, read-only snapshots included. */
+enum btrfs_result bt_tx_tree_merge(
+    struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned_root **result);
+
+/* btrfs_recover_relocation with merge steps of at most merge_work transaction
+ * work each, at least one swap (core/relocation.c). */
+enum btrfs_result bt_recover_relocation(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, size_t merge_work,
+    struct btrfs_relocation_report *report);
 
 #endif
