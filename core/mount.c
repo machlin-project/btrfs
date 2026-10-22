@@ -122,12 +122,14 @@ bt_mount_devices(struct btrfs_fs *fs, const struct bt_disk_super *super)
 	size_t j;
 	enum btrfs_result error = BTRFS_OK;
 
-	if (fs->env.device_count != bt_u64(super->devices) - 1) {
-		return fs->env.device_count < bt_u64(super->devices) - 1 ? BTRFS_UNSUPPORTED
-									 : BTRFS_INVALID_ARGUMENT;
+	if (fs->env.device_count > bt_u64(super->devices) - 1) {
+		return BTRFS_INVALID_ARGUMENT;
 	}
-	fs->devices =
-	    fs->env.allocate(fs->env.context, (fs->env.device_count + 1) * sizeof(*fs->devices));
+	if (fs->env.device_count < bt_u64(super->devices) - 1 && !fs->env.degraded) {
+		return BTRFS_UNSUPPORTED;
+	}
+	fs->device_capacity = (size_t)bt_u64(super->devices);
+	fs->devices = fs->env.allocate(fs->env.context, fs->device_capacity * sizeof(*fs->devices));
 	if (fs->devices == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
@@ -177,7 +179,9 @@ bt_mount_devices(struct btrfs_fs *fs, const struct bt_disk_super *super)
 		}
 	}
 	fs->env.release(fs->env.context, other, sizeof(*other));
-	if (error == BTRFS_OK && total != fs->info.total_bytes) {
+	/* Missing devices' sizes are unknown until their chunks name them. */
+	if (error == BTRFS_OK && fs->device_count == fs->device_capacity &&
+	    total != fs->info.total_bytes) {
 		error = BTRFS_CORRUPT;
 	}
 	return error;
@@ -354,8 +358,7 @@ btrfs_unmount(struct btrfs_fs *fs)
 		env.release(env.context, fs->chunks, fs->chunk_capacity * sizeof(*fs->chunks));
 	}
 	if (fs->devices != NULL) {
-		env.release(
-		    env.context, fs->devices, (env.device_count + 1) * sizeof(*fs->devices));
+		env.release(env.context, fs->devices, fs->device_capacity * sizeof(*fs->devices));
 	}
 	env.release(env.context, fs, sizeof(*fs));
 }

@@ -207,9 +207,15 @@ profile_check(struct btrfs_fs *fs, uint64_t profile, unsigned stripes, unsigned 
 	unsigned index;
 	int striped =
 	    (profile & (BT_BLOCK_RAID0 | BT_BLOCK_RAID10 | BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0;
+	/* A RAID5/6 copy above the first is a rebuild, not a place. */
+	unsigned places = (profile & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0 ? 1U : copies;
 
 	for (offset = 0; offset < 64 * BT_STRIPE_LENGTH; offset += 3 * TABLE_SECTOR) {
-		for (mirror = 0; mirror < copies; mirror++) {
+		if (places < copies) {
+			assert(bt_map_place(fs, PROFILE_CHUNK_LOGICAL + offset, TABLE_SECTOR,
+				   BT_BLOCK_DATA, places, &place, &mirrors) == BTRFS_UNSUPPORTED);
+		}
+		for (mirror = 0; mirror < places; mirror++) {
 			assert(
 			    bt_map_place(fs, PROFILE_CHUNK_LOGICAL + offset, 2 * BT_STRIPE_LENGTH,
 				BT_BLOCK_DATA, mirror, &place, &mirrors) == BTRFS_OK);
@@ -277,9 +283,9 @@ profile_contract(void)
 	assert(profile_add(&fs, BT_BLOCK_RAID10, 4, 2, 2 * PROFILE_STRIPE_BYTES) == BTRFS_OK);
 	profile_check(&fs, BT_BLOCK_RAID10, 4, 2);
 	assert(profile_add(&fs, BT_BLOCK_RAID5, 3, 1, 2 * PROFILE_STRIPE_BYTES) == BTRFS_OK);
-	profile_check(&fs, BT_BLOCK_RAID5, 3, 1);
+	profile_check(&fs, BT_BLOCK_RAID5, 3, 2);
 	assert(profile_add(&fs, BT_BLOCK_RAID6, 4, 1, 2 * PROFILE_STRIPE_BYTES) == BTRFS_OK);
-	profile_check(&fs, BT_BLOCK_RAID6, 4, 1);
+	profile_check(&fs, BT_BLOCK_RAID6, 4, 4);
 	/* Stripe counts and sub-stripes Linux's chunk checker rejects. */
 	assert(profile_add(&fs, BT_BLOCK_RAID1, 3, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
 	assert(profile_add(&fs, BT_BLOCK_RAID1C3, 2, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
@@ -312,6 +318,235 @@ profile_contract(void)
 	assert(profile_item(&fs, BT_BLOCK_RAID1, 2, 1, PROFILE_STRIPE_BYTES, 1) == BTRFS_CORRUPT);
 	assert(fs.chunk_count == 0);
 	free(fs.chunks);
+}
+
+/* RAID5 on five and RAID6 on six in-memory devices, four rows each. */
+#define PARITY_ROWS 4U
+#define PARITY_MAX_STRIPES 6U
+#define PARITY_DEVICE_BYTES (PARITY_ROWS * BT_STRIPE_LENGTH)
+#define PARITY_POLYNOMIAL 0x11dU
+
+struct parity_device {
+	uint8_t bytes[PARITY_DEVICE_BYTES];
+};
+
+static enum btrfs_result
+parity_read(void *context, uint64_t offset, void *buffer, size_t length)
+{
+	struct parity_device *device = context;
+
+	if (offset > PARITY_DEVICE_BYTES || length > PARITY_DEVICE_BYTES - offset) {
+		return BTRFS_IO;
+	}
+	memcpy(buffer, device->bytes + offset, length);
+	return BTRFS_OK;
+}
+
+/* An independent GF(2^8): exponent and logarithm tables of g = 2 under
+ * lib/raid6's polynomial, built by repeated doubling. */
+struct parity_field {
+	uint8_t exp[512];
+	uint8_t log[256];
+};
+
+static void
+parity_field_init(struct parity_field *field)
+{
+	unsigned value = 1;
+	unsigned i;
+
+	for (i = 0; i < 255; i++) {
+		field->exp[i] = (uint8_t)value;
+		field->exp[i + 255] = (uint8_t)value;
+		field->log[value] = (uint8_t)i;
+		value <<= 1;
+		if (value & 0x100U) {
+			value ^= PARITY_POLYNOMIAL;
+		}
+	}
+}
+
+static uint8_t
+parity_times(const struct parity_field *field, uint8_t value, unsigned power)
+{
+	return value == 0 ? 0 : field->exp[field->log[value] + power % 255];
+}
+
+/* Writes a chunk's rows: data units in logical order at stripe (row + d) %
+ * stripes, P after them, Q after P, as Linux's raid56 lays them out. */
+static void
+parity_fill(const struct parity_field *field, struct parity_device *devices, unsigned stripes,
+    unsigned parity, uint8_t *data)
+{
+	unsigned count = stripes - parity;
+	uint64_t row;
+	size_t at;
+	unsigned d;
+	uint8_t p;
+	uint8_t q;
+
+	for (row = 0; row < PARITY_ROWS; row++) {
+		for (at = 0; at < BT_STRIPE_LENGTH; at++) {
+			p = 0;
+			q = 0;
+			for (d = 0; d < count; d++) {
+				uint8_t byte = data[(row * count + d) * BT_STRIPE_LENGTH + at];
+
+				devices[(row + d) % stripes].bytes[row * BT_STRIPE_LENGTH + at] =
+				    byte;
+				p ^= byte;
+				q ^= parity_times(field, byte, d);
+			}
+			devices[(row + count) % stripes].bytes[row * BT_STRIPE_LENGTH + at] = p;
+			if (parity == 2) {
+				devices[(row + count + 1) % stripes]
+				    .bytes[row * BT_STRIPE_LENGTH + at] = q;
+			}
+		}
+	}
+}
+
+static enum btrfs_result
+parity_add(struct btrfs_fs *fs, uint64_t profile, unsigned stripes, uint64_t length)
+{
+	struct profile_item item;
+	struct bt_key key = { BT_FIRST_CHUNK_OBJECTID, PROFILE_CHUNK_LOGICAL, BT_CHUNK_ITEM };
+	unsigned i;
+
+	memset(&item, 0, sizeof(item));
+	bt_put64(&item.chunk.length, length);
+	bt_put64(&item.chunk.owner, BT_EXTENT_TREE);
+	bt_put64(&item.chunk.stripe_length, BT_STRIPE_LENGTH);
+	bt_put64(&item.chunk.type, BT_BLOCK_DATA | profile);
+	bt_put32(&item.chunk.sector_size, TABLE_SECTOR);
+	bt_put16(&item.chunk.stripes, (uint16_t)stripes);
+	bt_put16(&item.chunk.sub_stripes, 1);
+	for (i = 0; i < stripes; i++) {
+		bt_put64(&item.stripes[i].device, fs->devices[i].id);
+		memcpy(item.stripes[i].uuid, fs->devices[i].uuid, BTRFS_UUID_SIZE);
+	}
+	return bt_chunk_add(
+	    fs, key, &item, sizeof(item.chunk) + stripes * sizeof(item.stripes[0]), 0);
+}
+
+/* Reads every sector as copy mirror and compares it with the data. */
+static int
+parity_reads(
+    struct btrfs_fs *fs, unsigned mirror, const uint8_t *data, uint64_t length, uint64_t unit)
+{
+	uint8_t sector[TABLE_SECTOR];
+	uint64_t offset;
+	size_t span;
+	unsigned mirrors;
+
+	for (offset = unit * BT_STRIPE_LENGTH;
+	    offset < (unit + 1) * BT_STRIPE_LENGTH && offset < length; offset += TABLE_SECTOR) {
+		if (bt_read_copy(fs, PROFILE_CHUNK_LOGICAL + offset, sector, TABLE_SECTOR,
+			BT_BLOCK_DATA, mirror, &span, &mirrors) != BTRFS_OK ||
+		    span != TABLE_SECTOR || memcmp(sector, data + offset, TABLE_SECTOR) != 0) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* RAID5 and RAID6 rebuilds against an independent model of the parity:
+ * every copy reads every data unit while all devices are there, and with the
+ * unit's device lost, the copy that does without it (P; Q without P; P and
+ * Q without a second data stripe) still does. */
+static void
+parity_contract(void)
+{
+	static struct parity_device memory[PARITY_MAX_STRIPES];
+	static uint8_t data[PARITY_ROWS * PARITY_MAX_STRIPES * BT_STRIPE_LENGTH];
+	static const unsigned shapes[][2] = { { 5, 1 }, { 6, 2 } };
+	struct bt_device devices[PARITY_MAX_STRIPES];
+	struct parity_field field;
+	struct btrfs_fs fs;
+	uint64_t profile;
+	uint64_t length;
+	uint64_t unit;
+	uint32_t state = 0x2545f491U;
+	unsigned stripes;
+	unsigned parity;
+	unsigned count;
+	unsigned shape;
+	unsigned target;
+	unsigned other;
+	unsigned mirror;
+	unsigned copies;
+	unsigned i;
+
+	parity_field_init(&field);
+	for (i = 0; i < sizeof(data); i++) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		data[i] = (uint8_t)state;
+	}
+	for (shape = 0; shape < 2; shape++) {
+		stripes = shapes[shape][0];
+		parity = shapes[shape][1];
+		count = stripes - parity;
+		profile = parity == 1 ? BT_BLOCK_RAID5 : BT_BLOCK_RAID6;
+		length = (uint64_t)PARITY_ROWS * count * BT_STRIPE_LENGTH;
+		parity_fill(&field, memory, stripes, parity, data);
+		memset(&fs, 0, sizeof(fs));
+		fs.env.allocate = table_allocate;
+		fs.env.release = table_release;
+		fs.info.sector_size = TABLE_SECTOR;
+		for (i = 0; i < stripes; i++) {
+			memset(&devices[i], 0, sizeof(devices[i]));
+			devices[i].id = 1 + i;
+			devices[i].size = PARITY_DEVICE_BYTES;
+			devices[i].readable = PARITY_DEVICE_BYTES;
+			devices[i].context = &memory[i];
+			devices[i].read = parity_read;
+			memset(devices[i].uuid, 0x60 + (int)i, BTRFS_UUID_SIZE);
+		}
+		fs.devices = devices;
+		fs.device_count = stripes;
+		fs.device_capacity = stripes;
+		/* Device 0 reads through the environment, as the mounted device. */
+		fs.env.context = &memory[0];
+		fs.env.read = parity_read;
+		fs.env.size_bytes = PARITY_DEVICE_BYTES;
+		fs.chunk_capacity = BT_INITIAL_CHUNKS;
+		fs.chunks = malloc(fs.chunk_capacity * sizeof(*fs.chunks));
+		assert(fs.chunks != NULL);
+		assert(parity_add(&fs, profile, stripes, length) == BTRFS_OK);
+		copies = fs.chunks[0].mirrors;
+		assert(copies == (parity == 1 ? 2U : 3U + count - 1U));
+		for (unit = 0; unit < PARITY_ROWS * count; unit++) {
+			/* Unit's stripe, as the layout puts it. */
+			target = (unsigned)(((unit / count) + unit % count) % stripes);
+			for (mirror = 0; mirror < copies; mirror++) {
+				assert(parity_reads(&fs, mirror, data, length, unit));
+			}
+			/* Device 0 is the device the volume is mounted from: lose the
+			 * others' reads alone. */
+			devices[target].read = NULL;
+			assert(target == 0 || !parity_reads(&fs, 0, data, length, unit));
+			assert(parity_reads(&fs, 1, data, length, unit));
+			if (parity == 2) {
+				/* Without P too: Q rebuilds it. */
+				i = (unsigned)((unit / count + count) % stripes);
+				devices[i].read = NULL;
+				assert(parity_reads(&fs, 2, data, length, unit));
+				devices[i].read = parity_read;
+				/* Without each other data stripe too: P and Q. */
+				for (other = 0; other + 1 < count; other++) {
+					i = other < unit % count ? other : other + 1;
+					i = (unsigned)((unit / count + i) % stripes);
+					devices[i].read = NULL;
+					assert(parity_reads(&fs, 3 + other, data, length, unit));
+					devices[i].read = parity_read;
+				}
+			}
+			devices[target].read = parity_read;
+		}
+		free(fs.chunks);
+	}
 }
 
 static void
@@ -576,8 +811,9 @@ main(void)
 	xattr_name_contract();
 	chunk_table_contract();
 	profile_contract();
+	parity_contract();
 	btrfs_unmount(NULL);
-	puts("wire encoding, CRC32C known vector, key order, names, chunk table, chunk profiles "
-	     "and invalid API inputs: PASS");
+	puts("wire encoding, CRC32C known vector, key order, names, chunk table, chunk profiles, "
+	     "RAID5/6 rebuilds and invalid API inputs: PASS");
 	return 0;
 }

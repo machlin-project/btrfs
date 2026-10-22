@@ -113,9 +113,15 @@ struct btrfs_environment {
 	struct btrfs_cache *cache;
 	/* The volume's other devices when it spans several, in any order: mount
 	 * identifies each by its superblock and requires every device the
-	 * volume names. NULL and 0 for a volume of one device. */
+	 * volume names unless degraded is set. NULL and 0 for a volume of one
+	 * device. */
 	const struct btrfs_device *devices;
 	size_t device_count;
+	/* Admits a volume without some of its devices, as Linux's -o degraded:
+	 * their stripes read as failed, so other copies and RAID5/6 parity
+	 * serve what they held, and data on nothing else fails to read (IO).
+	 * Transactions are refused. */
+	int degraded;
 };
 
 /* Mutual exclusion for storing nodes in a cache shared by threads (lookups do

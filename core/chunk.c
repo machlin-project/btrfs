@@ -95,19 +95,31 @@ bt_chunk_data_stripes(uint64_t profile, unsigned stripes, unsigned sub_stripes)
 	return profile == BT_BLOCK_RAID6 ? stripes - 2 : 1;
 }
 
-/* The volume's device with id and uuid, as an index; device_count if none. */
+/* The volume's device with id and uuid, as an index; device_count if none.
+ * A degraded mount adds a device it lacks, with no reads, the first time a
+ * chunk names it, up to the volume's device count. */
 static size_t
-bt_chunk_device(const struct btrfs_fs *fs, uint64_t id, const uint8_t *uuid)
+bt_chunk_device(struct btrfs_fs *fs, uint64_t id, const uint8_t *uuid)
 {
+	struct bt_device *missing;
 	size_t i;
 
 	for (i = 0; i < fs->device_count; i++) {
-		if (fs->devices[i].id == id &&
-		    bt_equal(fs->devices[i].uuid, uuid, BTRFS_UUID_SIZE)) {
-			return i;
+		if (fs->devices[i].id == id) {
+			return bt_equal(fs->devices[i].uuid, uuid, BTRFS_UUID_SIZE)
+			    ? i
+			    : fs->device_count;
 		}
 	}
-	return fs->device_count;
+	if (!fs->env.degraded || id == 0 || fs->device_count == fs->device_capacity) {
+		return fs->device_count;
+	}
+	missing = &fs->devices[fs->device_count];
+	bt_zero(missing, sizeof(*missing));
+	missing->id = id;
+	missing->size = UINT64_MAX;
+	bt_copy(missing->uuid, uuid, BTRFS_UUID_SIZE);
+	return fs->device_count++;
 }
 
 enum btrfs_result
@@ -181,11 +193,11 @@ bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t le
 	stripes = (const void *)((const uint8_t *)data + sizeof(*disk));
 	chunk.stripes = (uint8_t)count;
 	chunk.sub_stripes = (uint8_t)sub_stripes;
-	chunk.mirrors = (uint8_t)(profile == 0 ||
-		    (profile & (BT_BLOCK_RAID0 | BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0
-		? 1
-		: profile == BT_BLOCK_RAID10 ? sub_stripes
-					     : count);
+	chunk.mirrors = (uint8_t)(profile == 0 || profile == BT_BLOCK_RAID0 ? 1U
+		: profile == BT_BLOCK_RAID10				    ? sub_stripes
+		: (profile & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0
+		? bt_raid56_copies(profile, count)
+		: count);
 	for (j = 0; j < count; j++) {
 		chunk.physical[j] = bt_u64(stripes[j].offset);
 		device = bt_chunk_device(fs, bt_u64(stripes[j].device), stripes[j].uuid);
@@ -287,6 +299,9 @@ bt_map_place(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_
 		factor = chunk->stripes / chunk->sub_stripes;
 		index = (unsigned)(stripe % factor) * chunk->sub_stripes + mirror;
 		stripe /= factor;
+	} else if (mirror != 0) {
+		/* A RAID5/6 copy above the first is a rebuild (bt_read_copy). */
+		return BTRFS_UNSUPPORTED;
 	} else {
 		/* RAID5/6: the data stripe, its parity rotating over the stripes. */
 		factor = chunk->stripes - (profile == BT_BLOCK_RAID5 ? 1U : 2U);
@@ -314,6 +329,41 @@ bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind
 	}
 	if (error == BTRFS_OK) {
 		*physical = place.physical;
+	}
+	return error;
+}
+
+enum btrfs_result
+bt_read_copy(const struct btrfs_fs *fs, uint64_t logical, void *buffer, size_t length,
+    uint64_t kind, unsigned mirror, size_t *span, unsigned *mirrors)
+{
+	const struct bt_chunk *chunk;
+	struct bt_place place;
+	size_t index = bt_chunk_containing(fs, logical);
+	uint64_t within;
+	enum btrfs_result error;
+
+	*span = 0;
+	if (index == fs->chunk_count) {
+		return BTRFS_CORRUPT;
+	}
+	chunk = &fs->chunks[index];
+	if (mirror != 0 && (chunk->type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0) {
+		within = logical - chunk->logical;
+		*mirrors = chunk->mirrors;
+		if ((chunk->type & kind) == 0 || length > chunk->length - within ||
+		    mirror >= chunk->mirrors) {
+			return BTRFS_CORRUPT;
+		}
+		*span = length < BT_STRIPE_LENGTH - within % BT_STRIPE_LENGTH
+		    ? length
+		    : (size_t)(BT_STRIPE_LENGTH - within % BT_STRIPE_LENGTH);
+		return bt_raid56_rebuild(fs, chunk, within, buffer, *span, mirror);
+	}
+	error = bt_map_place(fs, logical, length, kind, mirror, &place, mirrors);
+	if (error == BTRFS_OK) {
+		*span = place.span;
+		error = bt_read_device(fs, place.device, place.physical, buffer, place.span);
 	}
 	return error;
 }

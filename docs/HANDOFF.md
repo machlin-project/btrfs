@@ -147,8 +147,8 @@ is destroyed. `accept` is legal only after successful durable publication;
    metadata reservations against limits and simple quotas. 16 KiB sectors
    are read and written against fixtures a 16 KiB-page Linux wrote. Volumes
    of several devices are read with every Linux profile (`core/chunk.c`,
-   `tests/multidev.c`); remaining there: degraded mounts, RAID5/6
-   reconstruction from parity, and writing several devices; 64 KiB
+   `tests/multidev.c`), degraded and with RAID5/6 data rebuilt from parity
+   (`core/raid56.c`); remaining there: writing several devices; 64 KiB
    sectors against an image btrfs-progs formatted, whose check and restore
    accept what is written (`tests/large_sectors.c`). Remaining: a Linux
    kernel's verdict on 64 KiB sectors, which needs a 64 KiB-page kernel that

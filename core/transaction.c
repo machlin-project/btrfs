@@ -160,7 +160,7 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 		return BTRFS_UNSUPPORTED;
 	}
 	/* The writer writes one device, single and DUP chunks. */
-	if (base->device_count != 1 ||
+	if (base->device_count != 1 || base->device_capacity != 1 ||
 	    (base->info.incompat_features & (BT_FEATURE_RAID56 | BT_FEATURE_RAID1C34)) != 0) {
 		return BTRFS_UNSUPPORTED;
 	}
@@ -1598,7 +1598,7 @@ bt_tx_committed_view(struct btrfs_transaction *transaction, uint64_t tree, struc
 	/* The view outlives its base: it owns copies of the device and chunk
 	 * tables. */
 	fs->chunks = NULL;
-	fs->devices = env->allocate(env->context, (env->device_count + 1) * sizeof(*fs->devices));
+	fs->devices = env->allocate(env->context, fs->device_capacity * sizeof(*fs->devices));
 	if (fs->devices == NULL) {
 		btrfs_unmount(fs);
 		return BTRFS_NO_MEMORY;

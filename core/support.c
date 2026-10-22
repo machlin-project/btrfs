@@ -511,6 +511,9 @@ bt_read_device(
 		return BTRFS_CORRUPT;
 	}
 	target = &fs->devices[device];
+	if (target->read == NULL) {
+		return BTRFS_IO;
+	}
 	if (offset > target->readable || length > target->readable - offset) {
 		return BTRFS_CORRUPT;
 	}

@@ -153,6 +153,9 @@ struct btrfs_fs {
 	 * and shared by its views. */
 	struct bt_device *devices;
 	size_t device_count;
+	/* Entries the table holds: the volume's device count. A degraded mount
+	 * adds missing devices as the chunks name them, without reads. */
+	size_t device_capacity;
 	/* The root and level of a pending tree log, admitted only for its replay;
 	 * zero otherwise. */
 	uint64_t log_root;
@@ -372,9 +375,22 @@ enum btrfs_result bt_map_place(const struct btrfs_fs *fs, uint64_t logical, size
  * UNSUPPORTED. */
 enum btrfs_result bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,
     unsigned mirror, uint64_t *physical, unsigned *mirrors);
-/* Positioned reads of one device of the volume. */
+/* Positioned reads of one device of the volume; a missing device's are IO. */
 enum btrfs_result bt_read_device(
     const struct btrfs_fs *fs, uint32_t device, uint64_t offset, void *buffer, size_t length);
+/* Reads a logical range of a chunk of kind as copy mirror (below *mirrors)
+ * holds it: from the device of that copy, or for a RAID5/6 copy above the
+ * first, rebuilt from the other stripes of its row (core/raid56.c). *span is
+ * how much was read: the range up to a stripe boundary where the profile
+ * stripes. */
+enum btrfs_result bt_read_copy(const struct btrfs_fs *fs, uint64_t logical, void *buffer,
+    size_t length, uint64_t kind, unsigned mirror, size_t *span, unsigned *mirrors);
+/* Copies a RAID5 or RAID6 chunk of stripes offers a read. */
+unsigned bt_raid56_copies(uint64_t profile, unsigned stripes);
+/* Rebuilds length bytes at within of a RAID5/6 chunk, inside one 64 KiB
+ * stripe, as copy mirror (1 or above) of its data stripe. */
+enum btrfs_result bt_raid56_rebuild(const struct btrfs_fs *fs, const struct bt_chunk *chunk,
+    uint64_t within, uint8_t *out, size_t length, unsigned mirror);
 /* A root owner that asks for whichever owner the node's header names; the
  * node is verified otherwise as any other. */
 #define BT_OWNER_ANY UINT64_MAX

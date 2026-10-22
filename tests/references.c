@@ -688,7 +688,7 @@ audit_checksums(struct audit_state *state)
 	uint8_t sum[BT_CSUM_SIZE];
 	uint8_t *sector;
 	size_t size = bt_checksum_size(fs->info.checksum_type);
-	struct bt_place place;
+	size_t span;
 	uint64_t length;
 	uint64_t position;
 	uint64_t end;
@@ -730,16 +730,14 @@ audit_checksums(struct audit_state *state)
 		}
 		add_range(&state->checksummed, record.key.offset, record.key.offset + length);
 		state->audit->checksums += record.size / size;
-		/* Every copy of the data (DUP, RAID1, RAID10) holds the checksummed
-		 * bytes, on whichever device holds it. */
+		/* Every copy of the data holds the checksummed bytes: DUP, RAID1 and
+		 * RAID10 copies on their devices, and RAID5/6 rebuilds from parity. */
 		for (i = 0; i < record.size / size && !state->failed; i++) {
 			mirrors = 1;
 			for (mirror = 0; mirror < mirrors && !state->failed; mirror++) {
-				if (bt_map_place(fs, record.key.offset + i * fs->info.sector_size,
-					fs->info.sector_size, BT_BLOCK_DATA, mirror, &place,
-					&mirrors) != BTRFS_OK ||
-				    bt_read_device(fs, place.device, place.physical, sector,
-					fs->info.sector_size) != BTRFS_OK) {
+				if (bt_read_copy(fs, record.key.offset + i * fs->info.sector_size,
+					sector, fs->info.sector_size, BT_BLOCK_DATA, mirror, &span,
+					&mirrors) != BTRFS_OK) {
 					fail(state, "unreadable checksummed sector %llu copy %u",
 					    (unsigned long long)(record.key.offset +
 						i * fs->info.sector_size),

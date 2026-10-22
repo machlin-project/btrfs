@@ -113,19 +113,24 @@ devices in any order, and mount identifies each by its superblock: the same
 fsid, generation and committed roots as the device it was opened from, and a
 device item of its own whose id no other device has. Every device the volume
 counts must be there, as Linux requires without `-o degraded`: a missing one
-is UNSUPPORTED (degraded mounts are not implemented), a device whose
-generation differs missed commits (STALE), and a device of another volume is
-CORRUPT. Chunk stripes name their device by id and UUID, and every profile
+is UNSUPPORTED unless the environment asks for a degraded mount, a device
+whose generation differs missed commits (STALE), and a device of another
+volume is CORRUPT. A degraded mount gives each missing device its chunks name
+an entry without reads, so their stripes fail as an unreadable device's do. Chunk stripes name their device by id and UUID, and every profile
 Linux writes is read, with Linux's stripe counts (`btrfs_check_chunk_valid`):
 SINGLE and DUP, RAID1, RAID1C3 and RAID1C4 copies, RAID0 and RAID10 with 64
 KiB stripes in turn (RAID10's in pairs of copies), and RAID5 and RAID6 data
 stripes with the parity rotating over the stripes, as `btrfs_map_block` maps
 them. A tree block never crosses a stripe; a data read is one device request
 per stripe it crosses, from the first copy that reads, and a sector whose
-checksum fails is read again from each copy. Parity is not read: RAID5 and
-RAID6 data on a bad stripe is not reconstructed. The writer writes one device
-with SINGLE and DUP chunks; transaction admission refuses any other volume
-(UNSUPPORTED).
+checksum fails is read again from each copy. RAID5 and RAID6 data have further
+copies rebuilt from the same offset in the other stripes of their row
+(`core/raid56.c`), as Linux's raid56 rebuilds them, with lib/raid6's GF(2^8)
+(polynomial 0x11d, generator 2): from P and the other data stripes, for RAID6
+from Q and the other data stripes, and from P and Q with each other data
+stripe of the row lost too; a read or check takes the first that verifies.
+No repair is written. The writer writes one device with SINGLE and DUP
+chunks; transaction admission refuses any other volume (UNSUPPORTED).
 
 A cursor retains one heap buffer per tree level. Internal keys are numerically
 ordered by object ID, type and offset. Each child must match its parent's first

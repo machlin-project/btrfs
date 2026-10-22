@@ -4,11 +4,14 @@
  * two devices). Every file and symlink of Linux's manifest reads with its
  * mode, owner, size and SHA-256 or target; the reference audit, which reads
  * the checksummed sectors of every copy on its device, and the namespace
- * audit pass. Mounted from each of its devices, with the others in reverse
- * order, the volume reads the same. Without one of its devices a mount is
- * refused (degraded mounts are not supported), a device of another volume
- * among them is CORRUPT, and writable admission refuses the volume before
- * any write. */
+ * audit pass; it reads every copy, RAID5/6 rebuilds from parity included.
+ * Mounted from each of its devices, with the others in reverse order, the
+ * volume reads the same. Without one of its devices a mount is refused,
+ * unless degraded: then every file reads as before where each chunk keeps a
+ * copy or its parity, and otherwise fails to read (IO) but never reads other
+ * bytes; volumes whose chunks all survive two lost devices are read without
+ * each pair too. A device of another volume among them is CORRUPT, and
+ * writable admission refuses the volume before any write. */
 #include "../adapters/posix/image.h"
 #include "internal.h"
 #include "namespace_audit.h"
@@ -66,9 +69,10 @@ hex_digest(const uint8_t *bytes, size_t size, char hex[SHA256_HEX + 1])
 	}
 }
 
-/* Every manifest entry reads as Linux wrote it; returns their number. */
+/* Every manifest entry reads as Linux wrote it; returns their number. With
+ * lossy set, an entry may fail to read (IO) instead, counted in *lost. */
 static size_t
-check_manifest(struct btrfs_fs *fs, const char *path)
+check_manifest(struct btrfs_fs *fs, const char *path, int lossy, size_t *lost)
 {
 	char line[MANIFEST_LINE];
 	char name[MANIFEST_LINE];
@@ -84,6 +88,7 @@ check_manifest(struct btrfs_fs *fs, const char *path)
 	size_t count = 0;
 	size_t i;
 	FILE *stream;
+	enum btrfs_result result;
 
 	stream = fopen(path, "r");
 	REQUIRE(stream != NULL);
@@ -108,8 +113,14 @@ check_manifest(struct btrfs_fs *fs, const char *path)
 		}
 		bytes = malloc((size_t)size + 1);
 		REQUIRE(bytes != NULL);
-		REQUIRE(btrfs_read(fs, &inode, 0, bytes, (size_t)size, &completed) == BTRFS_OK &&
-		    completed == size);
+		result = btrfs_read(fs, &inode, 0, bytes, (size_t)size, &completed);
+		if (lossy && result == BTRFS_IO) {
+			(*lost)++;
+			free(bytes);
+			count++;
+			continue;
+		}
+		REQUIRE(result == BTRFS_OK && completed == size);
 		if ((mode & MODE_TYPE) == MODE_SYMLINK) {
 			REQUIRE(strlen(fields[2]) == size && memcmp(bytes, fields[2], size) == 0);
 		} else {
@@ -126,6 +137,64 @@ check_manifest(struct btrfs_fs *fs, const char *path)
 	return count;
 }
 
+/* How many lost devices every chunk of the volume survives: its copies but
+ * one, RAID10's pairs one, RAID5's parity one and RAID6's two. */
+static unsigned
+survivable(const struct btrfs_fs *fs)
+{
+	uint64_t profile;
+	unsigned lowest = UINT32_MAX;
+	unsigned chunk;
+	size_t i;
+
+	for (i = 0; i < fs->chunk_count; i++) {
+		profile = fs->chunks[i].type & BT_BLOCK_PROFILES;
+		chunk = profile == BT_BLOCK_RAID1 || profile == BT_BLOCK_RAID1C3 ||
+			profile == BT_BLOCK_RAID1C4
+		    ? fs->chunks[i].stripes - 1U
+		    : profile == BT_BLOCK_RAID10 || profile == BT_BLOCK_RAID5 ? 1U
+		    : profile == BT_BLOCK_RAID6				      ? 2U
+									      : 0U;
+		lowest = chunk < lowest ? chunk : lowest;
+	}
+	return lowest;
+}
+
+/* Mounts the volume degraded without the devices missing marks, from the
+ * first remaining one; returns the files that failed to read. */
+static size_t
+check_degraded(char **images, size_t devices, const int *missing, int complete,
+    const char *manifest, const struct namespace_digest *expected)
+{
+	const char *paths[MAX_DEVICES];
+	struct namespace_digest digest;
+	struct btrfs_image image;
+	struct btrfs_fs *fs;
+	size_t count = 0;
+	size_t lost = 0;
+	size_t i;
+
+	for (i = 0; i < devices; i++) {
+		if (!missing[i]) {
+			paths[count++] = images[i];
+		}
+	}
+	REQUIRE(btrfs_image_open_devices(paths, count, &image) == 0);
+	REQUIRE(btrfs_mount(&image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_UNSUPPORTED);
+	image.environment.degraded = 1;
+	REQUIRE(btrfs_mount(&image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	(void)check_manifest(fs, manifest, !complete, &lost);
+	if (complete) {
+		REQUIRE(namespace_content_digest(fs, &digest) == 0 &&
+		    digest.hash == expected->hash && digest.objects == expected->objects &&
+		    digest.bytes == expected->bytes);
+	}
+	btrfs_unmount(fs);
+	REQUIRE(image.live_allocations == 0);
+	btrfs_image_close(&image);
+	return lost;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -140,10 +209,15 @@ main(int argc, char **argv)
 	struct btrfs_image image;
 	struct btrfs_image foreign;
 	struct btrfs_fs *fs;
+	int missing[MAX_DEVICES] = { 0 };
 	size_t devices;
 	size_t files;
+	size_t lost = 0;
+	size_t degraded = 0;
+	size_t pairs = 0;
 	size_t i;
 	size_t j;
+	unsigned survives;
 
 	REQUIRE(argc >= 5);
 	devices = (size_t)(argc - 3);
@@ -154,7 +228,8 @@ main(int argc, char **argv)
 	REQUIRE(btrfs_image_open_devices(paths, devices, &image) == 0);
 	REQUIRE(btrfs_mount(&image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	REQUIRE(fs->device_count == devices);
-	files = check_manifest(fs, argv[1]);
+	files = check_manifest(fs, argv[1], 0, &lost);
+	survives = survivable(fs);
 	if (reference_audit(fs, &references) != 0) {
 		fprintf(stderr, "reference audit: %s\n", references.failure);
 		exit(1);
@@ -183,13 +258,31 @@ main(int argc, char **argv)
 		btrfs_image_close(&image);
 	}
 
-	/* Without its last device; with a device of another volume in its place. */
+	/* Without each device, then without each pair where every chunk
+	 * survives two lost devices. */
+	for (i = 0; i < devices; i++) {
+		missing[i] = 1;
+		lost += check_degraded(argv + 3, devices, missing, survives >= 1, argv[1], &digest);
+		missing[i] = 0;
+		degraded++;
+	}
+	REQUIRE(survives >= 1 || lost > 0);
+	for (i = 0; survives >= 2 && i < devices; i++) {
+		for (j = i + 1; j < devices; j++) {
+			missing[i] = 1;
+			missing[j] = 1;
+			REQUIRE(
+			    check_degraded(argv + 3, devices, missing, 1, argv[1], &digest) == 0);
+			missing[i] = 0;
+			missing[j] = 0;
+			pairs++;
+		}
+	}
+
+	/* A device of another volume in place of the last. */
 	for (i = 0; i < devices; i++) {
 		paths[i] = argv[3 + i];
 	}
-	REQUIRE(btrfs_image_open_devices(paths, devices - 1, &image) == 0);
-	REQUIRE(btrfs_mount(&image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_UNSUPPORTED);
-	btrfs_image_close(&image);
 	paths[devices - 1] = argv[2];
 	REQUIRE(btrfs_image_open_devices(paths, devices, &foreign) == 0);
 	REQUIRE(btrfs_mount(&foreign.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_CORRUPT);
@@ -197,7 +290,9 @@ main(int argc, char **argv)
 	btrfs_image_close(&foreign);
 	printf("multi-device: %zu devices, %zu files read as Linux wrote them; both audits pass "
 	       "(%zu checksummed copies); mounted from each device the volume reads the same; "
-	       "a missing device, a foreign device and writable admission are refused PASS\n",
-	    devices, files, references.checked_copies);
+	       "degraded without each of %zu devices (%zu files lost in all) and each of %zu "
+	       "pairs the volume reads as before where its chunks survive; a foreign device "
+	       "and writable admission are refused PASS\n",
+	    devices, files, references.checked_copies, degraded, lost, pairs);
 	return 0;
 }

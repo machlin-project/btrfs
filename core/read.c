@@ -42,23 +42,19 @@ bt_sector_checksum(struct bt_cursor *cursor, uint64_t logical, uint8_t *checksum
 }
 
 /* Reads a sector whose checksum did not match from every copy until one
- * matches; no repair is written. */
+ * matches, RAID5/6 rebuilds included; no repair is written. */
 static enum btrfs_result
 bt_reread_sector(const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, unsigned mirrors,
     const uint8_t *checksum)
 {
 	uint8_t sum[BT_CSUM_SIZE];
-	struct bt_place place;
+	size_t span;
 	unsigned mirror;
 	enum btrfs_result error = BTRFS_CORRUPT;
 
 	for (mirror = 0; mirror < mirrors; mirror++) {
-		error = bt_map_place(
-		    fs, logical, fs->info.sector_size, BT_BLOCK_DATA, mirror, &place, &mirrors);
-		if (error != BTRFS_OK) {
-			return error;
-		}
-		error = bt_read_device(fs, place.device, place.physical, out, fs->info.sector_size);
+		error = bt_read_copy(
+		    fs, logical, out, fs->info.sector_size, BT_BLOCK_DATA, mirror, &span, &mirrors);
 		if (error == BTRFS_OK) {
 			bt_checksum_sectors(fs, out, 1, sum);
 			error = bt_equal(sum, checksum, bt_checksum_size(fs->info.checksum_type))
@@ -78,21 +74,16 @@ static enum btrfs_result
 bt_device_read(
     const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, size_t length, unsigned *mirrors)
 {
-	struct bt_place place;
 	size_t position;
+	size_t span = 0;
 	unsigned mirror;
 	enum btrfs_result error = BTRFS_OK;
 
 	*mirrors = 1;
-	for (position = 0; error == BTRFS_OK && position < length; position += place.span) {
+	for (position = 0; error == BTRFS_OK && position < length; position += span) {
 		for (mirror = 0; mirror < *mirrors; mirror++) {
-			error = bt_map_place(fs, logical + position, length - position,
-			    BT_BLOCK_DATA, mirror, &place, mirrors);
-			if (error != BTRFS_OK) {
-				return error;
-			}
-			error = bt_read_device(
-			    fs, place.device, place.physical, out + position, place.span);
+			error = bt_read_copy(fs, logical + position, out + position,
+			    length - position, BT_BLOCK_DATA, mirror, &span, mirrors);
 			if (error != BTRFS_IO) {
 				break;
 			}
