@@ -105,6 +105,9 @@ logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
 relocation_test = executable('btrfs-relocation-test', 'tests/relocation.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd])
+multidev_test = executable('btrfs-multidev-test', 'tests/multidev.c', 'tests/references.c',
+  'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
+  dependencies: [zlib, zstd])
 balance_test = executable('btrfs-balance-test', 'tests/balance.c', 'tests/references.c',
   'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
@@ -316,6 +319,19 @@ if fixtures != ''
   test('large-sectors', large_sectors_test, args: [join_paths(fixtures, 'sectors-64k.raw'),
     join_paths(fixtures, 'sectors-64k.expected.tsv'), meson.current_build_dir()],
     timeout: 300, suite: 'images')
+  # Volumes Linux wrote across several devices: every profile reads as
+  # Linux's manifest says, from any of its devices.
+  foreach profile : [['multi-raid1', 2], ['multi-raid1c3', 3], ['multi-raid1c4', 4],
+      ['multi-raid10', 4], ['multi-raid0', 3], ['multi-raid5', 3], ['multi-raid6', 4],
+      ['multi-single', 2]]
+    images = []
+    foreach index : range(profile[1])
+      images += join_paths(fixtures, profile[0] + '-' + index.to_string() + '.raw')
+    endforeach
+    test(profile[0], multidev_test,
+      args: [join_paths(fixtures, profile[0] + '.expected.tsv'),
+        join_paths(fixtures, 'plain.raw')] + images, timeout: 300, suite: 'images')
+  endforeach
   # Balance: every block group relocated on its own, with its crash states,
   # then all in turn; the files read as before and sharing stays. A full
   # volume refuses for space, a v1 space cache before any write.

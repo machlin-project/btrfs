@@ -135,19 +135,24 @@ bt_tree_fetch(
     const struct btrfs_fs *fs, struct bt_root root, void *buffer, struct btrfs_cache *cache)
 {
 	const struct bt_disk_header *header = buffer;
+	struct bt_place place;
 	enum btrfs_result error = BTRFS_CORRUPT;
-	uint64_t physical;
 	unsigned mirrors = 1;
 	unsigned mirror;
 
 	for (mirror = 0; mirror < mirrors; mirror++) {
-		error = bt_map(fs, root.address, fs->info.node_size,
+		error = bt_map_place(fs, root.address, fs->info.node_size,
 		    root.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM : BT_BLOCK_METADATA, mirror,
-		    &physical, &mirrors);
+		    &place, &mirrors);
+		/* A node never crosses a stripe (Linux's check_crossing_stripes). */
+		if (error == BTRFS_OK && place.span != fs->info.node_size) {
+			error = BTRFS_CORRUPT;
+		}
 		if (error != BTRFS_OK) {
 			return error;
 		}
-		error = bt_read_physical(fs, physical, buffer, fs->info.node_size);
+		error =
+		    bt_read_device(fs, place.device, place.physical, buffer, fs->info.node_size);
 		if (error == BTRFS_OK) {
 			error = bt_validate_node(fs, root, buffer, 0);
 		}

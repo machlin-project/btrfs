@@ -84,6 +84,14 @@ struct btrfs_directory;
  * No callback in this interface can authorize a write. */
 struct btrfs_cache;
 
+/* A further device of a volume spanning several: its size and positioned
+ * reads, as the environment's own. */
+struct btrfs_device {
+	void *context;
+	uint64_t size_bytes;
+	enum btrfs_result (*read)(void *context, uint64_t offset, void *buffer, size_t length);
+};
+
 struct btrfs_environment {
 	void *context;
 	uint64_t size_bytes;
@@ -103,6 +111,11 @@ struct btrfs_environment {
 	/* Optional verified tree-node cache shared by the owner's mounts of this
 	 * device (btrfs_cache_create). */
 	struct btrfs_cache *cache;
+	/* The volume's other devices when it spans several, in any order: mount
+	 * identifies each by its superblock and requires every device the
+	 * volume names. NULL and 0 for a volume of one device. */
+	const struct btrfs_device *devices;
+	size_t device_count;
 };
 
 /* Mutual exclusion for storing nodes in a cache shared by threads (lookups do

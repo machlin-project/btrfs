@@ -65,6 +65,8 @@ chunk_table_contract(void)
 	size_t i;
 	size_t k;
 
+	struct bt_device device;
+
 	memset(&fs, 0, sizeof(fs));
 	fs.env.allocate = table_allocate;
 	fs.env.release = table_release;
@@ -72,6 +74,12 @@ chunk_table_contract(void)
 	fs.device_id = TABLE_DEVICE_ID;
 	fs.device_size = (uint64_t)(TABLE_CHUNKS + 1) * TABLE_CHUNK_BYTES;
 	memset(fs.device_uuid, 0x5a, BTRFS_UUID_SIZE);
+	memset(&device, 0, sizeof(device));
+	device.id = fs.device_id;
+	device.size = fs.device_size;
+	memcpy(device.uuid, fs.device_uuid, BTRFS_UUID_SIZE);
+	fs.devices = &device;
+	fs.device_count = 1;
 	fs.chunk_capacity = BT_INITIAL_CHUNKS;
 	fs.chunks = malloc(fs.chunk_capacity * sizeof(*fs.chunks));
 	assert(fs.chunks != NULL);
@@ -105,6 +113,204 @@ chunk_table_contract(void)
 	assert(table_add(&fs, 5 * TABLE_CHUNK_BYTES - TABLE_SECTOR, 2 * TABLE_SECTOR, BT_BLOCK_DATA,
 		   0) == BTRFS_CORRUPT);
 	assert(fs.chunk_count == TABLE_CHUNKS + 1);
+	free(fs.chunks);
+}
+
+/* Devices of the profile contract, and the chunk it maps. */
+#define PROFILE_DEVICES 4U
+#define PROFILE_DEVICE_BYTES (UINT64_C(1) << 32)
+#define PROFILE_CHUNK_LOGICAL (UINT64_C(1) << 30)
+#define PROFILE_STRIPE_BYTES (UINT64_C(16) << 20)
+#define PROFILE_MAX_STRIPES 17U
+
+struct profile_item {
+	struct bt_disk_chunk chunk;
+	struct bt_disk_stripe stripes[PROFILE_MAX_STRIPES];
+};
+
+/* A chunk item of stripes stripes, stripe i on device i % PROFILE_DEVICES at
+ * a distinct offset; forged gives its second stripe another device UUID. */
+static enum btrfs_result
+profile_item(struct btrfs_fs *fs, uint64_t type, unsigned stripes, unsigned sub_stripes,
+    uint64_t length, int forged)
+{
+	struct profile_item item;
+	struct bt_key key = { BT_FIRST_CHUNK_OBJECTID, PROFILE_CHUNK_LOGICAL, BT_CHUNK_ITEM };
+	unsigned i;
+
+	memset(&item, 0, sizeof(item));
+	bt_put64(&item.chunk.length, length);
+	bt_put64(&item.chunk.owner, BT_EXTENT_TREE);
+	bt_put64(&item.chunk.stripe_length, BT_STRIPE_LENGTH);
+	bt_put64(&item.chunk.type, BT_BLOCK_DATA | type);
+	bt_put32(&item.chunk.sector_size, TABLE_SECTOR);
+	bt_put16(&item.chunk.stripes, (uint16_t)stripes);
+	bt_put16(&item.chunk.sub_stripes, (uint16_t)sub_stripes);
+	for (i = 0; i < stripes; i++) {
+		bt_put64(&item.stripes[i].device, 1 + i % PROFILE_DEVICES);
+		bt_put64(&item.stripes[i].offset, (1 + i) * PROFILE_STRIPE_BYTES * 2);
+		memcpy(
+		    item.stripes[i].uuid, fs->devices[i % PROFILE_DEVICES].uuid, BTRFS_UUID_SIZE);
+	}
+	item.stripes[1].uuid[0] ^= (uint8_t)(forged != 0);
+	return bt_chunk_add(
+	    fs, key, &item, sizeof(item.chunk) + stripes * sizeof(item.stripes[0]), 0);
+}
+
+static enum btrfs_result
+profile_add(
+    struct btrfs_fs *fs, uint64_t type, unsigned stripes, unsigned sub_stripes, uint64_t length)
+{
+	return profile_item(fs, type, stripes, sub_stripes, length, 0);
+}
+
+/* An independent layout model: walks the chunk's 64 KiB data units in order,
+ * filling each row of stripes as Linux lays them out, and reports where unit
+ * goes for copy mirror. */
+static void
+profile_model(uint64_t profile, unsigned stripes, uint64_t unit, unsigned mirror, unsigned *index,
+    uint64_t *row)
+{
+	unsigned parity = profile == BT_BLOCK_RAID5 ? 1U : profile == BT_BLOCK_RAID6 ? 2U : 0U;
+	unsigned columns = profile == BT_BLOCK_RAID10 ? stripes / 2 : stripes - parity;
+	uint64_t walked = 0;
+	uint64_t r;
+	unsigned column;
+
+	for (r = 0;; r++) {
+		for (column = 0; column < columns; column++, walked++) {
+			if (walked != unit) {
+				continue;
+			}
+			*row = r;
+			if (profile == BT_BLOCK_RAID10) {
+				*index = column * 2 + mirror;
+			} else if (parity != 0) {
+				/* Row r's data begins at stripe r and its parity follows it. */
+				*index = (unsigned)((r + column) % stripes);
+			} else {
+				*index = column;
+			}
+			return;
+		}
+	}
+}
+
+static void
+profile_check(struct btrfs_fs *fs, uint64_t profile, unsigned stripes, unsigned copies)
+{
+	struct bt_place place;
+	uint64_t offset;
+	uint64_t row;
+	unsigned mirrors;
+	unsigned mirror;
+	unsigned index;
+	int striped =
+	    (profile & (BT_BLOCK_RAID0 | BT_BLOCK_RAID10 | BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0;
+
+	for (offset = 0; offset < 64 * BT_STRIPE_LENGTH; offset += 3 * TABLE_SECTOR) {
+		for (mirror = 0; mirror < copies; mirror++) {
+			assert(
+			    bt_map_place(fs, PROFILE_CHUNK_LOGICAL + offset, 2 * BT_STRIPE_LENGTH,
+				BT_BLOCK_DATA, mirror, &place, &mirrors) == BTRFS_OK);
+			assert(mirrors == copies);
+			if (!striped) {
+				assert(place.device == mirror % PROFILE_DEVICES &&
+				    place.physical ==
+					(1 + mirror) * PROFILE_STRIPE_BYTES * 2 + offset &&
+				    place.span == 2 * BT_STRIPE_LENGTH);
+				continue;
+			}
+			profile_model(
+			    profile, stripes, offset / BT_STRIPE_LENGTH, mirror, &index, &row);
+			assert(place.device == index % PROFILE_DEVICES);
+			assert(place.physical ==
+			    (1 + index) * PROFILE_STRIPE_BYTES * 2 + row * BT_STRIPE_LENGTH +
+				offset % BT_STRIPE_LENGTH);
+			assert(place.span == BT_STRIPE_LENGTH - offset % BT_STRIPE_LENGTH);
+		}
+		assert(bt_map_place(fs, PROFILE_CHUNK_LOGICAL + offset, TABLE_SECTOR, BT_BLOCK_DATA,
+			   copies, &place, &mirrors) == BTRFS_CORRUPT);
+	}
+	fs->chunk_count = 0;
+}
+
+/* Every profile Linux writes maps as an independent model of its layout
+ * says, and chunk items Linux's btrfs_check_chunk_valid rejects, stripes on
+ * unknown devices or overlapping on one, and more stripes than supported are
+ * refused. */
+static void
+profile_contract(void)
+{
+	struct bt_device devices[PROFILE_DEVICES];
+	struct btrfs_fs fs;
+	unsigned i;
+
+	memset(&fs, 0, sizeof(fs));
+	fs.env.allocate = table_allocate;
+	fs.env.release = table_release;
+	fs.info.sector_size = TABLE_SECTOR;
+	for (i = 0; i < PROFILE_DEVICES; i++) {
+		memset(&devices[i], 0, sizeof(devices[i]));
+		devices[i].id = 1 + i;
+		devices[i].size = PROFILE_DEVICE_BYTES;
+		memset(devices[i].uuid, 0x40 + (int)i, BTRFS_UUID_SIZE);
+	}
+	fs.devices = devices;
+	fs.device_count = PROFILE_DEVICES;
+	fs.chunk_capacity = BT_INITIAL_CHUNKS;
+	fs.chunks = malloc(fs.chunk_capacity * sizeof(*fs.chunks));
+	assert(fs.chunks != NULL);
+	assert(profile_add(&fs, 0, 1, 1, PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	profile_check(&fs, 0, 1, 1);
+	assert(profile_add(&fs, BT_BLOCK_RAID1, 2, 1, PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	profile_check(&fs, BT_BLOCK_RAID1, 2, 2);
+	assert(profile_add(&fs, BT_BLOCK_RAID1C3, 3, 1, PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	profile_check(&fs, BT_BLOCK_RAID1C3, 3, 3);
+	assert(profile_add(&fs, BT_BLOCK_RAID1C4, 4, 1, PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	profile_check(&fs, BT_BLOCK_RAID1C4, 4, 4);
+	for (i = 1; i <= PROFILE_DEVICES; i++) {
+		assert(
+		    profile_add(&fs, BT_BLOCK_RAID0, i, 1, i * PROFILE_STRIPE_BYTES) == BTRFS_OK);
+		profile_check(&fs, BT_BLOCK_RAID0, i, 1);
+	}
+	assert(profile_add(&fs, BT_BLOCK_RAID10, 4, 2, 2 * PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	profile_check(&fs, BT_BLOCK_RAID10, 4, 2);
+	assert(profile_add(&fs, BT_BLOCK_RAID5, 3, 1, 2 * PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	profile_check(&fs, BT_BLOCK_RAID5, 3, 1);
+	assert(profile_add(&fs, BT_BLOCK_RAID6, 4, 1, 2 * PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	profile_check(&fs, BT_BLOCK_RAID6, 4, 1);
+	/* Stripe counts and sub-stripes Linux's chunk checker rejects. */
+	assert(profile_add(&fs, BT_BLOCK_RAID1, 3, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID1C3, 2, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID1C4, 3, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID10, 3, 2, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID10, 4, 1, 2 * PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID5, 1, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID6, 2, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, 0, 2, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID1 | BT_BLOCK_RAID0, 2, 1, PROFILE_STRIPE_BYTES) ==
+	    BTRFS_CORRUPT);
+	/* A length its data stripes do not share evenly, a stripe past its
+	 * device, more stripes than supported, an unknown profile. */
+	assert(profile_add(&fs, BT_BLOCK_RAID0, 3, 1, PROFILE_STRIPE_BYTES + TABLE_SECTOR) ==
+	    BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID1, 2, 1, PROFILE_DEVICE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID0, PROFILE_MAX_STRIPES, 1,
+		   PROFILE_MAX_STRIPES * PROFILE_STRIPE_BYTES) == BTRFS_UNSUPPORTED);
+	assert(
+	    profile_add(&fs, UINT64_C(1) << 11, 1, 1, PROFILE_STRIPE_BYTES) == BTRFS_UNSUPPORTED);
+	/* RAID0 over eight stripes puts two on each device, 128 MiB apart: apart
+	 * when each holds 16 MiB, overlapping when each holds 160 MiB. */
+	assert(
+	    profile_add(&fs, BT_BLOCK_RAID0, 8, 1, 8 * 10 * PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	assert(profile_add(&fs, BT_BLOCK_RAID0, 8, 1, 8 * PROFILE_STRIPE_BYTES) == BTRFS_OK);
+	fs.chunk_count = 0;
+	devices[1].id = 99;
+	assert(profile_add(&fs, BT_BLOCK_RAID1, 2, 1, PROFILE_STRIPE_BYTES) == BTRFS_CORRUPT);
+	devices[1].id = 2;
+	assert(profile_item(&fs, BT_BLOCK_RAID1, 2, 1, PROFILE_STRIPE_BYTES, 1) == BTRFS_CORRUPT);
+	assert(fs.chunk_count == 0);
 	free(fs.chunks);
 }
 
@@ -369,8 +575,9 @@ main(void)
 	cache_ownership_contract();
 	xattr_name_contract();
 	chunk_table_contract();
+	profile_contract();
 	btrfs_unmount(NULL);
-	puts("wire encoding, CRC32C known vector, key order, names, chunk table and invalid API "
-	     "inputs: PASS");
+	puts("wire encoding, CRC32C known vector, key order, names, chunk table, chunk profiles "
+	     "and invalid API inputs: PASS");
 	return 0;
 }

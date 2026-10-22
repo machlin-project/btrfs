@@ -447,6 +447,37 @@ extracts every file with `btrfs restore -s -m -x -S` and prints the restored
 manifest, which must equal the model's byte for byte; `restore` reports that
 tmpfs cannot hold the `btrfs.compression` property and continues.
 
+## Multi-device volumes
+
+`tests/prepare_multidev_linux.py` prepares volumes a Linux kernel writes
+across several 256 MiB devices (`multi-raid1`, `-raid1c3`, `-raid1c4`,
+`-raid10`, `-raid0`, `-raid5`, `-raid6`, `-single`): `create` formats
+`/dev/vda`, `/dev/vdb`, ... with the profile's data and metadata profiles,
+mounts, writes the payload, unmounts, runs `btrfs check --check-data-csum`
+and prints the chunk profiles and the manifest. They need the lab runner
+built from `scripts/linux-vm.swift` with up to eight disks
+(`.cache/linux-reference/linux-vm-disks`, signed with
+`config/linux-vm.entitlements`). Use a staged root of its own
+(`root-multi`, `root` without `input`, `transaction` or `init`); for each
+profile and each of its devices, create the image exclusively, then:
+
+```sh
+python3 ../btrfs/tests/prepare_multidev_linux.py --root artifacts/btrfs-reference/root-multi \
+  --phase create --profile multi-raid10 --archive artifacts/btrfs-reference/multi-raid10-create.cpio
+.cache/linux-reference/linux-vm-disks .cache/linux-reference/Image \
+  artifacts/btrfs-reference/multi-raid10-create.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/fixtures/multi-raid10-{0,1,2,3}.raw > ../btrfs/logs/multi-raid10-create.log 2>&1
+grep -a '^BTRFS_MULTI_MANIFEST:' ../btrfs/logs/multi-raid10-create.log | \
+  sed 's/^BTRFS_MULTI_MANIFEST://' | tr -d '\r' > ../btrfs/artifacts/fixtures/multi-raid10.expected.tsv
+```
+
+Require `BTRFS_MULTI_CREATED`. `btrfs-multidev-test MANIFEST FOREIGN DEVICE...`
+(`tests/multidev.c`) reads every manifest entry, runs both audits, mounts the
+volume from each device, and requires a missing device, a FOREIGN volume's
+image in place of the last device and writable admission to be refused; the
+`multi-*` Meson tests run it.
+
 ## Balance
 
 `btrfs-balance-test IMAGE WORK [EXPORT]` (`tests/balance.c`) relocates every

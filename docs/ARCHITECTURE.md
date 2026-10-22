@@ -46,7 +46,7 @@ refused (RECOVERY_REQUIRED) rather than shown without its fsynced changes.
 Only the primary superblock is admitted. Automatic selection of an older mirror
 could silently roll back acknowledged data and is not a mount fallback. Unknown
 incompatible features and checksum algorithms, seeding/metadump formats,
-multiple devices and pending logs have explicit results. Unknown read-only
+missing devices and pending logs have explicit results. Unknown read-only
 compatible bits are admissible to the immutable reader only; transaction admission
 rejects them until their write semantics are implemented.
 
@@ -107,6 +107,25 @@ mapping records and reconciles the bootstrap copies exactly before publication.
 Chunk ranges cannot overlap logically; DUP copies cannot alias one another.
 Device ID and UUID, physical bounds, alignment, profile and extent-tree owner
 are checked. Metadata and data use their respective chunk classes.
+
+A volume may span up to 16 devices. The environment names the further
+devices in any order, and mount identifies each by its superblock: the same
+fsid, generation and committed roots as the device it was opened from, and a
+device item of its own whose id no other device has. Every device the volume
+counts must be there, as Linux requires without `-o degraded`: a missing one
+is UNSUPPORTED (degraded mounts are not implemented), a device whose
+generation differs missed commits (STALE), and a device of another volume is
+CORRUPT. Chunk stripes name their device by id and UUID, and every profile
+Linux writes is read, with Linux's stripe counts (`btrfs_check_chunk_valid`):
+SINGLE and DUP, RAID1, RAID1C3 and RAID1C4 copies, RAID0 and RAID10 with 64
+KiB stripes in turn (RAID10's in pairs of copies), and RAID5 and RAID6 data
+stripes with the parity rotating over the stripes, as `btrfs_map_block` maps
+them. A tree block never crosses a stripe; a data read is one device request
+per stripe it crosses, from the first copy that reads, and a sector whose
+checksum fails is read again from each copy. Parity is not read: RAID5 and
+RAID6 data on a bad stripe is not reconstructed. The writer writes one device
+with SINGLE and DUP chunks; transaction admission refuses any other volume
+(UNSUPPORTED).
 
 A cursor retains one heap buffer per tree level. Internal keys are numerically
 ordered by object ID, type and offset. Each child must match its parent's first

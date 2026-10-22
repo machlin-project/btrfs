@@ -47,6 +47,35 @@ image_read(void *context, uint64_t offset, void *buffer, size_t length)
 	return BTRFS_OK;
 }
 
+/* Reads of a further device, counted with the image's. */
+static enum btrfs_result
+image_device_read(void *context, uint64_t offset, void *buffer, size_t length)
+{
+	struct btrfs_image_device *device = context;
+	size_t done = 0;
+	ssize_t amount;
+	uint64_t call;
+
+	call = atomic_fetch_add(&device->image->reads, 1) + 1;
+	if (call == device->image->fail_read || offset > INT64_MAX ||
+	    length > (uint64_t)INT64_MAX - offset) {
+		return BTRFS_IO;
+	}
+	while (done < length) {
+		amount = pread(device->descriptor, (uint8_t *)buffer + done, length - done,
+		    (off_t)(offset + done));
+		if (amount < 0 && errno == EINTR) {
+			continue;
+		}
+		if (amount <= 0) {
+			return BTRFS_IO;
+		}
+		done += (size_t)amount;
+	}
+	atomic_fetch_add(&device->image->bytes_read, length);
+	return BTRFS_OK;
+}
+
 static void *
 image_allocate(void *context, size_t size)
 {
@@ -264,9 +293,49 @@ btrfs_image_writer(struct btrfs_image *image, struct btrfs_write_environment *wr
 	writer->compression = BTRFS_COMPRESSION_NONE;
 }
 
+int
+btrfs_image_open_devices(const char *const *paths, size_t count, struct btrfs_image *image)
+{
+	struct stat status;
+	size_t i;
+	int error;
+
+	if (count == 0 || count > BTRFS_IMAGE_DEVICES + 1) {
+		return EINVAL;
+	}
+	error = image_open(paths[0], O_RDONLY, image);
+	for (i = 1; error == 0 && i < count; i++) {
+		image->extra[i - 1].image = image;
+		image->extra[i - 1].descriptor = open(paths[i], O_RDONLY | O_CLOEXEC);
+		if (image->extra[i - 1].descriptor < 0) {
+			error = errno;
+			break;
+		}
+		image->environment.device_count = i;
+		error = fstat(image->extra[i - 1].descriptor, &status) == 0 ? 0 : errno;
+		if (error == 0 && (!S_ISREG(status.st_mode) || status.st_size < 0)) {
+			error = EINVAL;
+		}
+		image->devices[i - 1] = (struct btrfs_device){ &image->extra[i - 1],
+			(uint64_t)status.st_size, image_device_read };
+	}
+	image->environment.devices = count > 1 ? image->devices : NULL;
+	if (error != 0) {
+		btrfs_image_close(image);
+	}
+	return error;
+}
+
 void
 btrfs_image_close(struct btrfs_image *image)
 {
+	size_t i;
+
+	for (i = 0; i < image->environment.device_count; i++) {
+		close(image->extra[i].descriptor);
+	}
+	image->environment.device_count = 0;
+	image->environment.devices = NULL;
 	if (image->descriptor >= 0) {
 		close(image->descriptor);
 		image->descriptor = -1;

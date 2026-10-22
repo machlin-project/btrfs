@@ -498,6 +498,25 @@ bt_read_physical(const struct btrfs_fs *fs, uint64_t offset, void *buffer, size_
 	return fs->env.read(fs->env.context, offset, buffer, length);
 }
 
+enum btrfs_result
+bt_read_device(
+    const struct btrfs_fs *fs, uint32_t device, uint64_t offset, void *buffer, size_t length)
+{
+	const struct bt_device *target;
+
+	if (device == 0) {
+		return bt_read_physical(fs, offset, buffer, length);
+	}
+	if (device >= fs->device_count) {
+		return BTRFS_CORRUPT;
+	}
+	target = &fs->devices[device];
+	if (offset > target->readable || length > target->readable - offset) {
+		return BTRFS_CORRUPT;
+	}
+	return target->read(target->context, offset, buffer, length);
+}
+
 uint64_t
 bt_super_offset(unsigned mirror)
 {

@@ -20,7 +20,8 @@ bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t
 	}
 	flags = bt_u64(super->flags);
 	incompat = bt_u64(super->incompat);
-	if ((incompat & ~BT_INCOMPAT_SUPPORTED) != 0 || bt_u64(super->devices) != 1 ||
+	if ((incompat & ~BT_INCOMPAT_SUPPORTED) != 0 || bt_u64(super->devices) == 0 ||
+	    bt_u64(super->devices) > BT_MAX_DEVICES ||
 	    (flags & (BT_SUPER_SEEDING | BT_SUPER_METADUMP | BT_SUPER_METADUMP_V2)) != 0) {
 		return BTRFS_UNSUPPORTED;
 	}
@@ -51,7 +52,8 @@ bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t
 	    fs->info.generation == 0 || fs->device_id == 0 ||
 	    fs->device_size > fs->env.size_bytes ||
 	    fs->device_size < BT_SUPER_OFFSET + BT_SUPER_SIZE ||
-	    fs->info.total_bytes != fs->device_size || fs->info.used_bytes > fs->info.total_bytes ||
+	    (bt_u64(super->devices) == 1 && fs->info.total_bytes != fs->device_size) ||
+	    fs->info.used_bytes > fs->info.total_bytes ||
 	    bt_u64(super->device.used_bytes) > fs->device_size ||
 	    super->root_level >= BT_MAX_LEVEL || super->chunk_level >= BT_MAX_LEVEL ||
 	    bt_u32(super->system_array_size) > BT_SYSTEM_ARRAY_SIZE ||
@@ -69,6 +71,7 @@ bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t
 	if (!bt_equal(super->device.fsid, fs->metadata_uuid, BTRFS_UUID_SIZE)) {
 		return BTRFS_CORRUPT;
 	}
+
 	fs->root_tree.address = bt_u64(super->root);
 	fs->root_tree.generation = fs->info.generation;
 	fs->root_tree.owner = BT_ROOT_TREE;
@@ -78,6 +81,106 @@ bt_super_decode(struct btrfs_fs *fs, const struct bt_disk_super *super, uint64_t
 	fs->chunk_tree.owner = BT_CHUNK_TREE;
 	fs->chunk_tree.level = super->chunk_level;
 	return BTRFS_OK;
+}
+
+/* Whether another device's superblock belongs to the same committed state
+ * of the volume as the one it was opened from: everything but the device's
+ * own item, offset and checksum. */
+static int
+bt_super_sibling(const struct bt_disk_super *super, const struct bt_disk_super *other)
+{
+	return bt_equal(other->fsid, super->fsid, BTRFS_UUID_SIZE) &&
+	    bt_equal(other->metadata_uuid, super->metadata_uuid, BTRFS_UUID_SIZE) &&
+	    bt_u64(other->flags) == bt_u64(super->flags) &&
+	    bt_u64(other->root) == bt_u64(super->root) &&
+	    bt_u64(other->chunk_root) == bt_u64(super->chunk_root) &&
+	    bt_u64(other->chunk_generation) == bt_u64(super->chunk_generation) &&
+	    bt_u64(other->total_bytes) == bt_u64(super->total_bytes) &&
+	    bt_u64(other->devices) == bt_u64(super->devices) &&
+	    bt_u32(other->sector_size) == bt_u32(super->sector_size) &&
+	    bt_u32(other->node_size) == bt_u32(super->node_size) &&
+	    bt_u64(other->incompat) == bt_u64(super->incompat) &&
+	    bt_u64(other->compat_ro) == bt_u64(super->compat_ro) &&
+	    bt_u16(other->checksum_type) == bt_u16(super->checksum_type) &&
+	    other->root_level == super->root_level && other->chunk_level == super->chunk_level &&
+	    bt_u32(other->system_array_size) == bt_u32(super->system_array_size) &&
+	    bt_equal(other->system_array, super->system_array, BT_SYSTEM_ARRAY_SIZE);
+}
+
+/* The volume's other devices, each identified by its superblock: the same
+ * fsid and committed state, its own device item. Every device the volume
+ * names must be there, as Linux requires without -o degraded; a device whose
+ * generation differs missed commits (STALE). */
+static enum btrfs_result
+bt_mount_devices(struct btrfs_fs *fs, const struct bt_disk_super *super)
+{
+	const struct btrfs_device *source;
+	struct bt_disk_super *other;
+	struct bt_device *device;
+	uint64_t total = fs->device_size;
+	size_t i;
+	size_t j;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (fs->env.device_count != bt_u64(super->devices) - 1) {
+		return fs->env.device_count < bt_u64(super->devices) - 1 ? BTRFS_UNSUPPORTED
+									 : BTRFS_INVALID_ARGUMENT;
+	}
+	fs->devices =
+	    fs->env.allocate(fs->env.context, (fs->env.device_count + 1) * sizeof(*fs->devices));
+	if (fs->devices == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	fs->devices[0] = (struct bt_device){ fs->device_id, fs->device_size, { 0 }, fs->env.context,
+		fs->env.read, fs->env.size_bytes };
+	bt_copy(fs->devices[0].uuid, fs->device_uuid, BTRFS_UUID_SIZE);
+	fs->device_count = 1;
+	if (fs->env.device_count == 0) {
+		return BTRFS_OK;
+	}
+	other = fs->env.allocate(fs->env.context, sizeof(*other));
+	if (other == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	for (i = 0; error == BTRFS_OK && i < fs->env.device_count; i++) {
+		source = &fs->env.devices[i];
+		if (source->read == NULL || source->size_bytes < BT_SUPER_OFFSET + BT_SUPER_SIZE) {
+			error = BTRFS_INVALID_ARGUMENT;
+			break;
+		}
+		error = source->read(source->context, BT_SUPER_OFFSET, other, sizeof(*other));
+		if (error == BTRFS_OK) {
+			error = bt_super_check(other, BT_SUPER_OFFSET);
+		}
+		if (error == BTRFS_OK && bt_u64(other->generation) != bt_u64(super->generation)) {
+			error = BTRFS_STALE;
+		}
+		if (error == BTRFS_OK &&
+		    (!bt_super_sibling(super, other) || bt_u64(other->device.id) == 0 ||
+			!bt_equal(other->device.fsid, fs->metadata_uuid, BTRFS_UUID_SIZE) ||
+			bt_u64(other->device.total_bytes) > source->size_bytes ||
+			bt_u64(other->device.total_bytes) > UINT64_MAX - total)) {
+			error = BTRFS_CORRUPT;
+		}
+		for (j = 0; error == BTRFS_OK && j < fs->device_count; j++) {
+			if (fs->devices[j].id == bt_u64(other->device.id)) {
+				error = BTRFS_CORRUPT;
+			}
+		}
+		if (error == BTRFS_OK) {
+			device = &fs->devices[fs->device_count++];
+			*device = (struct bt_device){ bt_u64(other->device.id),
+				bt_u64(other->device.total_bytes), { 0 }, source->context,
+				source->read, source->size_bytes };
+			bt_copy(device->uuid, other->device.uuid, BTRFS_UUID_SIZE);
+			total += device->size;
+		}
+	}
+	fs->env.release(fs->env.context, other, sizeof(*other));
+	if (error == BTRFS_OK && total != fs->info.total_bytes) {
+		error = BTRFS_CORRUPT;
+	}
+	return error;
 }
 
 static enum btrfs_result
@@ -172,6 +275,9 @@ bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk
 		}
 	}
 	if (error == BTRFS_OK) {
+		error = bt_mount_devices(fs, super);
+	}
+	if (error == BTRFS_OK) {
 		error = bt_bootstrap_chunks(fs, super);
 	}
 	if (error == BTRFS_OK) {
@@ -246,6 +352,10 @@ btrfs_unmount(struct btrfs_fs *fs)
 	env = fs->env;
 	if (fs->chunks != NULL) {
 		env.release(env.context, fs->chunks, fs->chunk_capacity * sizeof(*fs->chunks));
+	}
+	if (fs->devices != NULL) {
+		env.release(
+		    env.context, fs->devices, (env.device_count + 1) * sizeof(*fs->devices));
 	}
 	env.release(env.context, fs, sizeof(*fs));
 }

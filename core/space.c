@@ -995,6 +995,8 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	chunk->logical = logical;
 	chunk->length = length;
 	chunk->type = type;
+	chunk->stripes = (uint8_t)stripes;
+	chunk->sub_stripes = 1;
 	chunk->mirrors = (uint8_t)stripes;
 	chunk->confirmed = 1;
 	for (stripe = 0; stripe < stripes; stripe++) {

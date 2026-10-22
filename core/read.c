@@ -41,27 +41,24 @@ bt_sector_checksum(struct bt_cursor *cursor, uint64_t logical, uint8_t *checksum
 	return BTRFS_OK;
 }
 
-/* Reads a sector whose checksum did not match from the other copies; no
- * repair is written. */
+/* Reads a sector whose checksum did not match from every copy until one
+ * matches; no repair is written. */
 static enum btrfs_result
 bt_reread_sector(const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, unsigned mirrors,
-    unsigned selected, const uint8_t *checksum)
+    const uint8_t *checksum)
 {
 	uint8_t sum[BT_CSUM_SIZE];
-	uint64_t physical;
+	struct bt_place place;
 	unsigned mirror;
 	enum btrfs_result error = BTRFS_CORRUPT;
 
 	for (mirror = 0; mirror < mirrors; mirror++) {
-		if (mirror == selected) {
-			continue;
-		}
-		error = bt_map(
-		    fs, logical, fs->info.sector_size, BT_BLOCK_DATA, mirror, &physical, &mirrors);
+		error = bt_map_place(
+		    fs, logical, fs->info.sector_size, BT_BLOCK_DATA, mirror, &place, &mirrors);
 		if (error != BTRFS_OK) {
 			return error;
 		}
-		error = bt_read_physical(fs, physical, out, fs->info.sector_size);
+		error = bt_read_device(fs, place.device, place.physical, out, fs->info.sector_size);
 		if (error == BTRFS_OK) {
 			bt_checksum_sectors(fs, out, 1, sum);
 			error = bt_equal(sum, checksum, bt_checksum_size(fs->info.checksum_type))
@@ -75,6 +72,35 @@ bt_reread_sector(const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, unsi
 	return error;
 }
 
+/* Reads a range of data as it lies on the volume: each run a stripe holds
+ * contiguous in one device request, from the first copy that reads. */
+static enum btrfs_result
+bt_device_read(
+    const struct btrfs_fs *fs, uint64_t logical, uint8_t *out, size_t length, unsigned *mirrors)
+{
+	struct bt_place place;
+	size_t position;
+	unsigned mirror;
+	enum btrfs_result error = BTRFS_OK;
+
+	*mirrors = 1;
+	for (position = 0; error == BTRFS_OK && position < length; position += place.span) {
+		for (mirror = 0; mirror < *mirrors; mirror++) {
+			error = bt_map_place(fs, logical + position, length - position,
+			    BT_BLOCK_DATA, mirror, &place, mirrors);
+			if (error != BTRFS_OK) {
+				return error;
+			}
+			error = bt_read_device(
+			    fs, place.device, place.physical, out + position, place.span);
+			if (error != BTRFS_IO) {
+				break;
+			}
+		}
+	}
+	return error;
+}
+
 static enum btrfs_result
 bt_verified_read(
     struct bt_cursor *cursor, uint64_t logical, void *buffer, size_t length, int checksummed)
@@ -83,41 +109,25 @@ bt_verified_read(
 	uint8_t *out = buffer;
 	uint8_t sums[BT_CHECKSUM_BATCH_BYTES];
 	uint8_t checksum[BT_CSUM_SIZE];
-	uint64_t physical;
 	size_t sector = fs->info.sector_size;
 	size_t size = bt_checksum_size(fs->info.checksum_type);
 	size_t limit = bt_checksum_batch(fs);
 	size_t position;
 	size_t batch = 0;
 	size_t i;
-	unsigned mirror;
 	unsigned mirrors = 1;
-	unsigned selected = 0;
-	enum btrfs_result error = BTRFS_OK;
+	enum btrfs_result error;
 
 	if (logical % fs->info.sector_size != 0 || length % fs->info.sector_size != 0 ||
 	    length > UINT64_MAX - logical) {
 		return BTRFS_CORRUPT;
 	}
-	/* One contiguous device request for the range. Checksums are consumed from
-	 * the retained checksum cursor; retry only a bad sector on the other copy. */
-	for (mirror = 0; mirror < mirrors; mirror++) {
-		error = bt_map(fs, logical, length, BT_BLOCK_DATA, mirror, &physical, &mirrors);
-		if (error != BTRFS_OK) {
-			return error;
-		}
-		error = bt_read_physical(fs, physical, buffer, length);
-		if (error == BTRFS_OK) {
-			selected = mirror;
-			break;
-		}
-		if (error != BTRFS_IO) {
-			return error;
-		}
-	}
+	error = bt_device_read(fs, logical, out, length, &mirrors);
 	if (error != BTRFS_OK || !checksummed) {
 		return error;
 	}
+	/* Checksums are consumed from the retained checksum cursor; only a bad
+	 * sector is read again, from the copies. */
 	for (position = 0; error == BTRFS_OK && position < length; position += batch * sector) {
 		batch = (length - position) / sector < limit ? (length - position) / sector : limit;
 		bt_checksum_sectors(fs, out + position, batch, sums);
@@ -126,7 +136,7 @@ bt_verified_read(
 			    bt_sector_checksum(cursor, logical + position + i * sector, checksum);
 			if (error == BTRFS_OK && !bt_equal(sums + i * size, checksum, size)) {
 				error = bt_reread_sector(fs, logical + position + i * sector,
-				    out + position + i * sector, mirrors, selected, checksum);
+				    out + position + i * sector, mirrors, checksum);
 			}
 		}
 	}

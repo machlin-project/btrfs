@@ -5,14 +5,29 @@
 #include <btrfs/write.h>
 #include <stdatomic.h>
 
+/* Further images of a volume spanning several devices. */
+#define BTRFS_IMAGE_DEVICES 15U
+
+struct btrfs_image;
+
+struct btrfs_image_device {
+	struct btrfs_image *image;
+	int descriptor;
+};
+
 struct btrfs_image {
 	int descriptor;
 	struct btrfs_environment environment;
 	_Atomic uint64_t reads, bytes_read, allocations, live_allocations, live_bytes;
 	uint64_t fail_read, fail_allocate;
+	struct btrfs_image_device extra[BTRFS_IMAGE_DEVICES];
+	struct btrfs_device devices[BTRFS_IMAGE_DEVICES];
 };
 
 int btrfs_image_open(const char *path, struct btrfs_image *image);
+/* Opens the images of a volume spanning several devices for reading: the
+ * first is the device it is mounted from, the others its further devices. */
+int btrfs_image_open_devices(const char *const *paths, size_t count, struct btrfs_image *image);
 /* Opens the image for reading and writing; btrfs_image_writer then supplies
  * exact positioned writes and a barrier that reaches stable storage. */
 int btrfs_image_open_writable(const char *path, struct btrfs_image *image);

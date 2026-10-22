@@ -132,6 +132,7 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	uint64_t free_space = BT_COMPAT_RO_FREE_SPACE_TREE | BT_COMPAT_RO_FREE_SPACE_TREE_VALID;
 	uint64_t maintained = free_space | BT_COMPAT_RO_BLOCK_GROUP_TREE | BT_COMPAT_RO_VERITY;
 	uint64_t readonly;
+	size_t i;
 	int relocating;
 
 	if (result == NULL) {
@@ -157,6 +158,16 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	    !(base->info.incompat_features & BT_FEATURE_SKINNY_METADATA) ||
 	    base->info.generation == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
+	}
+	/* The writer writes one device, single and DUP chunks. */
+	if (base->device_count != 1 ||
+	    (base->info.incompat_features & (BT_FEATURE_RAID56 | BT_FEATURE_RAID1C34)) != 0) {
+		return BTRFS_UNSUPPORTED;
+	}
+	for (i = 0; i < base->chunk_count; i++) {
+		if ((base->chunks[i].type & BT_BLOCK_PROFILES & ~BT_BLOCK_DUP) != 0) {
+			return BTRFS_UNSUPPORTED;
+		}
 	}
 	/* An unmerged balance needs relocation recovery first. */
 	error = bt_tx_relocating(base, &relocating);
@@ -1584,6 +1595,16 @@ bt_tx_committed_view(struct btrfs_transaction *transaction, uint64_t tree, struc
 	}
 	*fs = *bt_mutation_view(transaction->mutation);
 	fs->env = *env;
+	/* The view outlives its base: it owns copies of the device and chunk
+	 * tables. */
+	fs->chunks = NULL;
+	fs->devices = env->allocate(env->context, (env->device_count + 1) * sizeof(*fs->devices));
+	if (fs->devices == NULL) {
+		btrfs_unmount(fs);
+		return BTRFS_NO_MEMORY;
+	}
+	bt_copy(fs->devices, transaction->base->devices,
+	    transaction->base->device_count * sizeof(*fs->devices));
 	fs->root_tree = transaction->roots;
 	fs->chunk_tree = transaction->chunks;
 	fs->checksum_tree = transaction->checksums.root;

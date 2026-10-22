@@ -55,17 +55,77 @@ bt_chunk_grow(struct btrfs_fs *fs)
 	return BTRFS_OK;
 }
 
+/* Linux's btrfs_raid_array for one profile: stripes a chunk must have
+ * (exactly, or at least with minimum), stripes that hold one copy of the
+ * data (data_stripes counts them as a divisor of the stripe count), copies a
+ * read chooses among and RAID10's stripes per copy. */
+struct bt_profile {
+	uint64_t bits;
+	unsigned exact;
+	unsigned minimum;
+	unsigned parity;
+	unsigned sub_stripes;
+};
+
+static const struct bt_profile bt_profiles[] = {
+	{ 0, 1, 1, 0, 1 },
+	{ BT_BLOCK_DUP, 2, 2, 0, 1 },
+	{ BT_BLOCK_RAID0, 0, 1, 0, 1 },
+	{ BT_BLOCK_RAID1, 2, 2, 0, 1 },
+	{ BT_BLOCK_RAID1C3, 3, 3, 0, 1 },
+	{ BT_BLOCK_RAID1C4, 4, 4, 0, 1 },
+	{ BT_BLOCK_RAID10, 0, 2, 0, 2 },
+	{ BT_BLOCK_RAID5, 0, 2, 1, 1 },
+	{ BT_BLOCK_RAID6, 0, 3, 2, 1 },
+};
+
+/* Stripes over which the chunk's data spreads: each holds this share of it. */
+static unsigned
+bt_chunk_data_stripes(uint64_t profile, unsigned stripes, unsigned sub_stripes)
+{
+	if (profile == BT_BLOCK_RAID0) {
+		return stripes;
+	}
+	if (profile == BT_BLOCK_RAID10) {
+		return stripes / sub_stripes;
+	}
+	if (profile == BT_BLOCK_RAID5) {
+		return stripes - 1;
+	}
+	return profile == BT_BLOCK_RAID6 ? stripes - 2 : 1;
+}
+
+/* The volume's device with id and uuid, as an index; device_count if none. */
+static size_t
+bt_chunk_device(const struct btrfs_fs *fs, uint64_t id, const uint8_t *uuid)
+{
+	size_t i;
+
+	for (i = 0; i < fs->device_count; i++) {
+		if (fs->devices[i].id == id &&
+		    bt_equal(fs->devices[i].uuid, uuid, BTRFS_UUID_SIZE)) {
+			return i;
+		}
+	}
+	return fs->device_count;
+}
+
 enum btrfs_result
 bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap)
 {
 	const struct bt_disk_chunk *disk = data;
 	const struct bt_disk_stripe *stripes;
+	const struct bt_profile *rule = NULL;
 	struct bt_chunk chunk;
 	struct bt_chunk *existing;
 	uint64_t profile;
 	uint64_t kind;
+	uint64_t share;
+	size_t device;
 	unsigned count;
+	unsigned sub_stripes;
 	unsigned j;
+	unsigned k;
 	size_t i;
 	enum btrfs_result error;
 
@@ -79,16 +139,30 @@ bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t le
 	chunk.type = bt_u64(disk->type);
 	chunk.confirmed = !bootstrap;
 	count = bt_u16(disk->stripes);
+	sub_stripes = bt_u16(disk->sub_stripes);
 	if (count == 0 || (length - sizeof(*disk)) / sizeof(*stripes) != count ||
 	    (length - sizeof(*disk)) % sizeof(*stripes) != 0) {
 		return BTRFS_CORRUPT;
 	}
 	profile = chunk.type & ~(BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM);
 	kind = chunk.type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM);
-	if (profile != 0 && profile != BT_BLOCK_DUP) {
+	for (i = 0; i < sizeof(bt_profiles) / sizeof(bt_profiles[0]); i++) {
+		if (bt_profiles[i].bits == profile) {
+			rule = &bt_profiles[i];
+		}
+	}
+	if (rule == NULL) {
+		return (profile & ~BT_BLOCK_PROFILES) != 0 ? BTRFS_UNSUPPORTED : BTRFS_CORRUPT;
+	}
+	if (count > BT_MAX_STRIPES) {
 		return BTRFS_UNSUPPORTED;
 	}
-	if ((profile == BT_BLOCK_DUP ? count != 2 : count != 1) ||
+	/* Linux's btrfs_check_chunk_valid: the stripe counts its profile allows,
+	 * and RAID10's two-copy stripes in whole pairs; only RAID10 reads the
+	 * recorded sub-stripe count. */
+	if ((rule->exact != 0 ? count != rule->exact : count < rule->minimum) ||
+	    (profile == BT_BLOCK_RAID10 &&
+		(sub_stripes != rule->sub_stripes || count % rule->sub_stripes != 0)) ||
 	    (kind != BT_BLOCK_DATA && kind != BT_BLOCK_METADATA && kind != BT_BLOCK_SYSTEM &&
 		kind != (BT_BLOCK_DATA | BT_BLOCK_METADATA)) ||
 	    (bootstrap && kind != BT_BLOCK_SYSTEM) || bt_u64(disk->owner) != BT_EXTENT_TREE ||
@@ -98,21 +172,37 @@ bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t le
 	    chunk.logical % fs->info.sector_size != 0 || chunk.length % fs->info.sector_size != 0) {
 		return BTRFS_CORRUPT;
 	}
+	sub_stripes = rule->sub_stripes;
+	share = chunk.length / bt_chunk_data_stripes(profile, count, sub_stripes);
+	if (chunk.length % bt_chunk_data_stripes(profile, count, sub_stripes) != 0 ||
+	    share % fs->info.sector_size != 0) {
+		return BTRFS_CORRUPT;
+	}
 	stripes = (const void *)((const uint8_t *)data + sizeof(*disk));
-	chunk.mirrors = (uint8_t)count;
+	chunk.stripes = (uint8_t)count;
+	chunk.sub_stripes = (uint8_t)sub_stripes;
+	chunk.mirrors = (uint8_t)(profile == 0 ||
+		    (profile & (BT_BLOCK_RAID0 | BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0
+		? 1
+		: profile == BT_BLOCK_RAID10 ? sub_stripes
+					     : count);
 	for (j = 0; j < count; j++) {
 		chunk.physical[j] = bt_u64(stripes[j].offset);
-		if (bt_u64(stripes[j].device) != fs->device_id ||
-		    !bt_equal(stripes[j].uuid, fs->device_uuid, BTRFS_UUID_SIZE) ||
-		    chunk.physical[j] % fs->info.sector_size != 0 ||
-		    chunk.physical[j] > fs->device_size ||
-		    chunk.length > fs->device_size - chunk.physical[j]) {
+		device = bt_chunk_device(fs, bt_u64(stripes[j].device), stripes[j].uuid);
+		if (device == fs->device_count || chunk.physical[j] % fs->info.sector_size != 0 ||
+		    chunk.physical[j] > fs->devices[device].size ||
+		    share > fs->devices[device].size - chunk.physical[j]) {
 			return BTRFS_CORRUPT;
 		}
-	}
-	if (count == 2 && chunk.physical[0] < chunk.physical[1] + chunk.length &&
-	    chunk.physical[1] < chunk.physical[0] + chunk.length) {
-		return BTRFS_CORRUPT;
+		chunk.devices[j] = (uint8_t)device;
+		/* Stripes on one device never overlap. */
+		for (k = 0; k < j; k++) {
+			if (chunk.devices[k] == chunk.devices[j] &&
+			    chunk.physical[k] < chunk.physical[j] + share &&
+			    chunk.physical[j] < chunk.physical[k] + share) {
+				return BTRFS_CORRUPT;
+			}
+		}
 	}
 	/* The table is sorted and disjoint, so a new chunk can only collide with
 	 * its neighbours. */
@@ -120,8 +210,10 @@ bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t le
 	if (i < fs->chunk_count && fs->chunks[i].logical == chunk.logical) {
 		existing = &fs->chunks[i];
 		if (bootstrap || existing->confirmed || existing->length != chunk.length ||
-		    existing->type != chunk.type || existing->mirrors != chunk.mirrors ||
-		    !bt_equal(existing->physical, chunk.physical, sizeof(chunk.physical))) {
+		    existing->type != chunk.type || existing->stripes != chunk.stripes ||
+		    existing->sub_stripes != chunk.sub_stripes ||
+		    !bt_equal(existing->physical, chunk.physical, sizeof(chunk.physical)) ||
+		    !bt_equal(existing->devices, chunk.devices, sizeof(chunk.devices))) {
 			return BTRFS_CORRUPT;
 		}
 		existing->confirmed = 1;
@@ -144,14 +236,19 @@ bt_chunk_add(struct btrfs_fs *fs, struct bt_key key, const void *data, size_t le
 }
 
 enum btrfs_result
-bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind, unsigned mirror,
-    uint64_t *physical, unsigned *mirrors)
+bt_map_place(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,
+    unsigned mirror, struct bt_place *place, unsigned *mirrors)
 {
 	const struct bt_chunk *chunk;
+	uint64_t profile;
+	uint64_t within;
+	uint64_t stripe;
+	uint64_t offset;
+	unsigned index;
+	unsigned factor;
 	size_t low = 0;
 	size_t high = fs->chunk_count;
 	size_t middle;
-	uint64_t within;
 
 	while (low < high) {
 		middle = low + (high - low) / 2;
@@ -171,6 +268,52 @@ bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind
 	    length > chunk->length - within || mirror >= chunk->mirrors) {
 		return BTRFS_CORRUPT;
 	}
-	*physical = chunk->physical[mirror] + within;
+	profile = chunk->type & BT_BLOCK_PROFILES;
+	if ((profile & (BT_BLOCK_RAID0 | BT_BLOCK_RAID10 | BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) == 0) {
+		/* Every copy holds the chunk whole on one stripe. */
+		place->device = chunk->devices[mirror];
+		place->physical = chunk->physical[mirror] + within;
+		place->span = length;
+		return BTRFS_OK;
+	}
+	/* Linux's btrfs_map_block: 64 KiB stripes in turn over the stripes that
+	 * hold data. */
+	stripe = within / BT_STRIPE_LENGTH;
+	offset = within % BT_STRIPE_LENGTH;
+	if (profile == BT_BLOCK_RAID0) {
+		index = (unsigned)(stripe % chunk->stripes);
+		stripe /= chunk->stripes;
+	} else if (profile == BT_BLOCK_RAID10) {
+		factor = chunk->stripes / chunk->sub_stripes;
+		index = (unsigned)(stripe % factor) * chunk->sub_stripes + mirror;
+		stripe /= factor;
+	} else {
+		/* RAID5/6: the data stripe, its parity rotating over the stripes. */
+		factor = chunk->stripes - (profile == BT_BLOCK_RAID5 ? 1U : 2U);
+		index = (unsigned)(stripe % factor);
+		stripe /= factor;
+		index = (unsigned)((stripe + index) % chunk->stripes);
+	}
+	place->device = chunk->devices[index];
+	place->physical = chunk->physical[index] + stripe * BT_STRIPE_LENGTH + offset;
+	place->span =
+	    length < BT_STRIPE_LENGTH - offset ? length : (size_t)(BT_STRIPE_LENGTH - offset);
 	return BTRFS_OK;
+}
+
+enum btrfs_result
+bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind, unsigned mirror,
+    uint64_t *physical, unsigned *mirrors)
+{
+	struct bt_place place;
+	enum btrfs_result error;
+
+	error = bt_map_place(fs, logical, length, kind, mirror, &place, mirrors);
+	if (error == BTRFS_OK && (place.device != 0 || place.span != length)) {
+		error = BTRFS_UNSUPPORTED;
+	}
+	if (error == BTRFS_OK) {
+		*physical = place.physical;
+	}
+	return error;
 }

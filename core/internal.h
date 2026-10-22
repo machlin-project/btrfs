@@ -88,11 +88,40 @@ struct bt_root {
 };
 
 /* Copies of a block: SINGLE has one, DUP two on the same device. */
+/* Copies the writer writes (DUP). */
 #define BT_MAX_MIRRORS 2U
+/* Devices a volume may span, stripes a chunk may have, and copies a read
+ * chooses among (RAID1C4). */
+#define BT_MAX_DEVICES 16U
+#define BT_MAX_STRIPES 16U
+#define BT_MAX_COPIES 4U
+
+/* One device of the volume, as its superblock names it, and its reads: the
+ * environment's for the first, a further device's otherwise. */
+struct bt_device {
+	uint64_t id, size;
+	uint8_t uuid[BTRFS_UUID_SIZE];
+	void *context;
+	enum btrfs_result (*read)(void *context, uint64_t offset, void *buffer, size_t length);
+	uint64_t readable;
+};
+
+/* Where a logical range lies on one copy: a device (an index into the
+ * volume's devices), a physical offset, and how many bytes of the range lie
+ * contiguous there, which a striped profile cuts at a stripe boundary. */
+struct bt_place {
+	uint64_t physical;
+	size_t span;
+	uint32_t device;
+};
 
 struct bt_chunk {
-	uint64_t logical, length, type, physical[BT_MAX_MIRRORS];
-	uint8_t mirrors, confirmed;
+	uint64_t logical, length, type, physical[BT_MAX_STRIPES];
+	/* Each stripe's device, an index into the volume's devices. */
+	uint8_t devices[BT_MAX_STRIPES];
+	/* stripes is the chunk's stripe count, sub_stripes the copies of each
+	 * RAID10 stripe, mirrors the copies a read chooses among. */
+	uint8_t stripes, sub_stripes, mirrors, confirmed;
 	/* A writer removes this unused block group at commit. */
 	uint8_t removed;
 };
@@ -118,7 +147,12 @@ struct btrfs_fs {
 	struct bt_root root_tree, chunk_tree, checksum_tree, selected_tree;
 	struct btrfs_inode root_inode;
 	uint8_t metadata_uuid[BTRFS_UUID_SIZE], device_uuid[BTRFS_UUID_SIZE];
+	/* The device the volume was opened from (devices[0]). */
 	uint64_t device_id, device_size;
+	/* Every device of the volume, device_count of them, owned by the mount
+	 * and shared by its views. */
+	struct bt_device *devices;
+	size_t device_count;
 	/* The root and level of a pending tree log, admitted only for its replay;
 	 * zero otherwise. */
 	uint64_t log_root;
@@ -329,8 +363,18 @@ size_t bt_chunk_position(const struct btrfs_fs *fs, uint64_t logical);
 size_t bt_chunk_containing(const struct btrfs_fs *fs, uint64_t logical);
 enum btrfs_result bt_chunk_add(
     struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap);
+/* Maps a logical range on one copy (mirror below *mirrors) of a chunk of
+ * kind: the place of its start, and how much of it lies contiguous there. */
+enum btrfs_result bt_map_place(const struct btrfs_fs *fs, uint64_t logical, size_t length,
+    uint64_t kind, unsigned mirror, struct bt_place *place, unsigned *mirrors);
+/* bt_map_place for a range that lies whole on the first device, as every
+ * range of the volumes the writer admits does; anything else is
+ * UNSUPPORTED. */
 enum btrfs_result bt_map(const struct btrfs_fs *fs, uint64_t logical, size_t length, uint64_t kind,
     unsigned mirror, uint64_t *physical, unsigned *mirrors);
+/* Positioned reads of one device of the volume. */
+enum btrfs_result bt_read_device(
+    const struct btrfs_fs *fs, uint32_t device, uint64_t offset, void *buffer, size_t length);
 /* A root owner that asks for whichever owner the node's header names; the
  * node is verified otherwise as any other. */
 #define BT_OWNER_ANY UINT64_MAX
