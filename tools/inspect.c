@@ -408,6 +408,74 @@ relocate(const char *path, int argc, char **argv)
 					       : 1;
 }
 
+/* Block groups the balance command lists or relocates at most. */
+#define INSPECT_GROUPS 4096U
+
+/* Explicit balance, never implied by any other command. Without --apply the
+ * block groups are listed; with it the named groups, or every group, are
+ * relocated and removed one after the other (btrfs_relocate_group). */
+static int
+balance(const char *path, int argc, char **argv)
+{
+	struct btrfs_balance_report report;
+	struct btrfs_write_environment writer;
+	struct btrfs_image image;
+	struct btrfs_group *groups;
+	struct btrfs_fs *fs = NULL;
+	uint64_t group;
+	size_t count = 0;
+	size_t targets;
+	size_t i;
+	int apply = argc >= 1 && strcmp(argv[0], "--apply") == 0;
+	enum btrfs_result error;
+
+	if (argc > (apply ? 1 : 0) && !apply) {
+		fprintf(stderr, "Usage: btrfs-inspect IMAGE balance [--apply [GROUP...]]\n");
+		return 2;
+	}
+	groups = calloc(INSPECT_GROUPS, sizeof(*groups));
+	if (groups == NULL) {
+		perror("allocate");
+		return 1;
+	}
+	if ((apply ? btrfs_image_open_writable(path, &image) : btrfs_image_open(path, &image)) !=
+	    0) {
+		perror("open image");
+		free(groups);
+		return 1;
+	}
+	btrfs_image_writer(&image, &writer);
+	error = btrfs_mount(&image.environment, BTRFS_TOP_LEVEL_TREE, &fs);
+	if (error == BTRFS_OK) {
+		error = btrfs_get_groups(fs, groups, INSPECT_GROUPS, &count);
+	}
+	btrfs_unmount(fs);
+	for (i = 0; error == BTRFS_OK && !apply && i < count; i++) {
+		printf("{\"logical\":%" PRIu64 ",\"length\":%" PRIu64 ",\"flags\":%" PRIu64
+		       ",\"used\":%" PRIu64 "}\n",
+		    groups[i].logical, groups[i].length, groups[i].flags, groups[i].used);
+	}
+	targets = argc > 1 ? (size_t)(argc - 1) : count;
+	for (i = 0; error == BTRFS_OK && apply && i < targets; i++) {
+		group = argc > 1 ? strtoull(argv[i + 1], NULL, 0) : groups[i].logical;
+		error = btrfs_relocate_group(&image.environment, &writer, group, &report);
+		printf("{\"group\":%" PRIu64 ",\"result\":\"%s\",\"blocks\":%" PRIu64
+		       ",\"extents\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"commits\":%" PRIu64 "}\n",
+		    group, btrfs_result_string(error), report.blocks, report.extents, report.bytes,
+		    report.commits);
+	}
+	if (error != BTRFS_OK && !apply) {
+		fprintf(stderr, "%s\n", btrfs_result_string(error));
+	}
+	btrfs_image_close(&image);
+	free(groups);
+	if (image.live_allocations != 0 || image.live_bytes != 0) {
+		fprintf(stderr, "allocation leak\n");
+		return 1;
+	}
+	return error == BTRFS_OK ? 0 : 1;
+}
+
 /* Node cache for one command; the image does not change while it runs. */
 #define INSPECT_CACHE_BYTES (16U * 1024U * 1024U)
 
@@ -431,7 +499,8 @@ main(int argc, char **argv)
 		    "[PATH] [ARGS]\n       btrfs-inspect [--tree ID] IMAGE walk [--data]\n       "
 		    "btrfs-inspect IMAGE recover [--apply] [--acknowledged "
 		    "GENERATION]\n       btrfs-inspect IMAGE replay [--apply]\n       "
-		    "btrfs-inspect IMAGE relocate [--apply]\n");
+		    "btrfs-inspect IMAGE relocate [--apply]\n       "
+		    "btrfs-inspect IMAGE balance [--apply [GROUP...]]\n");
 		return 2;
 	}
 	if (strcmp(argv[argument + 1], "recover") == 0) {
@@ -442,6 +511,9 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[argument + 1], "relocate") == 0) {
 		return relocate(argv[argument], argc - argument - 2, argv + argument + 2);
+	}
+	if (strcmp(argv[argument + 1], "balance") == 0) {
+		return balance(argv[argument], argc - argument - 2, argv + argument + 2);
 	}
 	if (btrfs_image_open(argv[argument], &image) != 0) {
 		perror("open image");

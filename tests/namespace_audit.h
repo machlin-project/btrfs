@@ -44,5 +44,9 @@ struct namespace_digest {
  * bytes, and extended attributes, descending into subvolumes. Two views with
  * equal digests read the same. */
 int namespace_digest(const struct btrfs_fs *fs, struct namespace_digest *digest);
+/* namespace_digest with every file's data ranges (SEEK_DATA to SEEK_HOLE)
+ * and their bytes in place of the file extent items of large files: equal
+ * for volumes that read the same wherever their extents lie. */
+int namespace_content_digest(const struct btrfs_fs *fs, struct namespace_digest *digest);
 
 #endif

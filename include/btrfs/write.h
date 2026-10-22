@@ -126,6 +126,34 @@ struct btrfs_relocation_report {
 enum btrfs_result btrfs_recover_relocation(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, struct btrfs_relocation_report *report);
 
+/* What relocating a block group did: groups emptied and removed, tree
+ * blocks and data extents moved, data bytes copied, and commits. */
+struct btrfs_balance_report {
+	uint64_t groups;
+	uint64_t blocks;
+	uint64_t extents;
+	uint64_t bytes;
+	uint64_t commits;
+};
+
+/* Relocates every extent of the block group at logical address group to
+ * other groups and removes it, as Linux's balance relocates a chunk
+ * (btrfs_relocate_chunk), in bounded steps that each commit. The group takes
+ * no allocation while its extents move. A tree block moves once however
+ * many subvolumes share it: its copy replaces it in every parent and root
+ * item its references name, so sharing stays as it was; a data extent moves
+ * with the checksums it has to a copy every file extent item naming it then
+ * names. Every committed state holds the same files. Deleted subvolumes are
+ * dropped first. The last group of its kind gets a new chunk of its profile
+ * before it goes. Under simple quotas a moved tree block counts as new, as on
+ * Linux, and moved data does not. A group whose v1 space cache would have to
+ * go or a running quota rescan is UNSUPPORTED, and so is an extent with more
+ * references than one transaction moves; NOT_FOUND names no group. Pending tree logs and
+ * interrupted balances are recovered first (RECOVERY_REQUIRED). */
+enum btrfs_result btrfs_relocate_group(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t group,
+    struct btrfs_balance_report *report);
+
 /* Current admission: any of Linux's four checksum algorithms, skinny metadata,
  * SINGLE/DUP, no free-space cache tree, quotas or mixed groups. At least two
  * superblock copies must exist and agree with the mounted primary; otherwise

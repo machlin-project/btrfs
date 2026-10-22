@@ -258,6 +258,55 @@ btrfs_get_info(const struct btrfs_fs *fs, struct btrfs_info *info)
 	}
 }
 
+_Static_assert(BTRFS_GROUP_DATA == BT_BLOCK_DATA && BTRFS_GROUP_SYSTEM == BT_BLOCK_SYSTEM &&
+	BTRFS_GROUP_METADATA == BT_BLOCK_METADATA && BTRFS_GROUP_DUP == BT_BLOCK_DUP,
+    "Linux's block group type flags");
+
+enum btrfs_result
+btrfs_get_groups(
+    const struct btrfs_fs *fs, struct btrfs_group *groups, size_t capacity, size_t *count)
+{
+	const struct bt_disk_block_group *item;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	struct bt_key key;
+	size_t i;
+	enum btrfs_result error;
+
+	if (fs == NULL || count == NULL || (groups == NULL && capacity != 0)) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*count = fs->chunk_count;
+	error = bt_find_root(fs,
+	    (fs->info.readonly_features & BT_COMPAT_RO_BLOCK_GROUP_TREE) != 0 ? BT_BLOCK_GROUP_TREE
+									      : BT_EXTENT_TREE,
+	    &root);
+	for (i = 0; error == BTRFS_OK && i < fs->chunk_count && i < capacity; i++) {
+		key = (struct bt_key){ fs->chunks[i].logical, fs->chunks[i].length,
+			BT_BLOCK_GROUP_ITEM };
+		bt_cursor_init(&cursor, fs, root);
+		error = bt_cursor_seek(&cursor, key, 0);
+		if (error == BTRFS_OK) {
+			(void)bt_cursor_record(&cursor, &record);
+			item = (const void *)record.data;
+			if (bt_key_compare(record.key, key) != 0 || record.size != sizeof(*item) ||
+			    bt_u64(item->used_bytes) > fs->chunks[i].length) {
+				error = BTRFS_CORRUPT;
+			} else {
+				groups[i] = (struct btrfs_group){ fs->chunks[i].logical,
+					fs->chunks[i].length, fs->chunks[i].type,
+					bt_u64(item->used_bytes) };
+			}
+		}
+		bt_cursor_fini(&cursor);
+	}
+	if (error == BTRFS_NOT_FOUND) {
+		error = BTRFS_CORRUPT;
+	}
+	return error == BTRFS_OK && fs->chunk_count > capacity ? BTRFS_RANGE : error;
+}
+
 enum btrfs_result
 btrfs_identify(const struct btrfs_environment *environment, struct btrfs_info *info)
 {

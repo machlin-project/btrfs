@@ -52,7 +52,8 @@ back an acknowledged generation, and a Linux tree log left by fsync without a
 commit is replayed as Linux's mount replays it; writable mounts do both before
 they open, while read-only mounts refuse a pending log and write nothing. A
 balance stopped by a crash is merged and dropped as Linux's mount recovers
-it before a writable mount opens. Linux agrees with the recorded outcome of
+it before a writable mount opens, and the image tools relocate and remove
+block groups as Linux's balance does, keeping sharing between subvolumes. Linux agrees with the recorded outcome of
 reordered and torn crash states on twelve profiles, including namespace facts
 and its own cleanup of the orphans left. The XNU adapter writes through the
 unified buffer cache with grouped or synchronous commits; FSKit's block resource

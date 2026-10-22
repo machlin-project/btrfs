@@ -100,7 +100,15 @@ is destroyed. `accept` is legal only after successful durable publication;
    relocation orphans), checked against every crash state of a recorded
    balance and against Linux's own recovery (`tests/relocation.c`,
    `tests/relocation_log.c`), with full and simple quotas and with tree logs
-   beside relocation trees. Remaining: balance itself; data reference edits
+   beside relocation trees. A block group is relocated and removed as
+   Linux's balance relocates a chunk (`core/balance.c`, ARCHITECTURE.md,
+   Balance): each committed step moves extents in place of their originals,
+   a shared block once for every tree reaching it, so every state holds the
+   same files and sharing stays; `tests/balance.c` checks every group of the
+   writable fixtures with their crash states and faults, and Linux checks and
+   balances the results again (`tests/prepare_balance_linux.py`). Remaining:
+   balance with v1 space caches, filters and profile conversion, and a native
+   interface that starts one; data reference edits
    from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.

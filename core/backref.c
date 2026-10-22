@@ -672,3 +672,251 @@ bt_backref_set_flags(
 	bt_extent_end(&copy);
 	return error;
 }
+
+/* An inline reference at bytes[*position] of an item of size bytes. */
+static enum btrfs_result
+bt_inline_decode(const uint8_t *bytes, size_t size, size_t *position, struct bt_extent_ref *ref)
+{
+	const struct bt_le64 *value = (const void *)(bytes + *position + 1);
+	const struct bt_disk_data_ref *data = (const void *)(bytes + *position + 1);
+	const struct bt_disk_shared_data_ref *shared;
+	size_t length = bt_ref_size(bytes[*position]);
+
+	bt_zero(ref, sizeof(*ref));
+	ref->type = bytes[*position];
+	if (length == 0 || length > size - *position) {
+		return BTRFS_CORRUPT;
+	}
+	ref->count = 1;
+	if (ref->type == BT_TREE_BLOCK_REF) {
+		ref->root = bt_u64(*value);
+	} else if (ref->type == BT_SHARED_BLOCK_REF) {
+		ref->parent = bt_u64(*value);
+	} else if (ref->type == BT_EXTENT_DATA_REF) {
+		ref->root = bt_u64(data->root);
+		ref->inode = bt_u64(data->objectid);
+		ref->offset = bt_u64(data->offset);
+		ref->count = bt_u32(data->count);
+	} else {
+		shared = (const void *)(value + 1);
+		ref->parent = bt_u64(*value);
+		ref->count = bt_u32(shared->count);
+	}
+	*position += length;
+	return BTRFS_OK;
+}
+
+/* A keyed reference item following an extent item. */
+static enum btrfs_result
+bt_keyed_decode(const struct bt_record *record, struct bt_extent_ref *ref)
+{
+	const struct bt_disk_data_ref *data = (const void *)record->data;
+	const struct bt_disk_shared_data_ref *shared = (const void *)record->data;
+
+	bt_zero(ref, sizeof(*ref));
+	ref->type = record->key.type;
+	ref->count = 1;
+	switch (ref->type) {
+	case BT_TREE_BLOCK_REF:
+		ref->root = record->key.offset;
+		return record->size == 0 ? BTRFS_OK : BTRFS_CORRUPT;
+	case BT_SHARED_BLOCK_REF:
+		ref->parent = record->key.offset;
+		return record->size == 0 ? BTRFS_OK : BTRFS_CORRUPT;
+	case BT_EXTENT_DATA_REF:
+		if (record->size != sizeof(*data)) {
+			return BTRFS_CORRUPT;
+		}
+		ref->root = bt_u64(data->root);
+		ref->inode = bt_u64(data->objectid);
+		ref->offset = bt_u64(data->offset);
+		ref->count = bt_u32(data->count);
+		return BTRFS_OK;
+	case BT_SHARED_DATA_REF:
+		if (record->size != sizeof(*shared)) {
+			return BTRFS_CORRUPT;
+		}
+		ref->parent = record->key.offset;
+		ref->count = bt_u32(shared->count);
+		return BTRFS_OK;
+	default:
+		return BTRFS_UNSUPPORTED;
+	}
+}
+
+static enum btrfs_result
+bt_backref_append(struct bt_extent_ref *refs, size_t capacity, size_t *count,
+    const struct bt_extent_ref *ref, uint64_t *total, int data)
+{
+	if ((ref->type == BT_EXTENT_DATA_REF || ref->type == BT_SHARED_DATA_REF) != data ||
+	    ref->count == 0 || (ref->root == 0 && ref->parent == 0) ||
+	    *total > UINT64_MAX - ref->count) {
+		return BTRFS_CORRUPT;
+	}
+	if (*count == capacity) {
+		return BTRFS_RANGE;
+	}
+	*total += ref->count;
+	refs[(*count)++] = *ref;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+bt_backref_list(struct bt_mutation *mutation, struct bt_root extents, struct bt_key extent,
+    uint64_t *flags, uint64_t *generation, struct bt_extent_ref *refs, size_t capacity,
+    size_t *count)
+{
+	const struct bt_disk_extent_item *item;
+	struct bt_extent_ref ref;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	uint64_t expected = 0;
+	uint64_t total = 0;
+	uint64_t steps;
+	size_t position = 0;
+	int data = extent.type == BT_EXTENT_ITEM;
+	int found = 0;
+	int bad;
+	enum btrfs_result error;
+
+	*count = 0;
+	if (extent.type != BT_EXTENT_ITEM && extent.type != BT_METADATA_ITEM) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	bt_cursor_init(&cursor, bt_mutation_view(mutation), extents);
+	error = bt_cursor_seek(&cursor, extent, 0);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		found = bt_key_compare(record.key, extent) == 0;
+		error = !found			  ? BTRFS_NOT_FOUND
+		    : record.size < sizeof(*item) ? BTRFS_CORRUPT
+						  : BTRFS_OK;
+	}
+	if (error == BTRFS_OK) {
+		item = (const void *)record.data;
+		expected = bt_u64(item->refs);
+		*flags = bt_u64(item->flags);
+		*generation = bt_u64(item->generation);
+		bad = data ? *flags != BT_EXTENT_FLAG_DATA : !(*flags & BT_EXTENT_FLAG_TREE);
+		error = bad || expected == 0 ? BTRFS_CORRUPT : BTRFS_OK;
+		position = sizeof(*item);
+	}
+	if (error == BTRFS_OK && data && position < record.size &&
+	    record.data[position] == BT_EXTENT_OWNER_REF) {
+		position += sizeof(struct bt_disk_inline_ref);
+		error = position > record.size ? BTRFS_CORRUPT : BTRFS_OK;
+	}
+	while (error == BTRFS_OK && position < record.size) {
+		error = bt_inline_decode(record.data, record.size, &position, &ref);
+		if (error == BTRFS_OK) {
+			error = bt_backref_append(refs, capacity, count, &ref, &total, data);
+		}
+	}
+	if (error == BTRFS_OK) {
+		error = bt_cursor_next(&cursor);
+	}
+	/* Each keyed reference adds at least one to the item's count. */
+	for (steps = 0; error == BTRFS_OK; steps++) {
+		(void)bt_cursor_record(&cursor, &record);
+		if (record.key.objectid != extent.objectid || record.key.type < BT_TREE_BLOCK_REF ||
+		    record.key.type > BT_SHARED_DATA_REF) {
+			break;
+		}
+		if (steps == expected) {
+			error = BTRFS_CORRUPT;
+			break;
+		}
+		error = bt_keyed_decode(&record, &ref);
+		if (error == BTRFS_OK) {
+			error = bt_backref_append(refs, capacity, count, &ref, &total, data);
+		}
+		if (error == BTRFS_OK) {
+			error = bt_cursor_next(&cursor);
+		}
+	}
+	bt_cursor_fini(&cursor);
+	/* The end of the tree ends the keyed references. */
+	if (error == BTRFS_NOT_FOUND && found) {
+		error = BTRFS_OK;
+	}
+	if (error == BTRFS_OK && total != expected) {
+		error = BTRFS_CORRUPT;
+	}
+	return error;
+}
+
+enum btrfs_result
+bt_backref_move(struct bt_mutation *mutation, struct bt_root *extents, struct bt_key extent,
+    uint64_t objectid, uint64_t generation)
+{
+	struct bt_disk_extent_item *item;
+	struct bt_extent_copy copy;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { 0 };
+	struct bt_key moved = { objectid, extent.offset, extent.type };
+	uint8_t value[sizeof(struct bt_disk_data_ref)];
+	uint64_t steps;
+	uint64_t refs = 0;
+	size_t size = 0;
+	int found;
+	enum btrfs_result error;
+
+	error = bt_extent_begin(mutation, &copy);
+	if (error == BTRFS_OK) {
+		error = bt_extent_load(mutation, *extents, extent, &copy);
+	}
+	if (error == BTRFS_OK) {
+		item = (void *)copy.bytes;
+		refs = bt_u64(item->refs);
+		bt_put64(&item->generation, generation);
+		error =
+		    bt_mutation_edit(mutation, extents, moved, copy.bytes, copy.size, BT_INSERT);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_mutation_edit(mutation, extents, extent, NULL, 0, BT_DELETE);
+	}
+	/* Keyed references, one at a time: no cursor stays open across an edit. */
+	for (steps = 0; error == BTRFS_OK; steps++) {
+		found = 0;
+		bt_cursor_init(&cursor, bt_mutation_view(mutation), *extents);
+		error = bt_cursor_seek(
+		    &cursor, (struct bt_key){ extent.objectid, 0, BT_TREE_BLOCK_REF }, 0);
+		if (error == BTRFS_OK) {
+			(void)bt_cursor_record(&cursor, &record);
+			found = record.key.objectid == extent.objectid &&
+			    record.key.type <= BT_SHARED_DATA_REF;
+		}
+		if (found && record.size <= sizeof(value)) {
+			key = record.key;
+			size = record.size;
+			bt_copy(value, record.data, size);
+		} else if (found) {
+			error = BTRFS_CORRUPT;
+		}
+		bt_cursor_fini(&cursor);
+		if (error == BTRFS_NOT_FOUND || (error == BTRFS_OK && !found)) {
+			error = BTRFS_OK;
+			break;
+		}
+		if (error == BTRFS_OK && steps == refs) {
+			error = BTRFS_CORRUPT;
+		}
+		if (error == BTRFS_OK) {
+			error = bt_mutation_edit(mutation, extents,
+			    (struct bt_key){ objectid, key.offset, key.type }, value, size,
+			    BT_INSERT);
+		}
+		if (error == BTRFS_OK) {
+			error = bt_mutation_edit(mutation, extents, key, NULL, 0, BT_DELETE);
+		}
+	}
+	if (error == BTRFS_OK) {
+		error = bt_mutation_note_extent(mutation, extent);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_mutation_note_extent(mutation, moved);
+	}
+	bt_extent_end(&copy);
+	return error;
+}

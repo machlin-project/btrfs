@@ -974,6 +974,9 @@ struct digest_state {
 	struct namespace_digest *digest;
 	uint8_t *buffer;
 	char *names;
+	/* Every file's data ranges and bytes instead of the extent items of
+	 * large files (namespace_content_digest). */
+	int contents;
 };
 
 static void
@@ -1041,6 +1044,47 @@ digest_extents(struct digest_state *state, const struct btrfs_inode *inode)
 	return 0;
 }
 
+/* A file's data ranges, as SEEK_DATA and SEEK_HOLE find them, with their
+ * offsets and bytes: what its reads show, wherever its extents lie. */
+static int
+digest_ranges(struct digest_state *state, const struct btrfs_inode *inode)
+{
+	struct namespace_digest *digest = state->digest;
+	uint64_t position = 0;
+	uint64_t data;
+	uint64_t hole = 0;
+	size_t completed;
+	size_t length;
+	enum btrfs_result result;
+
+	while (position < inode->size) {
+		result = btrfs_seek(state->fs, inode, position, 0, &data);
+		if (result == BTRFS_NOT_FOUND) {
+			break;
+		}
+		if (result == BTRFS_OK) {
+			result = btrfs_seek(state->fs, inode, data, 1, &hole);
+		}
+		if (result != BTRFS_OK || hole <= data) {
+			return digest_fail(state, "seek", result, inode->id);
+		}
+		digest_u64(digest, data);
+		digest_u64(digest, hole);
+		for (position = data; position < hole; position += completed) {
+			length = hole - position < DIGEST_CHUNK ? (size_t)(hole - position)
+								: DIGEST_CHUNK;
+			result = btrfs_read(
+			    state->fs, inode, position, state->buffer, length, &completed);
+			if (result != BTRFS_OK || completed == 0) {
+				return digest_fail(state, "read", result, inode->id);
+			}
+			digest_mix(digest, state->buffer, completed);
+			digest->bytes += completed;
+		}
+	}
+	return 0;
+}
+
 static int
 digest_inode(struct digest_state *state, const struct btrfs_inode *inode)
 {
@@ -1087,6 +1131,9 @@ digest_inode(struct digest_state *state, const struct btrfs_inode *inode)
 	if ((inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_REGULAR &&
 	    (inode->mode & BTRFS_MODE_TYPE) != BTRFS_MODE_SYMLINK) {
 		return 0;
+	}
+	if (state->contents && (inode->mode & BTRFS_MODE_TYPE) == BTRFS_MODE_REGULAR) {
+		return digest_ranges(state, inode);
 	}
 	if (inode->size > DIGEST_FULL_BYTES && digest_extents(state, inode) != 0) {
 		return -1;
@@ -1170,8 +1217,8 @@ digest_directory(struct digest_state *state, const struct btrfs_inode *directory
 	return result == BTRFS_NOT_FOUND ? 0 : digest_fail(state, "next", result, directory->id);
 }
 
-int
-namespace_digest(const struct btrfs_fs *fs, struct namespace_digest *digest)
+static int
+digest_volume(const struct btrfs_fs *fs, struct namespace_digest *digest, int contents)
 {
 	struct digest_state state;
 	struct btrfs_inode root;
@@ -1182,6 +1229,7 @@ namespace_digest(const struct btrfs_fs *fs, struct namespace_digest *digest)
 	digest->hash = DIGEST_OFFSET;
 	state.fs = fs;
 	state.digest = digest;
+	state.contents = contents;
 	state.buffer = malloc(DIGEST_CHUNK);
 	state.names = malloc(DIGEST_XATTRS);
 	result = btrfs_root(fs, &root);
@@ -1195,4 +1243,16 @@ namespace_digest(const struct btrfs_fs *fs, struct namespace_digest *digest)
 	free(state.buffer);
 	free(state.names);
 	return status;
+}
+
+int
+namespace_digest(const struct btrfs_fs *fs, struct namespace_digest *digest)
+{
+	return digest_volume(fs, digest, 0);
+}
+
+int
+namespace_content_digest(const struct btrfs_fs *fs, struct namespace_digest *digest)
+{
+	return digest_volume(fs, digest, 1);
 }

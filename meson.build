@@ -12,7 +12,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/mutable.c', 'core/space.c', 'core/transaction.c', 'core/recovery.c', 'core/backref.c', 'core/csum.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/rename.c', 'core/subvolume.c', 'core/drop.c',
   'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c',
-  'core/verity.c', 'core/heuristic.c', 'core/relocation.c')
+  'core/verity.c', 'core/heuristic.c', 'core/relocation.c', 'core/balance.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
   add_project_link_arguments('-fsanitize=fuzzer-no-link', language: 'c')
@@ -105,6 +105,9 @@ logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
 relocation_test = executable('btrfs-relocation-test', 'tests/relocation.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd])
+balance_test = executable('btrfs-balance-test', 'tests/balance.c', 'tests/references.c',
+  'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
 large_sectors_test = executable('btrfs-large-sectors-test', 'tests/large_sectors.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
@@ -312,6 +315,26 @@ if fixtures != ''
     args: [join_paths(fixtures, 'sectors-64k.raw')], timeout: 600, suite: 'images')
   test('large-sectors', large_sectors_test, args: [join_paths(fixtures, 'sectors-64k.raw'),
     join_paths(fixtures, 'sectors-64k.expected.tsv'), meson.current_build_dir()],
+    timeout: 300, suite: 'images')
+  # Balance: every block group relocated on its own, with its crash states,
+  # then all in turn; the files read as before and sharing stays. A full
+  # volume refuses for space, a v1 space cache before any write.
+  foreach profile : ['transactions', 'transactions-shared', 'transactions-namespace',
+      'transactions-dup', 'transactions-data', 'transactions-quota', 'transactions-squota',
+      'transactions-mixed',
+      'transactions-block-group-tree', 'transactions-twins', 'transactions-holes',
+      'transactions-verity', 'transactions-keyed', 'transactions-fst',
+      'transactions-metadata-uuid', 'transactions-grow', 'transactions-full',
+      'transactions-16k', 'sectors-16k', 'sectors-64k', 'checksums-xxhash', 'checksums-blake2',
+      'codecs', 'default-subvolume']
+    test('balance-' + profile, balance_test,
+      args: [join_paths(fixtures, profile + '.raw'), '64'], timeout: 900, suite: 'images')
+  endforeach
+  test('balance-faults', balance_test,
+    args: ['--faults', join_paths(fixtures, 'transactions.raw'), '64'], timeout: 900,
+    suite: 'images')
+  test('balance-refused-transactions-space-cache', balance_test,
+    args: ['--unsupported', join_paths(fixtures, 'transactions-space-cache.raw'), '64'],
     timeout: 300, suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,

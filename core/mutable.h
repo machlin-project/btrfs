@@ -68,6 +68,27 @@ enum btrfs_result bt_mutation_rekey(struct bt_mutation *mutation, struct bt_root
 enum btrfs_result bt_mutation_set_child(struct bt_mutation *mutation, struct bt_root *root,
     struct bt_key key, uint8_t level, uint64_t address, uint64_t generation, uint64_t *old_address,
     uint64_t *old_generation);
+/* Copies the path of root's tree from its root down to the node at level on
+ * key's path, that node included, as a CoW before an edit would; the tree's
+ * shape and content do not change. */
+enum btrfs_result bt_mutation_cow_path(
+    struct bt_mutation *mutation, struct bt_root *root, struct bt_key key, uint8_t level);
+/* A copy of the committed node original at a new address, with this
+ * mutation's generation and the original's owner, flags and content: a
+ * relocated block that is to replace original wherever a tree reaches it.
+ * The caller redirects those pointers and moves the extent item; index is
+ * the copy's place among the mutated blocks. */
+enum btrfs_result bt_mutation_relocate(
+    struct bt_mutation *mutation, struct bt_root original, uint64_t *address, size_t *index);
+/* Sets the child pointer at slot of the node this mutation created or copied
+ * at address. */
+enum btrfs_result bt_mutation_set_pointer(struct bt_mutation *mutation, uint64_t address,
+    uint32_t slot, uint64_t child, uint64_t generation);
+/* The bytes of the node this mutation created or copied at address, for an
+ * edit of fixed-size fields in place; its checksum is computed again when the
+ * mutation is sealed. */
+enum btrfs_result bt_mutation_bytes(
+    struct bt_mutation *mutation, uint64_t address, uint8_t **bytes);
 /* A new tree root owned by owner: with copy, a copy of source's node (a
  * snapshot's root, with the same items and child pointers); otherwise an
  * empty leaf whose header identifies this filesystem as source's does. */
@@ -81,6 +102,8 @@ void bt_mutation_observe(struct bt_mutation *mutation, const struct bt_mutation_
  * changed; a failed report poisons the mutation. */
 enum btrfs_result bt_mutation_note_extent(struct bt_mutation *mutation, struct bt_key extent);
 size_t bt_mutation_count(const struct bt_mutation *mutation);
+/* Whether address is a node this mutation created or copied and still holds. */
+int bt_mutation_owns(struct bt_mutation *mutation, uint64_t address);
 /* Whether address is a node this mutation created or copied and then freed:
  * its extent item may remain until the transaction's next accounting pass. */
 int bt_mutation_discarded(struct bt_mutation *mutation, uint64_t address);

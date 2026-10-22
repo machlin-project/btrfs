@@ -447,6 +447,46 @@ extracts every file with `btrfs restore -s -m -x -S` and prints the restored
 manifest, which must equal the model's byte for byte; `restore` reports that
 tmpfs cannot hold the `btrfs.compression` property and continues.
 
+## Balance
+
+`btrfs-balance-test IMAGE WORK [EXPORT]` (`tests/balance.c`) relocates every
+block group of an image on its own, on an overlay that records writes and
+barriers, with steps that commit after WORK transaction work (64 gives many
+steps). Afterwards the group is gone, the content digest (every file's data
+ranges and bytes, attributes, xattrs and names, through subvolumes) is the
+original's, the reference, namespace and qgroup audits pass, and the file
+trees hold as many blocks and the data as many extents as before. Every state
+at a barrier reads the same after superblock recovery, and some relocate again
+to the end. Then all groups are relocated in turn; with EXPORT that image is
+written there as `balanced-PID.raw`. `--unsupported` expects refusals before
+any write (v1 space caches); `--faults` fails every write,
+barrier and allocation of each group's relocation in turn. The `balance-*`
+Meson tests run it on the writable fixtures.
+
+`tests/prepare_balance_linux.py` builds the Linux check: on `/dev/vda` it runs
+`btrfs check --readonly --check-data-csum`, mounts, prints the manifest
+(`BTRFS_BALANCE_MANIFEST_BEFORE:`), runs Linux's own
+`btrfs balance start --full-balance`, checks, prints it again (`_AFTER`),
+writes a file and checks once more. Use a staged root of its own
+(`root-balance`, `root` without `input`, `transaction` or `init`) and run it on
+APFS clones of an original fixture and of its exported balanced image:
+
+```sh
+python3 ../btrfs/tests/prepare_balance_linux.py --root artifacts/btrfs-reference/root-balance \
+  --archive artifacts/btrfs-reference/balance-verify.cpio
+.cache/linux-reference/linux-vm .cache/linux-reference/Image \
+  artifacts/btrfs-reference/balance-verify.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' CLONE.raw > LOG 2>&1
+```
+
+Require `BTRFS_BALANCE_VERIFY_PASS` for both, and equal `BEFORE` manifests of
+the original and the balanced image, equal to the balanced image's `AFTER`.
+Under quotas the qgroups print before and after Linux's balance
+(`BTRFS_BALANCE_QGROUP_*`): the balanced image's must equal those Linux's
+balance of the original reaches. `--phase squota` formats the device itself,
+writes data before and after enabling simple quotas and prints the qgroups
+around a full balance, which shows how Linux counts moved extents.
+
 ## Linux-written crash states
 
 `tests/prepare_logwrites_linux.py` builds a payload that records every write of a

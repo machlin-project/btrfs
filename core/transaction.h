@@ -132,6 +132,9 @@ struct btrfs_transaction {
 	 * follow Linux's reference rules for relocation trees. */
 	struct bt_owned_root relocation;
 	int relocating;
+	/* A balance step moves blocks of every tree, the data relocation tree's
+	 * too (core/balance.c). */
+	int balancing;
 	size_t free_space_applied;
 	size_t chunks_published;
 	int has_free_space;
@@ -234,6 +237,11 @@ enum btrfs_result bt_tx_shrink(struct btrfs_transaction *transaction, struct bt_
 void bt_tx_release_data(struct btrfs_transaction *transaction);
 /* A write or truncation of a regular file needs a settled privilege decision
  * when it has set-id bits Linux removes or a file capability. */
+/* Writes new data to every copy of its extent now: no committed root
+ * references the space, and the commit's first barrier makes it durable
+ * before any metadata names it (core/data.c). */
+enum btrfs_result bt_tx_write_data(
+    struct btrfs_transaction *transaction, uint64_t logical, const uint8_t *bytes, uint64_t length);
 /* Reads existing bytes of a file as this transaction sees them; bytes past
  * EOF read zero (core/data.c). */
 enum btrfs_result bt_tx_read(struct btrfs_transaction *transaction,
@@ -261,5 +269,11 @@ enum btrfs_result bt_tx_tree_merge(
 enum btrfs_result bt_recover_relocation(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, size_t merge_work,
     struct btrfs_relocation_report *report);
+
+/* btrfs_relocate_group with steps that commit once their transaction work
+ * reaches work (core/balance.c). */
+enum btrfs_result bt_relocate_group(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t group, size_t work,
+    struct btrfs_balance_report *report);
 
 #endif

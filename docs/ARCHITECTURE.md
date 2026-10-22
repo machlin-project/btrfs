@@ -526,6 +526,77 @@ array entry for a system group), and the device item's used bytes shrink. The
 device space becomes allocatable in the next transaction, never in this one,
 since the committed root set still maps it.
 
+## Balance
+
+`btrfs_relocate_group` (`core/balance.c`) relocates one block group as Linux's
+balance relocates a chunk (`btrfs_relocate_chunk`): every extent in the group
+moves to other groups, then the group goes as the cleaner removes an empty
+one. It works in steps that each commit after bounded transaction work and
+mount the state just committed, after dropping deleted subvolumes, whose
+trees being dropped have no parents to redirect. Within a step the group
+takes no allocation (`bt_space_readonly`, Linux's read-only block group), and
+nothing it frees is reused before the next transaction.
+
+Linux stages the moves in relocation trees, snapshots of the file trees in
+which it copies blocks out of the group, and in a data relocation inode that
+holds the copied data, and merges both into the file trees at the end; a crash
+leaves them for `btrfs_recover_relocation`. Here each step moves extents in
+place of their originals instead, so every committed state is an ordinary
+volume with the same files, which needs no recovery:
+
+- A block of a tree that is never shared (the root, extent, chunk, device,
+  checksum, free-space, block-group, quota, UUID or data relocation tree)
+  moves with the CoW of its path in that tree, whose reference rules release
+  the original at commit. A path that this transaction already copied, or a
+  tree it already shortened below the block, moved it before.
+- A block of a file tree moves once however many trees share it
+  (`bt_mutation_relocate`): its copy, with the original's owner, flags and
+  content and this transaction's generation, replaces it in every parent its
+  references name and in the root item of a tree whose root it is. A keyed
+  reference names a tree whose search path for the block's first key holds the
+  parent one level up (Linux's `resolve_indirect_ref`); a shared reference
+  names the parent itself. A parent that is not yet this transaction's own node
+  moves the same way, so the recursion climbs one level at a time up to the
+  roots. The extent item moves to the copy with every reference and count
+  (`bt_backref_move`), and a block that names its children by address
+  (FULL_BACKREF) moves their references to the copy first.
+- A data extent is copied with exactly the checksums it has (a preallocated
+  extent written in place has them for its written sectors only), every
+  checksummed sector verified on the way and read from the other copy when one
+  fails; the file extent items its references find (`find_data_references`
+  for keyed references, the parent leaf's items for shared ones) then name
+  the copy in moved leaves, and its extent item moves with its references and
+  keeps its generation.
+
+Sharing between subvolumes therefore stays exactly as it was: as many file-tree
+blocks and data extents exist afterwards, with the same references. Moved
+blocks carry this transaction's generation, newer than their trees' last
+snapshot, from which a CoW decides whether a block may be shared
+(`btrfs_block_can_be_shared`), so a root whose root node moved has its last
+snapshot set to this transaction, as Linux's `create_reloc_root` sets it for a
+balance. A later CoW looks up the references of every moved block, and a
+NODATACOW file's next write to an extent from before the balance is copied
+once, as after Linux's balance. Full quotas need nothing more: the trees that
+reach every moved extent stay the same, and accounting counts each original
+and copy once. Simple quotas count an extent from its generation, as on Linux:
+a moved tree block, with this transaction's generation, now counts for its
+owner even when the original predates the quotas, while moved data keeps its
+generation and counts as before; Linux's own balance of the same volume
+reaches the same numbers.
+
+When the group holds nothing, its free space leaves allocation and its items
+go at commit, as in the cleaner pass; the last group of its type and profile
+first gets a successor chunk of that profile, as Linux allocates one before it
+relocates the last. A volume without room for the group's extents elsewhere
+refuses with NO_SPACE; the steps it committed before leave the same files.
+Refused before any write (UNSUPPORTED): a running quota rescan; a group with a
+v1 space-cache inode, and data a v1 cache inode names, which Linux deletes with
+its group;
+an extent with more references than one transaction moves (1,024). Balance
+filters, profile conversion and a native interface that starts a balance are
+not implemented. `btrfs-inspect IMAGE balance` lists the block groups and,
+with `--apply`, relocates the named groups or every group.
+
 ## Format features
 
 A metadata UUID (METADATA_UUID, `btrfstune -m`) separates the filesystem's

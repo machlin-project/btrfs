@@ -529,6 +529,69 @@ free_space_tests(struct fixture *fixture)
 	puts("free-space tree disagreeing with the extent tree refuses writes: PASS");
 }
 
+/* Root a forged tree block reference names: no such tree exists. */
+#define FORGED_ROOT UINT64_C(4242)
+
+/* A file-tree leaf's extent item whose reference names a tree that does not
+ * exist, or that counts one reference too many, refuses the relocation of
+ * its block group before any write. */
+static void
+balance_tests(struct fixture *fixture)
+{
+	struct btrfs_environment environment = fixture->image.environment;
+	struct btrfs_write_environment writer = { NULL, refuse_write, refuse_flush, NULL,
+		BTRFS_COMPRESSION_NONE, 0 };
+	struct btrfs_balance_report report;
+	struct btrfs_inode greeting;
+	struct bt_disk_extent_item *item;
+	struct bt_disk_inline_ref *reference;
+	struct bt_cursor cursor;
+	struct bt_key key;
+	struct btrfs_fs *fs;
+	uint8_t *original;
+	uint8_t *copy;
+	uint64_t leaf;
+	uint64_t group;
+	size_t payload;
+	size_t size;
+	size_t chunk;
+
+	assert(btrfs_mount(&fixture->image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	assert(btrfs_image_lookup(fs, "greeting", &greeting) == BTRFS_OK);
+	key = (struct bt_key){ greeting.id.inode, 0, BT_INODE_ITEM };
+	bt_cursor_init(&cursor, fs, fs->selected_tree);
+	assert(bt_cursor_seek(&cursor, key, 0) == BTRFS_OK);
+	leaf = cursor.loaded[0].address;
+	bt_cursor_fini(&cursor);
+	chunk = bt_chunk_containing(fs, leaf);
+	assert(chunk < fs->chunk_count);
+	group = fs->chunks[chunk].logical;
+	copy = record_patch(fixture, fs, (struct btrfs_object_id){ BT_EXTENT_TREE, leaf },
+	    BT_METADATA_ITEM, &payload, &size);
+	original = malloc(fs->info.node_size);
+	assert(original != NULL);
+	memcpy(original, copy, fs->info.node_size);
+	item = (void *)(copy + payload);
+	reference = (void *)(item + 1);
+	assert(size >= sizeof(*item) + sizeof(*reference) && reference->type == BT_TREE_BLOCK_REF &&
+	    bt_u64(item->refs) == 1);
+	SET(reference, offset, FORGED_ROOT);
+	checksum(copy, fs->info.node_size);
+	environment.context = fixture;
+	environment.read = patched_read;
+	assert(bt_relocate_group(&environment, &writer, group, SIZE_MAX, &report) == BTRFS_CORRUPT);
+	puts("balance of a block naming a missing tree refuses before any write: PASS");
+	memcpy(copy, original, fs->info.node_size);
+	SET(item, refs, 2);
+	checksum(copy, fs->info.node_size);
+	assert(bt_relocate_group(&environment, &writer, group, SIZE_MAX, &report) == BTRFS_CORRUPT);
+	puts("balance of a block counting a missing reference refuses before any write: PASS");
+	fixture->count = 0;
+	free(copy);
+	free(original);
+	btrfs_unmount(fs);
+}
+
 static void
 stream_tests(struct fixture *fixture)
 {
@@ -698,6 +761,7 @@ main(int argc, char **argv)
 		free_space_tests(&fixture);
 	}
 	stream_tests(&fixture);
+	balance_tests(&fixture);
 	btrfs_image_close(&fixture.image);
 	puts("adversarial contracts: PASS");
 	return 0;

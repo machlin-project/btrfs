@@ -222,6 +222,26 @@ enum btrfs_result btrfs_mount(
     const struct btrfs_environment *environment, uint64_t tree, struct btrfs_fs **result);
 void btrfs_unmount(struct btrfs_fs *fs);
 void btrfs_get_info(const struct btrfs_fs *fs, struct btrfs_info *info);
+
+/* Linux's block group type flags (BTRFS_BLOCK_GROUP_*). */
+#define BTRFS_GROUP_DATA UINT64_C(1)
+#define BTRFS_GROUP_SYSTEM UINT64_C(2)
+#define BTRFS_GROUP_METADATA UINT64_C(4)
+#define BTRFS_GROUP_DUP UINT64_C(32)
+
+/* A block group: its logical start and length, its type flags and the bytes
+ * its extents use, as its block group item records them. */
+struct btrfs_group {
+	uint64_t logical;
+	uint64_t length;
+	uint64_t flags;
+	uint64_t used;
+};
+
+/* The volume's block groups in address order, up to capacity of them;
+ * *count reports how many there are (RANGE when more than capacity). */
+enum btrfs_result btrfs_get_groups(
+    const struct btrfs_fs *fs, struct btrfs_group *groups, size_t capacity, size_t *count);
 /* The identity the primary superblock records once its checksum and offset
  * verify, without mounting: what a probe needs to recognize a volume whose
  * mount first requires recovery (RECOVERY_REQUIRED, as a pending tree log

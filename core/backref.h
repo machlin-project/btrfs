@@ -41,6 +41,31 @@ enum btrfs_result bt_backref_drop(struct bt_mutation *mutation, struct bt_root *
     struct bt_key extent, const struct bt_backref *reference, uint32_t count, int *freed);
 enum btrfs_result bt_backref_set_flags(
     struct bt_mutation *mutation, struct bt_root *extents, struct bt_key extent, uint64_t flags);
+
+/* One reference of an extent: type is its item type; tree references name
+ * root or parent, data references (root, inode, offset) or parent, with a
+ * count. */
+struct bt_extent_ref {
+	uint64_t root;
+	uint64_t parent;
+	uint64_t inode;
+	uint64_t offset;
+	uint32_t count;
+	uint8_t type;
+};
+
+/* The extent item at extent in the mutation's view and its references,
+ * inline then keyed, up to capacity of them (RANGE beyond): its flags and
+ * generation, and every reference except a data extent's owner. Their counts
+ * must add up to the item's; NOT_FOUND without the item. */
+enum btrfs_result bt_backref_list(struct bt_mutation *mutation, struct bt_root extents,
+    struct bt_key extent, uint64_t *flags, uint64_t *generation, struct bt_extent_ref *refs,
+    size_t capacity, size_t *count);
+/* Moves the extent item at extent and its keyed references to objectid, with
+ * generation, as relocation moves an extent to a new place: flags, owner,
+ * references and counts stay. */
+enum btrfs_result bt_backref_move(struct bt_mutation *mutation, struct bt_root *extents,
+    struct bt_key extent, uint64_t objectid, uint64_t generation);
 uint64_t bt_backref_data_hash(uint64_t root, uint64_t inode, uint64_t offset);
 /* The bytes bt_backref_new_data writes at most. */
 #define BT_BACKREF_NEW_DATA_BYTES                                                                  \

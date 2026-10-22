@@ -44,6 +44,10 @@ enum btrfs_result bt_space_check_system(struct bt_space *space);
 enum btrfs_result bt_space_unused(struct bt_space *space, size_t chunk, int *unused);
 /* Takes an unused group out of allocation and marks it removed. */
 enum btrfs_result bt_space_retire(struct bt_space *space, size_t chunk);
+/* Takes a group out of allocation for the rest of the transaction, loading
+ * it first, as Linux's btrfs_inc_block_group_ro does for a group being
+ * relocated: nothing new is placed in it, and what it frees is not reused. */
+enum btrfs_result bt_space_readonly(struct bt_space *space, size_t chunk);
 /* Chunks at or after this index were created by growth in this transaction. */
 size_t bt_space_original_chunks(const struct bt_space *space);
 void bt_space_allocator(struct bt_space *space, struct bt_mutation_allocator *allocator);

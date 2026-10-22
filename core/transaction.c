@@ -295,8 +295,11 @@ bt_tx_tree(struct btrfs_transaction *transaction, uint64_t tree, struct bt_owned
 			return transaction->trees[i].read_only ? BTRFS_READ_ONLY : BTRFS_OK;
 		}
 	}
-	/* Relocation recovery also cleans the data relocation tree's orphans. */
-	if (!bt_file_tree(tree) && !(tree == BT_DATA_RELOC_TREE && transaction->base->relocation)) {
+	/* Relocation recovery also cleans the data relocation tree's orphans,
+	 * and a balance moves its blocks. */
+	if (!bt_file_tree(tree) &&
+	    !(tree == BT_DATA_RELOC_TREE &&
+		(transaction->base->relocation || transaction->balancing))) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	if (transaction->tree_count == BT_TRANSACTION_TREES) {

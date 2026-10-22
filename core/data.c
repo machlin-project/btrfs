@@ -559,7 +559,7 @@ bt_tx_shrink(struct btrfs_transaction *transaction, struct bt_owned_root *tree, 
 /* Writes new data to its extent now: no committed root references the space,
  * and the commit's first barrier makes it durable before any metadata naming
  * it. A failed write fails the transaction. */
-static enum btrfs_result
+enum btrfs_result
 bt_tx_write_data(
     struct btrfs_transaction *transaction, uint64_t logical, const uint8_t *bytes, uint64_t length)
 {

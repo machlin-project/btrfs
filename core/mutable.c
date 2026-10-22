@@ -1110,6 +1110,14 @@ failed:
 }
 
 int
+bt_mutation_owns(struct bt_mutation *mutation, uint64_t address)
+{
+	const struct bt_mutable_node *node = bt_mut_find_node(mutation, address);
+
+	return node != NULL && !node->discarded;
+}
+
+int
 bt_mutation_discarded(struct bt_mutation *mutation, uint64_t address)
 {
 	const struct bt_mutable_node *node = bt_mut_find_node(mutation, address);
@@ -1186,6 +1194,176 @@ bt_mutation_set_child(struct bt_mutation *mutation, struct bt_root *root, struct
 failed:
 	mutation->failure = error;
 	return error;
+}
+
+enum btrfs_result
+bt_mutation_cow_path(
+    struct bt_mutation *mutation, struct bt_root *root, struct bt_key key, uint8_t level)
+{
+	struct bt_mutable_node *path[BT_MAX_LEVEL];
+	uint32_t slots[BT_MAX_LEVEL];
+	struct bt_mutable_node *node;
+	struct bt_disk_pointer *pointers;
+	struct bt_root current;
+	uint8_t top;
+	uint8_t at;
+	enum btrfs_result error;
+
+	if (mutation == NULL || root == NULL || root->level >= BT_MAX_LEVEL ||
+	    level > root->level) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (mutation->sealed || mutation->failure != BTRFS_OK) {
+		return mutation->failure == BTRFS_OK ? BTRFS_READ_ONLY : mutation->failure;
+	}
+	error = bt_mut_unheld(mutation);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	current = *root;
+	top = current.level;
+	/* At most BT_MAX_LEVEL nodes, one per level from the root down. */
+	for (at = top;; at--) {
+		error = bt_mut_cow(mutation, current, &node);
+		if (error != BTRFS_OK) {
+			goto failed;
+		}
+		if (bt_mut_header(node)->level != at || (at != 0 && bt_mut_count(node) == 0)) {
+			error = BTRFS_CORRUPT;
+			goto failed;
+		}
+		path[at] = node;
+		if (at == level) {
+			break;
+		}
+		slots[at] = bt_mut_slot(node, key, 1);
+		pointers = (void *)(bt_mut_header(node) + 1);
+		current.address = bt_u64(pointers[slots[at]].bytenr);
+		current.generation = bt_u64(pointers[slots[at]].generation);
+		current.level = at - 1;
+	}
+	for (at = level + 1; at <= top; at++) {
+		pointers = (void *)(bt_mut_header(path[at]) + 1);
+		bt_put64(&pointers[slots[at]].bytenr, path[at - 1]->address);
+		bt_put64(&pointers[slots[at]].generation, mutation->view.info.generation);
+		path[at]->checksum_valid = 0;
+	}
+	*root = bt_mut_root(path[top]);
+	return BTRFS_OK;
+failed:
+	mutation->failure = error;
+	return error;
+}
+
+enum btrfs_result
+bt_mutation_relocate(
+    struct bt_mutation *mutation, struct bt_root original, uint64_t *address, size_t *index)
+{
+	const struct bt_disk_header *source_header;
+	struct bt_disk_header *header;
+	struct bt_mutable_node *node = NULL;
+	const uint8_t *source;
+	uint64_t owner = 0;
+	uint64_t flags = 0;
+	size_t handle;
+	enum btrfs_result error;
+
+	if (mutation == NULL || address == NULL || index == NULL ||
+	    original.level >= BT_MAX_LEVEL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (mutation->sealed || mutation->failure != BTRFS_OK) {
+		return mutation->failure == BTRFS_OK ? BTRFS_READ_ONLY : mutation->failure;
+	}
+	error = bt_mut_unheld(mutation);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	/* Only a committed node is relocated; this mutation's own nodes are
+	 * new already. */
+	if (bt_mut_find_node(mutation, original.address) != NULL) {
+		error = BTRFS_INVALID_ARGUMENT;
+		goto failed;
+	}
+	error = bt_tree_source(mutation->base, original, mutation->scratch, &source, &handle);
+	if (error == BTRFS_OK) {
+		source_header = (const void *)source;
+		owner = bt_u64(source_header->owner);
+		flags = bt_u64(source_header->flags);
+		original.owner = owner;
+		error = bt_mut_new(mutation, original, source, original.address, &node);
+	}
+	bt_tree_release(mutation->base, handle);
+	if (error != BTRFS_OK) {
+		goto failed;
+	}
+	header = bt_mut_header(node);
+	bt_put64(&header->owner, owner);
+	bt_put64(&header->flags, flags);
+	node->checksum_valid = 0;
+	*address = node->address;
+	*index = mutation->count - 1;
+	return BTRFS_OK;
+failed:
+	mutation->failure = error;
+	return error;
+}
+
+enum btrfs_result
+bt_mutation_set_pointer(struct bt_mutation *mutation, uint64_t address, uint32_t slot,
+    uint64_t child, uint64_t generation)
+{
+	struct bt_mutable_node *node;
+	struct bt_disk_pointer *pointers;
+	enum btrfs_result error;
+
+	if (mutation == NULL || child == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (mutation->sealed || mutation->failure != BTRFS_OK) {
+		return mutation->failure == BTRFS_OK ? BTRFS_READ_ONLY : mutation->failure;
+	}
+	error = bt_mut_unheld(mutation);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	node = bt_mut_find_node(mutation, address);
+	if (node == NULL || node->discarded || bt_mut_header(node)->level == 0 ||
+	    slot >= bt_mut_count(node)) {
+		mutation->failure = BTRFS_INVALID_ARGUMENT;
+		return mutation->failure;
+	}
+	pointers = (void *)(bt_mut_header(node) + 1);
+	bt_put64(&pointers[slot].bytenr, child);
+	bt_put64(&pointers[slot].generation, generation);
+	node->checksum_valid = 0;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+bt_mutation_bytes(struct bt_mutation *mutation, uint64_t address, uint8_t **bytes)
+{
+	struct bt_mutable_node *node;
+	enum btrfs_result error;
+
+	if (mutation == NULL || bytes == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (mutation->sealed || mutation->failure != BTRFS_OK) {
+		return mutation->failure == BTRFS_OK ? BTRFS_READ_ONLY : mutation->failure;
+	}
+	error = bt_mut_unheld(mutation);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	node = bt_mut_find_node(mutation, address);
+	if (node == NULL || node->discarded) {
+		mutation->failure = BTRFS_INVALID_ARGUMENT;
+		return mutation->failure;
+	}
+	node->checksum_valid = 0;
+	*bytes = node->bytes;
+	return BTRFS_OK;
 }
 
 enum btrfs_result

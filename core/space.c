@@ -1469,21 +1469,31 @@ enum btrfs_result
 bt_space_retire(struct bt_space *space, size_t chunk)
 {
 	struct bt_chunk *group = &space->fs->chunks[chunk];
-	struct bt_gaps *list = bt_space_class(space, group);
-	size_t i;
 	enum btrfs_result error;
 
-	error = bt_gaps_own(&space->fs->env, list);
-	if (error != BTRFS_OK) {
-		return error;
+	error = bt_space_carve(
+	    space, bt_space_class(space, group), group->logical, group->logical + group->length);
+	if (error == BTRFS_OK) {
+		group->removed = 1;
 	}
-	for (i = list->next; i < list->count; i++) {
-		if (list->items[i].start == group->logical) {
-			list->items[i].start = list->items[i].end;
-		}
+	return error;
+}
+
+enum btrfs_result
+bt_space_readonly(struct bt_space *space, size_t chunk)
+{
+	const struct bt_chunk *group = &space->fs->chunks[chunk];
+	enum btrfs_result error = BTRFS_OK;
+
+	if (chunk >= space->fs->chunk_count || group->removed) {
+		return BTRFS_INVALID_ARGUMENT;
 	}
-	group->removed = 1;
-	return BTRFS_OK;
+	if (!space->loaded[chunk]) {
+		error = bt_space_load_chunk(space, chunk);
+	}
+	return error == BTRFS_OK ? bt_space_carve(space, bt_space_class(space, group),
+				       group->logical, group->logical + group->length)
+				 : error;
 }
 
 void
