@@ -99,10 +99,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    as `btrfs_recover_relocation` does (`core/relocation.c`: merge, drop, data
    relocation orphans), checked against every crash state of a recorded
    balance and against Linux's own recovery (`tests/relocation.c`,
-   `tests/relocation_log.c`), with full quotas and with tree logs beside
-   relocation trees. Remaining: recovery with simple quotas (owners of
-   relocated copies) and balance itself; data reference edits from file
-   writes must join the same
+   `tests/relocation_log.c`), with full and simple quotas and with tree logs
+   beside relocation trees. Remaining: balance itself; data reference edits
+   from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
 3. **Extend file data.** `btrfs_transaction_write`/`_truncate` write CoW data

@@ -391,10 +391,12 @@ and unmounts; run it with `linux-vm-external` and the two images
 `relocation-log-data.raw` and `relocation-log.raw`, and require
 `BTRFS_RELOC_RECORD_PASS` and the same manifest as the fixture's. With
 `--quota` it enables full quotas before the files and rescans after them
-(`relocation-quota-log*.raw`); with `--fsync` it writes and fsyncs files in
+(`relocation-quota-log*.raw`), with `--squota` simple quotas before them
+(`relocation-squota-log*.raw`); with `--fsync` it writes and fsyncs files in
 `/mnt/log` while the balance runs, so that states hold tree logs beside
 relocation trees (`relocation-fsync-log*.raw`).
-`interrupted-balance-states`, `-quota-states` and `-fsync-states`
+`interrupted-balance-states`, `-quota-states`, `-squota-states` and
+`-fsync-states`
 (`tests/relocation_log.c`) replay every durable point between the marks,
 replay a pending tree log first, recover each state (with quotas, the
 independent qgroup audit before and after) and merge each state waiting for a

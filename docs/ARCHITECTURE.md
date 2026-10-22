@@ -89,9 +89,11 @@ them is accounted from the subvolumes that reach it before and after the swap
 `btrfs_qgroup_add_swapped_blocks`); a relocation tree's root, which references
 itself, leads to no subvolume, as Linux's backreference walk and `btrfs
 check` resolve it, and a subtree at level 3 or above marks quotas
-inconsistent, as dropping one does. Simple quotas are UNSUPPORTED: they count
-an extent for the subvolume that allocated it, and relocated copies' owners
-are not followed. Linux's merge
+inconsistent, as dropping one does. Simple quotas need nothing more: a
+relocation tree's blocks keep their file tree's owner, which Linux's
+allocation records as the owning root (`reloc_src_root`), and the data
+relocation tree's copies carry its own id, which counts for no qgroup. Linux's
+merge
 also copies the file tree's root after the last swap, to move a relocated
 root out of the block group being relocated; this one does not, which leaves
 an equivalent tree. A pending tree log replays first, beside relocation trees,

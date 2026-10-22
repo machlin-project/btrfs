@@ -17,7 +17,8 @@ manifest, unmount, require that no relocation tree remains and run
 `btrfs check --readonly`.
 
 record: write the same files (with --quota, under full quotas enabled before
-them and rescanned after) through dm-log-writes (/dev/mapper/logged logs
+them and rescanned after; with --squota, under simple quotas enabled before
+them) through dm-log-writes (/dev/mapper/logged logs
 /dev/vda into /dev/vdb), mark them `filled`, print the manifest, run a full
 balance to its end, mark `balanced` and unmount; every state a crash could
 leave during the balance can then be replayed from the log. With --fsync, new
@@ -198,7 +199,7 @@ echo BTRFS_RELOC_FSYNCS:$i
 """
 
 
-def record_init(quota: bool, fsync: bool) -> str:
+def record_init(quota: str, fsync: bool) -> str:
     # dm-log-writes needs its modules; no discards, which a replay would have
     # to zero.
     prelude = PRELUDE.replace("for module in $(cat /modules/order); do",
@@ -213,9 +214,11 @@ mark() {{
 mkfs.btrfs -f -K -s 4096 -n {NODE_SIZE} -m dup -d single -L machlin-btrfs /dev/mapper/logged
 mark mkfs
 mount -t btrfs -o noatime,nodiscard /dev/mapper/logged /mnt
-{"btrfs quota enable /mnt" if quota else ":"}
+{"btrfs quota enable /mnt" if quota == "full" else
+ "btrfs quota enable -s /mnt" if quota == "simple" else ":"}
 {fill()}
-{"btrfs quota rescan -w /mnt && btrfs qgroup show --raw /mnt && sync" if quota else ":"}
+{"btrfs quota rescan -w /mnt && btrfs qgroup show --raw /mnt && sync" if quota == "full" else
+ "btrfs qgroup show --raw /mnt" if quota == "simple" else ":"}
 mark filled
 manifest
 {FSYNC_BALANCE if fsync else "btrfs balance start --full-balance /mnt"}
@@ -249,7 +252,7 @@ poweroff -f
 """
 
 
-def prepare(root: Path, phase: str, archive: Path, quota: bool, fsync: bool) -> None:
+def prepare(root: Path, phase: str, archive: Path, quota: str, fsync: bool) -> None:
     inputs = root / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     for name, data in INPUTS.items():
@@ -278,10 +281,13 @@ def main() -> None:
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--quota", action="store_true",
                         help="record: enable full quotas before the files")
+    parser.add_argument("--squota", action="store_true",
+                        help="record: enable simple quotas before the files")
     parser.add_argument("--fsync", action="store_true",
                         help="record: write and fsync files while the balance runs")
     args = parser.parse_args()
-    prepare(args.root.resolve(), args.phase, args.archive.resolve(), args.quota, args.fsync)
+    quota = "full" if args.quota else "simple" if args.squota else ""
+    prepare(args.root.resolve(), args.phase, args.archive.resolve(), quota, args.fsync)
 
 
 if __name__ == "__main__":

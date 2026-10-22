@@ -120,9 +120,9 @@ struct btrfs_relocation_report {
  * when something is. A pending tree log must be replayed first
  * (btrfs_replay_log), which it may be beside relocation trees, as Linux's
  * mount replays it before its relocation recovery. With full quotas both
- * subtrees of every swap are accounted; simple quotas are UNSUPPORTED. A
- * balance item stays: Linux resumes the balance at its next read-write
- * mount. */
+ * subtrees of every swap are accounted; simple quotas count each block and
+ * extent for the owner it carries. A balance item stays: Linux resumes the
+ * balance at its next read-write mount. */
 enum btrfs_result btrfs_recover_relocation(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, struct btrfs_relocation_report *report);
 

@@ -1109,6 +1109,14 @@ failed:
 	return error;
 }
 
+int
+bt_mutation_discarded(struct bt_mutation *mutation, uint64_t address)
+{
+	const struct bt_mutable_node *node = bt_mut_find_node(mutation, address);
+
+	return node != NULL && node->discarded;
+}
+
 enum btrfs_result
 bt_mutation_set_child(struct bt_mutation *mutation, struct bt_root *root, struct bt_key key,
     uint8_t level, uint64_t address, uint64_t generation, uint64_t *old_address,

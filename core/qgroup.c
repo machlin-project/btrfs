@@ -1516,7 +1516,12 @@ bt_qg_simple_account(struct btrfs_transaction *transaction, struct bt_qgroups *q
 	for (i = 0; error == BTRFS_OK && i < qgroups->traced_count; i++) {
 		error = bt_qg_simple_extent(transaction->base, extents, qgroups->traced[i], block,
 		    &old_found, &old_generation, &old_owner);
-		if (error == BTRFS_OK) {
+		/* A block allocated and freed again in this transaction counts for
+		 * no one; its extent item goes in the next accounting pass. */
+		if (error == BTRFS_OK && qgroups->traced[i].type == BT_METADATA_ITEM &&
+		    bt_mutation_discarded(transaction->mutation, qgroups->traced[i].objectid)) {
+			new_found = 0;
+		} else if (error == BTRFS_OK) {
 			error = bt_qg_simple_extent(view, transaction->extents.root,
 			    qgroups->traced[i], block, &new_found, &new_generation, &new_owner);
 		}

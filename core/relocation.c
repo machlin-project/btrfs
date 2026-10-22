@@ -660,11 +660,6 @@ bt_rl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, si
 	*changed = 0;
 	fs->relocation = 1;
 	error = btrfs_transaction_begin(fs, writer, &transaction);
-	/* Simple quotas count an extent for the subvolume that allocated it; a
-	 * relocated copy's owner is not followed here. */
-	if (error == BTRFS_OK && bt_qgroup_simple(transaction)) {
-		error = BTRFS_UNSUPPORTED;
-	}
 	if (error == BTRFS_OK) {
 		error = bt_rl_merge(transaction, merge_work, &merged, &working);
 	}

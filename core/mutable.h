@@ -81,6 +81,9 @@ void bt_mutation_observe(struct bt_mutation *mutation, const struct bt_mutation_
  * changed; a failed report poisons the mutation. */
 enum btrfs_result bt_mutation_note_extent(struct bt_mutation *mutation, struct bt_key extent);
 size_t bt_mutation_count(const struct bt_mutation *mutation);
+/* Whether address is a node this mutation created or copied and then freed:
+ * its extent item may remain until the transaction's next accounting pass. */
+int bt_mutation_discarded(struct bt_mutation *mutation, uint64_t address);
 /* Describes changed node index; its bytes carry their checksum once the
  * mutation is sealed. */
 enum btrfs_result bt_mutation_block(

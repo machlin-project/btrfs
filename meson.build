@@ -170,6 +170,10 @@ if fixtures != ''
     args: [join_paths(fixtures, 'relocation-fsync-log.raw'),
       join_paths(fixtures, 'relocation-fsync-log-data.raw'),
       join_paths(fixtures, 'relocation.expected.tsv')], timeout: 3600, suite: 'images')
+  test('interrupted-balance-squota-states', relocation_log_test,
+    args: [join_paths(fixtures, 'relocation-squota-log.raw'),
+      join_paths(fixtures, 'relocation-squota-log-data.raw'),
+      join_paths(fixtures, 'relocation.expected.tsv')], timeout: 3600, suite: 'images')
   test('interrupted-balance-quota-states', relocation_log_test,
     args: [join_paths(fixtures, 'relocation-quota-log.raw'),
       join_paths(fixtures, 'relocation-quota-log-data.raw'),

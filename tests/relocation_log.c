@@ -778,7 +778,11 @@ main(int argc, char **argv)
 			    &step_states, &progress_states);
 		}
 		result = btrfs_recover_relocation(&environment, &writer, &report);
-		REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND);
+		if (result != BTRFS_OK && result != BTRFS_NOT_FOUND) {
+			fprintf(stderr, "entry %zu: relocation recovery: %s\n", i,
+			    btrfs_result_string(result));
+			exit(1);
+		}
 		REQUIRE((result == BTRFS_NOT_FOUND) == (before.trees == 0 && before.orphans == 0));
 		REQUIRE(report.merged == before.waiting && report.dropped == before.trees &&
 		    report.orphans == before.orphans);
