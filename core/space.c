@@ -919,8 +919,8 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	/* Linux's calc_chunk_size and init_alloc_chunk_ctl_policy_regular: the
 	 * class's largest chunk and stripe, and no chunk above a tenth of the
 	 * device. */
-	chunk_max = (kind & BT_BLOCK_DATA) != 0 ? BT_CHUNK_DATA_MAX
-	    : kind == BT_BLOCK_SYSTEM		? BT_CHUNK_SYSTEM_MAX
+	chunk_max = (kind & BT_BLOCK_DATA) != 0	      ? BT_CHUNK_DATA_MAX
+	    : kind == BT_BLOCK_SYSTEM		      ? BT_CHUNK_SYSTEM_MAX
 	    : fs->device_size > BT_CHUNK_LARGE_DEVICE ? BT_CHUNK_STRIPE_MAX
 						      : BT_CHUNK_METADATA_MAX;
 	stripe_max = chunk_max < BT_CHUNK_STRIPE_MAX ? chunk_max : BT_CHUNK_STRIPE_MAX;
