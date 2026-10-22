@@ -229,7 +229,11 @@ seals the nodes it will write, refusing the commit if any is malformed. The
 cache is valid only while the device changes through its owner's commits; it
 must be dropped when anything else changes the device.
 
-Inline data is protected by its leaf checksum. Sparse holes, hole items and
+Inline data is protected by its leaf checksum. An inline extent starts the
+file's first sector and need not hold exactly the inode's size: Linux reads its
+bytes up to the size and zeros after them, so symlink targets btrfs-progs
+stores with their NUL, compressed inline extents a truncation left longer and
+files grown past their inline extent read as they do there. Sparse holes, hole items and
 unwritten preallocation return zeroes; a hole item may carry the nonzero offset
 Linux leaves when it splits or trims one. Shared regular extents honor the recorded extent
 offset, not just disk_bytenr. Compressed extents verify their stored bytes before

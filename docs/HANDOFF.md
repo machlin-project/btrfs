@@ -22,8 +22,8 @@ make test MESON_OPTIONS='-Dfixtures=artifacts/fixtures'
 make check-style
 ```
 
-Require fifty passing test processes on macOS (forty-nine elsewhere) and
-all seven reader profiles (367 contracts). Thirteen writable images are required
+Require every test process to pass (ACCEPTANCE.md, Portable acceptance, gives
+the current count). Thirteen writable images are required
 by the transaction suites:
 `transactions` (4 KiB single), `transactions-dup` (16 KiB DUP),
 `transactions-large` (64 KiB DUP), `transactions-full` (128 MiB with full,
@@ -119,8 +119,8 @@ is destroyed. `accept` is legal only after successful durable publication;
    fs-verity files are verified on every read, keep their data on writable
    volumes, and fs-verity is enabled in bounded steps whose interruption orphan
    cleanup undoes, as Linux does (`core/verity.c`). Remaining: a 64 KiB-sector
-   fixture, and LXNU's FS_IOC_ENABLE_VERITY and keyring policy for builtin
-   signatures.
+   fs-verity fixture (btrfs-progs cannot enable fs-verity), and LXNU's
+   FS_IOC_ENABLE_VERITY and keyring policy for builtin signatures.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
    siblings, and data and metadata chunks grow from unallocated device space
@@ -136,8 +136,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    features), and qgroups are accounted as Linux's full mode accounts them
    (`core/qgroup.c`, ARCHITECTURE.md, Quotas), including rescans, Linux's
    metadata reservations against limits and simple quotas. 16 KiB sectors
-   are read and written against fixtures a 16 KiB-page Linux wrote.
-   Remaining: 64 KiB sectors, whose fixtures need a 64 KiB-page kernel that
+   are read and written against fixtures a 16 KiB-page Linux wrote; 64 KiB
+   sectors against an image btrfs-progs formatted, whose check and restore
+   accept what is written (`tests/large_sectors.c`). Remaining: a Linux
+   kernel's verdict on 64 KiB sectors, which needs a 64 KiB-page kernel that
    no Apple CPU runs.
 5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
    orphan items for open inodes, eviction and orphan cleanup, atomic rename

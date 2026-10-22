@@ -105,6 +105,9 @@ logwrites_test = executable('btrfs-logwrites-test', 'tests/logwrites.c',
 relocation_test = executable('btrfs-relocation-test', 'tests/relocation.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd])
+large_sectors_test = executable('btrfs-large-sectors-test', 'tests/large_sectors.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
 relocation_log_test = executable('btrfs-relocation-log-test', 'tests/relocation_log.c',
   'tests/references.c', 'tests/namespace_audit.c', 'tests/qgroup_audit.c',
   include_directories: inc,
@@ -157,7 +160,6 @@ if fixtures != ''
     '--fixtures', fixtures], timeout: 300, suite: 'images')
   test('tree-log-replay-faults', replay_test, args: [join_paths(fixtures, 'logs.raw')],
     timeout: 1800, suite: 'images')
-  # A balance Linux left unmerged: readable, refused for writing.
   # A balance Linux left unmerged, and every crash state of a recorded
   # balance: readable, recovered as Linux's mount recovers them.
   test('interrupted-balance', relocation_test, args: [join_paths(fixtures, 'relocation.raw'),
@@ -185,6 +187,8 @@ if fixtures != ''
   test('malformed-faults-and-io-budgets', adversarial,
     args: [join_paths(fixtures, 'plain.raw')], timeout: 180, suite: 'images')
   test('malformed-faults-16k', adversarial, args: [join_paths(fixtures, 'sectors-16k.raw')],
+    timeout: 180, suite: 'images')
+  test('malformed-faults-64k', adversarial, args: [join_paths(fixtures, 'sectors-64k.raw')],
     timeout: 180, suite: 'images')
   foreach algorithm : ['xxhash', 'blake2']
     test('malformed-faults-' + algorithm, adversarial,
@@ -301,6 +305,14 @@ if fixtures != ''
   test('compression-twins-16k', transaction_test,
     args: ['--twins', join_paths(fixtures, 'transactions-16k-twins.raw')], timeout: 900,
     suite: 'images')
+  # 64 KiB sectors, which no kernel on an Apple CPU mounts, written by
+  # btrfs-progs: every file reads as its manifest names it, and the crash
+  # states and written files of transactions read back.
+  test('transactions-64k', transaction_test,
+    args: [join_paths(fixtures, 'sectors-64k.raw')], timeout: 600, suite: 'images')
+  test('large-sectors', large_sectors_test, args: [join_paths(fixtures, 'sectors-64k.raw'),
+    join_paths(fixtures, 'sectors-64k.expected.tsv'), meson.current_build_dir()],
+    timeout: 300, suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
     suite: 'images')
@@ -331,7 +343,8 @@ if fixtures != ''
     join_paths(fixtures, 'transactions-verity.raw'),
     join_paths(fixtures, 'sectors-16k.raw'), join_paths(fixtures, 'transactions-16k.raw'),
     join_paths(fixtures, 'transactions-twins.raw'),
-    join_paths(fixtures, 'transactions-16k-twins.raw'), join_paths(fixtures, 'relocation.raw')],
+    join_paths(fixtures, 'transactions-16k-twins.raw'), join_paths(fixtures, 'relocation.raw'),
+    join_paths(fixtures, 'sectors-64k.raw')],
     suite: 'images')
   test('namespace-transactions', transaction_test,
     args: ['--namespace', join_paths(fixtures, 'transactions-namespace.raw')], timeout: 600,

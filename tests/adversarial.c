@@ -289,6 +289,82 @@ unverified_tests(struct fixture *fixture, struct btrfs_fs *fs, uint64_t logical)
 	puts("failed aligned data read leaves no unverified bytes: PASS");
 }
 
+/* Bytes beyond greeting's inline extent that a grown size reads as zeros. */
+#define INLINE_GROWTH 100U
+
+/* greeting's bytes read from a volume whose patched inode says size. */
+static void
+read_patched_greeting(struct fixture *fixture, uint64_t size, const uint8_t *text, size_t length)
+{
+	struct btrfs_environment environment = fixture->image.environment;
+	struct btrfs_fs *patched = NULL;
+	struct btrfs_inode inode;
+	uint8_t *buffer;
+	size_t completed;
+	size_t i;
+
+	buffer = malloc((size_t)size);
+	assert(buffer != NULL);
+	environment.context = fixture;
+	environment.read = patched_read;
+	assert(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &patched) == BTRFS_OK);
+	assert(btrfs_image_lookup(patched, "greeting", &inode) == BTRFS_OK && inode.size == size);
+	assert(btrfs_read(patched, &inode, 0, buffer, (size_t)size, &completed) == BTRFS_OK &&
+	    completed == size);
+	for (i = 0; i < size; i++) {
+		assert(buffer[i] == (i < length ? text[i] : 0));
+	}
+	btrfs_unmount(patched);
+	free(buffer);
+}
+
+/* An inline extent starts the file's first sector; Linux reads its bytes up
+ * to the inode's size and zeros after them. A size below the extent's length
+ * reads a prefix (btrfs-progs stores symlink targets with their NUL), a size
+ * above it the extent and zeros. An inline extent of no bytes is corrupt. */
+static void
+inline_tests(struct fixture *fixture, struct btrfs_fs *fs)
+{
+	struct btrfs_inode greeting;
+	struct bt_disk_inode *inode;
+	struct bt_disk_extent_header *extent;
+	uint8_t *text;
+	uint8_t *copy;
+	size_t payload;
+	size_t size;
+	size_t completed;
+
+	assert(btrfs_image_lookup(fs, "greeting", &greeting) == BTRFS_OK);
+	text = malloc((size_t)greeting.size);
+	assert(text != NULL);
+	assert(btrfs_read(fs, &greeting, 0, text, (size_t)greeting.size, &completed) == BTRFS_OK &&
+	    completed == greeting.size);
+	copy = record_patch(fixture, fs, greeting.id, BT_INODE_ITEM, &payload, &size);
+	inode = (void *)(copy + payload);
+	assert(size == sizeof(*inode) && bt_u64(inode->size) == greeting.size);
+	SET(inode, size, greeting.size - 1);
+	checksum(copy, fs->info.node_size);
+	read_patched_greeting(fixture, greeting.size - 1, text, (size_t)greeting.size);
+	puts("inline extent beyond the size reads up to the size: PASS");
+	SET(inode, size, greeting.size + INLINE_GROWTH);
+	checksum(copy, fs->info.node_size);
+	read_patched_greeting(fixture, greeting.size + INLINE_GROWTH, text, (size_t)greeting.size);
+	puts("inline extent short of the size reads zeros after it: PASS");
+	fixture->count = 0;
+	free(copy);
+	copy = record_patch(fixture, fs, greeting.id, BT_EXTENT_DATA, &payload, &size);
+	extent = (void *)(copy + payload);
+	assert(size >= sizeof(*extent) && extent->type == BT_EXTENT_INLINE &&
+	    extent->compression == BTRFS_COMPRESSION_NONE &&
+	    bt_u64(extent->ram_bytes) == greeting.size);
+	SET(extent, ram_bytes, 0);
+	checksum(copy, fs->info.node_size);
+	expect(fixture, "inline extent of no bytes", BTRFS_CORRUPT, "greeting");
+	fixture->count = 0;
+	free(copy);
+	free(text);
+}
+
 static void
 tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 {
@@ -360,8 +436,10 @@ tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 	assert(size == sizeof(*extent) && extent->header.type == BT_EXTENT_REGULAR);
 	assert(bt_map(fs, bt_u64(extent->disk_bytenr), fs->info.sector_size, BT_BLOCK_DATA, 0,
 		   &physical, &copies) == BTRFS_OK);
+	/* The corrupted sector lies in the first extent; the read may span more. */
 	assert(bt_u64(extent->offset) == 0 &&
-	    bt_u64(extent->length) >= UNVERIFIED_SECTORS * fs->info.sector_size);
+	    bt_u64(extent->length) > UNVERIFIED_BAD_SECTOR * fs->info.sector_size &&
+	    big.size >= UNVERIFIED_SECTORS * fs->info.sector_size);
 	logical = bt_u64(extent->disk_bytenr);
 	extent->header.compression = UINT8_MAX;
 	checksum(copy, fs->info.node_size);
@@ -386,6 +464,7 @@ tree_tests(struct fixture *fixture, struct btrfs_fs *fs)
 	fixture->count = 0;
 	free(sector);
 	unverified_tests(fixture, fs, logical);
+	inline_tests(fixture, fs);
 }
 
 static enum btrfs_result

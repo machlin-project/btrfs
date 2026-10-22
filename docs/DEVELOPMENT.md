@@ -295,7 +295,8 @@ a copy of it whose `modules/` holds `virtio_console.ko`, `virtio_blk.ko`,
 kernel's console is a module, so a guest sees no output before init loads it.
 Build those profiles with `--root artifacts/btrfs-reference/root-16k` and the
 16 KiB `Image`; `mkfs.btrfs` there formats with `-s 16384`. Apple CPUs implement
-no 64 KiB translation granule, so no 64 KiB-sector fixture can be made here.
+no 64 KiB translation granule, so no Linux kernel here mounts 64 KiB sectors;
+their fixture comes from btrfs-progs alone (64 KiB sectors, below).
 
 For each profile, run the following **from the absolute lab directory**, replacing
 `plain` consistently and using 128 MiB for `transactions-full`. The image creation
@@ -412,6 +413,39 @@ every file tree after Linux's recovery and this one. The `verify` phase
 requires no relocation tree and no data relocation orphan, runs
 `btrfs check --readonly`, mounts read-write with `skip_balance`, prints the
 manifest, writes a file, unmounts and checks again.
+
+## 64 KiB sectors
+
+`tests/prepare_progs_linux.py` prepares `sectors-64k` (512 MiB, 64 KiB sectors
+and nodes, DUP metadata) with btrfs-progs in user space, since no kernel here
+mounts it. `create` stages the base payload of `prepare_linux.py` on tmpfs with
+a writable subvolume `subvol` and a read-only one `snapshot`, formats `/dev/vda`
+with `mkfs.btrfs -s 65536 -n 65536 --rootdir --subvol rw:subvol
+--subvol ro:snapshot`, runs `btrfs check --readonly --check-data-csum` and
+prints the manifest of every regular file and symlink (path, `%f:%u:%g:%s`, and
+SHA-256 or target, sorted). Use a staged root of its own (`root-progs`, `root`
+without `input`, `transaction` or `init`):
+
+```sh
+python3 ../btrfs/tests/prepare_progs_linux.py --root artifacts/btrfs-reference/root-progs \
+  --phase create --archive artifacts/btrfs-reference/sectors-64k-create.cpio
+python3 -c "from pathlib import Path; f=Path('../btrfs/artifacts/fixtures/sectors-64k.raw').open('xb'); f.truncate(512 << 20); f.close()"
+.cache/linux-reference/linux-vm .cache/linux-reference/Image \
+  artifacts/btrfs-reference/sectors-64k-create.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/fixtures/sectors-64k.raw > ../btrfs/logs/linux-progs-sectors-64k.log 2>&1
+grep -a '^BTRFS_PROGS_MANIFEST:' ../btrfs/logs/linux-progs-sectors-64k.log | \
+  sed 's/^BTRFS_PROGS_MANIFEST://' | tr -d '\r' > ../btrfs/artifacts/fixtures/sectors-64k.expected.tsv
+```
+
+Require `BTRFS_PROGS_CREATED`. `large-sectors` (`tests/large_sectors.c`) reads
+every manifest entry, then writes three transactions to a clone in its output
+directory and leaves the image and its model's manifest there as
+`large-sectors-PID.raw` and `.tsv`. The `verify` phase, run the same way on a
+clone of that image, runs the check, prints the top level's file extents,
+extracts every file with `btrfs restore -s -m -x -S` and prints the restored
+manifest, which must equal the model's byte for byte; `restore` reports that
+tmpfs cannot hold the `btrfs.compression` property and continues.
 
 ## Linux-written crash states
 

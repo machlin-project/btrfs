@@ -147,8 +147,7 @@ bt_data_read(
 }
 
 static enum btrfs_result
-bt_extent_length(const struct btrfs_fs *fs, const struct bt_record *record,
-    const struct btrfs_inode *inode, uint64_t *length)
+bt_extent_length(const struct btrfs_fs *fs, const struct bt_record *record, uint64_t *length)
 {
 	const struct bt_disk_extent_header *header = (const void *)record->data;
 	const struct bt_disk_extent *extent = (const void *)record->data;
@@ -168,9 +167,13 @@ bt_extent_length(const struct btrfs_fs *fs, const struct bt_record *record,
 		return BTRFS_CORRUPT;
 	}
 	ram = bt_u64(header->ram_bytes);
+	/* An inline extent starts the file's first sector. Linux reads its bytes
+	 * up to the inode's size and zeros after them, so its length need not be
+	 * the size: btrfs-progs stores a symlink's target with its terminating
+	 * NUL, a truncated compressed inline extent keeps its length, and a file
+	 * grown past one keeps it until the grown sector is written back. */
 	if (header->type == BT_EXTENT_INLINE) {
-		if (record->key.offset != 0 || ram == 0 || ram != inode->size ||
-		    ram > BT_MAX_COMPRESSED_SIZE ||
+		if (record->key.offset != 0 || ram == 0 || ram > BT_MAX_COMPRESSED_SIZE ||
 		    (header->compression == BTRFS_COMPRESSION_NONE &&
 			ram != record->size - sizeof(*header))) {
 			return BTRFS_CORRUPT;
@@ -540,7 +543,7 @@ bt_read_data(const struct btrfs_fs *fs, const struct btrfs_inode *inode, uint64_
 			error = BTRFS_UNSUPPORTED;
 			break;
 		}
-		error = bt_extent_length(fs, &record, inode, &extent_length);
+		error = bt_extent_length(fs, &record, &extent_length);
 		if (error != BTRFS_OK || record.key.offset < previous_end) {
 			error = error == BTRFS_OK ? BTRFS_CORRUPT : error;
 			break;
@@ -643,7 +646,7 @@ btrfs_seek(const struct btrfs_fs *fs, const struct btrfs_inode *inode, uint64_t 
 		if (record.key.objectid != key.objectid || record.key.type != key.type) {
 			break;
 		}
-		error = bt_extent_length(fs, &record, inode, &length);
+		error = bt_extent_length(fs, &record, &length);
 		if (error != BTRFS_OK) {
 			break;
 		}
