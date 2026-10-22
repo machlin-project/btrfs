@@ -490,7 +490,11 @@ only the durable, or a random part of each device's pending writes on media)
 after superblock recovery; it requires a writer without each device, a degraded
 mount and RAID5/6 volumes to be refused before any write. It then balances
 every group and checks the balance's crash states the same way, some of them
-recovering the relocation and balancing again; `--grow` (for `multi-grow`)
+recovering the relocation and balancing again, requires Linux's conversion
+refusals (metadata to single without force, a profile needing more devices,
+RAID5) before any write, and converts data and metadata to other profiles the
+device count allows (RAID0, RAID1, RAID1C3, RAID10, RAID1C4, DUP), checking
+that conversion's crash states too; `--grow` (for `multi-grow`)
 instead preallocates beyond the free data space in a sixth transaction, so
 that new data chunks are placed across the devices, and checks its crash
 states. The `multi-*-writes` Meson tests run it without export. With an EXPORT directory

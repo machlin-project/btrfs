@@ -16,6 +16,11 @@ print the manifest, write a file, balance every group with Linux's own
 allocator (reporting whether it completes, since a full volume may refuse),
 print the chunk profiles, unmount and check again.
 
+convert: on a copy of a volume, have Linux convert data and metadata to the
+given profiles with its own balance (forced), then balance every group,
+reporting whether that completes, print the chunk profiles and check: the
+control for conversions this implementation made.
+
 The manifest names every regular file and symlink below the mount with its
 mode, owner, size and SHA-256 (or symlink target), one line each, sorted;
 subvolumes appear as their directories.
@@ -156,6 +161,7 @@ else
     echo BTRFS_MULTI_REBALANCE_REFUSED
     sed 's/^/BTRFS_MULTI_REBALANCE_OUTPUT:/' /tmp/balance
     btrfs filesystem usage -b /mnt | sed 's/^/BTRFS_MULTI_USAGE:/'
+    dmesg | tail -20 | sed 's/^/BTRFS_MULTI_DMESG:/'
 fi
 btrfs inspect-internal dump-tree -t chunk /dev/vda | grep -E 'type (DATA|METADATA|SYSTEM)' | sort | uniq -c | sed 's/^/BTRFS_MULTI_CHUNKS:/'
 umount /mnt
@@ -166,14 +172,48 @@ poweroff -f
 """
 
 
-def prepare(root: Path, phase: str, profile: str, archive: Path) -> None:
-    count, data, metadata = PROFILES[profile]
+def convert_init(data: str, metadata: str) -> str:
+    return PRELUDE + MANIFEST + f"""
+btrfs device scan
+mount -t btrfs -o noatime /dev/vda /mnt
+manifest
+if ! btrfs balance start -f -dconvert={data} -mconvert={metadata} /mnt > /tmp/balance 2>&1; then
+    sed 's/^/BTRFS_MULTI_CONVERT_OUTPUT:/' /tmp/balance
+    dmesg | tail -20 | sed 's/^/BTRFS_MULTI_DMESG:/'
+    false
+fi
+echo BTRFS_MULTI_CONVERTED
+if btrfs balance start --full-balance /mnt > /tmp/balance 2>&1; then
+    echo BTRFS_MULTI_REBALANCED
+else
+    echo BTRFS_MULTI_REBALANCE_REFUSED
+    sed 's/^/BTRFS_MULTI_REBALANCE_OUTPUT:/' /tmp/balance
+    btrfs filesystem usage -b /mnt | sed 's/^/BTRFS_MULTI_USAGE:/'
+    dmesg | tail -20 | sed 's/^/BTRFS_MULTI_DMESG:/'
+fi
+btrfs inspect-internal dump-tree -t chunk /dev/vda | grep -E 'type (DATA|METADATA|SYSTEM)' | sort | uniq -c | sed 's/^/BTRFS_MULTI_CHUNKS:/'
+umount /mnt
+btrfs check --readonly --check-data-csum /dev/vda
+echo BTRFS_MULTI_CONVERT_PASS
+trap - EXIT
+poweroff -f
+"""
+
+
+def prepare(root: Path, phase: str, profile: str, archive: Path, data: str = "",
+            metadata: str = "") -> None:
+    count, profile_data, profile_metadata = PROFILES[profile]
     inputs = root / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     for name, content in INPUTS.items():
         (inputs / name).write_bytes(content)
     sizes = device_sizes(profile, count)
-    init = create_init(count, data, metadata, sizes) if phase == "create" else verify_init(count)
+    if phase == "create":
+        init = create_init(count, profile_data, profile_metadata, sizes)
+    elif phase == "convert":
+        init = convert_init(data, metadata)
+    else:
+        init = verify_init(count)
     (root / "init").write_text(init)
     (root / "init").chmod(0o755)
     paths = subprocess.run(["find", ".", "-path", "./transaction", "-prune", "-o", "-print"],
@@ -184,7 +224,7 @@ def prepare(root: Path, phase: str, profile: str, archive: Path) -> None:
                        stdout=output, check=True)
     if phase == "create":
         report = {"profile": profile, "devices": count, "device_bytes": list(sizes),
-                  "node_size": NODE_SIZE, "data": data, "metadata": metadata}
+                  "node_size": NODE_SIZE, "data": profile_data, "metadata": profile_metadata}
         archive.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
 
 
@@ -192,11 +232,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True,
                         help="Disposable staged Alpine initrd root")
-    parser.add_argument("--phase", choices=("create", "verify"), required=True)
+    parser.add_argument("--phase", choices=("create", "verify", "convert"), required=True)
     parser.add_argument("--profile", choices=PROFILES, required=True)
     parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--data", default="", help="convert: the data target profile")
+    parser.add_argument("--metadata", default="", help="convert: the metadata target profile")
     args = parser.parse_args()
-    prepare(args.root.resolve(), args.phase, args.profile, args.archive.resolve())
+    if args.phase == "convert" and not (args.data and args.metadata):
+        parser.error("convert needs --data and --metadata")
+    prepare(args.root.resolve(), args.phase, args.profile, args.archive.resolve(), args.data,
+            args.metadata)
 
 
 if __name__ == "__main__":

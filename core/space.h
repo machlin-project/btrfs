@@ -57,9 +57,13 @@ enum btrfs_result bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t 
  * room; UNSUPPORTED for a profile Linux does not allocate. */
 enum btrfs_result bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total,
     uint64_t type, uint64_t minimum, uint64_t cap, struct bt_chunk *chunk);
-/* New chunks of kind (BT_BLOCK_DATA, _METADATA or _SYSTEM) take profile, 0
- * (single) or BT_BLOCK_DUP, for the rest of the transaction, as Linux's
- * balance gives them its convert target. */
+/* Linux's btrfs_raid_array for a profile: the fewest devices it allocates
+ * on, and whether it keeps a block through one lost copy (two copies or
+ * parity). UNSUPPORTED for anything else. */
+enum btrfs_result bt_space_profile(uint64_t profile, unsigned *devices, int *redundant);
+/* New chunks of kind (BT_BLOCK_DATA, _METADATA or _SYSTEM) take profile, any
+ * but RAID5 and RAID6 (UNSUPPORTED), for the rest of the transaction, as
+ * Linux's balance gives them its convert target. */
 enum btrfs_result bt_space_set_profile(struct bt_space *space, uint64_t kind, uint64_t profile);
 /* Linux's check_system_chunk before a chunk is added or removed: grows a
  * system chunk when free system space is below the nodes one chunk item and

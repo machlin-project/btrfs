@@ -107,9 +107,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    same files and sharing stays; `tests/balance.c` checks every group of the
    writable fixtures with their crash states and faults, and Linux checks and
    balances the results again (`tests/prepare_balance_linux.py`). Remaining:
-   balance with v1 space caches, RAID profiles, and a native interface that
-   starts one (`btrfs_balance` takes Linux's usage, convert and soft
-   filters); data reference edits
+   balance with v1 space caches, conversion to RAID5/6, and a native
+   interface that starts one (`btrfs_balance` takes Linux's usage, convert
+   and soft filters and force); data reference edits
    from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
@@ -152,8 +152,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    but RAID5/6, every copy on its device, each device's superblocks with its
    own item, recovered across devices, new chunks placed across them as
    Linux 6.12 places them and balanced (`tests/multidev_write.c`);
-   remaining there: RAID5/6 writes with their parity, balance conversion to
-   RAID profiles, and device add, remove and replace; 64 KiB
+   balance converts to every profile but RAID5/6 with Linux's refusals;
+   remaining there: RAID5/6 writes with their parity, and device add, remove
+   and replace; 64 KiB
    sectors against an image btrfs-progs formatted, whose check and restore
    accept what is written (`tests/large_sectors.c`). Remaining: a Linux
    kernel's verdict on 64 KiB sectors, which needs a 64 KiB-page kernel that

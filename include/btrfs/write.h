@@ -185,8 +185,9 @@ enum btrfs_result btrfs_relocate_group(const struct btrfs_environment *environme
  * btrfs_balance_args gives them: whether its groups are relocated; the usage
  * filter, only groups whose used bytes are below usage percent of their
  * length (0 selects empty groups, above 100 every group); the profile they
- * convert to, BTRFS_BALANCE_SINGLE or BTRFS_GROUP_DUP, or BTRFS_BALANCE_KEEP;
- * and soft, which leaves groups that already have that profile. */
+ * convert to, BTRFS_BALANCE_SINGLE or a BTRFS_GROUP_ profile, or
+ * BTRFS_BALANCE_KEEP; and soft, which leaves groups that already have that
+ * profile. */
 struct btrfs_balance_kind {
 	int enabled;
 	unsigned usage;
@@ -201,6 +202,9 @@ struct btrfs_balance_args {
 	struct btrfs_balance_kind data;
 	struct btrfs_balance_kind metadata;
 	struct btrfs_balance_kind system;
+	/* Linux's --force: metadata or system groups may convert to a profile
+	 * without a second copy or parity while the volume has such groups. */
+	int force;
 };
 
 /* Linux's btrfs balance: every block group the arguments select when it
@@ -208,9 +212,12 @@ struct btrfs_balance_args {
  * mixed group takes the data arguments, which must equal the metadata ones
  * (INVALID_ARGUMENT). While a kind converts, new chunks of it take the
  * target profile and no group of it with another profile takes allocation,
- * so its groups end with the target profile. Converting to a RAID profile
- * is UNSUPPORTED; the first refusal ends the balance, the groups relocated
- * before it stay so, and report counts them all. */
+ * so its groups end with the target profile. As Linux's btrfs_balance
+ * refuses them (INVALID_ARGUMENT), a target needs its profile's fewest
+ * devices, and metadata or system groups lose their redundancy only with
+ * force. Converting to RAID5 or RAID6 is UNSUPPORTED. The first refusal ends
+ * the balance, the groups relocated before it stay so, and report counts them
+ * all. */
 enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
     struct btrfs_balance_report *report);

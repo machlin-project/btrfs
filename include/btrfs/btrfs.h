@@ -249,7 +249,14 @@ void btrfs_get_info(const struct btrfs_fs *fs, struct btrfs_info *info);
 #define BTRFS_GROUP_DATA UINT64_C(1)
 #define BTRFS_GROUP_SYSTEM UINT64_C(2)
 #define BTRFS_GROUP_METADATA UINT64_C(4)
+#define BTRFS_GROUP_RAID0 UINT64_C(8)
+#define BTRFS_GROUP_RAID1 UINT64_C(16)
 #define BTRFS_GROUP_DUP UINT64_C(32)
+#define BTRFS_GROUP_RAID10 UINT64_C(64)
+#define BTRFS_GROUP_RAID5 UINT64_C(128)
+#define BTRFS_GROUP_RAID6 UINT64_C(256)
+#define BTRFS_GROUP_RAID1C3 UINT64_C(512)
+#define BTRFS_GROUP_RAID1C4 UINT64_C(1024)
 
 /* A block group: its logical start and length, its type flags and the bytes
  * its extents use, as its block group item records them. */

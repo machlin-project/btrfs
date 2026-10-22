@@ -18,7 +18,11 @@
  * btrfs_create_chunk places it takes its place (on a full volume a group may
  * be refused for space): the files read the same, every state a power cut
  * leaves at its barriers reads the same, and some of those states recover
- * the relocation and balance again. With --grow, a sixth transaction
+ * the relocation and balance again. Conversions follow: metadata without a
+ * second copy is refused unless forced, as are a profile needing more
+ * devices and RAID5, before any write; then data and metadata convert to
+ * other profiles the devices allow, every group ends with them, and the
+ * conversion's crash states are checked as the balance's. With --grow, a sixth transaction
  * preallocates beyond the free data space instead and writes into the new
  * chunks, which are placed across the devices as Linux places them; its crash
  * states are checked as the others. With an export directory, the written
@@ -838,8 +842,8 @@ balance_everything(struct btrfs_balance_args *args)
  * balance again to the same files. */
 static void
 check_balance_crashes(struct volume *volume, size_t first, size_t end,
-    const struct namespace_digest *expected, uint32_t *seed, size_t *states, size_t *recoveries,
-    size_t *resumed)
+    const struct btrfs_balance_args *args, const struct namespace_digest *expected, uint32_t *seed,
+    size_t *states, size_t *recoveries, size_t *resumed)
 {
 	struct btrfs_environment environment;
 	struct btrfs_write_environment writer;
@@ -847,7 +851,6 @@ check_balance_crashes(struct volume *volume, size_t first, size_t end,
 	struct btrfs_write_device writers[MAX_DEVICES - 1];
 	struct btrfs_relocation_report relocation;
 	struct btrfs_balance_report report;
-	struct btrfs_balance_args args;
 	struct namespace_digest digest;
 	struct volume crash;
 	struct btrfs_fs *fs;
@@ -860,7 +863,6 @@ check_balance_crashes(struct volume *volume, size_t first, size_t end,
 	enum btrfs_result result;
 
 	REQUIRE(visible != NULL);
-	balance_everything(&args);
 	for (position = first; position <= end; position++) {
 		positions +=
 		    position == first || position == end || volume->events[position].bytes == NULL;
@@ -886,7 +888,7 @@ check_balance_crashes(struct volume *volume, size_t first, size_t end,
 				result =
 				    btrfs_recover_relocation(&environment, &writer, &relocation);
 				REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND);
-				result = btrfs_balance(&environment, &writer, &args, &report);
+				result = btrfs_balance(&environment, &writer, args, &report);
 				REQUIRE(result == BTRFS_OK || result == BTRFS_NO_SPACE);
 				mount_volume(&crash, 0, &fs);
 				REQUIRE(namespace_content_digest(fs, &digest) == 0 &&
@@ -901,6 +903,84 @@ check_balance_crashes(struct volume *volume, size_t first, size_t end,
 		}
 	}
 	free(visible);
+}
+
+/* The profile of the volume's groups of kind (data, or else metadata). */
+static uint64_t
+profile_of(const struct btrfs_fs *fs, uint64_t kind)
+{
+	size_t i;
+
+	for (i = 0; i < fs->chunk_count; i++) {
+		if ((fs->chunks[i].type & BT_BLOCK_DATA) == (kind & BT_BLOCK_DATA)) {
+			return fs->chunks[i].type & BT_BLOCK_PROFILES;
+		}
+	}
+	return 0;
+}
+
+/* Conversions the device count allows, to a profile each kind does not have
+ * yet: data to RAID1 or RAID0 on two devices, RAID1C3 or RAID1 on three,
+ * RAID10 or RAID1C4 on four; metadata and system groups to DUP or RAID1, to
+ * RAID1 or RAID1C3, to RAID1C4 or RAID10. */
+static void
+conversion_args(
+    struct volume *volume, struct btrfs_balance_args *args, uint64_t *data, uint64_t *metadata)
+{
+	static const uint64_t targets[3][4] = {
+		{ BTRFS_GROUP_RAID1, BTRFS_GROUP_RAID0, BTRFS_GROUP_DUP, BTRFS_GROUP_RAID1 },
+		{ BTRFS_GROUP_RAID1C3, BTRFS_GROUP_RAID1, BTRFS_GROUP_RAID1, BTRFS_GROUP_RAID1C3 },
+		{ BTRFS_GROUP_RAID10, BTRFS_GROUP_RAID1C4, BTRFS_GROUP_RAID1C4,
+		    BTRFS_GROUP_RAID10 },
+	};
+	struct btrfs_fs *fs;
+	const uint64_t *choice;
+
+	REQUIRE(volume->devices >= 2 && volume->devices <= 4);
+	choice = targets[volume->devices - 2];
+	mount_volume(volume, 0, &fs);
+	*data = profile_of(fs, BT_BLOCK_DATA) != choice[0] ? choice[0] : choice[1];
+	*metadata = profile_of(fs, BT_BLOCK_METADATA) != choice[2] ? choice[2] : choice[3];
+	btrfs_unmount(fs);
+	memset(args, 0, sizeof(*args));
+	args->data = (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, *data, 0 };
+	args->metadata = (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, *metadata, 0 };
+	args->system = args->metadata;
+}
+
+/* Conversions Linux's btrfs_balance refuses, before any write: metadata
+ * without its second copy unless forced, a profile needing more devices,
+ * and RAID5, which this writer does not write. */
+static void
+check_conversion_refusals(struct volume *volume)
+{
+	struct btrfs_environment environment;
+	struct btrfs_write_environment writer;
+	struct btrfs_device readers[MAX_DEVICES - 1];
+	struct btrfs_write_device writers[MAX_DEVICES - 1];
+	struct btrfs_balance_report report;
+	struct btrfs_balance_args args;
+	struct btrfs_balance_kind keep = { 1, BALANCE_EVERY_GROUP, BTRFS_BALANCE_KEEP, 0 };
+	size_t count = volume->count;
+
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	memset(&args, 0, sizeof(args));
+	args.data = keep;
+	args.metadata =
+	    (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_BALANCE_SINGLE, 0 };
+	args.system = args.metadata;
+	REQUIRE(btrfs_balance(&environment, &writer, &args, &report) == BTRFS_INVALID_ARGUMENT);
+	args.metadata = keep;
+	args.system = keep;
+	if (volume->devices < 4) {
+		args.data =
+		    (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_GROUP_RAID1C4, 0 };
+		REQUIRE(
+		    btrfs_balance(&environment, &writer, &args, &report) == BTRFS_INVALID_ARGUMENT);
+	}
+	args.data = (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_GROUP_RAID5, 0 };
+	REQUIRE(btrfs_balance(&environment, &writer, &args, &report) == BTRFS_UNSUPPORTED);
+	REQUIRE(volume->count == count);
 }
 
 /* Applies the volume's writes to clones of its device images. */
@@ -1021,6 +1101,13 @@ main(int argc, char **argv)
 	size_t rebalanced = 0;
 	size_t grown = 0;
 	size_t kept = 0;
+	size_t convert_first;
+	size_t convert_end;
+	size_t convert_states = 0;
+	uint64_t data_target;
+	uint64_t metadata_target;
+	uint64_t converted;
+	uint64_t balanced_groups;
 	size_t steps;
 	size_t group_count;
 	size_t commit_count = COMMITS;
@@ -1228,20 +1315,47 @@ main(int argc, char **argv)
 		kept += fs->chunks[i].logical <= highest;
 	}
 	REQUIRE(report.groups > 0 && (balanced == BTRFS_NO_SPACE || kept == 0));
+	balanced_groups = report.groups;
 	btrfs_unmount(fs);
 
-	check_balance_crashes(&volume, balance_first, balance_end, &commits[COMMITS].digest, &seed,
-	    &balance_states, &recoveries, &rebalanced);
+	check_balance_crashes(&volume, balance_first, balance_end, &args, &commits[COMMITS].digest,
+	    &seed, &balance_states, &recoveries, &rebalanced);
+
+	/* Conversions: refusals first, then data and metadata to other
+	 * profiles the device count allows. */
+	check_conversion_refusals(&volume);
+	convert_first = volume.count;
+	conversion_args(&volume, &args, &data_target, &metadata_target);
+	volume_environment(&volume, 0, &environment, &writer, readers, writers);
+	REQUIRE(btrfs_balance(&environment, &writer, &args, &report) == BTRFS_OK);
+	convert_end = volume.count;
+	mount_volume(&volume, 0, &fs);
+	check_model(fs, &model, "converted", &copies);
+	REQUIRE(namespace_content_digest(fs, &digest) == 0 &&
+	    digest.hash == commits[COMMITS].digest.hash &&
+	    digest.objects == commits[COMMITS].digest.objects &&
+	    digest.bytes == commits[COMMITS].digest.bytes);
+	for (i = 0; i < fs->chunk_count; i++) {
+		REQUIRE((fs->chunks[i].type & BT_BLOCK_PROFILES) ==
+		    ((fs->chunks[i].type & BT_BLOCK_DATA) != 0 ? data_target : metadata_target));
+	}
+	converted = report.groups;
+	btrfs_unmount(fs);
+	check_balance_crashes(&volume, convert_first, convert_end, &args, &commits[COMMITS].digest,
+	    &seed, &convert_states, &recoveries, &rebalanced);
 	finish(&volume, &model, argv, &image);
 	printf("multi-device writes: %zu devices, %zu files; five commits read back as the model "
 	       "holds them and pass both audits (%zu checksummed copies), %zu unused groups "
 	       "removed; the volume reads the same from each device; %zu crash states read as a "
 	       "commit and pass the reference audit, %zu taking a further transaction; a balance "
 	       "relocated %llu groups (%s) into %zu new chunks, %zu old ones kept, reading the "
-	       "same, as do %zu of its crash states, %zu balanced again (%zu states after "
-	       "superblock recovery in all); refusals before any write PASS\n",
+	       "same, as do %zu of its crash states; converting data to profile %llx and "
+	       "metadata to %llx relocated %llu groups, reading the same, as do %zu of its "
+	       "crash states; %zu balances resumed (%zu states after superblock recovery in "
+	       "all); refusals before any write PASS\n",
 	    devices, model.count, copies, removed, states, resumed,
-	    (unsigned long long)report.groups, btrfs_result_string(balanced), grown, kept,
-	    balance_states, rebalanced, recoveries);
+	    (unsigned long long)balanced_groups, btrfs_result_string(balanced), grown, kept,
+	    balance_states, (unsigned long long)data_target, (unsigned long long)metadata_target,
+	    (unsigned long long)converted, convert_states, rebalanced, recoveries);
 	return 0;
 }

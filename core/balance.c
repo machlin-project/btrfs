@@ -1311,11 +1311,62 @@ bt_bl_selects(const struct btrfs_balance_kind *kind, const struct btrfs_group *g
 	    (group->flags & ~BT_BALANCE_KINDS) == kind->convert);
 }
 
-static int
-bt_bl_profile_valid(const struct btrfs_balance_kind *kind)
+/* Linux's validate_convert_profile: a target is one profile, one this
+ * writer allocates (RAID5 and RAID6 are UNSUPPORTED), on no fewer devices
+ * than it needs (INVALID_ARGUMENT). */
+static enum btrfs_result
+bt_bl_target(const struct btrfs_balance_kind *kind, size_t devices, int *redundant)
 {
-	return kind->convert == BTRFS_BALANCE_KEEP || kind->convert == BTRFS_BALANCE_SINGLE ||
-	    kind->convert == BTRFS_GROUP_DUP;
+	unsigned fewest;
+
+	*redundant = 1;
+	if (!kind->enabled || kind->convert == BTRFS_BALANCE_KEEP) {
+		return BTRFS_OK;
+	}
+	if (bt_space_profile(kind->convert, &fewest, redundant) != BTRFS_OK) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if ((kind->convert & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0) {
+		return BTRFS_UNSUPPORTED;
+	}
+	return fewest > devices ? BTRFS_INVALID_ARGUMENT : BTRFS_OK;
+}
+
+/* Linux's btrfs_balance argument checks against the mounted volume: valid
+ * targets, and metadata or system redundancy reduced only with force while
+ * some group of the kind has it. */
+static enum btrfs_result
+bt_bl_arguments(const struct btrfs_fs *fs, const struct btrfs_balance_args *args)
+{
+	int redundant[3];
+	int present[3] = { 0, 0, 0 };
+	uint64_t kinds[3] = { BT_BLOCK_DATA, BT_BLOCK_METADATA, BT_BLOCK_SYSTEM };
+	const struct btrfs_balance_kind *targets[3] = { &args->data, &args->metadata,
+		&args->system };
+	unsigned fewest;
+	int has;
+	size_t i;
+	size_t k;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (k = 0; error == BTRFS_OK && k < 3; k++) {
+		error = bt_bl_target(targets[k], fs->device_count, &redundant[k]);
+	}
+	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
+		for (k = 1; k < 3; k++) {
+			if ((fs->chunks[i].type & kinds[k]) != 0 &&
+			    bt_space_profile(fs->chunks[i].type & BT_BLOCK_PROFILES, &fewest,
+				&has) == BTRFS_OK) {
+				present[k] |= has;
+			}
+		}
+	}
+	for (k = 1; error == BTRFS_OK && k < 3; k++) {
+		if (present[k] && !redundant[k] && !args->force) {
+			error = BTRFS_INVALID_ARGUMENT;
+		}
+	}
+	return error;
 }
 
 enum btrfs_result
@@ -1336,11 +1387,15 @@ bt_balance(const struct btrfs_environment *environment,
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	bt_zero(report, sizeof(*report));
-	if (!bt_bl_profile_valid(&args->data) || !bt_bl_profile_valid(&args->metadata) ||
-	    !bt_bl_profile_valid(&args->system)) {
-		return BTRFS_UNSUPPORTED;
+	error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
+	if (error == BTRFS_OK) {
+		error = bt_bl_arguments(fs, args);
 	}
-	error = bt_bl_clean(environment, writer, report);
+	btrfs_unmount(fs);
+	fs = NULL;
+	if (error == BTRFS_OK) {
+		error = bt_bl_clean(environment, writer, report);
+	}
 	if (error == BTRFS_OK) {
 		error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
 	}

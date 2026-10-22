@@ -869,30 +869,6 @@ bt_space_kind_index(uint64_t kind)
 				       : BT_SPACE_METADATA;
 }
 
-enum btrfs_result
-bt_space_set_profile(struct bt_space *space, uint64_t kind, uint64_t profile)
-{
-	enum bt_space_kind index = bt_space_kind_index(kind);
-
-	if (profile != 0 && profile != BT_BLOCK_DUP) {
-		return BTRFS_UNSUPPORTED;
-	}
-	if (space->mixed && kind != BT_BLOCK_SYSTEM) {
-		index = BT_SPACE_METADATA;
-	}
-	space->profiles[index] = profile;
-	space->converting[index] = 1;
-	if (kind & (BT_BLOCK_DATA | BT_BLOCK_METADATA)) {
-		if (space->mixed || kind == BT_BLOCK_DATA) {
-			space->data_copies = profile == BT_BLOCK_DUP ? 2 : 1;
-		}
-		if (space->mixed || kind != BT_BLOCK_DATA) {
-			space->metadata_copies = profile == BT_BLOCK_DUP ? 2 : 1;
-		}
-	}
-	return BTRFS_OK;
-}
-
 /* Linux's btrfs_raid_array: per profile, the copies a RAID10 stripe has,
  * stripes per device, device counts (devs_max 0: every device) and their
  * increment, copies and parity stripes. */
@@ -918,6 +894,56 @@ static const struct bt_raid_attr bt_raid_attrs[] = {
 	{ BT_BLOCK_RAID5, 1, 1, 0, 2, 1, 1, 1 },
 	{ BT_BLOCK_RAID6, 1, 1, 0, 3, 1, 1, 2 },
 };
+
+static const struct bt_raid_attr *
+bt_raid_attr(uint64_t profile)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(bt_raid_attrs) / sizeof(bt_raid_attrs[0]); i++) {
+		if (bt_raid_attrs[i].profile == profile) {
+			return &bt_raid_attrs[i];
+		}
+	}
+	return NULL;
+}
+
+enum btrfs_result
+bt_space_profile(uint64_t profile, unsigned *devices, int *redundant)
+{
+	const struct bt_raid_attr *attr = bt_raid_attr(profile);
+
+	if (attr == NULL) {
+		return BTRFS_UNSUPPORTED;
+	}
+	*devices = attr->devs_min;
+	*redundant = attr->ncopies >= 2 || attr->nparity >= 1;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+bt_space_set_profile(struct bt_space *space, uint64_t kind, uint64_t profile)
+{
+	enum bt_space_kind index = bt_space_kind_index(kind);
+
+	if (bt_raid_attr(profile) == NULL || (profile & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if (space->mixed && kind != BT_BLOCK_SYSTEM) {
+		index = BT_SPACE_METADATA;
+	}
+	space->profiles[index] = profile;
+	space->converting[index] = 1;
+	if (kind & (BT_BLOCK_DATA | BT_BLOCK_METADATA)) {
+		if (space->mixed || kind == BT_BLOCK_DATA) {
+			space->data_copies = profile == BT_BLOCK_DUP ? 2 : 1;
+		}
+		if (space->mixed || kind != BT_BLOCK_DATA) {
+			space->metadata_copies = profile == BT_BLOCK_DUP ? 2 : 1;
+		}
+	}
+	return BTRFS_OK;
+}
 
 /* A device as Linux's gather_device_info finds it: where the hole a chunk
  * would take starts, how much of it the chunk may take, its unallocated
@@ -1016,7 +1042,7 @@ bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total
     uint64_t minimum, uint64_t cap, struct bt_chunk *chunk)
 {
 	struct bt_device_info items[BT_MAX_DEVICES];
-	const struct bt_raid_attr *attr = NULL;
+	const struct bt_raid_attr *attr;
 	const struct bt_plan_device *device;
 	uint64_t profile = type & BT_BLOCK_PROFILES;
 	uint64_t chunk_max;
@@ -1036,11 +1062,7 @@ bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total
 	unsigned data;
 	unsigned stripes;
 
-	for (i = 0; i < sizeof(bt_raid_attrs) / sizeof(bt_raid_attrs[0]); i++) {
-		if (bt_raid_attrs[i].profile == profile) {
-			attr = &bt_raid_attrs[i];
-		}
-	}
+	attr = bt_raid_attr(profile);
 	if (attr == NULL || count == 0 || count > BT_MAX_DEVICES) {
 		return BTRFS_UNSUPPORTED;
 	}

@@ -508,8 +508,11 @@ convert_run(struct btrfs_image *image, const char *source, size_t work,
 	args.metadata.convert = BTRFS_BALANCE_KEEP;
 	args.system.convert = BTRFS_BALANCE_KEEP;
 	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	/* Mixed groups convert their metadata too, which Linux leaves without
+	 * a second copy only when forced. */
 	if ((fs->info.incompat_features & BT_FEATURE_MIXED_GROUPS) != 0) {
 		args.metadata = args.data;
+		args.force = 1;
 	}
 	btrfs_unmount(fs);
 	REQUIRE(bt_balance(&environment, &writer, &args, work, &report) == BTRFS_OK);
