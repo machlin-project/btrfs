@@ -12,11 +12,14 @@
  * bytes; volumes whose chunks all survive two lost devices are read without
  * each pair too. A device of another volume among them is CORRUPT, and a
  * writer without the further devices is refused before any write
- * (tests/multidev_write.c writes them). */
+ * (tests/multidev_write.c writes them). Every chunk the Linux kernel made
+ * after mkfs's is planned again (bt_space_plan) from the devices' state
+ * before it, with Linux's devices, order, offsets and size. */
 #include "../adapters/posix/image.h"
 #include "internal.h"
 #include "namespace_audit.h"
 #include "references.h"
+#include "space.h"
 #include <btrfs/write.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +40,8 @@
 #define MODE_TYPE 0170000U
 #define MODE_SYMLINK 0120000U
 #define MAX_DEVICES 16U
+/* Stripes of the chunks below one chunk on one device. */
+#define MAX_STRIPES_BELOW 64U
 
 static enum btrfs_result
 refused_write(void *context, uint64_t offset, const void *bytes, size_t length)
@@ -138,6 +143,100 @@ check_manifest(struct btrfs_fs *fs, const char *path, int lossy, size_t *lost)
 	return count;
 }
 
+/* mkfs.btrfs makes one chunk of each class before the kernel makes any. */
+#define MKFS_CHUNKS 3U
+
+/* Device d's free ranges and used bytes below chunk end: the complement of
+ * the stripes of the chunks before it, past the reserved first MiB. */
+static void
+device_state(const struct btrfs_fs *fs, size_t end, uint32_t d, struct bt_gap *holes,
+    struct bt_plan_device *device)
+{
+	struct bt_gap stripes[MAX_STRIPES_BELOW];
+	struct bt_gap swap;
+	const struct bt_chunk *chunk;
+	uint64_t length;
+	uint64_t position = BT_DEVICE_RESERVED;
+	size_t count = 0;
+	size_t i;
+	size_t j;
+	unsigned s;
+
+	device->used = 0;
+	for (i = 0; i < end; i++) {
+		chunk = &fs->chunks[i];
+		length = bt_chunk_stripe_length(chunk);
+		for (s = 0; s < chunk->stripes; s++) {
+			if (chunk->devices[s] != d) {
+				continue;
+			}
+			REQUIRE(count < MAX_STRIPES_BELOW);
+			stripes[count++] =
+			    (struct bt_gap){ chunk->physical[s], chunk->physical[s] + length };
+			device->used += length;
+		}
+	}
+	for (i = 1; i < count; i++) {
+		for (j = i; j > 0 && stripes[j - 1].start > stripes[j].start; j--) {
+			swap = stripes[j];
+			stripes[j] = stripes[j - 1];
+			stripes[j - 1] = swap;
+		}
+	}
+	device->count = 0;
+	for (i = 0; i < count; i++) {
+		if (stripes[i].start > position) {
+			holes[device->count++] = (struct bt_gap){ position, stripes[i].start };
+		}
+		position = stripes[i].end > position ? stripes[i].end : position;
+	}
+	if (fs->devices[d].size > position) {
+		holes[device->count++] = (struct bt_gap){ position, fs->devices[d].size };
+	}
+	device->holes = holes;
+	device->id = fs->devices[d].id;
+	device->size = fs->devices[d].size;
+}
+
+/* Every chunk Linux's kernel made, after mkfs's, planned again from the
+ * devices' state before it: the planner chooses Linux's devices, in its
+ * order, at its offsets, with its stripe size. Returns their number. */
+static size_t
+replay_allocations(const struct btrfs_fs *fs)
+{
+	static struct bt_gap holes[MAX_DEVICES][MAX_STRIPES_BELOW + 1];
+	struct bt_plan_device devices[MAX_DEVICES];
+	struct bt_chunk planned;
+	const struct bt_chunk *chunk;
+	uint64_t total = 0;
+	size_t k;
+	uint32_t d;
+
+	for (d = 0; d < fs->device_count; d++) {
+		total += fs->devices[d].size;
+	}
+	for (k = MKFS_CHUNKS; k < fs->chunk_count; k++) {
+		chunk = &fs->chunks[k];
+		for (d = 0; d < fs->device_count; d++) {
+			device_state(fs, k, d, holes[d], &devices[d]);
+		}
+		REQUIRE(bt_space_plan(devices, fs->device_count, total, chunk->type, 0, UINT64_MAX,
+			    &planned) == BTRFS_OK);
+		if (planned.length != chunk->length || planned.stripes != chunk->stripes ||
+		    planned.sub_stripes != chunk->sub_stripes ||
+		    planned.mirrors != chunk->mirrors ||
+		    memcmp(planned.devices, chunk->devices, chunk->stripes) != 0 ||
+		    memcmp(planned.physical, chunk->physical,
+			chunk->stripes * sizeof(chunk->physical[0])) != 0) {
+			fprintf(stderr, "chunk %llu: planned %llu bytes over %u stripes\n",
+			    (unsigned long long)chunk->logical, (unsigned long long)planned.length,
+			    planned.stripes);
+			exit(1);
+		}
+	}
+	return fs->chunk_count > MKFS_CHUNKS ? fs->chunk_count - MKFS_CHUNKS : 0;
+}
+
 /* How many lost devices every chunk of the volume survives: its copies but
  * one, RAID10's pairs one, RAID5's parity one and RAID6's two. */
 static unsigned
@@ -216,6 +315,7 @@ main(int argc, char **argv)
 	size_t lost = 0;
 	size_t degraded = 0;
 	size_t pairs = 0;
+	size_t replayed;
 	size_t i;
 	size_t j;
 	unsigned survives;
@@ -230,6 +330,7 @@ main(int argc, char **argv)
 	REQUIRE(btrfs_mount(&image.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	REQUIRE(fs->device_count == devices);
 	files = check_manifest(fs, argv[1], 0, &lost);
+	replayed = replay_allocations(fs);
 	survives = survivable(fs);
 	if (reference_audit(fs, &references) != 0) {
 		fprintf(stderr, "reference audit: %s\n", references.failure);
@@ -289,11 +390,12 @@ main(int argc, char **argv)
 	REQUIRE(btrfs_mount(&foreign.environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_CORRUPT);
 	REQUIRE(foreign.live_allocations == 0);
 	btrfs_image_close(&foreign);
-	printf("multi-device: %zu devices, %zu files read as Linux wrote them; both audits pass "
+	printf("multi-device: %zu devices, %zu files read as Linux wrote them; %zu chunks the "
+	       "kernel allocated planned again as it placed them; both audits pass "
 	       "(%zu checksummed copies); mounted from each device the volume reads the same; "
 	       "degraded without each of %zu devices (%zu files lost in all) and each of %zu "
 	       "pairs the volume reads as before where its chunks survive; a foreign device "
 	       "and a writer without the further devices are refused PASS\n",
-	    devices, files, references.checked_copies, degraded, lost, pairs);
+	    devices, files, replayed, references.checked_copies, degraded, lost, pairs);
 	return 0;
 }

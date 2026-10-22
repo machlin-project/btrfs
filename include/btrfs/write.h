@@ -208,9 +208,9 @@ struct btrfs_balance_args {
  * mixed group takes the data arguments, which must equal the metadata ones
  * (INVALID_ARGUMENT). While a kind converts, new chunks of it take the
  * target profile and no group of it with another profile takes allocation,
- * so its groups end with the target profile. RAID profiles are UNSUPPORTED;
- * the first refusal ends the balance, the groups relocated before it stay
- * so, and report counts them all. */
+ * so its groups end with the target profile. Converting to a RAID profile
+ * is UNSUPPORTED; the first refusal ends the balance, the groups relocated
+ * before it stay so, and report counts them all. */
 enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
     struct btrfs_balance_report *report);
@@ -219,10 +219,9 @@ enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
  * free-space and block-group trees, fs-verity, quotas and simple quotas, and
  * mixed groups whose nodes are one sector, on one device or on several: every
  * device of the volume present (not degraded), a writer device for each
- * further one (INVALID_ARGUMENT otherwise), and any profile but RAID5/6. New
- * chunks grow on a volume of one device only; on one of several an operation
- * that needs one is refused (NO_SPACE or UNSUPPORTED). Every device must hold
- * at least two superblock copies that agree with the mounted primary;
+ * further one (INVALID_ARGUMENT otherwise), and any profile but RAID5/6; new
+ * chunks are placed across the devices as Linux places them. Every device
+ * must hold at least two superblock copies that agree with the mounted primary;
  * otherwise begin returns RECOVERY_REQUIRED. Unsupported layouts return
  * before any media write. Native adapters open read-write only on request,
  * and run btrfs_recover_supers first when admission returns

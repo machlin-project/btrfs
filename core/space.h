@@ -9,6 +9,21 @@ struct bt_space;
 
 #define BT_SPACE_MAX_CHANGES 131072U
 
+/* A free range [start, end). */
+struct bt_gap {
+	uint64_t start, end;
+};
+
+/* One device as chunk planning sees it: its unallocated ranges, ascending
+ * and disjoint, its id, its size and the bytes its device extents hold. */
+struct bt_plan_device {
+	struct bt_gap *holes;
+	size_t count;
+	uint64_t id;
+	uint64_t size;
+	uint64_t used;
+};
+
 struct bt_space_change {
 	uint64_t start;
 	uint64_t length;
@@ -30,11 +45,18 @@ enum btrfs_result bt_space_create(struct btrfs_fs *fs, struct bt_root extent_roo
 /* Loads every chunk not loaded yet (explicit recovery validates a candidate
  * this way). */
 enum btrfs_result bt_space_load_all(struct bt_space *space);
-/* Verifies the device item and device extents against the chunk map and enables
- * chunk growth from the device's unallocated space. */
+/* Verifies each device's item and device extents against the chunk map and
+ * enables chunk growth from the devices' unallocated space. */
 enum btrfs_result bt_space_devices(
     struct bt_space *space, struct bt_root chunk_tree, struct bt_root device_tree);
 enum btrfs_result bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum);
+/* Linux 6.12's btrfs_create_chunk for a chunk of type (class and profile) on
+ * devices whose sizes total total, in memory (core/space.c): its length,
+ * stripes and their devices (indexes into devices) and offsets, at least
+ * minimum and at most cap bytes long. NO_SPACE when too few devices have
+ * room; UNSUPPORTED for a profile Linux does not allocate. */
+enum btrfs_result bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total,
+    uint64_t type, uint64_t minimum, uint64_t cap, struct bt_chunk *chunk);
 /* New chunks of kind (BT_BLOCK_DATA, _METADATA or _SYSTEM) take profile, 0
  * (single) or BT_BLOCK_DUP, for the rest of the transaction, as Linux's
  * balance gives them its convert target. */

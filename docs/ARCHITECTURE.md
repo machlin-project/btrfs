@@ -143,10 +143,8 @@ copies by device and offset, on every device. New data goes to every copy in
 pieces cut at stripe boundaries. Group removal deletes each stripe's device
 extent and shrinks the used bytes of the stripe's device. Each device's
 superblocks carry that device's item (its used bytes as the chunk tree
-records them); every other field is the volume's. New chunks are created on
-volumes of one device only: on a volume of several, an operation that needs
-one is refused (NO_SPACE where a room check finds none, UNSUPPORTED where the
-allocator would grow one).
+records them); every other field is the volume's. New chunks are placed
+across the devices as Linux places them (Block-group growth).
 
 A cursor retains one heap buffer per tree level. Internal keys are numerically
 ordered by object ID, type and offset. Each child must match its parent's first
@@ -458,7 +456,11 @@ volume that ordinary operations filled can still delete. Data written
 afterwards honors the same metadata: data chunks grow only into device space
 beyond what metadata growth would need, and availability counts device space
 in whole 1 MiB units per stripe, as chunks take it, so an admitted operation
-does not find its chunk impossible later. A data range takes the largest chunk
+does not find its chunk impossible later. On a volume of several devices both
+are planned ahead on copies of the devices' free ranges: a data chunk is
+shortened, in 64 KiB units of its stripes, until metadata chunks planned after
+it hold the metadata held beyond free space, and availability plans data
+chunks so in turn, at most as many as the transaction may still create. A data range takes the largest chunk
 that fits when one for the whole range does not.
 
 Deleting data is bounded the same way. A shrinking truncation removes file
@@ -540,17 +542,26 @@ Linux's reserved first MiB, and sum to the device's used bytes. The gaps
 between them are the device's unallocated space.
 
 When a reservation finds no free range, the allocator creates a chunk of that
-class in memory only, sized and placed as Linux's `btrfs_create_chunk` does on
-one device: the address after the highest chunk (`find_next_chunk`), the
-profile of an existing chunk of the class (DUP gives two stripes) or the one a
-balance converts the class to, and the first device hole that holds the
-class's largest stripes, else the largest hole (`find_free_dev_extent`). The
-stripes take what that hole allows (`decide_stripe_size_regular`); when that
-exceeds the class's chunk limit, at most a tenth of the device and 10 GiB for
-data, 256 MiB for metadata (1 GiB above 50 GiB) or 32 MiB for system chunks
-(`calc_chunk_size`), they take the limit rounded up to 16 MiB instead, never
-more than 1 GiB, in 64 KiB units; DUP stripes lie side by side. A reservation
-that needs more contiguous space takes it when the hole holds it. Before a data or metadata chunk is added or a group removed,
+class in memory only, sized and placed as Linux 6.12's `btrfs_create_chunk`
+does (`bt_space_plan`): the address after the highest chunk
+(`find_next_chunk`), the profile of an existing chunk of the class or the one a
+balance converts the class to, with Linux's stripes per device, device counts,
+increments, copies and parity (`btrfs_raid_array`). `gather_device_info` takes,
+in device id order, every device with a stripe's worth of unallocated bytes
+and room in the first hole that holds the class's largest stripes, else its
+largest hole (`find_free_dev_extent`), and sorts them by that room, then by
+unallocated bytes, with the kernel's `sort()` (lib/sort.c, a bottom-up heapsort
+that extracts two elements at a time), whose order decides equal devices'
+stripes. As many devices as the profile allows in its increment take stripes,
+as large as the last of them holds (`decide_stripe_size_regular`); when the
+chunk would exceed the class's limit, at most a tenth of the volume and 10 GiB
+for data, 256 MiB for metadata (1 GiB above 50 GiB) or 32 MiB for system chunks
+(`calc_chunk_size`), the stripes take the limit over the data stripes rounded
+up to 16 MiB instead, never more than 1 GiB, in 64 KiB units, each at the start
+of its device's hole, a DUP device's side by side. Every chunk the Linux kernel
+allocated in the multi-device fixtures is planned again identically from the
+state before it. A reservation that needs more contiguous space takes it when
+the last chosen device's hole holds it. Before a data or metadata chunk is added or a group removed,
 a system chunk is created first when free system space is below what one chunk
 item and one device item update may need (24 nodes, Linux's
 `check_system_chunk`); chunk-tree blocks that find no system space grow one

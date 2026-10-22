@@ -20,10 +20,6 @@
  * chunk item insertion (btrfs_calc_insert_metadata_size), in nodes. */
 #define BT_SYSTEM_RESERVE_NODES (BT_MAX_LEVEL * 2U + BT_MAX_LEVEL)
 
-struct bt_gap {
-	uint64_t start, end;
-};
-
 /* Free ranges of one chunk class in ascending logical order. Reservations
  * consume them from next onward and never return a range to the list. A
  * transaction's list taken from a kept map is borrowed (the map owns items)
@@ -52,8 +48,12 @@ struct bt_space {
 	struct bt_gaps data;
 	struct bt_gaps system;
 	/* Unallocated physical ranges of each device of the volume (its index),
-	 * known after verification. */
+	 * known after verification; from then on they only shrink. */
 	struct bt_gaps devices[BT_MAX_DEVICES];
+	/* Room for two copies of every device's ranges, on which growth plans
+	 * ahead for a volume of several devices. */
+	struct bt_gap *trials;
+	size_t trial_capacity;
 	/* Bytes used per chunk; used_capacity entries (the chunk table's). Before
 	 * a chunk is loaded its block-group item gives it. */
 	uint64_t *used;
@@ -893,57 +893,485 @@ bt_space_set_profile(struct bt_space *space, uint64_t kind, uint64_t profile)
 	return BTRFS_OK;
 }
 
-/* Linux's find_free_dev_extent: the first device hole that holds want
- * bytes, else the largest; *size is what it holds, at most want. */
-static int
-bt_space_hole(const struct bt_gaps *device, uint64_t want, size_t *index, uint64_t *size)
-{
-	uint64_t length;
-	size_t i;
-	int found = 0;
+/* Linux's btrfs_raid_array: per profile, the copies a RAID10 stripe has,
+ * stripes per device, device counts (devs_max 0: every device) and their
+ * increment, copies and parity stripes. */
+struct bt_raid_attr {
+	uint64_t profile;
+	uint8_t sub_stripes;
+	uint8_t dev_stripes;
+	uint8_t devs_max;
+	uint8_t devs_min;
+	uint8_t devs_increment;
+	uint8_t ncopies;
+	uint8_t nparity;
+};
 
-	*size = 0;
-	for (i = 0; i < device->count; i++) {
-		length = device->items[i].end - device->items[i].start;
-		if (length >= want) {
-			*index = i;
-			*size = want;
-			return 1;
+static const struct bt_raid_attr bt_raid_attrs[] = {
+	{ BT_BLOCK_RAID10, 2, 1, 0, 2, 2, 2, 0 },
+	{ BT_BLOCK_RAID1, 1, 1, 2, 2, 2, 2, 0 },
+	{ BT_BLOCK_RAID1C3, 1, 1, 3, 3, 3, 3, 0 },
+	{ BT_BLOCK_RAID1C4, 1, 1, 4, 4, 4, 4, 0 },
+	{ BT_BLOCK_DUP, 1, 2, 1, 1, 1, 2, 0 },
+	{ BT_BLOCK_RAID0, 1, 1, 0, 1, 1, 1, 0 },
+	{ 0, 1, 1, 1, 1, 1, 1, 0 },
+	{ BT_BLOCK_RAID5, 1, 1, 0, 2, 1, 1, 1 },
+	{ BT_BLOCK_RAID6, 1, 1, 0, 3, 1, 1, 2 },
+};
+
+/* A device as Linux's gather_device_info finds it: where the hole a chunk
+ * would take starts, how much of it the chunk may take, its unallocated
+ * bytes, and its index in the plan's devices. */
+struct bt_device_info {
+	uint64_t offset;
+	uint64_t max_avail;
+	uint64_t total_avail;
+	size_t device;
+};
+
+/* btrfs_cmp_device_info: more room first, then more unallocated bytes. */
+static int
+bt_info_compare(const struct bt_device_info *a, const struct bt_device_info *b)
+{
+	if (a->max_avail != b->max_avail) {
+		return a->max_avail > b->max_avail ? -1 : 1;
+	}
+	if (a->total_avail != b->total_avail) {
+		return a->total_avail > b->total_avail ? -1 : 1;
+	}
+	return 0;
+}
+
+static void
+bt_info_swap(struct bt_device_info *items, size_t a, size_t b)
+{
+	struct bt_device_info swap = items[a];
+
+	items[a] = items[b];
+	items[b] = swap;
+}
+
+/* Linux 6.12's sort() (lib/sort.c): a bottom-up heapsort that extracts two
+ * elements at a time. Equal devices end in the order it leaves them, which
+ * decides the order of a chunk's stripes. */
+static void
+bt_info_sort(struct bt_device_info *items, size_t count)
+{
+	size_t n = count;
+	size_t a = count / 2;
+	size_t b;
+	size_t c;
+	size_t d;
+	unsigned shift = 0;
+
+	if (a == 0) {
+		return;
+	}
+	for (;;) {
+		if (a != 0) {
+			/* Building the heap: sift a down. */
+			a -= (size_t)1 << shift;
+		} else if (n > 3) {
+			/* Extracting the two largest elements. */
+			n--;
+			bt_info_swap(items, 0, n);
+			shift = bt_info_compare(&items[1], &items[2]) <= 0;
+			a = (size_t)1 << shift;
+			n--;
+			bt_info_swap(items, a, n);
+		} else {
+			break;
 		}
-		if (length > *size) {
-			*index = i;
-			*size = length;
-			found = 1;
+		/* The sift-down path to a leaf, then back to where a belongs. */
+		b = a;
+		for (;;) {
+			c = 2 * b + 1;
+			d = c + 1;
+			if (d >= n) {
+				break;
+			}
+			b = bt_info_compare(&items[c], &items[d]) > 0 ? c : d;
+		}
+		if (d == n) {
+			b = c;
+		}
+		while (b != a && bt_info_compare(&items[a], &items[b]) >= 0) {
+			b = (b - 1) / 2;
+		}
+		c = b;
+		while (b != a) {
+			b = (b - 1) / 2;
+			bt_info_swap(items, b, c);
 		}
 	}
-	return found;
+	n--;
+	bt_info_swap(items, 0, n);
+	if (n == 2 && bt_info_compare(&items[0], &items[1]) > 0) {
+		bt_info_swap(items, 0, 1);
+	}
 }
 
 enum btrfs_result
-bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
+bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total, uint64_t type,
+    uint64_t minimum, uint64_t cap, struct bt_chunk *chunk)
 {
-	struct btrfs_fs *fs = space->fs;
-	struct bt_chunk *chunk;
-	struct bt_gap *hole;
-	uint64_t type = 0;
-	uint64_t logical = 0;
+	struct bt_device_info items[BT_MAX_DEVICES];
+	const struct bt_raid_attr *attr = NULL;
+	const struct bt_plan_device *device;
+	uint64_t profile = type & BT_BLOCK_PROFILES;
 	uint64_t chunk_max;
 	uint64_t stripe_max;
-	uint64_t available = 0;
+	uint64_t want;
 	uint64_t length;
-	uint64_t allowed = UINT64_MAX;
-	size_t index = 0;
+	uint64_t stripe;
+	uint64_t largest;
+	uint64_t offset;
+	uint64_t total_avail;
+	size_t order[BT_MAX_DEVICES];
+	size_t ndevs = 0;
+	size_t devs_max;
+	size_t swap;
 	size_t i;
+	size_t j;
+	unsigned data;
 	unsigned stripes;
-	unsigned stripe;
-	enum btrfs_result error;
 
-	/* New chunks are placed on a volume of one device only. */
-	if (fs->device_count != 1) {
+	for (i = 0; i < sizeof(bt_raid_attrs) / sizeof(bt_raid_attrs[0]); i++) {
+		if (bt_raid_attrs[i].profile == profile) {
+			attr = &bt_raid_attrs[i];
+		}
+	}
+	if (attr == NULL || count == 0 || count > BT_MAX_DEVICES) {
 		return BTRFS_UNSUPPORTED;
 	}
-	if (!space->growth || fs->chunk_count >= fs->chunk_capacity ||
-	    fs->chunk_count >= space->used_capacity || fs->chunk_count == BT_MAX_CHUNKS) {
+	/* calc_chunk_size and init_alloc_chunk_ctl_policy_regular: the class's
+	 * largest chunk and stripe, and no chunk above a tenth of the volume. */
+	chunk_max = (type & BT_BLOCK_DATA) != 0 ? BT_CHUNK_DATA_MAX
+	    : (type & BT_BLOCK_SYSTEM) != 0	? BT_CHUNK_SYSTEM_MAX
+	    : total > BT_CHUNK_LARGE_DEVICE	? BT_CHUNK_STRIPE_MAX
+						: BT_CHUNK_METADATA_MAX;
+	stripe_max = chunk_max < BT_CHUNK_STRIPE_MAX ? chunk_max : BT_CHUNK_STRIPE_MAX;
+	chunk_max = total / 10 < chunk_max ? total / 10 : chunk_max;
+	want = stripe_max * attr->dev_stripes;
+	/* gather_device_info over the devices in id order, as Linux's
+	 * allocation list holds them. */
+	for (i = 0; i < count; i++) {
+		order[i] = i;
+		for (j = i; j > 0 && devices[order[j - 1]].id > devices[order[j]].id; j--) {
+			swap = order[j];
+			order[j] = order[j - 1];
+			order[j - 1] = swap;
+		}
+	}
+	for (i = 0; i < count; i++) {
+		device = &devices[order[i]];
+		total_avail = device->size > device->used ? device->size - device->used : 0;
+		if (total_avail < BT_STRIPE_LENGTH * attr->dev_stripes) {
+			continue;
+		}
+		/* find_free_dev_extent: the first hole that holds want, else
+		 * the first largest. */
+		largest = 0;
+		offset = 0;
+		for (j = 0; j < device->count; j++) {
+			length = device->holes[j].end - device->holes[j].start;
+			if (length >= want) {
+				largest = want;
+				offset = device->holes[j].start;
+				break;
+			}
+			if (length > largest) {
+				largest = length;
+				offset = device->holes[j].start;
+			}
+		}
+		if (largest < BT_STRIPE_LENGTH * attr->dev_stripes) {
+			continue;
+		}
+		items[ndevs++] = (struct bt_device_info){ offset, largest, total_avail, order[i] };
+	}
+	bt_info_sort(items, ndevs);
+	/* decide_stripe_size: whole increments of devices, at least the
+	 * profile's minimum, at most its maximum. */
+	ndevs -= ndevs % attr->devs_increment;
+	if (ndevs == 0 || ndevs < attr->devs_min) {
+		return BTRFS_NO_SPACE;
+	}
+	devs_max = attr->devs_max != 0 ? attr->devs_max : BT_MAX_STRIPES / attr->dev_stripes;
+	ndevs = ndevs < devs_max ? ndevs : devs_max;
+	/* decide_stripe_size_regular: as much as the last device holds; above
+	 * the chunk limit, the limit rounded up to 16 MiB; at most 1 GiB, in
+	 * 64 KiB units. */
+	stripes = (unsigned)(ndevs * attr->dev_stripes);
+	data = (stripes - attr->nparity) / attr->ncopies;
+	stripe = items[ndevs - 1].max_avail / attr->dev_stripes;
+	if (stripe * data > chunk_max) {
+		length = (chunk_max / data + BT_CHUNK_ROUND - 1) / BT_CHUNK_ROUND * BT_CHUNK_ROUND;
+		stripe = length < stripe ? length : stripe;
+	}
+	stripe = stripe < BT_CHUNK_STRIPE_MAX ? stripe : BT_CHUNK_STRIPE_MAX;
+	stripe &= ~(BT_STRIPE_LENGTH - 1);
+	/* A reservation that needs a longer chunk takes it when the last
+	 * device's hole holds it; a cap shortens the chunk. */
+	if (stripe * data < minimum) {
+		length =
+		    ((minimum + data - 1) / data + BT_STRIPE_LENGTH - 1) & ~(BT_STRIPE_LENGTH - 1);
+		if (length > items[ndevs - 1].max_avail / attr->dev_stripes) {
+			return BTRFS_NO_SPACE;
+		}
+		stripe = length;
+	}
+	if (stripe * data > cap) {
+		stripe = (cap / data) & ~(BT_STRIPE_LENGTH - 1);
+	}
+	if (stripe < BT_STRIPE_LENGTH || stripe * data < minimum) {
+		return BTRFS_NO_SPACE;
+	}
+	bt_zero(chunk, sizeof(*chunk));
+	chunk->type = type;
+	chunk->length = stripe * data;
+	chunk->stripes = (uint8_t)stripes;
+	chunk->sub_stripes = attr->sub_stripes;
+	chunk->mirrors = (uint8_t)(profile == 0 || profile == BT_BLOCK_RAID0 ? 1U
+		: profile == BT_BLOCK_RAID10				     ? attr->sub_stripes
+		: (profile & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0
+		? bt_raid56_copies(profile, stripes)
+		: stripes);
+	chunk->confirmed = 1;
+	for (i = 0; i < ndevs; i++) {
+		for (j = 0; j < attr->dev_stripes; j++) {
+			chunk->devices[i * attr->dev_stripes + j] = (uint8_t)items[i].device;
+			chunk->physical[i * attr->dev_stripes + j] = items[i].offset + j * stripe;
+		}
+	}
+	return BTRFS_OK;
+}
+
+/* The bytes of all the volume's devices: Linux's total_rw_bytes. */
+static uint64_t
+bt_space_volume_bytes(const struct btrfs_fs *fs)
+{
+	uint64_t total = 0;
+	size_t i;
+
+	for (i = 0; i < fs->device_count; i++) {
+		total += fs->devices[i].size;
+	}
+	return total;
+}
+
+/* Chunks the transaction may still create. */
+static size_t
+bt_space_room(const struct bt_space *space)
+{
+	const struct btrfs_fs *fs = space->fs;
+	size_t limit =
+	    fs->chunk_capacity < space->used_capacity ? fs->chunk_capacity : space->used_capacity;
+
+	limit = limit < BT_MAX_CHUNKS ? limit : BT_MAX_CHUNKS;
+	return limit > fs->chunk_count ? limit - fs->chunk_count : 0;
+}
+
+/* The type a new chunk of kind takes: an existing chunk's of the kind, with
+ * the profile a balance converts the kind to; 0 when the kind has none. */
+static uint64_t
+bt_space_type(const struct bt_space *space, uint64_t kind)
+{
+	const struct btrfs_fs *fs = space->fs;
+	uint64_t type = 0;
+	size_t i;
+
+	for (i = 0; type == 0 && i < fs->chunk_count; i++) {
+		if ((fs->chunks[i].type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) ==
+			kind &&
+		    !fs->chunks[i].removed) {
+			type = fs->chunks[i].type;
+		}
+	}
+	if (type != 0 && space->converting[bt_space_kind_index(kind)]) {
+		type = (type & ~BT_BLOCK_PROFILES) | space->profiles[bt_space_kind_index(kind)];
+	}
+	return type;
+}
+
+/* The planner's view of the devices: each one's free ranges, in place or
+ * copied into scratch, and the bytes the stripes of its chunks hold. A group
+ * removed in this transaction no longer counts, as Linux lowers a device's
+ * used bytes when it removes a chunk, while its space waits for the commit. */
+static void
+bt_space_plan_view(
+    const struct bt_space *space, struct bt_plan_device *devices, struct bt_gap *scratch)
+{
+	const struct btrfs_fs *fs = space->fs;
+	const struct bt_chunk *chunk;
+	uint64_t length;
+	size_t copied = 0;
+	size_t i;
+	unsigned stripe;
+
+	for (i = 0; i < fs->device_count; i++) {
+		devices[i] = (struct bt_plan_device){ space->devices[i].items,
+			space->devices[i].count, fs->devices[i].id, fs->devices[i].size, 0 };
+		if (scratch != NULL && devices[i].count != 0) {
+			bt_copy(scratch + copied, devices[i].holes,
+			    devices[i].count * sizeof(*scratch));
+			devices[i].holes = scratch + copied;
+			copied += devices[i].count;
+		}
+	}
+	for (i = 0; i < fs->chunk_count; i++) {
+		chunk = &fs->chunks[i];
+		if (chunk->removed) {
+			continue;
+		}
+		length = bt_chunk_stripe_length(chunk);
+		for (stripe = 0; stripe < chunk->stripes; stripe++) {
+			devices[chunk->devices[stripe]].used += length;
+		}
+	}
+}
+
+/* A copy of a view, its free ranges in scratch. */
+static void
+bt_space_plan_copy(const struct bt_plan_device *source, struct bt_plan_device *target, size_t count,
+    struct bt_gap *scratch)
+{
+	size_t copied = 0;
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		target[i] = source[i];
+		if (target[i].count != 0) {
+			bt_copy(
+			    scratch + copied, source[i].holes, source[i].count * sizeof(*scratch));
+			target[i].holes = scratch + copied;
+			copied += source[i].count;
+		}
+	}
+}
+
+/* Takes a planned chunk's stripes from the start of their holes, which never
+ * splits a hole. */
+static enum btrfs_result
+bt_space_take(struct bt_plan_device *devices, const struct bt_chunk *chunk)
+{
+	struct bt_plan_device *device;
+	uint64_t length = bt_chunk_stripe_length(chunk);
+	size_t i;
+	unsigned stripe;
+
+	for (stripe = 0; stripe < chunk->stripes; stripe++) {
+		device = &devices[chunk->devices[stripe]];
+		for (i = 0; i < device->count && device->holes[i].start != chunk->physical[stripe];
+		    i++) {
+		}
+		if (i == device->count || length > device->holes[i].end - device->holes[i].start) {
+			return BTRFS_CORRUPT;
+		}
+		device->holes[i].start += length;
+		device->used += length;
+	}
+	return BTRFS_OK;
+}
+
+/* Bytes of the nodes the transaction holds that free metadata space lacks. */
+static uint64_t
+bt_space_shortfall(const struct bt_space *space)
+{
+	uint64_t free = bt_space_metadata_free(space, space->metadata_hold);
+
+	return free >= space->metadata_hold
+	    ? 0
+	    : (space->metadata_hold - free) * space->fs->info.node_size;
+}
+
+/* Whether chunks of type, planned and taken one after another, at most room
+ * of them, hold need bytes. */
+static int
+bt_space_simulate(const struct bt_space *space, struct bt_plan_device *devices, uint64_t type,
+    uint64_t need, size_t room)
+{
+	const struct btrfs_fs *fs = space->fs;
+	struct bt_chunk chunk;
+	uint64_t total = 0;
+	size_t i;
+
+	for (i = 0; total < need && i < room; i++) {
+		if (bt_space_plan(devices, fs->device_count, bt_space_volume_bytes(fs), type, 0,
+			UINT64_MAX, &chunk) != BTRFS_OK ||
+		    bt_space_take(devices, &chunk) != BTRFS_OK) {
+			return 0;
+		}
+		total += chunk.length;
+	}
+	return total >= need;
+}
+
+/* A data chunk on a volume of several devices: Linux's, shortened in 64 KiB
+ * units of its stripes until the metadata the transaction holds beyond free
+ * metadata space still fits in metadata chunks planned after it. devices is
+ * the state planned on; the trials use scratch. */
+static enum btrfs_result
+bt_space_plan_data(const struct bt_space *space, const struct bt_plan_device *devices,
+    uint64_t type, uint64_t minimum, size_t room, struct bt_gap *scratch, struct bt_chunk *chunk)
+{
+	struct bt_plan_device trial[BT_MAX_DEVICES];
+	struct bt_chunk candidate;
+	const struct btrfs_fs *fs = space->fs;
+	uint64_t shortfall = bt_space_shortfall(space);
+	uint64_t metadata = bt_space_type(space, BT_BLOCK_METADATA);
+	uint64_t total = bt_space_volume_bytes(fs);
+	uint64_t stripes;
+	uint64_t low = 0;
+	uint64_t high;
+	uint64_t middle;
+	enum btrfs_result error;
+
+	error = bt_space_plan(devices, fs->device_count, total, type, minimum, UINT64_MAX, chunk);
+	if (error != BTRFS_OK || shortfall == 0) {
+		return error;
+	}
+	if (metadata == 0 || room < 2) {
+		return BTRFS_NO_SPACE;
+	}
+	stripes = chunk->length / bt_chunk_stripe_length(chunk);
+	high = bt_chunk_stripe_length(chunk) / BT_STRIPE_LENGTH;
+	while (low < high) {
+		middle = low + (high - low + 1) / 2;
+		bt_space_plan_copy(devices, trial, fs->device_count, scratch);
+		if (bt_space_plan(trial, fs->device_count, total, type, minimum,
+			middle * BT_STRIPE_LENGTH * stripes, &candidate) == BTRFS_OK &&
+		    bt_space_take(trial, &candidate) == BTRFS_OK &&
+		    bt_space_simulate(space, trial, metadata, shortfall, room - 1)) {
+			low = middle;
+		} else {
+			high = middle - 1;
+		}
+	}
+	if (low == 0) {
+		return BTRFS_NO_SPACE;
+	}
+	return bt_space_plan(devices, fs->device_count, total, type, minimum,
+	    low * BT_STRIPE_LENGTH * stripes, chunk);
+}
+
+/* Creates a chunk of kind from unallocated device space, in memory only,
+ * placed as bt_space_plan places it. On one device, data leaves the units
+ * metadata would need to grow (bt_space_holdback); on several, the metadata
+ * held beyond free space must fit in chunks planned after it. */
+enum btrfs_result
+bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
+{
+	struct bt_plan_device devices[BT_MAX_DEVICES];
+	struct btrfs_fs *fs = space->fs;
+	struct bt_chunk *chunk;
+	uint64_t type;
+	uint64_t logical = 0;
+	uint64_t cap = UINT64_MAX;
+	size_t i;
+	enum btrfs_result error;
+
+	if (!space->growth || bt_space_room(space) == 0) {
 		return BTRFS_NO_SPACE;
 	}
 	/* Mixed groups grow for data and metadata alike, sized as Linux sizes any
@@ -951,15 +1379,6 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	if (space->mixed && kind != BT_BLOCK_SYSTEM) {
 		kind = BT_BLOCK_DATA | BT_BLOCK_METADATA;
 	}
-	/* Linux's calc_chunk_size and init_alloc_chunk_ctl_policy_regular: the
-	 * class's largest chunk and stripe, and no chunk above a tenth of the
-	 * device. */
-	chunk_max = (kind & BT_BLOCK_DATA) != 0	      ? BT_CHUNK_DATA_MAX
-	    : kind == BT_BLOCK_SYSTEM		      ? BT_CHUNK_SYSTEM_MAX
-	    : fs->device_size > BT_CHUNK_LARGE_DEVICE ? BT_CHUNK_STRIPE_MAX
-						      : BT_CHUNK_METADATA_MAX;
-	stripe_max = chunk_max < BT_CHUNK_STRIPE_MAX ? chunk_max : BT_CHUNK_STRIPE_MAX;
-	chunk_max = fs->device_size / 10 < chunk_max ? fs->device_size / 10 : chunk_max;
 	/* The chunk item and device item updates need system space first. */
 	if (kind != BT_BLOCK_SYSTEM) {
 		error = bt_space_check_system(space);
@@ -967,81 +1386,50 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 			return error;
 		}
 	}
-	error = bt_gaps_own(&fs->env, &space->devices[0]);
-	if (error != BTRFS_OK) {
-		return error;
-	}
-	for (i = 0; i < fs->chunk_count; i++) {
-		if ((fs->chunks[i].type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) ==
-			kind &&
-		    !fs->chunks[i].removed && type == 0) {
-			type = fs->chunks[i].type;
+	for (i = 0; i < fs->device_count; i++) {
+		error = bt_gaps_own(&fs->env, &space->devices[i]);
+		if (error != BTRFS_OK) {
+			return error;
 		}
-		/* Linux's find_next_chunk: after the highest chunk. */
+	}
+	/* Linux's find_next_chunk: after the highest chunk. */
+	for (i = 0; i < fs->chunk_count; i++) {
 		if (fs->chunks[i].logical + fs->chunks[i].length > logical) {
 			logical = fs->chunks[i].logical + fs->chunks[i].length;
 		}
 	}
-	if (type == 0 || logical > UINT64_MAX - chunk_max - BT_CHUNK_STRIPE_MAX) {
+	type = bt_space_type(space, kind);
+	if (type == 0) {
 		return BTRFS_NO_SPACE;
 	}
-	if (space->converting[bt_space_kind_index(kind)]) {
-		type = (type & ~BT_BLOCK_DUP) | space->profiles[bt_space_kind_index(kind)];
-	}
-	stripes = type & BT_BLOCK_DUP ? 2 : 1;
-	/* Linux's decide_stripe_size_regular for one device: as much of the
-	 * hole as the stripes may take; above the chunk limit, that limit
-	 * rounded up to 16 MiB; at most 1 GiB, in 64 KiB units. */
-	if (!bt_space_hole(&space->devices[0], stripe_max * stripes, &index, &available) ||
-	    available < BT_STRIPE_LENGTH * stripes) {
-		return BTRFS_NO_SPACE;
-	}
-	length = available / stripes;
-	if (length > chunk_max) {
-		stripe_max = (chunk_max + BT_CHUNK_ROUND - 1) / BT_CHUNK_ROUND * BT_CHUNK_ROUND;
-		length = stripe_max < length ? stripe_max : length;
-	}
-	length = length < BT_CHUNK_STRIPE_MAX ? length : BT_CHUNK_STRIPE_MAX;
-	length &= ~(BT_STRIPE_LENGTH - 1);
-	/* A reservation that needs more contiguous space takes it when the hole
-	 * holds it. */
-	minimum = (minimum + BT_STRIPE_LENGTH - 1) & ~(BT_STRIPE_LENGTH - 1);
-	if (length < minimum) {
-		if (minimum > available / stripes) {
-			return BTRFS_NO_SPACE;
-		}
-		length = minimum;
-	}
-	/* Data leaves the device space metadata would need to grow. */
-	if (kind == BT_BLOCK_DATA) {
-		allowed = bt_space_growable(space, stripes, bt_space_holdback(space));
-		if (length > allowed) {
-			length = allowed & ~(BT_STRIPE_LENGTH - 1);
-		}
-		if (length < minimum || length < BT_STRIPE_LENGTH) {
-			return BTRFS_NO_SPACE;
-		}
-	}
-	/* DUP stripes lie side by side in the hole, as Linux's create_chunk
-	 * places a device's stripes. */
-	hole = &space->devices[0].items[index];
+	bt_space_plan_view(space, devices, NULL);
 	chunk = &fs->chunks[fs->chunk_count];
-	bt_zero(chunk, sizeof(*chunk));
-	chunk->logical = logical;
-	chunk->length = length;
-	chunk->type = type;
-	chunk->stripes = (uint8_t)stripes;
-	chunk->sub_stripes = 1;
-	chunk->mirrors = (uint8_t)stripes;
-	chunk->confirmed = 1;
-	for (stripe = 0; stripe < stripes; stripe++) {
-		chunk->physical[stripe] = hole->start + stripe * length;
+	if (fs->device_count == 1 && kind == BT_BLOCK_DATA) {
+		cap = bt_space_growable(
+		    space, type & BT_BLOCK_DUP ? 2U : 1U, bt_space_holdback(space));
 	}
-	hole->start += stripes * length;
+	if (fs->device_count != 1 && kind == BT_BLOCK_DATA) {
+		error = bt_space_plan_data(
+		    space, devices, type, minimum, bt_space_room(space), space->trials, chunk);
+	} else {
+		error = bt_space_plan(devices, fs->device_count, bt_space_volume_bytes(fs), type,
+		    minimum, cap, chunk);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	if (logical > UINT64_MAX - chunk->length) {
+		return BTRFS_NO_SPACE;
+	}
+	chunk->logical = logical;
+	error = bt_space_take(devices, chunk);
+	if (error != BTRFS_OK) {
+		return error;
+	}
 	space->used[fs->chunk_count] = 0;
 	space->loaded[fs->chunk_count] = 1;
 	fs->chunk_count++;
-	error = bt_space_gap(space, bt_space_class(space, chunk), logical, logical + length);
+	error = bt_space_gap(space, bt_space_class(space, chunk), logical, logical + chunk->length);
 	return error == BTRFS_OK ? bt_space_exclude_chunk(space, fs->chunk_count - 1) : error;
 }
 
@@ -1202,6 +1590,38 @@ bt_space_hold_metadata(struct bt_space *space, uint64_t nodes)
 	space->metadata_hold = nodes;
 }
 
+/* Whether data chunks planned one after another, each as growth would plan
+ * it, hold need bytes. */
+static int
+bt_space_data_growable(const struct bt_space *space, uint64_t need)
+{
+	struct bt_plan_device devices[BT_MAX_DEVICES];
+	struct bt_chunk chunk;
+	const struct btrfs_fs *fs = space->fs;
+	uint64_t type =
+	    bt_space_type(space, space->mixed ? BT_BLOCK_DATA | BT_BLOCK_METADATA : BT_BLOCK_DATA);
+	uint64_t total = 0;
+	size_t room = bt_space_room(space);
+	enum btrfs_result error;
+
+	if (type == 0) {
+		return 0;
+	}
+	bt_space_plan_view(space, devices, space->trials);
+	while (total < need && room != 0) {
+		error = space->mixed ? bt_space_plan(devices, fs->device_count,
+					   bt_space_volume_bytes(fs), type, 0, UINT64_MAX, &chunk)
+				     : bt_space_plan_data(space, devices, type, 0, room,
+					   space->trials + space->trial_capacity / 2, &chunk);
+		if (error != BTRFS_OK || bt_space_take(devices, &chunk) != BTRFS_OK) {
+			return 0;
+		}
+		total += chunk.length;
+		room--;
+	}
+	return total >= need;
+}
+
 int
 bt_space_data_available(const struct bt_space *space, uint64_t length)
 {
@@ -1227,6 +1647,9 @@ bt_space_data_available(const struct bt_space *space, uint64_t length)
 	if (!space->growth) {
 		return 0;
 	}
+	if (space->fs->device_count != 1) {
+		return bt_space_data_growable(space, length - available);
+	}
 	return bt_space_growable(space, space->data_copies,
 		   space->mixed ? 0 : bt_space_holdback(space)) >= length - available;
 }
@@ -1234,6 +1657,7 @@ bt_space_data_available(const struct bt_space *space, uint64_t length)
 int
 bt_space_metadata_available(const struct bt_space *space, uint64_t nodes)
 {
+	struct bt_plan_device devices[BT_MAX_DEVICES];
 	uint64_t available = bt_space_metadata_free(space, nodes);
 
 	if (available >= nodes) {
@@ -1241,6 +1665,13 @@ bt_space_metadata_available(const struct bt_space *space, uint64_t nodes)
 	}
 	if (!space->growth) {
 		return 0;
+	}
+	if (space->fs->device_count != 1) {
+		bt_space_plan_view(space, devices, space->trials);
+		return bt_space_simulate(space, devices,
+		    bt_space_type(space,
+			space->mixed ? BT_BLOCK_DATA | BT_BLOCK_METADATA : BT_BLOCK_METADATA),
+		    (nodes - available) * space->fs->info.node_size, bt_space_room(space));
 	}
 	return bt_space_growable(space, space->metadata_copies, 0) / space->fs->info.node_size >=
 	    nodes - available;
@@ -1436,6 +1867,22 @@ bt_space_chunk_at(struct btrfs_fs *fs, uint64_t logical)
 									   : NULL;
 }
 
+/* Room for two copies of every device's free ranges. */
+static enum btrfs_result
+bt_space_trials(struct bt_space *space)
+{
+	size_t count = 0;
+	size_t i;
+
+	for (i = 0; i < space->fs->device_count; i++) {
+		count += space->devices[i].count;
+	}
+	space->trial_capacity = 2 * count + 1;
+	space->trials = space->fs->env.allocate(
+	    space->fs->env.context, space->trial_capacity * sizeof(*space->trials));
+	return space->trials == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+}
+
 /* One device's item and device extents: the item names the device with the
  * size its superblock gives; each extent maps one stripe of a chunk on the
  * device, not seen before, ascending and disjoint past the reserved first
@@ -1555,8 +2002,10 @@ bt_space_devices(struct bt_space *space, struct bt_root chunk_tree, struct bt_ro
 		}
 	}
 	fs->env.release(fs->env.context, seen, fs->chunk_count * sizeof(*seen));
-	/* Chunks grow on a volume of one device. */
-	space->growth = error == BTRFS_OK && fs->device_count == 1;
+	if (error == BTRFS_OK) {
+		error = bt_space_trials(space);
+	}
+	space->growth = error == BTRFS_OK;
 	return error;
 }
 
@@ -1852,6 +2301,10 @@ bt_space_destroy(struct bt_space *space)
 			env->release(env->context, space->devices[i].items,
 			    space->devices[i].capacity * sizeof(*space->devices[i].items));
 		}
+	}
+	if (space->trials != NULL) {
+		env->release(
+		    env->context, space->trials, space->trial_capacity * sizeof(*space->trials));
 	}
 	if (space->changes != NULL) {
 		env->release(
@@ -2294,6 +2747,9 @@ bt_space_from_map(struct btrfs_fs *fs, struct btrfs_allocation_map *map, struct 
 		for (i = 0; i < fs->device_count; i++) {
 			bt_gaps_borrow(&space->devices[i], &map->devices[i]);
 		}
+	}
+	if (error == BTRFS_OK && space->growth) {
+		error = bt_space_trials(space);
 	}
 	if (error != BTRFS_OK) {
 		bt_space_destroy(space);

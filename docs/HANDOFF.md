@@ -150,10 +150,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    `tests/multidev.c`), degraded and with RAID5/6 data rebuilt from parity
    (`core/raid56.c`), and written in the chunks they hold with every profile
    but RAID5/6, every copy on its device, each device's superblocks with its
-   own item, and recovered across devices (`tests/multidev_write.c`);
-   remaining there: new chunks across several devices (Linux's
-   `gather_device_info` and stripe sizing), balance on them, and RAID5/6
-   writes with their parity; 64 KiB
+   own item, recovered across devices, new chunks placed across them as
+   Linux 6.12 places them and balanced (`tests/multidev_write.c`);
+   remaining there: RAID5/6 writes with their parity, balance conversion to
+   RAID profiles, and device add, remove and replace; 64 KiB
    sectors against an image btrfs-progs formatted, whose check and restore
    accept what is written (`tests/large_sectors.c`). Remaining: a Linux
    kernel's verdict on 64 KiB sectors, which needs a 64 KiB-page kernel that

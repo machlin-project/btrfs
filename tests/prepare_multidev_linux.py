@@ -2,7 +2,8 @@
 """Prepare Linux payloads for multi-device volumes; never boot or select a
 host device.
 
-create: format the guest's /dev/vda, /dev/vdb, ... (one image per device) as
+create: format the guest's /dev/vda, /dev/vdb, ... (one image per device, of
+256 MiB unless the profile names their sizes) as
 one volume with the profile's data and metadata profiles, mount it, have the
 kernel write the payload (files larger than a full stripe set on every
 device, small and inline files, xattrs, owner and mode, a hard link, a
@@ -11,7 +12,9 @@ snapshot), unmount, run `btrfs check --readonly --check-data-csum`, print
 the devices' chunk profiles and the manifest.
 
 verify: on images this implementation wrote, run the same check, mount,
-print the manifest, write a file, unmount and check again.
+print the manifest, write a file, balance every group with Linux's own
+allocator (reporting whether it completes, since a full volume may refuse),
+print the chunk profiles, unmount and check again.
 
 The manifest names every regular file and symlink below the mount with its
 mode, owner, size and SHA-256 (or symlink target), one line each, sorted;
@@ -36,7 +39,18 @@ PROFILES = {
     "multi-raid5": (3, "raid5", "raid1"),
     "multi-raid6": (4, "raid6", "raid1c3"),
     "multi-single": (2, "single", "raid1"),
+    # Devices of unequal size with unallocated space, for chunks a writer
+    # creates across them.
+    "multi-grow": (3, "raid1", "raid1c3"),
 }
+# Device sizes of profiles whose devices differ.
+DEVICE_SIZES = {
+    "multi-grow": (512 << 20, 384 << 20, 320 << 20),
+}
+
+
+def device_sizes(profile: str, count: int) -> tuple:
+    return DEVICE_SIZES.get(profile, (DEVICE_BYTES,) * count)
 MANY_ENTRIES = 300
 SPARSE_BYTES = 8388608
 SPARSE_LEFT = 17
@@ -86,11 +100,10 @@ def devices(count: int) -> str:
     return " ".join(f"/dev/vd{chr(ord('a') + i)}" for i in range(count))
 
 
-def create_init(count: int, data: str, metadata: str) -> str:
-    return PRELUDE + MANIFEST + f"""
-for device in {devices(count)}; do
-    test "$(blockdev --getsize64 $device)" = {DEVICE_BYTES}
-done
+def create_init(count: int, data: str, metadata: str, sizes: tuple) -> str:
+    checks = "".join(f"test \"$(blockdev --getsize64 /dev/vd{chr(ord('a') + i)})\" = {size}\n"
+                     for i, size in enumerate(sizes))
+    return PRELUDE + MANIFEST + checks + f"""
 mkfs.btrfs -f -n {NODE_SIZE} -d {data} -m {metadata} -L machlin-btrfs {devices(count)}
 btrfs device scan
 mount -t btrfs -o noatime /dev/vda /mnt
@@ -137,6 +150,14 @@ mount -t btrfs -o noatime /dev/vda /mnt
 manifest
 printf 'written after the check\\n' > /mnt/after-check
 sync
+if btrfs balance start --full-balance /mnt > /tmp/balance 2>&1; then
+    echo BTRFS_MULTI_REBALANCED
+else
+    echo BTRFS_MULTI_REBALANCE_REFUSED
+    sed 's/^/BTRFS_MULTI_REBALANCE_OUTPUT:/' /tmp/balance
+    btrfs filesystem usage -b /mnt | sed 's/^/BTRFS_MULTI_USAGE:/'
+fi
+btrfs inspect-internal dump-tree -t chunk /dev/vda | grep -E 'type (DATA|METADATA|SYSTEM)' | sort | uniq -c | sed 's/^/BTRFS_MULTI_CHUNKS:/'
 umount /mnt
 btrfs check --readonly --check-data-csum /dev/vda
 echo BTRFS_MULTI_VERIFY_PASS
@@ -151,7 +172,8 @@ def prepare(root: Path, phase: str, profile: str, archive: Path) -> None:
     inputs.mkdir(parents=True, exist_ok=True)
     for name, content in INPUTS.items():
         (inputs / name).write_bytes(content)
-    init = create_init(count, data, metadata) if phase == "create" else verify_init(count)
+    sizes = device_sizes(profile, count)
+    init = create_init(count, data, metadata, sizes) if phase == "create" else verify_init(count)
     (root / "init").write_text(init)
     (root / "init").chmod(0o755)
     paths = subprocess.run(["find", ".", "-path", "./transaction", "-prune", "-o", "-print"],
@@ -161,7 +183,7 @@ def prepare(root: Path, phase: str, profile: str, archive: Path) -> None:
         subprocess.run(["/usr/bin/cpio", "-o", "-H", "newc"], cwd=root, input=paths,
                        stdout=output, check=True)
     if phase == "create":
-        report = {"profile": profile, "devices": count, "device_bytes": DEVICE_BYTES,
+        report = {"profile": profile, "devices": count, "device_bytes": list(sizes),
                   "node_size": NODE_SIZE, "data": data, "metadata": metadata}
         archive.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
 

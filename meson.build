@@ -324,11 +324,13 @@ if fixtures != ''
     join_paths(fixtures, 'sectors-64k.expected.tsv'), meson.current_build_dir()],
     timeout: 300, suite: 'images')
   # Volumes Linux wrote across several devices: every profile reads as
-  # Linux's manifest says, from any of its devices; writes with their crash
-  # states, RAID5/6 refused.
-  foreach profile : [['multi-raid1', 2], ['multi-raid1c3', 3], ['multi-raid1c4', 4],
-      ['multi-raid10', 4], ['multi-raid0', 3], ['multi-raid5', 3], ['multi-raid6', 4],
-      ['multi-single', 2]]
+  # Linux's manifest says, from any of its devices, and the kernel's chunks
+  # are planned again as it placed them; writes and a balance with their
+  # crash states, RAID5/6 refused; on unequal devices, new data chunks.
+  foreach profile : [['multi-raid1', 2, []], ['multi-raid1c3', 3, []],
+      ['multi-raid1c4', 4, []], ['multi-raid10', 4, []], ['multi-raid0', 3, []],
+      ['multi-raid5', 3, []], ['multi-raid6', 4, []], ['multi-single', 2, []],
+      ['multi-grow', 3, ['--grow']]]
     images = []
     foreach index : range(profile[1])
       images += join_paths(fixtures, profile[0] + '-' + index.to_string() + '.raw')
@@ -337,8 +339,8 @@ if fixtures != ''
       args: [join_paths(fixtures, profile[0] + '.expected.tsv'),
         join_paths(fixtures, 'plain.raw')] + images, timeout: 300, suite: 'images')
     test(profile[0] + '-writes', multidev_write_test,
-      args: [profile[0], join_paths(fixtures, profile[0] + '.expected.tsv'), '-'] + images,
-      timeout: 1200, suite: 'images')
+      args: profile[2] + [profile[0], join_paths(fixtures, profile[0] + '.expected.tsv'),
+        '-'] + images, timeout: 1200, suite: 'images')
   endforeach
   # Balance: every block group relocated on its own, with its crash states,
   # then all in turn; the files read as before and sharing stays. A full

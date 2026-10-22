@@ -451,7 +451,9 @@ tmpfs cannot hold the `btrfs.compression` property and continues.
 
 `tests/prepare_multidev_linux.py` prepares volumes a Linux kernel writes
 across several 256 MiB devices (`multi-raid1`, `-raid1c3`, `-raid1c4`,
-`-raid10`, `-raid0`, `-raid5`, `-raid6`, `-single`): `create` formats
+`-raid10`, `-raid0`, `-raid5`, `-raid6`, `-single`), and `multi-grow`, RAID1
+data and RAID1C3 metadata on devices of 512, 384 and 320 MiB with unallocated
+space: `create` formats
 `/dev/vda`, `/dev/vdb`, ... with the profile's data and metadata profiles,
 mounts, writes the payload, unmounts, runs `btrfs check --check-data-csum`
 and prints the chunk profiles and the manifest. They need the lab runner
@@ -474,18 +476,24 @@ grep -a '^BTRFS_MULTI_MANIFEST:' ../btrfs/logs/multi-raid10-create.log | \
 
 Require `BTRFS_MULTI_CREATED`. `btrfs-multidev-test MANIFEST FOREIGN DEVICE...`
 (`tests/multidev.c`) reads every manifest entry, runs both audits, mounts the
-volume from each device, and requires a missing device, a FOREIGN volume's
-image in place of the last device and a writer without the further devices to
-be refused; the `multi-*` Meson tests run it.
+volume from each device, plans every chunk the kernel made after mkfs's three
+again from the devices' state before it and requires Linux's devices, order,
+offsets and size, and requires a missing device, a FOREIGN volume's image in
+place of the last device and a writer without the further devices to be
+refused; the `multi-*` Meson tests run it.
 
-`btrfs-multidev-write-test NAME MANIFEST EXPORT|- DEVICE...`
+`btrfs-multidev-write-test [--grow] NAME MANIFEST EXPORT|- DEVICE...`
 (`tests/multidev_write.c`) writes five transactions to a recording of the
 devices, checks every file against a model after each commit, then every state
 a power cut leaves at a barrier or superblock write of each commit (with all,
 only the durable, or a random part of each device's pending writes on media)
 after superblock recovery; it requires a writer without each device, a degraded
-mount and RAID5/6 volumes to be refused before any write. The
-`multi-*-writes` Meson tests run it without export. With an EXPORT directory
+mount and RAID5/6 volumes to be refused before any write. It then balances
+every group and checks the balance's crash states the same way, some of them
+recovering the relocation and balancing again; `--grow` (for `multi-grow`)
+instead preallocates beyond the free data space in a sixth transaction, so
+that new data chunks are placed across the devices, and checks its crash
+states. The `multi-*-writes` Meson tests run it without export. With an EXPORT directory
 (new and empty), it clones the devices there as `NAME-N.raw`, applies its
 writes and writes the model's manifest as `NAME.expected.tsv`; Linux then
 checks them with the `verify` phase (from `lab/`):
@@ -503,7 +511,10 @@ grep -a '^BTRFS_MULTI_MANIFEST:' ../btrfs/logs/multi-raid10-verify.log | \
 ```
 
 Require `BTRFS_MULTI_VERIFY_PASS` (`btrfs check --readonly --check-data-csum`
-before and after Linux writes a file) and an empty `cmp`.
+before and after Linux writes a file and balances every group with its own
+allocator) and an empty `cmp`. `BTRFS_MULTI_REBALANCED` reports that Linux's
+balance completed; `BTRFS_MULTI_REBALANCE_REFUSED` prints its error and the
+volume's usage, as a full volume may refuse for space.
 
 ## Balance
 
