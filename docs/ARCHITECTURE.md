@@ -82,14 +82,23 @@ trees with refs 0 are then dropped as `clean_dirty_subvols` drops them
 (`btrfs_drop_snapshot(reloc_root, 0, 1)`: shared blocks only lose this
 tree's reference, no qgroup is traced, only the root item goes), and the data
 relocation tree's orphan inodes are removed as `btrfs_orphan_cleanup` removes
-them. Each transaction does a bounded step and commits. Volumes with quotas
-are UNSUPPORTED: Linux's merge records swapped subtrees for its qgroups
-(`btrfs_qgroup_add_swapped_blocks`), which is not implemented. Linux's merge
+them. Each transaction does a bounded step and commits. With full quotas,
+both subtrees of every swap are traced, so every block and data extent in
+them is accounted from the subvolumes that reach it before and after the swap
+(Linux defers that trace to the next CoW of the subtree,
+`btrfs_qgroup_add_swapped_blocks`); a relocation tree's root, which references
+itself, leads to no subvolume, as Linux's backreference walk and `btrfs
+check` resolve it, and a subtree at level 3 or above marks quotas
+inconsistent, as dropping one does. Simple quotas are UNSUPPORTED: they count
+an extent for the subvolume that allocated it, and relocated copies' owners
+are not followed. Linux's merge
 also copies the file tree's root after the last swap, to move a relocated
 root out of the block group being relocated; this one does not, which leaves
-an equivalent tree. A pending tree log together with relocation trees needs
-Linux's mount. A balance item is not interpreted: Linux resumes the balance at
-its next read-write mount.
+an equivalent tree. A pending tree log replays first, beside relocation trees,
+as Linux's mount replays it before `btrfs_recover_relocation` (its file trees
+are copied as any shared tree is, and the merge keeps what changed since the
+relocation trees' snapshot). A balance item is not interpreted: Linux
+resumes the balance at its next read-write mount.
 
 The superblock bootstraps SYSTEM chunks. The chunk-tree scan validates full
 mapping records and reconciles the bootstrap copies exactly before publication.

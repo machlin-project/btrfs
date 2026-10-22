@@ -7,17 +7,21 @@
  * superblock recovery when its copies disagree, and be consistent: both audits
  * pass. btrfs_recover_relocation then merges and drops what relocation trees
  * it holds and cleans the data relocation tree, on an overlay of the state;
- * afterwards no relocation tree or orphan remains, the audits pass, a
+ * afterwards no relocation tree or orphan remains, the audits pass (with
+ * quotas, also the independent qgroup audit before and after), a
  * transaction is admitted, and the files read as Linux's manifest says. States
  * still waiting for a merge must occur, and so must states whose merge Linux
- * had begun. A state waiting for a merge is also merged in steps of one swap
+ * had begun. A state holding a tree log replays it first, as Linux's mount
+ * does, and states holding both must occur with a log recorded during the
+ * balance. A state waiting for a merge is also merged in steps of one swap
  * each, committed one by one: every state a crash leaves at a barrier of
  * those steps recovers to the same leaves in every file tree, and some hold
  * the merge's recorded progress. Replaying the whole log must reproduce
  * Linux's final image. With
  * an export directory, the first recovered states that merged relocation
  * trees are written there for Linux to check, each as the crash state
- * (crash) and as recovered here (ours). `--compare LINUX OURS` then requires
+ * (crash) and as recovered here (ours), and so are the first such states
+ * that also replayed a tree log (logged-crash, logged-ours). `--compare LINUX OURS` then requires
  * that Linux's recovery of such a crash state and this one leave every file
  * tree with the same leaves: both swapped the same subtrees, and only the
  * copied paths above them differ. */
@@ -25,6 +29,7 @@
 #include "../adapters/posix/image.h"
 #include "internal.h"
 #include "namespace_audit.h"
+#include "qgroup_audit.h"
 #include "transaction.h"
 #include "references.h"
 #include <btrfs/write.h>
@@ -69,6 +74,9 @@
 /* States without relocation trees check their files at this stride. */
 #define FILE_STRIDE 16U
 #define EXPORT_STATES 3U
+#define EXPORT_LOGGED_STATES 2U
+/* The time replay stamps on directories it changes. */
+#define REPLAY_SECONDS INT64_C(1800000000)
 #define EXPORT_BLOCK 4096U
 #define OVERLAY_GROWTH 1024U
 
@@ -372,11 +380,15 @@ check_files(struct btrfs_fs *fs, const struct manifest *manifest)
 	}
 }
 
+/* Qgroup states the audit compared with an independent count. */
+static size_t qgroup_states;
+
 static void
 audit(const struct btrfs_fs *fs, size_t position, const char *when)
 {
 	struct reference_audit references;
 	struct namespace_audit names;
+	struct qgroup_audit qgroups;
 
 	if (reference_audit(fs, &references) != 0) {
 		fprintf(stderr, "entry %zu %s: reference audit: %s\n", position, when,
@@ -388,6 +400,12 @@ audit(const struct btrfs_fs *fs, size_t position, const char *when)
 		    stderr, "entry %zu %s: namespace audit: %s\n", position, when, names.failure);
 		exit(1);
 	}
+	if (qgroup_audit(fs, &qgroups) != 0) {
+		fprintf(
+		    stderr, "entry %zu %s: qgroup audit: %s\n", position, when, qgroups.failure);
+		exit(1);
+	}
+	qgroup_states += qgroups.quotas && !qgroups.skipped;
 }
 
 static void
@@ -687,6 +705,12 @@ main(int argc, char **argv)
 	size_t super_recoveries = 0;
 	size_t exported = 0;
 	size_t kept;
+	size_t logged = 0;
+	size_t logged_relocating = 0;
+	size_t logged_exported = 0;
+	struct btrfs_replay_report replay;
+	struct btrfs_time replay_time = { REPLAY_SECONDS, 0 };
+	int replayed;
 	size_t step_states = 0;
 	int exported_partial = 0;
 	size_t progress_states = 0;
@@ -733,14 +757,23 @@ main(int argc, char **argv)
 		} else {
 			REQUIRE(result == BTRFS_OK);
 		}
-		REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+		/* A pending tree log replays before relocation recovery. */
+		replayed = 0;
+		result = btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs);
+		if (result == BTRFS_RECOVERY_REQUIRED) {
+			REQUIRE(btrfs_replay_log(&environment, &writer, replay_time, &replay) ==
+			    BTRFS_OK);
+			replayed = 1;
+			result = btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs);
+		}
+		REQUIRE(result == BTRFS_OK);
 		audit(fs, i, "before recovery");
 		classify(fs, &before);
 		if (before.trees != 0 || states % FILE_STRIDE == 0) {
 			check_files(fs, &manifest);
 		}
 		btrfs_unmount(fs);
-		if (before.waiting != 0 && !recovered_supers) {
+		if (before.waiting != 0 && !recovered_supers && !replayed) {
 			check_steps(device, i, argc == 5 ? argv[4] : NULL, &exported_partial,
 			    &step_states, &progress_states);
 		}
@@ -760,7 +793,16 @@ main(int argc, char **argv)
 		btrfs_transaction_destroy(transaction);
 		btrfs_unmount(fs);
 		/* Linux mounts only states whose primary copy it can use. */
-		if (argc == 5 && before.waiting != 0 && !recovered_supers &&
+		if (argc == 5 && before.waiting != 0 && !recovered_supers && replayed &&
+		    logged_exported < EXPORT_LOGGED_STATES) {
+			kept = overlay.count;
+			overlay.count = 0;
+			export_state(&overlay, argv[4], i, "logged-crash");
+			overlay.count = kept;
+			export_state(&overlay, argv[4], i, "logged-ours");
+			logged_exported++;
+		}
+		if (argc == 5 && before.waiting != 0 && !recovered_supers && !replayed &&
 		    exported < EXPORT_STATES) {
 			kept = overlay.count;
 			overlay.count = 0;
@@ -772,6 +814,8 @@ main(int argc, char **argv)
 		overlay_clear(&overlay);
 		states++;
 		relocating += before.trees != 0;
+		logged += replayed;
+		logged_relocating += replayed && before.trees != 0;
 		waiting += before.waiting != 0;
 		merging += before.merging != 0;
 		orphan_states += before.orphans != 0;
@@ -800,8 +844,10 @@ main(int argc, char **argv)
 	       "relocation orphans), %zu after superblock recovery; recovery merged %zu and "
 	       "dropped %zu relocation trees, and every state ends consistent with Linux's files; "
 	       "merged in single swaps, %zu crash states at their barriers (%zu holding the "
-	       "merge's progress) recover to the same leaves; final image reproduced PASS\n",
+	       "merge's progress) recover to the same leaves; %zu replayed a tree log first (%zu "
+	       "beside relocation trees); %zu audited states' qgroups "
+	       "equal an independent count; final image reproduced PASS\n",
 	    states, relocating, waiting, merging, orphan_states, super_recoveries, merged, dropped,
-	    step_states, progress_states);
+	    step_states, progress_states, logged, logged_relocating, qgroup_states);
 	return 0;
 }

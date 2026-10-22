@@ -1044,6 +1044,10 @@ bt_qg_block_roots(struct bt_qgroup_view *view, uint64_t address, unsigned depth,
 		if (refs[i].type == BT_TREE_BLOCK_REF) {
 			error = bt_qg_tree_ref(
 			    view, refs[i].root, address, level, generation, depth, &set);
+		} else if (refs[i].type == BT_SHARED_BLOCK_REF && refs[i].parent == address) {
+			/* A relocation tree's root references itself; Linux's
+			 * walk stops there, and no subvolume reaches it. */
+			continue;
 		} else if (refs[i].type == BT_SHARED_BLOCK_REF) {
 			error = bt_qg_block_roots(view, refs[i].parent, depth + 1, 0, &set);
 		} else {

@@ -106,7 +106,8 @@ relocation_test = executable('btrfs-relocation-test', 'tests/relocation.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd])
 relocation_log_test = executable('btrfs-relocation-log-test', 'tests/relocation_log.c',
-  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  'tests/references.c', 'tests/namespace_audit.c', 'tests/qgroup_audit.c',
+  include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 volume_test = executable('btrfs-volume-test', 'tests/volume.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
@@ -164,6 +165,14 @@ if fixtures != ''
   test('interrupted-balance-states', relocation_log_test,
     args: [join_paths(fixtures, 'relocation-log.raw'),
       join_paths(fixtures, 'relocation-log-data.raw'),
+      join_paths(fixtures, 'relocation.expected.tsv')], timeout: 3600, suite: 'images')
+  test('interrupted-balance-fsync-states', relocation_log_test,
+    args: [join_paths(fixtures, 'relocation-fsync-log.raw'),
+      join_paths(fixtures, 'relocation-fsync-log-data.raw'),
+      join_paths(fixtures, 'relocation.expected.tsv')], timeout: 3600, suite: 'images')
+  test('interrupted-balance-quota-states', relocation_log_test,
+    args: [join_paths(fixtures, 'relocation-quota-log.raw'),
+      join_paths(fixtures, 'relocation-quota-log-data.raw'),
       join_paths(fixtures, 'relocation.expected.tsv')], timeout: 3600, suite: 'images')
   test('linux-crash-states', logwrites_test, args: [join_paths(fixtures, 'logwrites.log'),
     join_paths(fixtures, 'logwrites-data.raw')], timeout: 600, suite: 'images')

@@ -16,10 +16,13 @@ merges the relocation trees as btrfs_recover_relocation does, print the
 manifest, unmount, require that no relocation tree remains and run
 `btrfs check --readonly`.
 
-record: write the same files through dm-log-writes (/dev/mapper/logged logs
+record: write the same files (with --quota, under full quotas enabled before
+them and rescanned after) through dm-log-writes (/dev/mapper/logged logs
 /dev/vda into /dev/vdb), mark them `filled`, print the manifest, run a full
 balance to its end, mark `balanced` and unmount; every state a crash could
-leave during the balance can then be replayed from the log.
+leave during the balance can then be replayed from the log. With --fsync, new
+files are written and fsynced while the balance runs, so that states hold tree
+logs beside relocation trees.
 
 verify: on an image this implementation recovered, require that no relocation
 tree and no data relocation orphan remains and that `btrfs check --readonly`
@@ -177,7 +180,25 @@ poweroff -f
 """
 
 
-def record_init() -> str:
+# Bytes of each file written and fsynced while the balance runs (--fsync).
+FSYNC_BYTES = 3000
+FSYNC_BALANCE = f"""
+mkdir /mnt/log
+sync
+btrfs balance start --full-balance /mnt > /tmp/balance.txt 2>&1 &
+balance=$!
+i=0
+while kill -0 "$balance" 2>/dev/null; do
+    dd if=/input/random of=/mnt/log/f$i bs=1 skip=$i count={FSYNC_BYTES} 2>/dev/null
+    fsync /mnt/log/f$i
+    i=$((i + 1))
+done
+wait "$balance"
+echo BTRFS_RELOC_FSYNCS:$i
+"""
+
+
+def record_init(quota: bool, fsync: bool) -> str:
     # dm-log-writes needs its modules; no discards, which a replay would have
     # to zero.
     prelude = PRELUDE.replace("for module in $(cat /modules/order); do",
@@ -192,10 +213,12 @@ mark() {{
 mkfs.btrfs -f -K -s 4096 -n {NODE_SIZE} -m dup -d single -L machlin-btrfs /dev/mapper/logged
 mark mkfs
 mount -t btrfs -o noatime,nodiscard /dev/mapper/logged /mnt
+{"btrfs quota enable /mnt" if quota else ":"}
 {fill()}
+{"btrfs quota rescan -w /mnt && btrfs qgroup show --raw /mnt && sync" if quota else ":"}
 mark filled
 manifest
-btrfs balance start --full-balance /mnt
+{FSYNC_BALANCE if fsync else "btrfs balance start --full-balance /mnt"}
 sync
 mark balanced
 umount /mnt
@@ -226,13 +249,13 @@ poweroff -f
 """
 
 
-def prepare(root: Path, phase: str, archive: Path) -> None:
+def prepare(root: Path, phase: str, archive: Path, quota: bool, fsync: bool) -> None:
     inputs = root / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     for name, data in INPUTS.items():
         (inputs / name).write_bytes(data)
     init = {"create": create_init, "expect": expect_init, "recover": recover_init,
-            "record": record_init, "verify": verify_init}[phase]()
+            "record": lambda: record_init(quota, fsync), "verify": verify_init}[phase]()
     (root / "init").write_text(init)
     (root / "init").chmod(0o755)
     paths = subprocess.run(["find", ".", "-print"], cwd=root, check=True,
@@ -253,8 +276,12 @@ def main() -> None:
     parser.add_argument("--phase", choices=("create", "expect", "recover", "record", "verify"),
                         required=True)
     parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--quota", action="store_true",
+                        help="record: enable full quotas before the files")
+    parser.add_argument("--fsync", action="store_true",
+                        help="record: write and fsync files while the balance runs")
     args = parser.parse_args()
-    prepare(args.root.resolve(), args.phase, args.archive.resolve())
+    prepare(args.root.resolve(), args.phase, args.archive.resolve(), args.quota, args.fsync)
 
 
 if __name__ == "__main__":

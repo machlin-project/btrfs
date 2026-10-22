@@ -335,6 +335,10 @@ qa_one_root(const struct qa_state *state, uint64_t bytenr, unsigned depth)
 	if (state->refs[first].root != 0) {
 		return state->refs[first].root;
 	}
+	/* A relocation tree's root references itself: it counts for no qgroup. */
+	if (state->refs[first].parent == bytenr) {
+		return BT_TREE_RELOC;
+	}
 	return qa_one_root(state, state->refs[first].parent, depth + 1);
 }
 
@@ -462,6 +466,9 @@ qa_roots(struct qa_state *state, uint64_t bytenr, unsigned depth, uint64_t **roo
 			if (bt_file_tree(state->refs[i].root)) {
 				qa_add_root(roots, count, capacity, state->refs[i].root);
 			}
+		} else if (state->refs[i].parent == bytenr) {
+			/* A relocation tree's root: no subvolume reaches it. */
+			continue;
 		} else if (qa_roots(state, state->refs[i].parent, depth + 1, roots, count,
 			       capacity) != 0) {
 			return -1;

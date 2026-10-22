@@ -1936,7 +1936,11 @@ btrfs_replay_log(const struct btrfs_environment *environment,
 		    environment, super, BT_SUPER_OFFSET, BTRFS_TOP_LEVEL_TREE, 1, &fs);
 	}
 	environment->release(environment->context, super, sizeof(*super));
+	/* As Linux's mount, the log replays before relocation recovery: file
+	 * trees that relocation trees share are copied as any shared tree is,
+	 * and the merge later keeps what changed since their snapshot. */
 	if (error == BTRFS_OK) {
+		fs->relocation = 1;
 		error = btrfs_transaction_begin(
 		    fs, writer != NULL ? writer : &inspection, &transaction);
 	}

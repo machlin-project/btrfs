@@ -118,8 +118,11 @@ struct btrfs_relocation_report {
  * RECOVERY_REQUIRED while relocation trees remain. NOT_FOUND when nothing is
  * left to recover; a NULL writer only inspects and returns RECOVERY_REQUIRED
  * when something is. A pending tree log must be replayed first
- * (btrfs_replay_log); a volume with quotas is UNSUPPORTED. A balance item
- * stays: Linux resumes the balance at its next read-write mount. */
+ * (btrfs_replay_log), which it may be beside relocation trees, as Linux's
+ * mount replays it before its relocation recovery. With full quotas both
+ * subtrees of every swap are accounted; simple quotas are UNSUPPORTED. A
+ * balance item stays: Linux resumes the balance at its next read-write
+ * mount. */
 enum btrfs_result btrfs_recover_relocation(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, struct btrfs_relocation_report *report);
 

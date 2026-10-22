@@ -7,8 +7,12 @@
  * clean_dirty_subvols does, and the data relocation tree's orphan inodes,
  * which hold the relocated copies, are removed as btrfs_orphan_cleanup does.
  * Each transaction does a bounded step and commits a state Linux's recovery
- * resumes from. A balance item stays: Linux resumes the balance at its next
- * read-write mount. */
+ * resumes from. With full quotas, both subtrees of every swap are traced, so
+ * every extent in them is accounted from the trees that reach it before and
+ * after, where Linux defers the trace to the next CoW
+ * (btrfs_qgroup_add_swapped_blocks); a relocation tree reaches none. A balance item stays: Linux
+ * resumes the balance at its next read-write mount. */
+#include "qgroup.h"
 #include "transaction.h"
 
 /* Blocks a drop step visits, and work a merge or orphan step does, per
@@ -421,6 +425,17 @@ bt_rl_replace(struct bt_rl_merge *merge, int lowest, int max_level, int *swapped
 			error = bt_rl_reference(
 			    merge, old_address, (uint8_t)(level - 1), 0, root.owner, 0);
 		}
+		/* The swapped subtrees change the subvolume that reaches them. */
+		if (error == BTRFS_OK) {
+			error = bt_qgroup_trace_subtree(transaction,
+			    (struct bt_root){
+				old_address, old_generation, root.owner, (uint8_t)(level - 1) });
+		}
+		if (error == BTRFS_OK) {
+			error = bt_qgroup_trace_subtree(transaction,
+			    (struct bt_root){
+				new_address, new_generation, root.owner, (uint8_t)(level - 1) });
+		}
 		if (error == BTRFS_OK) {
 			transaction->changed = 1;
 			*swapped = level;
@@ -634,29 +649,22 @@ bt_rl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, si
     struct btrfs_relocation_report *report, int *changed)
 {
 	struct btrfs_transaction *transaction = NULL;
-	struct bt_root quota;
 	size_t dropped = 0;
 	size_t cleaned = 0;
 	uint64_t merged = 0;
-	uint32_t refs = 0;
 	int working = 0;
 	int pending = 0;
 	int live = 0;
-	int quotas = 0;
 	enum btrfs_result error;
 
 	*changed = 0;
-	/* Linux's merge records swapped subtrees for qgroups
-	 * (btrfs_qgroup_add_swapped_blocks); that is not implemented. */
-	error = bt_rl_root(fs, fs->root_tree, BT_QUOTA_TREE, &quota, &refs, &quotas);
-	if (error != BTRFS_OK) {
-		return error;
-	}
-	if (quotas) {
-		return BTRFS_UNSUPPORTED;
-	}
 	fs->relocation = 1;
 	error = btrfs_transaction_begin(fs, writer, &transaction);
+	/* Simple quotas count an extent for the subvolume that allocated it; a
+	 * relocated copy's owner is not followed here. */
+	if (error == BTRFS_OK && bt_qgroup_simple(transaction)) {
+		error = BTRFS_UNSUPPORTED;
+	}
 	if (error == BTRFS_OK) {
 		error = bt_rl_merge(transaction, merge_work, &merged, &working);
 	}
