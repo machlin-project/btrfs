@@ -497,11 +497,17 @@ the device and above Linux's reserved first MiB, and sum to the device's used
 bytes. The gaps between them are the device's unallocated space.
 
 When a reservation finds no free range, the allocator creates a chunk of that
-class in memory only: the next logical address after the last chunk, the
-profile of an existing chunk of the class (DUP gives two stripes), a tenth of
-the device rounded down to 1 MiB and capped at 1 GiB for data, 256 MiB for
-metadata or 32 MiB for system chunks, halved until the stripes fit in
-unallocated space. Before a data or metadata chunk is added or a group removed,
+class in memory only, sized and placed as Linux's `btrfs_create_chunk` does on
+one device: the address after the highest chunk (`find_next_chunk`), the
+profile of an existing chunk of the class (DUP gives two stripes) or the one a
+balance converts the class to, and the first device hole that holds the
+class's largest stripes, else the largest hole (`find_free_dev_extent`). The
+stripes take what that hole allows (`decide_stripe_size_regular`); when that
+exceeds the class's chunk limit, at most a tenth of the device and 10 GiB for
+data, 256 MiB for metadata (1 GiB above 50 GiB) or 32 MiB for system chunks
+(`calc_chunk_size`), they take the limit rounded up to 16 MiB instead, never
+more than 1 GiB, in 64 KiB units; DUP stripes lie side by side. A reservation
+that needs more contiguous space takes it when the hole holds it. Before a data or metadata chunk is added or a group removed,
 a system chunk is created first when free system space is below what one chunk
 item and one device item update may need (24 nodes, Linux's
 `check_system_chunk`); chunk-tree blocks that find no system space grow one

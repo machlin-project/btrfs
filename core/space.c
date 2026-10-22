@@ -3,11 +3,18 @@
 #include "fst.h"
 
 #define BT_SPACE_MAX_GAPS 131072U
-/* New chunks: a tenth of the device, at most Linux's class limits. */
+/* Units in which growth estimates count unallocated device space. */
 #define BT_CHUNK_ALIGN (UINT64_C(1) << 20)
-#define BT_CHUNK_DATA_MAX (UINT64_C(1) << 30)
+/* Linux's chunk limits (calc_chunk_size): data chunks of up to 10 GiB
+ * (BTRFS_MAX_DATA_CHUNK_SIZE), metadata of 256 MiB, or 1 GiB above 50 GiB of
+ * writable space, system of 32 MiB; stripes of at most 1 GiB, rounded up to
+ * 16 MiB when the tenth-of-the-device limit cuts them. */
+#define BT_CHUNK_DATA_MAX (UINT64_C(10) << 30)
 #define BT_CHUNK_METADATA_MAX (UINT64_C(256) << 20)
 #define BT_CHUNK_SYSTEM_MAX (UINT64_C(32) << 20)
+#define BT_CHUNK_STRIPE_MAX (UINT64_C(1) << 30)
+#define BT_CHUNK_LARGE_DEVICE (UINT64_C(50) << 30)
+#define BT_CHUNK_ROUND (UINT64_C(16) << 20)
 /* Linux's check_system_chunk: system space for one device item update
  * (btrfs_calc_metadata_size, nodes for BTRFS_MAX_LEVEL levels, twice) and one
  * chunk item insertion (btrfs_calc_insert_metadata_size), in nodes. */
@@ -728,27 +735,6 @@ bt_space_load_all(struct bt_space *space)
 	return error;
 }
 
-/* Takes length bytes, aligned, from the first device gap that holds them. */
-static int
-bt_space_take(struct bt_gaps *device, uint64_t length, uint64_t *physical)
-{
-	struct bt_gap *gap;
-	uint64_t start;
-	size_t i;
-
-	for (i = 0; i < device->count; i++) {
-		gap = &device->items[i];
-		start = (gap->start + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
-		if (start >= gap->start && start <= gap->end && length <= gap->end - start) {
-			/* Alignment padding stays unallocated and is simply not reused. */
-			*physical = start;
-			gap->start = start + length;
-			return 1;
-		}
-	}
-	return 0;
-}
-
 /* Free metadata nodes, counting chunks not loaded yet. */
 static uint64_t
 bt_space_metadata_free(const struct bt_space *space, uint64_t enough)
@@ -764,8 +750,8 @@ bt_space_metadata_free(const struct bt_space *space, uint64_t enough)
 }
 
 /* Units of BT_CHUNK_ALIGN bytes of unallocated device space that chunk
- * stripes can take, gap by gap as bt_space_take aligns them; a chunk takes
- * whole units, one run per stripe. */
+ * stripes can take, gap by gap from 1 MiB boundaries: an estimate below
+ * what growth, which places stripes in 64 KiB units, can take. */
 static uint64_t
 bt_space_device_units(const struct bt_space *space)
 {
@@ -876,23 +862,49 @@ bt_space_set_profile(struct bt_space *space, uint64_t kind, uint64_t profile)
 	return BTRFS_OK;
 }
 
+/* Linux's find_free_dev_extent: the first device hole that holds want
+ * bytes, else the largest; *size is what it holds, at most want. */
+static int
+bt_space_hole(const struct bt_gaps *device, uint64_t want, size_t *index, uint64_t *size)
+{
+	uint64_t length;
+	size_t i;
+	int found = 0;
+
+	*size = 0;
+	for (i = 0; i < device->count; i++) {
+		length = device->items[i].end - device->items[i].start;
+		if (length >= want) {
+			*index = i;
+			*size = want;
+			return 1;
+		}
+		if (length > *size) {
+			*index = i;
+			*size = length;
+			found = 1;
+		}
+	}
+	return found;
+}
+
 enum btrfs_result
 bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 {
 	struct btrfs_fs *fs = space->fs;
-	struct bt_gaps saved;
 	struct bt_chunk *chunk;
-	struct bt_gap *copy;
+	struct bt_gap *hole;
 	uint64_t type = 0;
 	uint64_t logical = 0;
+	uint64_t chunk_max;
+	uint64_t stripe_max;
+	uint64_t available = 0;
 	uint64_t length;
-	uint64_t limit;
-	uint64_t physical[BT_MAX_MIRRORS];
 	uint64_t allowed = UINT64_MAX;
+	size_t index = 0;
 	size_t i;
 	unsigned stripes;
 	unsigned stripe;
-	int fits;
 	enum btrfs_result error;
 
 	if (!space->growth || fs->chunk_count >= fs->chunk_capacity ||
@@ -904,9 +916,15 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	if (space->mixed && kind != BT_BLOCK_SYSTEM) {
 		kind = BT_BLOCK_DATA | BT_BLOCK_METADATA;
 	}
-	limit = (kind & BT_BLOCK_DATA) != 0 ? BT_CHUNK_DATA_MAX
-	    : kind == BT_BLOCK_SYSTEM	    ? BT_CHUNK_SYSTEM_MAX
-					    : BT_CHUNK_METADATA_MAX;
+	/* Linux's calc_chunk_size and init_alloc_chunk_ctl_policy_regular: the
+	 * class's largest chunk and stripe, and no chunk above a tenth of the
+	 * device. */
+	chunk_max = (kind & BT_BLOCK_DATA) != 0 ? BT_CHUNK_DATA_MAX
+	    : kind == BT_BLOCK_SYSTEM		? BT_CHUNK_SYSTEM_MAX
+	    : fs->device_size > BT_CHUNK_LARGE_DEVICE ? BT_CHUNK_STRIPE_MAX
+						      : BT_CHUNK_METADATA_MAX;
+	stripe_max = chunk_max < BT_CHUNK_STRIPE_MAX ? chunk_max : BT_CHUNK_STRIPE_MAX;
+	chunk_max = fs->device_size / 10 < chunk_max ? fs->device_size / 10 : chunk_max;
 	/* The chunk item and device item updates need system space first. */
 	if (kind != BT_BLOCK_SYSTEM) {
 		error = bt_space_check_system(space);
@@ -918,61 +936,60 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	saved = space->device;
 	for (i = 0; i < fs->chunk_count; i++) {
 		if ((fs->chunks[i].type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)) ==
 			kind &&
 		    !fs->chunks[i].removed && type == 0) {
 			type = fs->chunks[i].type;
 		}
+		/* Linux's find_next_chunk: after the highest chunk. */
 		if (fs->chunks[i].logical + fs->chunks[i].length > logical) {
 			logical = fs->chunks[i].logical + fs->chunks[i].length;
 		}
 	}
-	if (type == 0 || logical > UINT64_MAX - limit - BT_CHUNK_ALIGN) {
+	if (type == 0 || logical > UINT64_MAX - chunk_max - BT_CHUNK_STRIPE_MAX) {
 		return BTRFS_NO_SPACE;
 	}
 	if (space->converting[bt_space_kind_index(kind)]) {
 		type = (type & ~BT_BLOCK_DUP) | space->profiles[bt_space_kind_index(kind)];
 	}
-	logical = (logical + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
 	stripes = type & BT_BLOCK_DUP ? 2 : 1;
-	length = fs->device_size / 10 & ~(BT_CHUNK_ALIGN - 1);
-	length = length > limit ? limit : length;
-	length = length < BT_CHUNK_ALIGN ? BT_CHUNK_ALIGN : length;
-	minimum = (minimum + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
-	length = length < minimum ? minimum : length;
+	/* Linux's decide_stripe_size_regular for one device: as much of the
+	 * hole as the stripes may take; above the chunk limit, that limit
+	 * rounded up to 16 MiB; at most 1 GiB, in 64 KiB units. */
+	if (!bt_space_hole(&space->device, stripe_max * stripes, &index, &available) ||
+	    available < BT_STRIPE_LENGTH * stripes) {
+		return BTRFS_NO_SPACE;
+	}
+	length = available / stripes;
+	if (length > chunk_max) {
+		stripe_max = (chunk_max + BT_CHUNK_ROUND - 1) / BT_CHUNK_ROUND * BT_CHUNK_ROUND;
+		length = stripe_max < length ? stripe_max : length;
+	}
+	length = length < BT_CHUNK_STRIPE_MAX ? length : BT_CHUNK_STRIPE_MAX;
+	length &= ~(BT_STRIPE_LENGTH - 1);
+	/* A reservation that needs more contiguous space takes it when the hole
+	 * holds it. */
+	minimum = (minimum + BT_STRIPE_LENGTH - 1) & ~(BT_STRIPE_LENGTH - 1);
+	if (length < minimum) {
+		if (minimum > available / stripes) {
+			return BTRFS_NO_SPACE;
+		}
+		length = minimum;
+	}
 	/* Data leaves the device space metadata would need to grow. */
 	if (kind == BT_BLOCK_DATA) {
 		allowed = bt_space_growable(space, stripes, bt_space_holdback(space));
-	}
-	/* Device gaps are copied so a failed attempt leaves them untouched. */
-	copy = fs->env.allocate(fs->env.context, (saved.count + 1) * sizeof(*copy));
-	if (copy == NULL) {
-		return BTRFS_NO_MEMORY;
-	}
-	for (fits = 0; !fits && length >= minimum && length >= BT_CHUNK_ALIGN;
-	    length = (length / 2) & ~(BT_CHUNK_ALIGN - 1)) {
 		if (length > allowed) {
-			continue;
+			length = allowed & ~(BT_STRIPE_LENGTH - 1);
 		}
-		bt_copy(copy, saved.items, saved.count * sizeof(*copy));
-		space->device.items = copy;
-		fits = 1;
-		for (stripe = 0; fits && stripe < stripes; stripe++) {
-			fits = bt_space_take(&space->device, length, &physical[stripe]);
-		}
-		if (fits) {
-			break;
+		if (length < minimum || length < BT_STRIPE_LENGTH) {
+			return BTRFS_NO_SPACE;
 		}
 	}
-	space->device.items = saved.items;
-	if (!fits) {
-		fs->env.release(fs->env.context, copy, (saved.count + 1) * sizeof(*copy));
-		return BTRFS_NO_SPACE;
-	}
-	bt_copy(saved.items, copy, saved.count * sizeof(*copy));
-	fs->env.release(fs->env.context, copy, (saved.count + 1) * sizeof(*copy));
+	/* DUP stripes lie side by side in the hole, as Linux's create_chunk
+	 * places a device's stripes. */
+	hole = &space->device.items[index];
 	chunk = &fs->chunks[fs->chunk_count];
 	bt_zero(chunk, sizeof(*chunk));
 	chunk->logical = logical;
@@ -981,8 +998,9 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	chunk->mirrors = (uint8_t)stripes;
 	chunk->confirmed = 1;
 	for (stripe = 0; stripe < stripes; stripe++) {
-		chunk->physical[stripe] = physical[stripe];
+		chunk->physical[stripe] = hole->start + stripe * length;
 	}
+	hole->start += stripes * length;
 	space->used[fs->chunk_count] = 0;
 	space->loaded[fs->chunk_count] = 1;
 	fs->chunk_count++;

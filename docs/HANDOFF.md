@@ -109,9 +109,7 @@ is destroyed. `accept` is legal only after successful durable publication;
    balances the results again (`tests/prepare_balance_linux.py`). Remaining:
    balance with v1 space caches, RAID profiles, and a native interface that
    starts one (`btrfs_balance` takes Linux's usage, convert and soft
-   filters); new chunks are sized at a tenth of the device, where Linux's
-   `decide_stripe_size_regular` rounds a stripe above that limit up to 16 MiB
-   (its DUP data chunks on a 256 MiB device are 32 MiB, these 25 MiB); data reference edits
+   filters); data reference edits
    from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
