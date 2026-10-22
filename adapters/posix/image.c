@@ -203,9 +203,8 @@ btrfs_image_compress(void *context, enum btrfs_compression codec, const void *in
 }
 
 static enum btrfs_result
-image_write(void *context, uint64_t offset, const void *buffer, size_t length)
+image_pwrite(int descriptor, uint64_t offset, const void *buffer, size_t length)
 {
-	struct btrfs_image *image = context;
 	size_t done = 0;
 	ssize_t amount;
 
@@ -213,7 +212,7 @@ image_write(void *context, uint64_t offset, const void *buffer, size_t length)
 		return BTRFS_IO;
 	}
 	while (done < length) {
-		amount = pwrite(image->descriptor, (const uint8_t *)buffer + done, length - done,
+		amount = pwrite(descriptor, (const uint8_t *)buffer + done, length - done,
 		    (off_t)(offset + done));
 		if (amount < 0 && errno == EINTR) {
 			continue;
@@ -229,16 +228,46 @@ image_write(void *context, uint64_t offset, const void *buffer, size_t length)
 /* A barrier reaches stable storage: F_FULLFSYNC where the platform has it,
  * since fsync alone may leave data in the drive's cache. */
 static enum btrfs_result
+image_sync(int descriptor)
+{
+#ifdef F_FULLFSYNC
+	if (fcntl(descriptor, F_FULLFSYNC) == 0) {
+		return BTRFS_OK;
+	}
+#endif
+	return fsync(descriptor) == 0 ? BTRFS_OK : BTRFS_IO;
+}
+
+static enum btrfs_result
+image_write(void *context, uint64_t offset, const void *buffer, size_t length)
+{
+	struct btrfs_image *image = context;
+
+	return image_pwrite(image->descriptor, offset, buffer, length);
+}
+
+static enum btrfs_result
 image_flush(void *context)
 {
 	struct btrfs_image *image = context;
 
-#ifdef F_FULLFSYNC
-	if (fcntl(image->descriptor, F_FULLFSYNC) == 0) {
-		return BTRFS_OK;
-	}
-#endif
-	return fsync(image->descriptor) == 0 ? BTRFS_OK : BTRFS_IO;
+	return image_sync(image->descriptor);
+}
+
+static enum btrfs_result
+image_device_write(void *context, uint64_t offset, const void *buffer, size_t length)
+{
+	struct btrfs_image_device *device = context;
+
+	return image_pwrite(device->descriptor, offset, buffer, length);
+}
+
+static enum btrfs_result
+image_device_flush(void *context)
+{
+	struct btrfs_image_device *device = context;
+
+	return image_sync(device->descriptor);
 }
 
 static int
@@ -285,16 +314,24 @@ btrfs_image_open_writable(const char *path, struct btrfs_image *image)
 void
 btrfs_image_writer(struct btrfs_image *image, struct btrfs_write_environment *writer)
 {
+	size_t i;
+
 	memset(writer, 0, sizeof(*writer));
 	writer->context = image;
 	writer->write = image_write;
 	writer->flush = image_flush;
 	writer->compress = btrfs_image_compress;
 	writer->compression = BTRFS_COMPRESSION_NONE;
+	for (i = 0; i < image->environment.device_count; i++) {
+		image->writers[i] = (struct btrfs_write_device){ &image->extra[i],
+			image_device_write, image_device_flush };
+	}
+	writer->devices = image->environment.device_count != 0 ? image->writers : NULL;
+	writer->device_count = image->environment.device_count;
 }
 
-int
-btrfs_image_open_devices(const char *const *paths, size_t count, struct btrfs_image *image)
+static int
+image_open_devices(const char *const *paths, size_t count, int flags, struct btrfs_image *image)
 {
 	struct stat status;
 	size_t i;
@@ -303,10 +340,10 @@ btrfs_image_open_devices(const char *const *paths, size_t count, struct btrfs_im
 	if (count == 0 || count > BTRFS_IMAGE_DEVICES + 1) {
 		return EINVAL;
 	}
-	error = image_open(paths[0], O_RDONLY, image);
+	error = image_open(paths[0], flags, image);
 	for (i = 1; error == 0 && i < count; i++) {
 		image->extra[i - 1].image = image;
-		image->extra[i - 1].descriptor = open(paths[i], O_RDONLY | O_CLOEXEC);
+		image->extra[i - 1].descriptor = open(paths[i], flags | O_CLOEXEC);
 		if (image->extra[i - 1].descriptor < 0) {
 			error = errno;
 			break;
@@ -324,6 +361,18 @@ btrfs_image_open_devices(const char *const *paths, size_t count, struct btrfs_im
 		btrfs_image_close(image);
 	}
 	return error;
+}
+
+int
+btrfs_image_open_devices(const char *const *paths, size_t count, struct btrfs_image *image)
+{
+	return image_open_devices(paths, count, O_RDONLY, image);
+}
+
+int
+btrfs_image_open_devices_writable(const char *const *paths, size_t count, struct btrfs_image *image)
+{
+	return image_open_devices(paths, count, O_RDWR, image);
 }
 
 void

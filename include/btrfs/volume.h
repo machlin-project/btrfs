@@ -28,7 +28,8 @@ struct btrfs_volume_locks {
 
 /* writer NULL opens the volume read-only. A writable volume admits its first
  * transaction at open (superblock copies, features), so an inadmissible
- * filesystem fails here rather than at the first write. */
+ * filesystem fails here rather than at the first write. A writer of several
+ * devices is UNSUPPORTED: the volume counts and orders one device's writes. */
 enum btrfs_result btrfs_volume_open(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_volume_locks *locks,
     uint64_t tree, struct btrfs_volume **result);

@@ -84,6 +84,9 @@ struct btrfs_directory;
  * No callback in this interface can authorize a write. */
 struct btrfs_cache;
 
+/* Devices one volume may span. */
+#define BTRFS_MAX_DEVICES 16U
+
 /* A further device of a volume spanning several: its size and positioned
  * reads, as the environment's own. */
 struct btrfs_device {
@@ -113,8 +116,8 @@ struct btrfs_environment {
 	struct btrfs_cache *cache;
 	/* The volume's other devices when it spans several, in any order: mount
 	 * identifies each by its superblock and requires every device the
-	 * volume names unless degraded is set. NULL and 0 for a volume of one
-	 * device. */
+	 * volume names unless degraded is set, and keeps each device's entry,
+	 * not the table. NULL and 0 for a volume of one device. */
 	const struct btrfs_device *devices;
 	size_t device_count;
 	/* Admits a volume without some of its devices, as Linux's -o degraded:

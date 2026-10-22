@@ -95,6 +95,14 @@ bt_chunk_data_stripes(uint64_t profile, unsigned stripes, unsigned sub_stripes)
 	return profile == BT_BLOCK_RAID6 ? stripes - 2 : 1;
 }
 
+uint64_t
+bt_chunk_stripe_length(const struct bt_chunk *chunk)
+{
+	return chunk->length /
+	    bt_chunk_data_stripes(
+		chunk->type & BT_BLOCK_PROFILES, chunk->stripes, chunk->sub_stripes);
+}
+
 /* The volume's device with id and uuid, as an index; device_count if none.
  * A degraded mount adds a device it lacks, with no reads, the first time a
  * chunk names it, up to the volume's device count. */

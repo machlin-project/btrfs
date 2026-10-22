@@ -109,6 +109,9 @@ relocation_test = executable('btrfs-relocation-test', 'tests/relocation.c',
 multidev_test = executable('btrfs-multidev-test', 'tests/multidev.c', 'tests/references.c',
   'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
   dependencies: [zlib, zstd])
+multidev_write_test = executable('btrfs-multidev-write-test', 'tests/multidev_write.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
 balance_test = executable('btrfs-balance-test', 'tests/balance.c', 'tests/references.c',
   'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
@@ -321,7 +324,8 @@ if fixtures != ''
     join_paths(fixtures, 'sectors-64k.expected.tsv'), meson.current_build_dir()],
     timeout: 300, suite: 'images')
   # Volumes Linux wrote across several devices: every profile reads as
-  # Linux's manifest says, from any of its devices.
+  # Linux's manifest says, from any of its devices; writes with their crash
+  # states, RAID5/6 refused.
   foreach profile : [['multi-raid1', 2], ['multi-raid1c3', 3], ['multi-raid1c4', 4],
       ['multi-raid10', 4], ['multi-raid0', 3], ['multi-raid5', 3], ['multi-raid6', 4],
       ['multi-single', 2]]
@@ -332,6 +336,9 @@ if fixtures != ''
     test(profile[0], multidev_test,
       args: [join_paths(fixtures, profile[0] + '.expected.tsv'),
         join_paths(fixtures, 'plain.raw')] + images, timeout: 300, suite: 'images')
+    test(profile[0] + '-writes', multidev_write_test,
+      args: [profile[0], join_paths(fixtures, profile[0] + '.expected.tsv'), '-'] + images,
+      timeout: 1200, suite: 'images')
   endforeach
   # Balance: every block group relocated on its own, with its crash states,
   # then all in turn; the files read as before and sharing stays. A full

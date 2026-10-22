@@ -68,48 +68,145 @@ bt_tx_relocating(const struct btrfs_fs *fs, int *relocating)
 }
 
 /* Every superblock copy Linux maintains must be intact and agree with the
- * mounted primary. A disagreement is an unresolved earlier publication; a new
- * commit could otherwise overwrite blocks still referenced by a newer copy. */
+ * mounted primary: each device's copies agree with its primary, and its
+ * primary with the first device's but for its own device item. A
+ * disagreement is an unresolved earlier publication; a new commit could
+ * otherwise overwrite blocks still referenced by a newer copy. */
 static enum btrfs_result
 bt_tx_copies(struct btrfs_transaction *transaction)
 {
+	const struct btrfs_fs *base = transaction->base;
 	const struct bt_disk_super *copy;
+	struct bt_tx_device *target;
 	uint64_t offset;
+	uint32_t device;
 	unsigned mirror;
-	int logged = transaction->base->log_root != 0;
+	int logged = base->log_root != 0;
 	enum btrfs_result error;
 
-	transaction->copies = 0;
 	if (logged &&
-	    (bt_u64(transaction->original_super.log_root) != transaction->base->log_root ||
-		transaction->original_super.log_level != transaction->base->log_level)) {
+	    (bt_u64(transaction->original_super.log_root) != base->log_root ||
+		transaction->original_super.log_level != base->log_level)) {
 		return BTRFS_STALE;
 	}
-	for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
-		if (!bt_super_present(transaction->base->device_size, mirror)) {
-			continue;
-		}
-		offset = bt_super_offset(mirror);
-		/* Callers have just read the primary into original_super or compared
-		 * it byte for byte with it. */
-		copy = &transaction->original_super;
-		if (mirror != 0) {
-			copy = (const void *)transaction->scratch;
-			error = bt_read_physical(
-			    transaction->base, offset, transaction->scratch, BT_SUPER_SIZE);
-			if (error != BTRFS_OK) {
-				return error;
-			}
-		}
-		if (bt_super_check(copy, offset) != BTRFS_OK ||
-		    !(mirror != 0 && logged
-			    ? bt_super_same_but_log(copy, &transaction->original_super)
-			    : bt_super_same(copy, &transaction->original_super))) {
+	for (device = 0; device < base->device_count; device++) {
+		target = &transaction->targets[device];
+		target->copies = 0;
+		if (!bt_super_same_volume(&target->original, &transaction->original_super) ||
+		    bt_u64(target->original.device.id) != base->devices[device].id ||
+		    !bt_equal(target->original.device.uuid, base->devices[device].uuid,
+			BTRFS_UUID_SIZE)) {
 			return BTRFS_RECOVERY_REQUIRED;
 		}
-		transaction->copies++;
+		for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
+			if (!bt_super_present(base->devices[device].size, mirror)) {
+				continue;
+			}
+			offset = bt_super_offset(mirror);
+			/* Callers have just read each primary into its original or
+			 * compared it byte for byte with it. */
+			copy = &target->original;
+			if (mirror != 0) {
+				copy = (const void *)transaction->scratch;
+				error = bt_read_device(
+				    base, device, offset, transaction->scratch, BT_SUPER_SIZE);
+				if (error != BTRFS_OK) {
+					return error;
+				}
+			}
+			if (bt_super_check(copy, offset) != BTRFS_OK ||
+			    !(mirror != 0 && logged ? bt_super_same_but_log(copy, &target->original)
+						    : bt_super_same(copy, &target->original))) {
+				return BTRFS_RECOVERY_REQUIRED;
+			}
+			target->copies++;
+		}
 	}
 	return BTRFS_OK;
+}
+
+/* The writes and barrier of every device, and each device's primary
+ * superblock, which must name the mounted generation. */
+static enum btrfs_result
+bt_tx_targets(struct btrfs_transaction *transaction)
+{
+	const struct btrfs_fs *base = transaction->base;
+	const struct btrfs_write_device *source;
+	struct bt_tx_device *target;
+	size_t i;
+	enum btrfs_result error = BTRFS_OK;
+
+	transaction->targets = base->env.allocate(
+	    base->env.context, base->device_count * sizeof(*transaction->targets));
+	if (transaction->targets == NULL) {
+		return BTRFS_NO_MEMORY;
+	}
+	bt_zero(transaction->targets, base->device_count * sizeof(*transaction->targets));
+	for (i = 0; error == BTRFS_OK && i < base->device_count; i++) {
+		target = &transaction->targets[i];
+		if (i == 0) {
+			target->context = transaction->io.context;
+			target->write = transaction->io.write;
+			target->flush = transaction->io.flush;
+			target->original = transaction->original_super;
+		} else {
+			source = &transaction->io.devices[i - 1];
+			target->context = source->context;
+			target->write = source->write;
+			target->flush = source->flush;
+			error = bt_read_device(base, (uint32_t)i, BT_SUPER_OFFSET,
+			    &target->original, sizeof(target->original));
+		}
+		if (error == BTRFS_OK &&
+		    bt_u64(target->original.generation) != base->info.generation) {
+			error = BTRFS_STALE;
+		}
+		target->item = target->original.device;
+	}
+	return error;
+}
+
+size_t
+bt_tx_device_index(const struct btrfs_transaction *transaction, uint64_t id)
+{
+	size_t i;
+
+	for (i = 0; i < transaction->fs.device_count; i++) {
+		if (transaction->fs.devices[i].id == id) {
+			break;
+		}
+	}
+	return i;
+}
+
+enum btrfs_result
+bt_tx_device_used(struct btrfs_transaction *transaction, uint64_t id, uint64_t bytes, int add)
+{
+	struct bt_disk_device device;
+	struct bt_key key = { BT_DEV_ITEMS_OBJECTID, id, BT_DEV_ITEM };
+	uint64_t used;
+	uint64_t total;
+	size_t index = bt_tx_device_index(transaction, id);
+	size_t size;
+	enum btrfs_result error;
+
+	if (index == transaction->fs.device_count) {
+		return BTRFS_CORRUPT;
+	}
+	error = bt_mutation_find(
+	    transaction->mutation, transaction->chunks, key, &device, sizeof(device), &size);
+	if (error != BTRFS_OK) {
+		return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
+	}
+	used = bt_u64(device.used_bytes);
+	total = bt_u64(device.total_bytes);
+	if (size != sizeof(device) || used > total || (add ? bytes > total - used : bytes > used)) {
+		return BTRFS_CORRUPT;
+	}
+	bt_put64(&device.used_bytes, add ? used + bytes : used - bytes);
+	transaction->targets[index].item.used_bytes = device.used_bytes;
+	return bt_tx_edit(
+	    transaction, &transaction->chunks, key, &device, sizeof(device), BT_REPLACE);
 }
 
 enum btrfs_result
@@ -140,8 +237,15 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	}
 	*result = NULL;
 	if (base == NULL || environment == NULL || environment->write == NULL ||
-	    environment->flush == NULL) {
+	    environment->flush == NULL ||
+	    (environment->device_count != 0 && environment->devices == NULL)) {
 		return BTRFS_INVALID_ARGUMENT;
+	}
+	for (i = 0; i < environment->device_count; i++) {
+		if (environment->devices[i].write == NULL ||
+		    environment->devices[i].flush == NULL) {
+			return BTRFS_INVALID_ARGUMENT;
+		}
 	}
 	/* The free-space and block-group trees are maintained, and fs-verity
 	 * files keep their data; other read-only features are not supported.
@@ -159,13 +263,18 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	    base->info.generation == UINT64_MAX) {
 		return BTRFS_UNSUPPORTED;
 	}
-	/* The writer writes one device, single and DUP chunks. */
-	if (base->device_count != 1 || base->device_capacity != 1 ||
-	    (base->info.incompat_features & (BT_FEATURE_RAID56 | BT_FEATURE_RAID1C34)) != 0) {
+	/* Every device of the volume is written, through the writer's device
+	 * of the same order; a degraded mount is not. RAID5/6 chunks would need
+	 * their parity rewritten with their data. */
+	if (environment->device_count != base->env.device_count) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (base->env.degraded || base->device_count != base->device_capacity ||
+	    base->device_count != environment->device_count + 1) {
 		return BTRFS_UNSUPPORTED;
 	}
 	for (i = 0; i < base->chunk_count; i++) {
-		if ((base->chunks[i].type & BT_BLOCK_PROFILES & ~BT_BLOCK_DUP) != 0) {
+		if ((base->chunks[i].type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0) {
 			return BTRFS_UNSUPPORTED;
 		}
 	}
@@ -212,16 +321,17 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 	    ? BTRFS_NO_MEMORY
 	    : bt_read_physical(base, BT_SUPER_OFFSET, &transaction->original_super,
 		  sizeof(transaction->original_super));
-	if (error == BTRFS_OK &&
-	    bt_u64(transaction->original_super.generation) != base->info.generation) {
-		error = BTRFS_STALE;
+	if (error == BTRFS_OK) {
+		error = bt_tx_targets(transaction);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_tx_copies(transaction);
 	}
 	/* A single copy cannot survive its own torn publication write. */
-	if (error == BTRFS_OK && transaction->copies < 2) {
-		error = BTRFS_UNSUPPORTED;
+	for (i = 0; error == BTRFS_OK && i < base->device_count; i++) {
+		if (transaction->targets[i].copies < 2) {
+			error = BTRFS_UNSUPPORTED;
+		}
 	}
 	if (error == BTRFS_OK) {
 		transaction->super = transaction->original_super;
@@ -1059,7 +1169,7 @@ bt_tx_backup(struct btrfs_transaction *transaction)
 	backup->checksum_level = transaction->checksums.root.level;
 	backup->total_bytes = transaction->super.total_bytes;
 	backup->used_bytes = transaction->super.used_bytes;
-	bt_put64(&backup->devices, 1);
+	backup->devices = transaction->super.devices;
 }
 
 static enum btrfs_result
@@ -1088,15 +1198,16 @@ bt_tx_publish_chunks(struct btrfs_transaction *transaction)
 {
 	struct {
 		struct bt_disk_chunk chunk;
-		struct bt_disk_stripe stripes[2];
+		struct bt_disk_stripe stripes[BT_MAX_STRIPES];
 	} item;
 	struct bt_disk_dev_extent extent;
-	struct bt_disk_device device;
 	struct bt_disk_block_group group;
 	struct bt_disk_free_space_info info;
 	const struct bt_chunk *chunk;
+	const struct bt_device *device;
 	const struct btrfs_fs *base = transaction->base;
 	struct bt_key key;
+	uint64_t length;
 	size_t size;
 	unsigned stripe;
 	enum btrfs_result error = BTRFS_OK;
@@ -1104,6 +1215,7 @@ bt_tx_publish_chunks(struct btrfs_transaction *transaction)
 	for (; error == BTRFS_OK && transaction->chunks_published < transaction->fs.chunk_count;
 	    transaction->chunks_published++) {
 		chunk = &transaction->fs.chunks[transaction->chunks_published];
+		length = bt_chunk_stripe_length(chunk);
 		bt_zero(&item, sizeof(item));
 		bt_put64(&item.chunk.length, chunk->length);
 		bt_put64(&item.chunk.owner, BT_EXTENT_TREE);
@@ -1112,44 +1224,35 @@ bt_tx_publish_chunks(struct btrfs_transaction *transaction)
 		bt_put32(&item.chunk.io_align, BT_STRIPE_LENGTH);
 		bt_put32(&item.chunk.io_width, BT_STRIPE_LENGTH);
 		bt_put32(&item.chunk.sector_size, base->info.sector_size);
-		bt_put16(&item.chunk.stripes, chunk->mirrors);
-		bt_put16(&item.chunk.sub_stripes, 1);
-		for (stripe = 0; stripe < chunk->mirrors; stripe++) {
-			bt_put64(&item.stripes[stripe].device, base->device_id);
+		bt_put16(&item.chunk.stripes, chunk->stripes);
+		bt_put16(&item.chunk.sub_stripes, chunk->sub_stripes);
+		for (stripe = 0; stripe < chunk->stripes; stripe++) {
+			device = &transaction->fs.devices[chunk->devices[stripe]];
+			bt_put64(&item.stripes[stripe].device, device->id);
 			bt_put64(&item.stripes[stripe].offset, chunk->physical[stripe]);
-			bt_copy(item.stripes[stripe].uuid, base->device_uuid, BTRFS_UUID_SIZE);
+			bt_copy(item.stripes[stripe].uuid, device->uuid, BTRFS_UUID_SIZE);
 		}
 		key = (struct bt_key){ BT_FIRST_CHUNK_OBJECTID, chunk->logical, BT_CHUNK_ITEM };
-		size = sizeof(item.chunk) + chunk->mirrors * sizeof(item.stripes[0]);
+		size = sizeof(item.chunk) + chunk->stripes * sizeof(item.stripes[0]);
 		error = bt_tx_edit(transaction, &transaction->chunks, key, &item, size, BT_INSERT);
 		/* Chunk-tree blocks may live in a new system chunk, so the superblock's
 		 * bootstrap array names it too (btrfs_add_system_chunk). */
 		if (error == BTRFS_OK && (chunk->type & BT_BLOCK_SYSTEM) != 0) {
 			error = bt_tx_system_array_add(transaction, key, &item, size);
 		}
-		for (stripe = 0; error == BTRFS_OK && stripe < chunk->mirrors; stripe++) {
+		for (stripe = 0; error == BTRFS_OK && stripe < chunk->stripes; stripe++) {
+			device = &transaction->fs.devices[chunk->devices[stripe]];
 			bt_zero(&extent, sizeof(extent));
 			bt_put64(&extent.chunk_tree, BT_CHUNK_TREE);
 			bt_put64(&extent.chunk_objectid, BT_FIRST_CHUNK_OBJECTID);
 			bt_put64(&extent.chunk_offset, chunk->logical);
-			bt_put64(&extent.length, chunk->length);
-			key = (struct bt_key){ base->device_id, chunk->physical[stripe],
-				BT_DEV_EXTENT };
+			bt_put64(&extent.length, length);
+			key = (struct bt_key){ device->id, chunk->physical[stripe], BT_DEV_EXTENT };
 			error = bt_tx_edit(transaction, &transaction->devices.root, key, &extent,
 			    sizeof(extent), BT_INSERT);
-		}
-		key = (struct bt_key){ BT_DEV_ITEMS_OBJECTID, base->device_id, BT_DEV_ITEM };
-		if (error == BTRFS_OK) {
-			error = bt_mutation_find(transaction->mutation, transaction->chunks, key,
-			    &device, sizeof(device), &size);
-			error = error == BTRFS_OK && size != sizeof(device) ? BTRFS_CORRUPT : error;
-		}
-		if (error == BTRFS_OK) {
-			bt_put64(&device.used_bytes,
-			    bt_u64(device.used_bytes) + chunk->length * chunk->mirrors);
-			transaction->super.device.used_bytes = device.used_bytes;
-			error = bt_tx_edit(transaction, &transaction->chunks, key, &device,
-			    sizeof(device), BT_REPLACE);
+			if (error == BTRFS_OK) {
+				error = bt_tx_device_used(transaction, device->id, length, 1);
+			}
 		}
 		if (error == BTRFS_OK) {
 			bt_zero(&group, sizeof(group));
@@ -1375,17 +1478,44 @@ bt_tx_prepare(struct btrfs_transaction *transaction)
 	return BTRFS_NO_SPACE;
 }
 
+/* Writes copy mirror of the superblock on one device, with its own device
+ * item. */
 static enum btrfs_result
-bt_tx_publish(struct btrfs_transaction *transaction, unsigned mirror)
+bt_tx_publish(struct btrfs_transaction *transaction, uint32_t device, unsigned mirror)
 {
+	struct bt_tx_device *target = &transaction->targets[device];
 	uint64_t offset = bt_super_offset(mirror);
 
-	bt_super_seal(&transaction->super, offset);
-	return transaction->io.write(
-	    transaction->io.context, offset, &transaction->super, sizeof(transaction->super));
+	transaction->published = transaction->super;
+	transaction->published.device = target->item;
+	bt_super_seal(&transaction->published, offset);
+	return target->write(
+	    target->context, offset, &transaction->published, sizeof(transaction->published));
 }
 
-/* Heap order by physical address: bounded and without allocation. */
+/* A barrier on every device of the volume. */
+static enum btrfs_result
+bt_tx_barrier(struct btrfs_transaction *transaction)
+{
+	struct bt_tx_device *target;
+	size_t i;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (i = 0; error == BTRFS_OK && i < transaction->fs.device_count; i++) {
+		target = &transaction->targets[i];
+		error = target->flush(target->context);
+	}
+	return error;
+}
+
+static int
+bt_tx_write_before(const struct bt_tx_write *a, const struct bt_tx_write *b)
+{
+	return a->device != b->device ? a->device < b->device : a->physical < b->physical;
+}
+
+/* Heap order by device and physical address: bounded and without
+ * allocation. */
 static void
 bt_tx_sift(struct bt_tx_write *writes, size_t root, size_t count)
 {
@@ -1397,10 +1527,10 @@ bt_tx_sift(struct bt_tx_write *writes, size_t root, size_t count)
 		if (child >= count) {
 			return;
 		}
-		if (child + 1 < count && writes[child + 1].physical > writes[child].physical) {
+		if (child + 1 < count && bt_tx_write_before(&writes[child], &writes[child + 1])) {
 			child++;
 		}
-		if (writes[root].physical >= writes[child].physical) {
+		if (!bt_tx_write_before(&writes[root], &writes[child])) {
 			return;
 		}
 		swap = writes[root];
@@ -1427,14 +1557,15 @@ bt_tx_sort(struct bt_tx_write *writes, size_t count)
 	}
 }
 
-/* Lists every copy of every written node by physical address. Copies never
- * overlap: chunk stripes were checked to be disjoint when space was loaded. */
+/* Lists every copy of every written node by device and physical address.
+ * Copies never overlap: chunk stripes were checked to be disjoint when space
+ * was loaded. */
 static enum btrfs_result
 bt_tx_writes(struct btrfs_transaction *transaction, struct bt_tx_write *writes, size_t capacity,
     size_t *count)
 {
 	struct bt_mutated_block block;
-	uint64_t physical;
+	struct bt_place place;
 	size_t i;
 	unsigned mirrors;
 	unsigned mirror;
@@ -1451,28 +1582,31 @@ bt_tx_writes(struct btrfs_transaction *transaction, struct bt_tx_write *writes, 
 		}
 		mirrors = 1;
 		for (mirror = 0; mirror < mirrors; mirror++) {
-			error = bt_map(&transaction->fs, block.address, block.size,
+			error = bt_map_place(&transaction->fs, block.address, block.size,
 			    block.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM : BT_BLOCK_METADATA,
-			    mirror, &physical, &mirrors);
+			    mirror, &place, &mirrors);
 			if (error != BTRFS_OK) {
 				return error;
 			}
-			if (*count == capacity) {
+			if (*count == capacity || place.span != block.size) {
 				return BTRFS_CORRUPT;
 			}
-			writes[(*count)++] = (struct bt_tx_write){ physical, block.bytes };
+			writes[(*count)++] =
+			    (struct bt_tx_write){ place.physical, block.bytes, place.device };
 		}
 	}
 	bt_tx_sort(writes, *count);
 	for (i = 1; i < *count; i++) {
-		if (writes[i].physical - writes[i - 1].physical < transaction->fs.info.node_size) {
+		if (writes[i].device == writes[i - 1].device &&
+		    writes[i].physical - writes[i - 1].physical < transaction->fs.info.node_size) {
 			return BTRFS_CORRUPT;
 		}
 	}
 	return BTRFS_OK;
 }
 
-/* Number of nodes in the run of physically contiguous copies at first. */
+/* Number of nodes in the run of physically contiguous copies at first, on
+ * its device. */
 static size_t
 bt_tx_run(const struct btrfs_transaction *transaction, const struct bt_tx_write *writes,
     size_t count, size_t first)
@@ -1481,7 +1615,7 @@ bt_tx_run(const struct btrfs_transaction *transaction, const struct bt_tx_write 
 	size_t limit = BT_WRITE_RUN / node_size;
 	size_t end = first + 1;
 
-	while (end < count && end - first < limit &&
+	while (end < count && end - first < limit && writes[end].device == writes[first].device &&
 	    writes[end].physical == writes[end - 1].physical + node_size) {
 		end++;
 	}
@@ -1495,9 +1629,10 @@ bt_tx_write_nodes(struct btrfs_transaction *transaction)
 {
 	const struct btrfs_environment *env = &transaction->base->env;
 	struct bt_tx_write *writes;
+	struct bt_tx_device *target;
 	uint8_t *staging = NULL;
 	size_t node_size = transaction->fs.info.node_size;
-	size_t capacity = BT_MAX_MIRRORS * bt_mutation_count(transaction->mutation);
+	size_t capacity = BT_MAX_COPIES * bt_mutation_count(transaction->mutation);
 	size_t count;
 	size_t longest = 1;
 	size_t length;
@@ -1523,16 +1658,17 @@ bt_tx_write_nodes(struct btrfs_transaction *transaction)
 	}
 	for (i = 0; error == BTRFS_OK && i < count; i += length) {
 		length = bt_tx_run(transaction, writes, count, i);
+		target = &transaction->targets[writes[i].device];
 		if (length == 1) {
-			error = transaction->io.write(transaction->io.context, writes[i].physical,
-			    writes[i].bytes, node_size);
+			error = target->write(
+			    target->context, writes[i].physical, writes[i].bytes, node_size);
 			continue;
 		}
 		for (j = 0; j < length; j++) {
 			bt_copy(staging + j * node_size, writes[i + j].bytes, node_size);
 		}
-		error = transaction->io.write(
-		    transaction->io.context, writes[i].physical, staging, length * node_size);
+		error =
+		    target->write(target->context, writes[i].physical, staging, length * node_size);
 	}
 	if (staging != NULL) {
 		env->release(env->context, staging, longest * node_size);
@@ -1544,36 +1680,41 @@ bt_tx_write_nodes(struct btrfs_transaction *transaction)
 static enum btrfs_result
 bt_tx_persist(struct btrfs_transaction *transaction)
 {
+	const struct btrfs_fs *fs = &transaction->fs;
 	enum btrfs_result error;
+	uint32_t device;
 	unsigned mirror;
 
 	/* New data was written when its extents were created; it and the
-	 * metadata naming it are durable at the first barrier. */
+	 * metadata naming it are durable on every device at the first barrier. */
 	error = bt_tx_write_nodes(transaction);
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	error = transaction->io.flush(transaction->io.context);
+	error = bt_tx_barrier(transaction);
 	if (error != BTRFS_OK) {
 		return error;
 	}
-	/* Secondary copies, barrier, primary, barrier. Until the second barrier the
-	 * untouched primary holds the acknowledged generation; afterwards the durable
-	 * secondaries hold the new one. A torn copy is resolved only by explicit
-	 * recovery; the immutable reader never silently selects a mirror. */
+	/* Secondary copies of every device, barrier, primaries, barrier. Until the
+	 * second barrier the untouched primaries hold the acknowledged generation;
+	 * afterwards the durable secondaries hold the new one. A torn copy, or
+	 * primaries of two generations, are resolved only by explicit recovery;
+	 * the immutable reader never silently selects a mirror. */
 	for (mirror = BT_SUPER_MIRRORS - 1; mirror != 0; mirror--) {
-		if (bt_super_present(transaction->base->device_size, mirror)) {
-			error = bt_tx_publish(transaction, mirror);
-			if (error != BTRFS_OK) {
-				return error;
+		for (device = 0; device < fs->device_count; device++) {
+			if (bt_super_present(fs->devices[device].size, mirror)) {
+				error = bt_tx_publish(transaction, device, mirror);
+				if (error != BTRFS_OK) {
+					return error;
+				}
 			}
 		}
 	}
-	error = transaction->io.flush(transaction->io.context);
-	if (error == BTRFS_OK) {
-		error = bt_tx_publish(transaction, 0);
+	error = bt_tx_barrier(transaction);
+	for (device = 0; error == BTRFS_OK && device < fs->device_count; device++) {
+		error = bt_tx_publish(transaction, device, 0);
 	}
-	return error == BTRFS_OK ? transaction->io.flush(transaction->io.context) : error;
+	return error == BTRFS_OK ? bt_tx_barrier(transaction) : error;
 }
 
 /* The prepared root set and chunk map already describe the next generation.
@@ -1654,6 +1795,7 @@ static enum btrfs_result
 bt_tx_commit(struct btrfs_transaction *transaction, uint64_t tree, struct btrfs_fs **view)
 {
 	struct btrfs_fs *prepared = NULL;
+	size_t i;
 	enum btrfs_result error;
 
 	if (transaction == NULL) {
@@ -1670,17 +1812,19 @@ bt_tx_commit(struct btrfs_transaction *transaction, uint64_t tree, struct btrfs_
 	if (error == BTRFS_OK && view != NULL) {
 		error = bt_tx_committed_view(transaction, tree, &prepared);
 	}
-	if (error == BTRFS_OK) {
-		error = bt_read_physical(
-		    transaction->base, BT_SUPER_OFFSET, transaction->scratch, BT_SUPER_SIZE);
+	/* Every device still holds the primary the transaction began with. */
+	for (i = 0; error == BTRFS_OK && i < transaction->base->device_count; i++) {
+		error = bt_read_device(transaction->base, (uint32_t)i, BT_SUPER_OFFSET,
+		    transaction->scratch, BT_SUPER_SIZE);
 		if (error == BTRFS_OK &&
-		    !bt_equal(transaction->scratch, &transaction->original_super, BT_SUPER_SIZE)) {
+		    !bt_equal(
+			transaction->scratch, &transaction->targets[i].original, BT_SUPER_SIZE)) {
 			error = BTRFS_STALE;
 		}
-		if (error == BTRFS_OK) {
-			error = bt_tx_copies(transaction);
-			error = error == BTRFS_RECOVERY_REQUIRED ? BTRFS_STALE : error;
-		}
+	}
+	if (error == BTRFS_OK) {
+		error = bt_tx_copies(transaction);
+		error = error == BTRFS_RECOVERY_REQUIRED ? BTRFS_STALE : error;
 	}
 	if (error == BTRFS_OK) {
 		transaction->writing = 1;
@@ -1743,6 +1887,10 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 		return;
 	}
 	env = &transaction->base->env;
+	if (transaction->targets != NULL) {
+		env->release(env->context, transaction->targets,
+		    transaction->base->device_count * sizeof(*transaction->targets));
+	}
 	bt_tx_release_data(transaction);
 	bt_qgroup_end(transaction);
 	bt_mutation_destroy(transaction->mutation);

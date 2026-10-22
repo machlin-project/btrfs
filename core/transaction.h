@@ -90,10 +90,25 @@ struct btrfs_counters {
 	uint64_t forgotten;
 };
 
-/* One copy of a node a commit writes. */
+/* One copy of a node a commit writes, on one of the volume's devices. */
 struct bt_tx_write {
 	uint64_t physical;
 	const void *bytes;
+	uint32_t device;
+};
+
+/* A device of the volume as the transaction writes it (the volume's device
+ * of the same index): its writes and barrier, its primary superblock as the
+ * transaction began, and the device item its superblocks publish, whose used
+ * bytes follow the device extents the transaction adds and removes. */
+struct bt_tx_device {
+	void *context;
+	enum btrfs_result (*write)(void *context, uint64_t offset, const void *bytes, size_t size);
+	enum btrfs_result (*flush)(void *context);
+	struct bt_disk_super original;
+	struct bt_disk_device item;
+	/* Superblock copies the device holds. */
+	unsigned copies;
 };
 
 struct btrfs_transaction {
@@ -140,6 +155,11 @@ struct btrfs_transaction {
 	int has_free_space;
 	struct bt_disk_super original_super;
 	struct bt_disk_super super;
+	/* Every device of the volume, as many as the base's devices; the first
+	 * writes through io. */
+	struct bt_tx_device *targets;
+	/* The superblock a publication writes: super with one device's item. */
+	struct bt_disk_super published;
 	uint8_t accounted[BT_TRANSACTION_NODES];
 	uint8_t *scratch;
 	uint8_t *original;
@@ -173,7 +193,6 @@ struct btrfs_transaction {
 	/* Inodes whose set-id bits and file capability a privileged writer keeps. */
 	struct btrfs_object_id privileged[BT_TRANSACTION_PRIVILEGED];
 	size_t privileged_count;
-	unsigned copies;
 	/* btrfs_transaction_reader's view, rebuilt by each call. */
 	struct btrfs_fs reader;
 	enum btrfs_result failure;
@@ -235,6 +254,12 @@ void bt_tx_hold_metadata(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_shrink(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
     uint64_t inode, uint64_t start, size_t budget, uint64_t *removed, uint64_t *reached, int *done);
 void bt_tx_release_data(struct btrfs_transaction *transaction);
+/* The index of the volume's device named id, or the device count. */
+size_t bt_tx_device_index(const struct btrfs_transaction *transaction, uint64_t id);
+/* Adds (add set) or removes bytes of device extents on the device named id:
+ * its chunk-tree item and the item its superblocks publish count them. */
+enum btrfs_result bt_tx_device_used(
+    struct btrfs_transaction *transaction, uint64_t id, uint64_t bytes, int add);
 /* A write or truncation of a regular file needs a settled privilege decision
  * when it has set-id bits Linux removes or a file capability. */
 /* Writes new data to every copy of its extent now: no committed root

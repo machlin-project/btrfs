@@ -492,7 +492,7 @@ free_space_tests(struct fixture *fixture)
 {
 	struct btrfs_environment environment = fixture->image.environment;
 	struct btrfs_write_environment writer = { NULL, refuse_write, refuse_flush, NULL,
-		BTRFS_COMPRESSION_NONE, 0 };
+		BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 	struct btrfs_transaction *transaction = NULL;
 	struct btrfs_fs *fs;
 	struct btrfs_fs *patched;
@@ -540,7 +540,7 @@ balance_tests(struct fixture *fixture)
 {
 	struct btrfs_environment environment = fixture->image.environment;
 	struct btrfs_write_environment writer = { NULL, refuse_write, refuse_flush, NULL,
-		BTRFS_COMPRESSION_NONE, 0 };
+		BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 	struct btrfs_balance_report report;
 	struct btrfs_inode greeting;
 	struct bt_disk_extent_item *item;

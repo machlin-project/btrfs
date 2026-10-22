@@ -6,6 +6,14 @@
 
 struct btrfs_transaction;
 
+/* A further device of a volume spanning several: positioned writes and a
+ * barrier, as the write environment's own. */
+struct btrfs_write_device {
+	void *context;
+	enum btrfs_result (*write)(void *context, uint64_t offset, const void *bytes, size_t size);
+	enum btrfs_result (*flush)(void *context);
+};
+
 /* Separate from the immutable reader's environment: write authority is explicit.
  * The owner must hold exclusive resource access, drain readers before commit,
  * and retire the original btrfs_fs after a successful or uncertain commit.
@@ -28,6 +36,12 @@ struct btrfs_write_environment {
 	 * that does not compress marks its file NOCOMPRESS unless the file's
 	 * property names the codec. */
 	int compress_force;
+	/* Writes to the volume's other devices when it spans several: one for
+	 * each of the reader environment's devices, in the same order; begin
+	 * keeps each entry, not the table. NULL and 0 for a volume of one
+	 * device. */
+	const struct btrfs_write_device *devices;
+	size_t device_count;
 };
 
 #define BTRFS_SUPER_COPIES 3U
@@ -42,25 +56,38 @@ struct btrfs_super_copy {
 };
 
 struct btrfs_recovery_report {
+	/* The copies on the environment's own device. */
 	struct btrfs_super_copy copies[BTRFS_SUPER_COPIES];
+	/* Copies inside the devices, on all of them. */
 	unsigned present;
 	unsigned selected;
 	uint64_t generation;
 	unsigned rewritten;
+	/* For a volume spanning several devices, the copies on each of the
+	 * environment's further devices, in its order, and the device of the
+	 * selected copy: 0 for the environment's own, i + 1 for devices[i]. */
+	struct btrfs_super_copy device_copies[BTRFS_MAX_DEVICES - 1][BTRFS_SUPER_COPIES];
+	unsigned selected_device;
 };
 
 /* Explicit, exclusive superblock recovery; mount never selects a mirror. Chooses
- * the newest checksum-valid copy and requires equal-generation copies to agree.
- * It never selects a generation below acknowledged (STALE), a tree log outside
- * the primary copy (UNSUPPORTED) or a copy of another filesystem (CORRUPT). A
- * selected primary may name a pending tree log, which Linux's fsync writes to
- * the primary alone: equal copies then name none, the copies recovery rewrites
- * name none either, and btrfs_replay_log replays the log. When copies disagree,
- * it first opens the selection's chunk, root, extent and device trees and its
- * allocation map. A NULL writer only inspects and then returns RECOVERY_REQUIRED.
- * With a writer, each disagreeing copy is rewritten from the selected copy, which
- * itself is never written, followed by one barrier. The report's status fields
- * describe the copies as found; current describes them after a successful call. */
+ * the newest checksum-valid copy on any device of the volume, every one of which
+ * the environment names (UNSUPPORTED otherwise), and requires equal-generation
+ * copies to agree but for each device's own item. A device's copies must name one
+ * device, and the devices distinct ones. It never selects a generation below
+ * acknowledged (STALE), a tree log outside a primary copy (UNSUPPORTED) or a copy
+ * of another filesystem (CORRUPT). A selected primary may name a pending tree
+ * log, which Linux's fsync writes to the primaries alone: equal secondaries then
+ * name none, the copies recovery rewrites name none either, so every primary
+ * must already name it, and btrfs_replay_log replays the log. When copies
+ * disagree, it first opens the selection's chunk, root, extent and device trees
+ * and its allocation map on every device. A NULL writer only inspects and then
+ * returns RECOVERY_REQUIRED. With a writer, which writes each further device
+ * too, each disagreeing copy is rewritten from the selection with its device's
+ * item, whose used bytes the selection's chunk tree gives, followed by a
+ * barrier on every device; the selected copy itself is never written. The
+ * report's status fields describe the copies as found; current describes them
+ * after a successful call. */
 enum btrfs_result btrfs_recover_supers(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, uint64_t acknowledged,
     struct btrfs_recovery_report *report);
@@ -188,17 +215,24 @@ enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
     struct btrfs_balance_report *report);
 
-/* Current admission: any of Linux's four checksum algorithms, skinny metadata,
- * SINGLE/DUP, no free-space cache tree, quotas or mixed groups. At least two
- * superblock copies must exist and agree with the mounted primary; otherwise
- * begin returns RECOVERY_REQUIRED. Changes are confined to unshared top-level
- * tree paths. Unsupported layouts return before any media write. Native
- * adapters open read-write only on request, and run btrfs_recover_supers first
- * when admission returns RECOVERY_REQUIRED.
+/* Admission: any of Linux's four checksum algorithms, skinny metadata, the
+ * free-space and block-group trees, fs-verity, quotas and simple quotas, and
+ * mixed groups whose nodes are one sector, on one device or on several: every
+ * device of the volume present (not degraded), a writer device for each
+ * further one (INVALID_ARGUMENT otherwise), and any profile but RAID5/6. New
+ * chunks grow on a volume of one device only; on one of several an operation
+ * that needs one is refused (NO_SPACE or UNSUPPORTED). Every device must hold
+ * at least two superblock copies that agree with the mounted primary;
+ * otherwise begin returns RECOVERY_REQUIRED. Unsupported layouts return
+ * before any media write. Native adapters open read-write only on request,
+ * and run btrfs_recover_supers first when admission returns
+ * RECOVERY_REQUIRED.
  *
- * Commit writes new metadata, barrier, secondary superblocks, barrier, primary,
- * barrier. Every crash point therefore retains a valid copy at the last
- * acknowledged generation or later; btrfs_recover_supers selects it. */
+ * Commit writes new metadata (every copy on its device), a barrier on every
+ * device, the secondary superblocks of every device, barriers, the primaries,
+ * barriers; each device's superblocks carry its own device item. Every crash
+ * point therefore retains a valid copy at the last acknowledged generation or
+ * later; btrfs_recover_supers selects it. */
 enum btrfs_result btrfs_transaction_begin(const struct btrfs_fs *base,
     const struct btrfs_write_environment *environment, struct btrfs_transaction **result);
 /* Inode numbers and directory indexes that stay unique across the transactions

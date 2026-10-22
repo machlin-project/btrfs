@@ -178,7 +178,7 @@ overlay_environment(struct overlay *overlay, struct btrfs_environment *environme
 	environment->allocate = overlay_allocate;
 	environment->release = overlay_release;
 	*writer = (struct btrfs_write_environment){ overlay, overlay_write, overlay_flush, NULL,
-		BTRFS_COMPRESSION_NONE, 0 };
+		BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 }
 
 /* A crash state: the first visible writes of source, then fresh writes. */
@@ -395,7 +395,7 @@ main(int argc, char **argv)
 		single_wait, single_wake };
 	struct refusal refusal = { 0, 0 };
 	struct btrfs_write_environment refused = { &refusal, refused_write, refused_flush, NULL,
-		BTRFS_COMPRESSION_NONE, 0 };
+		BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 	struct btrfs_environment environment;
 	struct btrfs_write_environment writer;
 	struct btrfs_relocation_report report;

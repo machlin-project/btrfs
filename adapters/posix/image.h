@@ -22,6 +22,7 @@ struct btrfs_image {
 	uint64_t fail_read, fail_allocate;
 	struct btrfs_image_device extra[BTRFS_IMAGE_DEVICES];
 	struct btrfs_device devices[BTRFS_IMAGE_DEVICES];
+	struct btrfs_write_device writers[BTRFS_IMAGE_DEVICES];
 };
 
 int btrfs_image_open(const char *path, struct btrfs_image *image);
@@ -29,8 +30,11 @@ int btrfs_image_open(const char *path, struct btrfs_image *image);
  * first is the device it is mounted from, the others its further devices. */
 int btrfs_image_open_devices(const char *const *paths, size_t count, struct btrfs_image *image);
 /* Opens the image for reading and writing; btrfs_image_writer then supplies
- * exact positioned writes and a barrier that reaches stable storage. */
+ * exact positioned writes and a barrier that reaches stable storage, on each
+ * device the images of btrfs_image_open_devices_writable. */
 int btrfs_image_open_writable(const char *path, struct btrfs_image *image);
+int btrfs_image_open_devices_writable(
+    const char *const *paths, size_t count, struct btrfs_image *image);
 void btrfs_image_writer(struct btrfs_image *image, struct btrfs_write_environment *writer);
 void btrfs_image_close(struct btrfs_image *image);
 /* zlib and Zstd compression for the write environment's compress callback. */

@@ -55,7 +55,7 @@ unmounts, detach operations and unchanged-media hash checks must succeed.
 | Immutable reader | Validated geometry, chunks, trees, inodes, namespaces, extents/checksums, subvolumes and xattrs | `core/{mount,chunk,tree,inode,directory,parent,read,xattr}.c` |
 | Private tree editor | Path CoW; insert/replace/upsert/delete; variable-item splits including three leaves; root growth and collapse; poisoned failures | `core/mutable.c`, `tests/mutable.c` |
 | Reservation allocator | Extent-map and block-group reconciliation, physical alias/super-stripe exclusion, pinned committed allocations, bounded free gaps | `core/space.c` |
-| Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission, reference/accounting fixed point, root/backup updates, three barriers, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
+| Transaction owner | Multi-inode inline replacement, copy agreement/staleness admission on every device, reference/accounting fixed point, root/backup updates, three barriers on every device, terminal failures | `core/transaction.c`, `include/btrfs/write.h` |
 | Superblock recovery | Explicit newest-valid-copy selection with acknowledged floor, foreign-copy and non-primary-log refusal, a primary's log kept for replay, selection validation, rewrite of disagreeing copies | `core/recovery.c`, `include/btrfs/write.h` |
 | Tree-log replay | Linux's log passes in one transaction through a G+1 log view: withheld log blocks and logged extents, inode overwrite rules, directory and xattr deletions, names, back references, file extents with references, allocation and checksums, link-count fixups with orphans | `core/replay.c`, `include/btrfs/write.h`, `tests/replay.c` |
 | Free-space tree | Verification against the extent tree, logged allocation changes applied in the fixed point, extents and bitmaps | `core/fst.c`, `core/space.c` |
@@ -148,7 +148,12 @@ is destroyed. `accept` is legal only after successful durable publication;
    are read and written against fixtures a 16 KiB-page Linux wrote. Volumes
    of several devices are read with every Linux profile (`core/chunk.c`,
    `tests/multidev.c`), degraded and with RAID5/6 data rebuilt from parity
-   (`core/raid56.c`); remaining there: writing several devices; 64 KiB
+   (`core/raid56.c`), and written in the chunks they hold with every profile
+   but RAID5/6, every copy on its device, each device's superblocks with its
+   own item, and recovered across devices (`tests/multidev_write.c`);
+   remaining there: new chunks across several devices (Linux's
+   `gather_device_info` and stripe sizing), balance on them, and RAID5/6
+   writes with their parity; 64 KiB
    sectors against an image btrfs-progs formatted, whose check and restore
    accept what is written (`tests/large_sectors.c`). Remaining: a Linux
    kernel's verdict on 64 KiB sectors, which needs a 64 KiB-page kernel that

@@ -216,6 +216,10 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	    (writer != NULL && (writer->write == NULL || writer->flush == NULL))) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
+	/* The volume counts and orders the writes of one device. */
+	if (writer != NULL && writer->device_count != 0) {
+		return BTRFS_UNSUPPORTED;
+	}
 	*result = NULL;
 	volume = environment->allocate(environment->context, sizeof(*volume));
 	if (volume == NULL) {
@@ -252,6 +256,8 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 		volume->counted.compress = writer->compress != NULL ? volume_compress : NULL;
 		volume->counted.compression = writer->compression;
 		volume->counted.compress_force = writer->compress_force;
+		volume->counted.devices = NULL;
+		volume->counted.device_count = 0;
 	}
 	error = volume_view(volume, &volume->current);
 	if (error == BTRFS_OK && volume->writable) {

@@ -116,16 +116,15 @@ bt_group_system_array_remove(struct btrfs_transaction *transaction, uint64_t log
 
 /* The items of one removed group, as btrfs_remove_chunk and
  * btrfs_remove_block_group delete them: the block group and its free-space
- * items, the device extents with the device's used bytes, and the chunk item
+ * items, the device extents with their devices' used bytes, the chunk item
  * (and system array entry). Its device space is free from the next
  * transaction on. */
 static enum btrfs_result
 bt_group_remove(struct btrfs_transaction *transaction, const struct bt_chunk *chunk)
 {
-	struct bt_disk_device device;
-	const struct btrfs_fs *base = transaction->base;
+	const struct bt_device *device;
 	struct bt_key key = { chunk->logical, chunk->length, BT_BLOCK_GROUP_ITEM };
-	size_t size;
+	uint64_t length = bt_chunk_stripe_length(chunk);
 	unsigned stripe;
 	enum btrfs_result error;
 
@@ -134,27 +133,14 @@ bt_group_remove(struct btrfs_transaction *transaction, const struct bt_chunk *ch
 		error = bt_fst_remove_group(
 		    transaction->mutation, &transaction->free_space.root, chunk);
 	}
-	for (stripe = 0; error == BTRFS_OK && stripe < chunk->mirrors; stripe++) {
-		key = (struct bt_key){ base->device_id, chunk->physical[stripe], BT_DEV_EXTENT };
+	for (stripe = 0; error == BTRFS_OK && stripe < chunk->stripes; stripe++) {
+		device = &transaction->fs.devices[chunk->devices[stripe]];
+		key = (struct bt_key){ device->id, chunk->physical[stripe], BT_DEV_EXTENT };
 		error =
 		    bt_tx_edit(transaction, &transaction->devices.root, key, NULL, 0, BT_DELETE);
-	}
-	key = (struct bt_key){ BT_DEV_ITEMS_OBJECTID, base->device_id, BT_DEV_ITEM };
-	if (error == BTRFS_OK) {
-		error = bt_mutation_find(transaction->mutation, transaction->chunks, key, &device,
-		    sizeof(device), &size);
-		error = error == BTRFS_OK &&
-			(size != sizeof(device) ||
-			    bt_u64(device.used_bytes) < chunk->length * chunk->mirrors)
-		    ? BTRFS_CORRUPT
-		    : error;
-	}
-	if (error == BTRFS_OK) {
-		bt_put64(
-		    &device.used_bytes, bt_u64(device.used_bytes) - chunk->length * chunk->mirrors);
-		transaction->super.device.used_bytes = device.used_bytes;
-		error = bt_tx_edit(
-		    transaction, &transaction->chunks, key, &device, sizeof(device), BT_REPLACE);
+		if (error == BTRFS_OK) {
+			error = bt_tx_device_used(transaction, device->id, length, 0);
+		}
 	}
 	if (error == BTRFS_OK) {
 		key = (struct bt_key){ BT_FIRST_CHUNK_OBJECTID, chunk->logical, BT_CHUNK_ITEM };

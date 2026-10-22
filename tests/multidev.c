@@ -10,8 +10,9 @@
  * unless degraded: then every file reads as before where each chunk keeps a
  * copy or its parity, and otherwise fails to read (IO) but never reads other
  * bytes; volumes whose chunks all survive two lost devices are read without
- * each pair too. A device of another volume among them is CORRUPT, and
- * writable admission refuses the volume before any write. */
+ * each pair too. A device of another volume among them is CORRUPT, and a
+ * writer without the further devices is refused before any write
+ * (tests/multidev_write.c writes them). */
 #include "../adapters/posix/image.h"
 #include "internal.h"
 #include "namespace_audit.h"
@@ -200,7 +201,7 @@ main(int argc, char **argv)
 {
 	const char *paths[MAX_DEVICES];
 	struct btrfs_write_environment refused = { NULL, refused_write, refused_flush, NULL,
-		BTRFS_COMPRESSION_NONE, 0 };
+		BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 	struct reference_audit references;
 	struct namespace_audit names;
 	struct namespace_digest digest;
@@ -239,7 +240,7 @@ main(int argc, char **argv)
 		exit(1);
 	}
 	REQUIRE(namespace_content_digest(fs, &digest) == 0);
-	REQUIRE(btrfs_transaction_begin(fs, &refused, &transaction) == BTRFS_UNSUPPORTED);
+	REQUIRE(btrfs_transaction_begin(fs, &refused, &transaction) == BTRFS_INVALID_ARGUMENT);
 	btrfs_unmount(fs);
 	REQUIRE(image.live_allocations == 0);
 	btrfs_image_close(&image);
@@ -292,7 +293,7 @@ main(int argc, char **argv)
 	       "(%zu checksummed copies); mounted from each device the volume reads the same; "
 	       "degraded without each of %zu devices (%zu files lost in all) and each of %zu "
 	       "pairs the volume reads as before where its chunks survive; a foreign device "
-	       "and writable admission are refused PASS\n",
+	       "and a writer without the further devices are refused PASS\n",
 	    devices, files, references.checked_copies, degraded, lost, pairs);
 	return 0;
 }

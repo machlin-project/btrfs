@@ -475,8 +475,35 @@ grep -a '^BTRFS_MULTI_MANIFEST:' ../btrfs/logs/multi-raid10-create.log | \
 Require `BTRFS_MULTI_CREATED`. `btrfs-multidev-test MANIFEST FOREIGN DEVICE...`
 (`tests/multidev.c`) reads every manifest entry, runs both audits, mounts the
 volume from each device, and requires a missing device, a FOREIGN volume's
-image in place of the last device and writable admission to be refused; the
-`multi-*` Meson tests run it.
+image in place of the last device and a writer without the further devices to
+be refused; the `multi-*` Meson tests run it.
+
+`btrfs-multidev-write-test NAME MANIFEST EXPORT|- DEVICE...`
+(`tests/multidev_write.c`) writes five transactions to a recording of the
+devices, checks every file against a model after each commit, then every state
+a power cut leaves at a barrier or superblock write of each commit (with all,
+only the durable, or a random part of each device's pending writes on media)
+after superblock recovery; it requires a writer without each device, a degraded
+mount and RAID5/6 volumes to be refused before any write. The
+`multi-*-writes` Meson tests run it without export. With an EXPORT directory
+(new and empty), it clones the devices there as `NAME-N.raw`, applies its
+writes and writes the model's manifest as `NAME.expected.tsv`; Linux then
+checks them with the `verify` phase (from `lab/`):
+
+```sh
+python3 ../btrfs/tests/prepare_multidev_linux.py --root artifacts/btrfs-reference/root-multi \
+  --phase verify --profile multi-raid10 --archive artifacts/btrfs-reference/multi-raid10-verify.cpio
+.cache/linux-reference/linux-vm-disks .cache/linux-reference/Image \
+  artifacts/btrfs-reference/multi-raid10-verify.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/EXPORT/multi-raid10-{0,1,2,3}.raw > ../btrfs/logs/multi-raid10-verify.log 2>&1
+grep -a '^BTRFS_MULTI_MANIFEST:' ../btrfs/logs/multi-raid10-verify.log | \
+  sed 's/^BTRFS_MULTI_MANIFEST://' | tr -d '\r' | \
+  cmp - ../btrfs/artifacts/EXPORT/multi-raid10.expected.tsv
+```
+
+Require `BTRFS_MULTI_VERIFY_PASS` (`btrfs check --readonly --check-data-csum`
+before and after Linux writes a file) and an empty `cmp`.
 
 ## Balance
 

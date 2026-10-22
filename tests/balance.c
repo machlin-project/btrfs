@@ -181,7 +181,7 @@ overlay_environment(struct overlay *overlay, struct btrfs_environment *environme
 	environment->allocate = overlay_allocate;
 	environment->release = overlay_release;
 	*writer = (struct btrfs_write_environment){ overlay, overlay_write, overlay_flush,
-		btrfs_image_compress, BTRFS_COMPRESSION_NONE, 0 };
+		btrfs_image_compress, BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 }
 
 /* A crash state: the first visible writes of source, then fresh writes. */

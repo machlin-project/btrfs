@@ -244,7 +244,7 @@ overlay_environment(struct overlay *overlay, struct btrfs_environment *environme
 	environment->allocate = allocate;
 	environment->release = release;
 	*writer = (struct btrfs_write_environment){ overlay, overlay_write, overlay_flush, NULL,
-		BTRFS_COMPRESSION_NONE, 0 };
+		BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 }
 
 static void *

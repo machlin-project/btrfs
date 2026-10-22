@@ -19,15 +19,17 @@ void __asan_unpoison_memory_region(void const volatile *address, size_t size);
 
 struct bt_mutable_node;
 
+/* One copy of a node: where it lies on which of the volume's devices. */
 struct bt_shadow {
 	struct bt_shadow *next;
 	struct bt_mutable_node *node;
 	uint64_t physical;
+	uint32_t device;
 };
 
 struct bt_mutable_node {
 	struct bt_mutable_node *next;
-	struct bt_shadow shadows[2];
+	struct bt_shadow shadows[BT_MAX_COPIES];
 	uint8_t *bytes;
 	uint64_t address;
 	/* The tree the node belongs to; a relocation tree's nodes keep the
@@ -62,9 +64,21 @@ struct bt_mut_split {
 	size_t count;
 };
 
+struct bt_mutation;
+
+/* A further device of the view, read through the mutation. */
+struct bt_mut_device {
+	struct bt_mutation *mutation;
+	uint32_t index;
+};
+
 struct bt_mutation {
 	const struct btrfs_fs *base;
 	struct btrfs_fs view;
+	/* The view's device table: every device reads this mutation's node
+	 * copies where they lie, as the first does through the view's read. */
+	struct bt_device *devices;
+	struct bt_mut_device device_contexts[BT_MAX_DEVICES];
 	struct bt_mutation_allocator allocator;
 	struct bt_mutable_node *logical[BT_MUTATION_BUCKETS];
 	struct bt_shadow *physical[BT_MUTATION_BUCKETS];
@@ -152,25 +166,54 @@ bt_mut_checksum(struct bt_mutation *mutation, struct bt_mutable_node *node)
 	}
 }
 
+static struct bt_shadow *
+bt_mut_find_shadow(const struct bt_mutation *mutation, uint32_t device, uint64_t physical)
+{
+	struct bt_shadow *shadow;
+
+	for (shadow = mutation->physical[bt_mut_hash(physical)]; shadow != NULL;
+	    shadow = shadow->next) {
+		if (shadow->physical == physical && shadow->device == device) {
+			return shadow;
+		}
+	}
+	return NULL;
+}
+
+/* Reads of one device of the view: a copy of a node of this mutation as it
+ * will be written, anything else from the device. */
+static enum btrfs_result
+bt_mut_read_on(
+    struct bt_mutation *mutation, uint32_t device, uint64_t offset, void *buffer, size_t length)
+{
+	struct bt_shadow *shadow = bt_mut_find_shadow(mutation, device, offset);
+	const struct btrfs_environment *env = &mutation->base->env;
+	const struct bt_device *source = &mutation->base->devices[device];
+
+	if (shadow != NULL) {
+		if (length != mutation->view.info.node_size || shadow->node->discarded) {
+			return BTRFS_CORRUPT;
+		}
+		bt_mut_checksum(mutation, shadow->node);
+		bt_copy(buffer, shadow->node->bytes, length);
+		return BTRFS_OK;
+	}
+	return device == 0 ? env->read(env->context, offset, buffer, length)
+			   : source->read(source->context, offset, buffer, length);
+}
+
 static enum btrfs_result
 bt_mut_read(void *context, uint64_t offset, void *buffer, size_t length)
 {
-	struct bt_mutation *mutation = context;
-	struct bt_shadow *shadow;
-	const struct btrfs_environment *env = &mutation->base->env;
+	return bt_mut_read_on(context, 0, offset, buffer, length);
+}
 
-	for (shadow = mutation->physical[bt_mut_hash(offset)]; shadow != NULL;
-	    shadow = shadow->next) {
-		if (shadow->physical == offset) {
-			if (length != mutation->view.info.node_size || shadow->node->discarded) {
-				return BTRFS_CORRUPT;
-			}
-			bt_mut_checksum(mutation, shadow->node);
-			bt_copy(buffer, shadow->node->bytes, length);
-			return BTRFS_OK;
-		}
-	}
-	return env->read(env->context, offset, buffer, length);
+static enum btrfs_result
+bt_mut_read_device(void *context, uint64_t offset, void *buffer, size_t length)
+{
+	struct bt_mut_device *device = context;
+
+	return bt_mut_read_on(device->mutation, device->index, offset, buffer, length);
 }
 
 /* A cursor still reading the nodes in place would see them change: the edit
@@ -273,9 +316,9 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 	struct bt_mutable_node *node;
 	struct bt_disk_header *header;
 	struct bt_shadow *shadow;
+	struct bt_place places[BT_MAX_COPIES];
 	const struct btrfs_environment *env = &mutation->base->env;
 	uint64_t address;
-	uint64_t physical[BT_MAX_MIRRORS];
 	uint64_t kind = root.owner == BT_CHUNK_TREE ? BT_BLOCK_SYSTEM : BT_BLOCK_METADATA;
 	unsigned mirrors = 1;
 	unsigned i;
@@ -312,18 +355,18 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 		error = BTRFS_CORRUPT;
 		goto unreserve;
 	}
+	/* Every copy lies whole on one device: a node never crosses a stripe. */
 	for (i = 0; i < mirrors; i++) {
-		error = bt_map(mutation->base, address, mutation->view.info.node_size, kind, i,
-		    &physical[i], &mirrors);
+		error = bt_map_place(mutation->base, address, mutation->view.info.node_size, kind,
+		    i, &places[i], &mirrors);
+		if (error == BTRFS_OK &&
+		    (mirrors > BT_MAX_COPIES || places[i].span != mutation->view.info.node_size ||
+			bt_mut_find_shadow(mutation, places[i].device, places[i].physical) !=
+			    NULL)) {
+			error = BTRFS_CORRUPT;
+		}
 		if (error != BTRFS_OK) {
 			goto unreserve;
-		}
-		for (shadow = mutation->physical[bt_mut_hash(physical[i])]; shadow != NULL;
-		    shadow = shadow->next) {
-			if (shadow->physical == physical[i]) {
-				error = BTRFS_CORRUPT;
-				goto unreserve;
-			}
 		}
 	}
 	bt_copy(node->bytes, source, mutation->view.info.node_size);
@@ -356,8 +399,9 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 	for (i = 0; i < mirrors; i++) {
 		shadow = &node->shadows[i];
 		shadow->node = node;
-		shadow->physical = physical[i];
-		bucket = bt_mut_hash(physical[i]);
+		shadow->physical = places[i].physical;
+		shadow->device = places[i].device;
+		bucket = bt_mut_hash(places[i].physical);
 		shadow->next = mutation->physical[bucket];
 		mutation->physical[bucket] = shadow;
 	}
@@ -1386,6 +1430,7 @@ bt_mutation_create(const struct btrfs_fs *base, const struct bt_mutation_allocat
 {
 	struct bt_mutation *mutation;
 	const struct btrfs_environment *env;
+	size_t i;
 
 	if (result == NULL) {
 		return BTRFS_INVALID_ARGUMENT;
@@ -1427,11 +1472,23 @@ bt_mutation_create(const struct btrfs_fs *base, const struct bt_mutation_allocat
 	mutation->merge_scratch = env->allocate(env->context, base->info.node_size);
 	mutation->records =
 	    env->allocate(env->context, mutation->record_capacity * sizeof(*mutation->records));
+	mutation->devices =
+	    env->allocate(env->context, base->device_capacity * sizeof(*mutation->devices));
 	if (mutation->nodes == NULL || mutation->scratch == NULL ||
-	    mutation->merge_scratch == NULL || mutation->records == NULL) {
+	    mutation->merge_scratch == NULL || mutation->records == NULL ||
+	    mutation->devices == NULL) {
 		bt_mutation_destroy(mutation);
 		return BTRFS_NO_MEMORY;
 	}
+	bt_copy(mutation->devices, base->devices, base->device_count * sizeof(*base->devices));
+	for (i = 1; i < base->device_count; i++) {
+		mutation->device_contexts[i] = (struct bt_mut_device){ mutation, (uint32_t)i };
+		if (base->devices[i].read != NULL) {
+			mutation->devices[i].context = &mutation->device_contexts[i];
+			mutation->devices[i].read = bt_mut_read_device;
+		}
+	}
+	mutation->view.devices = mutation->devices;
 	*result = mutation;
 	return BTRFS_OK;
 }
@@ -1774,6 +1831,10 @@ bt_mutation_destroy(struct bt_mutation *mutation)
 	if (mutation->nodes != NULL) {
 		env->release(env->context, mutation->nodes,
 		    mutation->allocator.node_limit * sizeof(*mutation->nodes));
+	}
+	if (mutation->devices != NULL) {
+		env->release(env->context, mutation->devices,
+		    mutation->base->device_capacity * sizeof(*mutation->devices));
 	}
 	env->release(env->context, mutation, sizeof(*mutation));
 }

@@ -129,8 +129,24 @@ copies rebuilt from the same offset in the other stripes of their row
 (polynomial 0x11d, generator 2): from P and the other data stripes, for RAID6
 from Q and the other data stripes, and from P and Q with each other data
 stripe of the row lost too; a read or check takes the first that verifies.
-No repair is written. The writer writes one device with SINGLE and DUP
-chunks; transaction admission refuses any other volume (UNSUPPORTED).
+No repair is written.
+
+The writer writes every profile but RAID5 and RAID6, whose data and parity
+would have to change together. Admission needs every device of the volume (a
+degraded mount is refused, UNSUPPORTED) and a write environment with a writer
+device for each further device in the reader environment's order
+(INVALID_ARGUMENT otherwise); the device table keeps the environment's order,
+so device index i writes through the same device it reads. A new node takes
+every copy `btrfs_map_block` gives it, each whole on one device since a node
+never crosses a 64 KiB stripe; the transaction's view reads its own node
+copies by device and offset, on every device. New data goes to every copy in
+pieces cut at stripe boundaries. Group removal deletes each stripe's device
+extent and shrinks the used bytes of the stripe's device. Each device's
+superblocks carry that device's item (its used bytes as the chunk tree
+records them); every other field is the volume's. New chunks are created on
+volumes of one device only: on a volume of several, an operation that needs
+one is refused (NO_SPACE where a room check finds none, UNSUPPORTED where the
+allocator would grow one).
 
 A cursor retains one heap buffer per tree level. Internal keys are numerically
 ordered by object ID, type and offset. Each child must match its parent's first
@@ -394,8 +410,10 @@ block-group record may lie between chunks (nor beyond the last one, checked at
 start), extents must be aligned, disjoint and bounded by their chunk, they must
 sum to its block-group total, and its free runs must equal its free-space items.
 Nothing is allocated in, or released into, a chunk before it is loaded. The
-start rejects physical chunk aliases; a load removes superblock stripes from the
-chunk's free ranges, and the allocator produces bounded metadata reservations.
+start rejects physical chunk aliases on each device; a load removes from the
+chunk's free ranges every range Linux's `exclude_super_stripes` finds with
+`btrfs_rmap_block` (one 64 KiB stripe per superblock copy on a stripe's
+device, a full row of data stripes for RAID5/6), and the allocator produces bounded metadata reservations.
 Until a chunk loads, its free bytes come from its block-group total, so the
 space checks see the whole class.
 It pins the committed allocation map for the whole transaction and never reuses a
@@ -410,7 +428,7 @@ chunks as it needs them: the state was verified when it was loaded, and only
 this owner's commits changed it since. A successful commit adds the chunks it
 loaded, then replays into the map its grown chunks (free as a
 whole, minus superblock stripes), its allocation log in order, its block-group
-totals and its removed groups, and derives the device's free ranges from the
+totals and its removed groups, and derives each device's free ranges from the
 chunk map; a map that cannot follow is dropped, and any other base is loaded,
 verified and saved. A failed or aborted transaction leaves the map at its
 generation. Grouping many operations into one commit, with the reservations and
@@ -515,10 +533,11 @@ Linux records it for snapshots.
 
 A transaction works on a private copy of the chunk map with room for every
 chunk the format allows; the mutation, allocator and publisher all map through
-it. Admission verifies the device item and device extents against the chunk
-map: every stripe has exactly one extent, extents do not overlap, stay inside
-the device and above Linux's reserved first MiB, and sum to the device's used
-bytes. The gaps between them are the device's unallocated space.
+it. Admission verifies each device's item and device extents against the
+chunk map: every stripe has exactly one extent on its device, of the chunk's
+stripe length, extents do not overlap, stay inside the device and above
+Linux's reserved first MiB, and sum to the device's used bytes. The gaps
+between them are the device's unallocated space.
 
 When a reservation finds no free range, the allocator creates a chunk of that
 class in memory only, sized and placed as Linux's `btrfs_create_chunk` does on
@@ -1387,21 +1406,25 @@ mounted write suite stays a recorded failure on FSKit.
 ## Superblock copies, publication and recovery
 
 Linux maintains a superblock copy at 64 KiB, 64 MiB and 256 GiB when the copy
-ends strictly before the device end. Copies differ only in their offset and
-checksum. Admission requires at least two copies, each intact and identical to
-the mounted primary; otherwise `begin` returns RECOVERY_REQUIRED. A disagreement
-means an earlier publication was not resolved, and a new commit could reuse blocks
-that a newer copy still references. Commit re-reads every copy and returns STALE
-if any changed after `begin`.
+ends strictly before the device end, on every device of the volume. Copies on
+one device differ only in their offset and checksum; those of two devices also
+in the device item. Admission requires at least two copies on each device, each
+intact and identical to its device's primary, and each device's primary equal
+to the mounted one but for its item; otherwise `begin` returns
+RECOVERY_REQUIRED. A disagreement means an earlier publication was not
+resolved, and a new commit could reuse blocks that a newer copy still
+references. Commit re-reads every copy and returns STALE if any changed after
+`begin`.
 
-The publisher writes new metadata in physical order, merging contiguous node
-copies into writes of at most 256 KiB (an order the barrier below makes free to
-choose), then:
+The publisher writes new metadata in device and physical order, merging
+contiguous node copies of one device into writes of at most 256 KiB (an order
+the barrier below makes free to choose), then:
 
-1. barrier: the new tree is durable but unreferenced;
-2. secondary copies, barrier: the untouched primary still names the
-   acknowledged generation;
-3. primary copy, barrier: success is returned only after this barrier.
+1. barrier on every device: the new tree is durable but unreferenced;
+2. secondary copies of every device, barrier on every device: the untouched
+   primaries still name the acknowledged generation;
+3. primary copies, barrier on every device: success is returned only after
+   these barriers.
 
 Between barriers the device may persist issued writes in any order and tear any
 of them at sector granularity. At every crash point at least one intact copy
@@ -1418,18 +1441,27 @@ device persistence/atomicity guarantee and its own recovery oracle; ordinary
 completion of a write callback supplies neither.
 
 Mount reads only the primary, so a torn primary fails as CORRUPT and an older
-mirror is never silently chosen. `btrfs_recover_supers` is the explicit,
-exclusive recovery operation, matching `btrfs rescue super-recover`: it selects
-the newest checksum-valid copy, requires same-generation copies to agree, and
-refuses a selection below the caller's acknowledged generation (STALE), a tree
-log named outside the primary (UNSUPPORTED) or a copy with another filesystem
-identity (CORRUPT). Linux's fsync writes the log root into the primary alone, so
-a selected primary may name a log: a same-generation copy that differs only by
-naming none agrees with it, rewritten copies name none, and the log stays for
-replay.
+mirror is never silently chosen; devices whose primaries name two generations,
+as a cut between them leaves a volume of several, are STALE.
+`btrfs_recover_supers` is the explicit, exclusive recovery operation, matching
+`btrfs rescue super-recover`: it reads every copy on every device of the volume
+(all of which the environment must name), selects the newest checksum-valid
+copy, requires same-generation copies to agree but for each device's own item,
+and refuses a selection below the caller's acknowledged generation (STALE), a
+tree log named outside a primary (UNSUPPORTED) or a copy with another filesystem
+identity or a device named twice (CORRUPT). Each device is identified by its
+copy at the selected generation, else its newest one. Linux's fsync writes the
+log root into the primaries alone, so a selected primary may name a log: a
+same-generation secondary that differs only by naming none agrees with it,
+rewritten copies name none, so every primary must already name it, and the log
+stays for replay.
 Before writing, it opens the selection's chunk, root, checksum, top-level, device
-and extent trees and allocation map; file trees are not scrubbed. It rewrites
-only disagreeing copies, never the selected source, followed by one barrier.
+and extent trees and allocation map on all devices, each further device's
+primary read as the selection gives it; a device without a copy at the selected
+generation takes its used bytes from the selection's chunk tree, whose item
+must otherwise agree with its own. File trees are not scrubbed. It rewrites
+only disagreeing copies, each with its device's item, never the selected
+source, followed by a barrier on every device.
 Without a writer it reports the decision and returns RECOVERY_REQUIRED.
 `btrfs-inspect IMAGE recover` offers it for image files: without `--apply` it
 prints the decision (each copy's status and generation, the selection) as JSON,

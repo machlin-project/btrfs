@@ -108,7 +108,7 @@ main(int argc, char **argv)
 	context->env.decompress = decompress_device;
 	context->writer = (struct btrfs_write_environment){ context->device, write_device,
 		flush_device, kernel_codecs ? kernel_compress : btrfs_image_compress,
-		BTRFS_COMPRESSION_NONE, 0 };
+		BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
 	context->seed = UINT32_C(0x142857);
 	REQUIRE(btrfs_mount(&context->env, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 	btrfs_get_info(fs, &info);

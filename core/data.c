@@ -558,27 +558,32 @@ bt_tx_shrink(struct btrfs_transaction *transaction, struct bt_owned_root *tree, 
 
 /* Writes new data to its extent now: no committed root references the space,
  * and the commit's first barrier makes it durable before any metadata naming
- * it. A failed write fails the transaction. */
+ * it. Each copy goes in pieces of at most BT_DATA_WRITE, cut where a striped
+ * profile moves on to its next stripe. A failed write fails the
+ * transaction. */
 enum btrfs_result
 bt_tx_write_data(
     struct btrfs_transaction *transaction, uint64_t logical, const uint8_t *bytes, uint64_t length)
 {
-	uint64_t physical;
+	struct bt_place place;
+	struct bt_tx_device *target;
 	uint64_t done;
-	size_t chunk = 0;
+	size_t piece = 0;
 	unsigned mirrors = 1;
 	unsigned mirror;
 	enum btrfs_result error = BTRFS_OK;
 
 	for (mirror = 0; error == BTRFS_OK && mirror < mirrors; mirror++) {
-		for (done = 0; error == BTRFS_OK && done < length; done += chunk) {
-			chunk =
+		for (done = 0; error == BTRFS_OK && done < length; done += piece) {
+			piece =
 			    length - done < BT_DATA_WRITE ? (size_t)(length - done) : BT_DATA_WRITE;
-			error = bt_map(&transaction->fs, logical + done, chunk, BT_BLOCK_DATA,
-			    mirror, &physical, &mirrors);
+			error = bt_map_place(&transaction->fs, logical + done, piece, BT_BLOCK_DATA,
+			    mirror, &place, &mirrors);
 			if (error == BTRFS_OK) {
-				error = transaction->io.write(
-				    transaction->io.context, physical, bytes + done, chunk);
+				piece = place.span;
+				target = &transaction->targets[place.device];
+				error = target->write(
+				    target->context, place.physical, bytes + done, piece);
 			}
 		}
 	}

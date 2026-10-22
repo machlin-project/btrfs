@@ -87,17 +87,16 @@ struct bt_root {
 	uint8_t level;
 };
 
-/* Copies of a block: SINGLE has one, DUP two on the same device. */
-/* Copies the writer writes (DUP). */
-#define BT_MAX_MIRRORS 2U
-/* Devices a volume may span, stripes a chunk may have, and copies a read
- * chooses among (RAID1C4). */
-#define BT_MAX_DEVICES 16U
+/* Devices a volume may span, stripes a chunk may have, and copies of a
+ * block (RAID1C4), which a read chooses among and a write writes. */
+#define BT_MAX_DEVICES BTRFS_MAX_DEVICES
 #define BT_MAX_STRIPES 16U
 #define BT_MAX_COPIES 4U
 
 /* One device of the volume, as its superblock names it, and its reads: the
- * environment's for the first, a further device's otherwise. */
+ * environment's for the first, a further device's otherwise. Further devices
+ * keep the environment's order: devices[i + 1] is env.devices[i], and a
+ * degraded mount appends missing ones after them. */
 struct bt_device {
 	uint64_t id, size;
 	uint8_t uuid[BTRFS_UUID_SIZE];
@@ -355,6 +354,9 @@ int bt_super_same(const struct bt_disk_super *a, const struct bt_disk_super *b);
  * agrees with a primary naming a log when it names none and every other
  * field but its own offset and checksum is the primary's. */
 int bt_super_same_but_log(const struct bt_disk_super *copy, const struct bt_disk_super *primary);
+/* Superblocks two devices of one volume hold for one commit: every field
+ * but their offsets, checksums and device items is equal. */
+int bt_super_same_volume(const struct bt_disk_super *a, const struct bt_disk_super *b);
 /* logged admits a pending tree log, recorded in log_root and log_level, for
  * its replay; any other mount refuses it (RECOVERY_REQUIRED). */
 enum btrfs_result bt_mount_super(const struct btrfs_environment *environment,
@@ -366,6 +368,8 @@ size_t bt_chunk_position(const struct btrfs_fs *fs, uint64_t logical);
 size_t bt_chunk_containing(const struct btrfs_fs *fs, uint64_t logical);
 enum btrfs_result bt_chunk_add(
     struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap);
+/* The length of each of the chunk's stripes: its device extents' length. */
+uint64_t bt_chunk_stripe_length(const struct bt_chunk *chunk);
 /* Maps a logical range on one copy (mirror below *mirrors) of a chunk of
  * kind: the place of its start, and how much of it lies contiguous there. */
 enum btrfs_result bt_map_place(const struct btrfs_fs *fs, uint64_t logical, size_t length,

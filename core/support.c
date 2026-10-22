@@ -588,6 +588,21 @@ bt_super_same_but_log(const struct bt_disk_super *copy, const struct bt_disk_sup
 	    bt_equal(a + log_level + 1, b + log_level + 1, sizeof(*copy) - log_level - 1);
 }
 
+int
+bt_super_same_volume(const struct bt_disk_super *a, const struct bt_disk_super *b)
+{
+	const uint8_t *x = (const void *)a;
+	const uint8_t *y = (const void *)b;
+	size_t bytenr = offsetof(struct bt_disk_super, bytenr);
+	size_t flags = offsetof(struct bt_disk_super, flags);
+	size_t device = offsetof(struct bt_disk_super, device);
+	size_t label = offsetof(struct bt_disk_super, label);
+
+	return bt_equal(x + BT_CSUM_SIZE, y + BT_CSUM_SIZE, bytenr - BT_CSUM_SIZE) &&
+	    bt_equal(x + flags, y + flags, device - flags) &&
+	    bt_equal(x + label, y + label, sizeof(*a) - label);
+}
+
 const char *
 btrfs_result_string(enum btrfs_result result)
 {

@@ -744,6 +744,7 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 		return error;
 	}
 	environment.cache = mount->cache;
+	bzero(&writer, sizeof(writer));
 	writer.context = mount;
 	writer.write = btrfs_xnu_resource_write;
 	writer.flush = btrfs_xnu_resource_flush;
