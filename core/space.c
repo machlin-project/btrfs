@@ -73,6 +73,10 @@ struct bt_space {
 	/* Copies a new data or metadata chunk takes (DUP profiles). */
 	unsigned data_copies;
 	unsigned metadata_copies;
+	/* Per class, the profile a new chunk takes when a balance converts the
+	 * class (converting set), else that of an existing chunk. */
+	uint64_t profiles[BT_SPACE_KINDS];
+	int converting[BT_SPACE_KINDS];
 	/* Mixed groups (MIXED_GROUPS): data and metadata share DATA|METADATA
 	 * groups and their one free list, the metadata class. */
 	int mixed;
@@ -838,6 +842,40 @@ bt_space_check_system(struct bt_space *space)
  * free-space items (and a system chunk's superblock array entry) before
  * writing. Profiles copy an existing chunk of the class. Undone with the whole
  * transaction. */
+/* The class index of a chunk kind (BT_BLOCK_DATA, _METADATA, _SYSTEM or
+ * mixed DATA|METADATA, whose list is the metadata class). */
+static enum bt_space_kind
+bt_space_kind_index(uint64_t kind)
+{
+	return kind == BT_BLOCK_SYSTEM ? BT_SPACE_SYSTEM
+	    : kind == BT_BLOCK_DATA    ? BT_SPACE_DATA
+				       : BT_SPACE_METADATA;
+}
+
+enum btrfs_result
+bt_space_set_profile(struct bt_space *space, uint64_t kind, uint64_t profile)
+{
+	enum bt_space_kind index = bt_space_kind_index(kind);
+
+	if (profile != 0 && profile != BT_BLOCK_DUP) {
+		return BTRFS_UNSUPPORTED;
+	}
+	if (space->mixed && kind != BT_BLOCK_SYSTEM) {
+		index = BT_SPACE_METADATA;
+	}
+	space->profiles[index] = profile;
+	space->converting[index] = 1;
+	if (kind & (BT_BLOCK_DATA | BT_BLOCK_METADATA)) {
+		if (space->mixed || kind == BT_BLOCK_DATA) {
+			space->data_copies = profile == BT_BLOCK_DUP ? 2 : 1;
+		}
+		if (space->mixed || kind != BT_BLOCK_DATA) {
+			space->metadata_copies = profile == BT_BLOCK_DUP ? 2 : 1;
+		}
+	}
+	return BTRFS_OK;
+}
+
 enum btrfs_result
 bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 {
@@ -893,6 +931,9 @@ bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum)
 	}
 	if (type == 0 || logical > UINT64_MAX - limit - BT_CHUNK_ALIGN) {
 		return BTRFS_NO_SPACE;
+	}
+	if (space->converting[bt_space_kind_index(kind)]) {
+		type = (type & ~BT_BLOCK_DUP) | space->profiles[bt_space_kind_index(kind)];
 	}
 	logical = (logical + BT_CHUNK_ALIGN - 1) & ~(BT_CHUNK_ALIGN - 1);
 	stripes = type & BT_BLOCK_DUP ? 2 : 1;

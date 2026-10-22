@@ -330,6 +330,14 @@ if fixtures != ''
     test('balance-' + profile, balance_test,
       args: [join_paths(fixtures, profile + '.raw'), '64'], timeout: 900, suite: 'images')
   endforeach
+  # Conversions of every kind to DUP and of data back to single, with the
+  # usage and soft filters.
+  foreach profile : ['transactions', 'transactions-mixed', 'transactions-shared',
+      'transactions-quota', 'sectors-64k']
+    test('balance-convert-' + profile, balance_test,
+      args: ['--convert', join_paths(fixtures, profile + '.raw'), '64'], timeout: 900,
+      suite: 'images')
+  endforeach
   test('balance-faults', balance_test,
     args: ['--faults', join_paths(fixtures, 'transactions.raw'), '64'], timeout: 900,
     suite: 'images')

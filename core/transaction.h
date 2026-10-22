@@ -276,4 +276,9 @@ enum btrfs_result bt_relocate_group(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, uint64_t group, size_t work,
     struct btrfs_balance_report *report);
 
+/* btrfs_balance with steps of at most work (core/balance.c). */
+enum btrfs_result bt_balance(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
+    size_t work, struct btrfs_balance_report *report);
+
 #endif

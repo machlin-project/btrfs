@@ -411,9 +411,80 @@ relocate(const char *path, int argc, char **argv)
 /* Block groups the balance command lists or relocates at most. */
 #define INSPECT_GROUPS 4096U
 
+/* One kind's filters as btrfs-progs takes them after -d, -m or -s:
+ * comma-separated usage=PERCENT, convert=single|dup and soft. */
+static int
+balance_filters(const char *text, struct btrfs_balance_kind *kind)
+{
+	char copy[128];
+	char *word;
+	char *rest;
+
+	*kind = (struct btrfs_balance_kind){ 1, 101, BTRFS_BALANCE_KEEP, 0 };
+	if (strlen(text) >= sizeof(copy)) {
+		return -1;
+	}
+	strcpy(copy, text);
+	for (word = strtok_r(copy, ",", &rest); word != NULL; word = strtok_r(NULL, ",", &rest)) {
+		if (strncmp(word, "usage=", 6) == 0) {
+			kind->usage = (unsigned)strtoul(word + 6, NULL, 10);
+		} else if (strcmp(word, "convert=single") == 0) {
+			kind->convert = BTRFS_BALANCE_SINGLE;
+		} else if (strcmp(word, "convert=dup") == 0) {
+			kind->convert = BTRFS_GROUP_DUP;
+		} else if (strcmp(word, "soft") == 0) {
+			kind->soft = 1;
+		} else {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* btrfs balance start's selection: -d, -m and -s with their filters, -m
+ * applying to system groups too unless -s is given; none selects every
+ * group. */
+static int
+balance_args(int argc, char **argv, struct btrfs_balance_args *args)
+{
+	int any = 0;
+	int system = 0;
+	int i;
+
+	memset(args, 0, sizeof(*args));
+	args->data.convert = BTRFS_BALANCE_KEEP;
+	args->metadata.convert = BTRFS_BALANCE_KEEP;
+	args->system.convert = BTRFS_BALANCE_KEEP;
+	for (i = 0; i < argc; i++) {
+		if (strncmp(argv[i], "-d", 2) == 0 &&
+		    balance_filters(argv[i] + 2, &args->data) == 0) {
+			any = 1;
+		} else if (strncmp(argv[i], "-m", 2) == 0 &&
+		    balance_filters(argv[i] + 2, &args->metadata) == 0) {
+			any = 1;
+		} else if (strncmp(argv[i], "-s", 2) == 0 &&
+		    balance_filters(argv[i] + 2, &args->system) == 0) {
+			any = 1;
+			system = 1;
+		} else {
+			return -1;
+		}
+	}
+	if (!any) {
+		args->data = (struct btrfs_balance_kind){ 1, 101, BTRFS_BALANCE_KEEP, 0 };
+		args->metadata = args->data;
+		args->system = args->data;
+	} else if (args->metadata.enabled && !system) {
+		args->system = args->metadata;
+	}
+	return 0;
+}
+
 /* Explicit balance, never implied by any other command. Without --apply the
- * block groups are listed; with it the named groups, or every group, are
- * relocated and removed one after the other (btrfs_relocate_group). */
+ * block groups are listed; with it the named groups are relocated and
+ * removed one after the other (btrfs_relocate_group), or the groups that
+ * btrfs balance start's filters select (btrfs_balance), every group without
+ * any. */
 static int
 balance(const char *path, int argc, char **argv)
 {
@@ -429,8 +500,15 @@ balance(const char *path, int argc, char **argv)
 	int apply = argc >= 1 && strcmp(argv[0], "--apply") == 0;
 	enum btrfs_result error;
 
-	if (argc > (apply ? 1 : 0) && !apply) {
-		fprintf(stderr, "Usage: btrfs-inspect IMAGE balance [--apply [GROUP...]]\n");
+	struct btrfs_balance_args args;
+	int filtered = apply && argc > 1 && argv[1][0] == '-';
+
+	if ((argc > (apply ? 1 : 0) && !apply) ||
+	    (filtered && balance_args(argc - 1, argv + 1, &args) != 0)) {
+		fprintf(stderr,
+		    "Usage: btrfs-inspect IMAGE balance [--apply [GROUP...|FILTERS]]\n"
+		    "       FILTERS: -d[ARGS] -m[ARGS] -s[ARGS], ARGS: "
+		    "usage=PERCENT,convert=single|dup,soft\n");
 		return 2;
 	}
 	groups = calloc(INSPECT_GROUPS, sizeof(*groups));
@@ -455,7 +533,14 @@ balance(const char *path, int argc, char **argv)
 		       ",\"used\":%" PRIu64 "}\n",
 		    groups[i].logical, groups[i].length, groups[i].flags, groups[i].used);
 	}
-	targets = argc > 1 ? (size_t)(argc - 1) : count;
+	if (filtered && error == BTRFS_OK) {
+		error = btrfs_balance(&image.environment, &writer, &args, &report);
+		printf("{\"result\":\"%s\",\"groups\":%" PRIu64 ",\"blocks\":%" PRIu64
+		       ",\"extents\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"commits\":%" PRIu64 "}\n",
+		    btrfs_result_string(error), report.groups, report.blocks, report.extents,
+		    report.bytes, report.commits);
+	}
+	targets = filtered ? 0 : argc > 1 ? (size_t)(argc - 1) : count;
 	for (i = 0; error == BTRFS_OK && apply && i < targets; i++) {
 		group = argc > 1 ? strtoull(argv[i + 1], NULL, 0) : groups[i].logical;
 		error = btrfs_relocate_group(&image.environment, &writer, group, &report);
@@ -500,7 +585,8 @@ main(int argc, char **argv)
 		    "btrfs-inspect IMAGE recover [--apply] [--acknowledged "
 		    "GENERATION]\n       btrfs-inspect IMAGE replay [--apply]\n       "
 		    "btrfs-inspect IMAGE relocate [--apply]\n       "
-		    "btrfs-inspect IMAGE balance [--apply [GROUP...]]\n");
+		    "btrfs-inspect IMAGE balance [--apply [GROUP...|-d[ARGS] -m[ARGS] "
+		    "-s[ARGS]]]\n");
 		return 2;
 	}
 	if (strcmp(argv[argument + 1], "recover") == 0) {

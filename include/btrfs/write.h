@@ -154,6 +154,40 @@ enum btrfs_result btrfs_relocate_group(const struct btrfs_environment *environme
     const struct btrfs_write_environment *writer, uint64_t group,
     struct btrfs_balance_report *report);
 
+/* A balance's arguments for one kind of block group, as Linux's struct
+ * btrfs_balance_args gives them: whether its groups are relocated; the usage
+ * filter, only groups whose used bytes are below usage percent of their
+ * length (0 selects empty groups, above 100 every group); the profile they
+ * convert to, BTRFS_BALANCE_SINGLE or BTRFS_GROUP_DUP, or BTRFS_BALANCE_KEEP;
+ * and soft, which leaves groups that already have that profile. */
+struct btrfs_balance_kind {
+	int enabled;
+	unsigned usage;
+	uint64_t convert;
+	int soft;
+};
+
+#define BTRFS_BALANCE_KEEP UINT64_MAX
+#define BTRFS_BALANCE_SINGLE UINT64_C(0)
+
+struct btrfs_balance_args {
+	struct btrfs_balance_kind data;
+	struct btrfs_balance_kind metadata;
+	struct btrfs_balance_kind system;
+};
+
+/* Linux's btrfs balance: every block group the arguments select when it
+ * begins is relocated once (btrfs_relocate_group), in address order; a
+ * mixed group takes the data arguments, which must equal the metadata ones
+ * (INVALID_ARGUMENT). While a kind converts, new chunks of it take the
+ * target profile and no group of it with another profile takes allocation,
+ * so its groups end with the target profile. RAID profiles are UNSUPPORTED;
+ * the first refusal ends the balance, the groups relocated before it stay
+ * so, and report counts them all. */
+enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
+    struct btrfs_balance_report *report);
+
 /* Current admission: any of Linux's four checksum algorithms, skinny metadata,
  * SINGLE/DUP, no free-space cache tree, quotas or mixed groups. At least two
  * superblock copies must exist and agree with the mounted primary; otherwise

@@ -429,6 +429,133 @@ fault_sweep(struct btrfs_image *image, uint64_t group, size_t work, const struct
 	return faults;
 }
 
+/* Whether every group of a kind has profile (BTRFS_GROUP_DUP or 0). */
+static int
+profiles_are(const struct btrfs_fs *fs, uint64_t kind, uint64_t profile)
+{
+	size_t i;
+
+	for (i = 0; i < fs->chunk_count; i++) {
+		if ((fs->chunks[i].type & kind) != 0 &&
+		    (fs->chunks[i].type & BTRFS_GROUP_DUP) != profile) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static struct btrfs_balance_kind
+balance_kind(unsigned usage, uint64_t convert, int soft)
+{
+	return (struct btrfs_balance_kind){ 1, usage, convert, soft };
+}
+
+/* Conversions as `btrfs balance start -dconvert=dup -mconvert=dup
+ * -sconvert=dup`, then `-dconvert=single,soft`, then usage filters: each
+ * leaves its kinds with the profile and the volume reading as before, and
+ * so does every state a crash leaves at a barrier of the first. */
+static void
+convert_run(struct btrfs_image *image, const char *source, size_t work,
+    const struct expected *expected, const char *directory)
+{
+	struct btrfs_environment environment;
+	struct btrfs_write_environment writer;
+	struct btrfs_balance_report report;
+	struct btrfs_balance_args args;
+	struct overlay recorded;
+	struct overlay crash;
+	struct btrfs_fs *fs;
+	char path[EXPORT_PATH];
+	uint64_t before[MAX_GROUPS];
+	size_t before_count;
+	size_t states = 0;
+	size_t recoveries = 0;
+	size_t kept = 0;
+	size_t i;
+	size_t j;
+	int present;
+
+	overlay_init(&recorded, image);
+	overlay_environment(&recorded, &environment, &writer);
+	memset(&args, 0, sizeof(args));
+	args.data = balance_kind(101, BTRFS_GROUP_DUP, 0);
+	args.metadata = balance_kind(101, BTRFS_GROUP_DUP, 0);
+	args.system = balance_kind(101, BTRFS_GROUP_DUP, 0);
+	REQUIRE(bt_balance(&environment, &writer, &args, work, &report) == BTRFS_OK);
+	REQUIRE(report.groups > 0);
+	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(profiles_are(
+	    fs, BTRFS_GROUP_DATA | BTRFS_GROUP_METADATA | BTRFS_GROUP_SYSTEM, BTRFS_GROUP_DUP));
+	check_state(fs, expected, 1, "converted to DUP");
+	btrfs_unmount(fs);
+	if (directory != NULL) {
+		REQUIRE(snprintf(path, sizeof(path), "%s/dup-%ld.raw", directory, (long)getpid()) <
+		    (int)sizeof(path));
+		export_overlay(&recorded, source, path);
+	}
+	for (i = 0; i < recorded.barrier_count; i++, states++) {
+		overlay_fork(&crash, &recorded, recorded.barriers[i]);
+		mount_state(&crash, &fs, &recoveries);
+		check_state(fs, expected, 0, "conversion crash state");
+		btrfs_unmount(fs);
+		overlay_free(&crash);
+	}
+
+	/* Data back to single; soft leaves the groups already single. */
+	overlay_environment(&recorded, &environment, &writer);
+	memset(&args, 0, sizeof(args));
+	args.data = balance_kind(101, BTRFS_BALANCE_SINGLE, 1);
+	args.metadata.convert = BTRFS_BALANCE_KEEP;
+	args.system.convert = BTRFS_BALANCE_KEEP;
+	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	if ((fs->info.incompat_features & BT_FEATURE_MIXED_GROUPS) != 0) {
+		args.metadata = args.data;
+	}
+	btrfs_unmount(fs);
+	REQUIRE(bt_balance(&environment, &writer, &args, work, &report) == BTRFS_OK);
+	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	REQUIRE(profiles_are(fs, BTRFS_GROUP_DATA, 0));
+	if ((fs->info.incompat_features & BT_FEATURE_MIXED_GROUPS) == 0) {
+		REQUIRE(
+		    profiles_are(fs, BTRFS_GROUP_METADATA | BTRFS_GROUP_SYSTEM, BTRFS_GROUP_DUP));
+	}
+	check_state(fs, expected, 1, "data converted to single");
+	before_count = fs->chunk_count;
+	for (i = 0; i < before_count; i++) {
+		before[i] = fs->chunks[i].logical;
+	}
+	btrfs_unmount(fs);
+
+	/* usage=0 relocates only empty groups, and soft conversion to the
+	 * profile every group has relocates none. */
+	memset(&args, 0, sizeof(args));
+	args.data = balance_kind(0, BTRFS_BALANCE_KEEP, 0);
+	args.metadata = balance_kind(0, BTRFS_BALANCE_KEEP, 0);
+	args.system = balance_kind(101, BTRFS_GROUP_DUP, 1);
+	REQUIRE(bt_balance(&environment, &writer, &args, work, &report) == BTRFS_OK);
+	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
+	for (i = 0; i < before_count; i++) {
+		present = 0;
+		for (j = 0; j < fs->chunk_count; j++) {
+			present |= fs->chunks[j].logical == before[i];
+		}
+		kept += present;
+	}
+	REQUIRE(kept + report.groups == before_count);
+	check_state(fs, expected, 1, "usage filter");
+	btrfs_unmount(fs);
+	if (directory != NULL) {
+		REQUIRE(snprintf(path, sizeof(path), "%s/converted-%ld.raw", directory,
+			    (long)getpid()) < (int)sizeof(path));
+		export_overlay(&recorded, source, path);
+	}
+	overlay_free(&recorded);
+	printf("balance conversions: every kind to DUP (%zu crash states read the same, %zu "
+	       "after superblock recovery), data back to single, usage and soft filters; the "
+	       "volume reads as before PASS\n",
+	    states, recoveries);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -452,6 +579,7 @@ main(int argc, char **argv)
 	size_t fault_points = 0;
 	int unsupported = 0;
 	int faults = 0;
+	int convert = 0;
 	size_t group_count;
 	size_t work;
 	size_t states = 0;
@@ -467,6 +595,11 @@ main(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "--faults") == 0) {
 		faults = 1;
+		argc--;
+		argv++;
+	}
+	if (argc > 1 && strcmp(argv[1], "--convert") == 0) {
+		convert = 1;
 		argc--;
 		argv++;
 	}
@@ -488,6 +621,12 @@ main(int argc, char **argv)
 	}
 	btrfs_unmount(fs);
 	memset(&total, 0, sizeof(total));
+	if (convert) {
+		convert_run(&image, argv[1], work, &expected, argc == 4 ? argv[3] : NULL);
+		REQUIRE(image.live_allocations == 0);
+		btrfs_image_close(&image);
+		return 0;
+	}
 	if (faults) {
 		for (g = 0; g < group_count; g++) {
 			fault_points +=

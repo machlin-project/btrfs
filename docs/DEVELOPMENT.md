@@ -458,7 +458,10 @@ original's, the reference, namespace and qgroup audits pass, and the file
 trees hold as many blocks and the data as many extents as before. Every state
 at a barrier reads the same after superblock recovery, and some relocate again
 to the end. Then all groups are relocated in turn; with EXPORT that image is
-written there as `balanced-PID.raw`. `--unsupported` expects refusals before
+written there as `balanced-PID.raw`. `--convert` converts every kind to DUP
+(checking the crash states of that conversion), data back to single with
+`soft`, then runs the usage and soft filters, exporting `dup-PID.raw` and
+`converted-PID.raw`. `--unsupported` expects refusals before
 any write (v1 space caches); `--faults` fails every write,
 barrier and allocation of each group's relocation in turn. The `balance-*`
 Meson tests run it on the writable fixtures.

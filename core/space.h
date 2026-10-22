@@ -35,6 +35,10 @@ enum btrfs_result bt_space_load_all(struct bt_space *space);
 enum btrfs_result bt_space_devices(
     struct bt_space *space, struct bt_root chunk_tree, struct bt_root device_tree);
 enum btrfs_result bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t minimum);
+/* New chunks of kind (BT_BLOCK_DATA, _METADATA or _SYSTEM) take profile, 0
+ * (single) or BT_BLOCK_DUP, for the rest of the transaction, as Linux's
+ * balance gives them its convert target. */
+enum btrfs_result bt_space_set_profile(struct bt_space *space, uint64_t kind, uint64_t profile);
 /* Linux's check_system_chunk before a chunk is added or removed: grows a
  * system chunk when free system space is below the nodes one chunk item and
  * one device item update may need; failing to grow is not an error. */

@@ -41,6 +41,8 @@
 #define BT_BALANCE_SECTORS (BT_BALANCE_WINDOW / 4096U)
 /* Committed steps after which a relocation that still moves extents stops. */
 #define BT_BALANCE_STEPS 1048576U
+/* The kind bits of a block group's type; the rest is its profile. */
+#define BT_BALANCE_KINDS (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM)
 /* A data reference's offset (file offset minus extent offset) this large
  * wrapped below zero; its items are searched from the inode's first, as
  * Linux's find_data_references does. */
@@ -980,14 +982,15 @@ bt_bl_cached(struct btrfs_transaction *transaction, uint64_t logical)
 }
 
 /* Takes the emptied group out, as btrfs_remove_chunk: its items go at
- * commit. When it is the last of its kind and profile, a new chunk of them
- * takes its place first, as Linux's balance allocates one before it
- * relocates the last. */
+ * commit. When it is the last of its kind with its profile, or with the
+ * profile a conversion gives the kind, a new chunk of them takes its place
+ * first, as Linux's balance allocates one before it relocates the last. */
 static enum btrfs_result
-bt_bl_remove(struct btrfs_transaction *transaction, size_t chunk)
+bt_bl_remove(struct btrfs_transaction *transaction, size_t chunk, uint64_t profile)
 {
 	const struct bt_chunk *group = &transaction->fs.chunks[chunk];
-	uint64_t kind = group->type & (BT_BLOCK_DATA | BT_BLOCK_METADATA | BT_BLOCK_SYSTEM);
+	uint64_t kind = group->type & BT_BALANCE_KINDS;
+	uint64_t type = profile == BTRFS_BALANCE_KEEP ? group->type : kind | profile;
 	size_t i;
 	int sibling = 0;
 	enum btrfs_result error = BTRFS_OK;
@@ -997,7 +1000,7 @@ bt_bl_remove(struct btrfs_transaction *transaction, size_t chunk)
 	}
 	for (i = 0; i < transaction->fs.chunk_count; i++) {
 		sibling |= i != chunk && !transaction->fs.chunks[i].removed &&
-		    transaction->fs.chunks[i].type == group->type;
+		    transaction->fs.chunks[i].type == type;
 	}
 	if (!sibling) {
 		error = bt_space_grow(transaction->space, kind, 0);
@@ -1072,12 +1075,37 @@ bt_bl_allocate(const struct btrfs_environment *env, struct bt_balance *balance, 
 	    : BTRFS_OK;
 }
 
+/* A conversion of the group's kind to profile, as Linux's balance converts:
+ * new chunks of the kind take the profile, and no group of the kind with
+ * another one takes allocation. */
+static enum btrfs_result
+bt_bl_convert(struct btrfs_transaction *transaction, size_t chunk, uint64_t profile)
+{
+	const struct btrfs_fs *fs = &transaction->fs;
+	uint64_t kind = fs->chunks[chunk].type & BT_BALANCE_KINDS;
+	size_t count = fs->chunk_count;
+	size_t i;
+	enum btrfs_result error;
+
+	error = bt_space_set_profile(transaction->space, kind, profile);
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		if (i != chunk && !fs->chunks[i].removed &&
+		    (fs->chunks[i].type & BT_BALANCE_KINDS) == kind &&
+		    (fs->chunks[i].type & ~BT_BALANCE_KINDS) != profile) {
+			error = bt_space_readonly(transaction->space, i);
+		}
+	}
+	return error;
+}
+
 /* One committed step: extents of the group move until the work reaches
- * work (one extent when single), or the emptied group goes (*done). *moved
+ * work (one extent when single), or the emptied group goes (*done); with a
+ * profile other than BTRFS_BALANCE_KEEP, its kind converts to it. *moved
  * counts the extents moved. */
 static enum btrfs_result
 bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, uint64_t group,
-    size_t work, int single, struct btrfs_balance_report *report, int *done, uint64_t *moved)
+    size_t work, int single, uint64_t profile, struct btrfs_balance_report *report, int *done,
+    uint64_t *moved)
 {
 	struct btrfs_transaction *transaction = NULL;
 	struct bt_balance balance;
@@ -1111,6 +1139,9 @@ bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, ui
 	if (error == BTRFS_OK) {
 		error = bt_space_readonly(transaction->space, chunk);
 	}
+	if (error == BTRFS_OK && profile != BTRFS_BALANCE_KEEP) {
+		error = bt_bl_convert(transaction, chunk, profile);
+	}
 	if (error == BTRFS_OK) {
 		balance.transaction = transaction;
 		balance.start = group;
@@ -1140,7 +1171,7 @@ bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, ui
 		}
 	}
 	if (error == BTRFS_OK && *moved == 0) {
-		error = bt_bl_remove(transaction, chunk);
+		error = bt_bl_remove(transaction, chunk, profile);
 		*done = error == BTRFS_OK;
 	}
 	if (error == BTRFS_OK) {
@@ -1200,22 +1231,19 @@ bt_bl_clean(const struct btrfs_environment *environment,
 	return error;
 }
 
-enum btrfs_result
-bt_relocate_group(const struct btrfs_environment *environment,
-    const struct btrfs_write_environment *writer, uint64_t group, size_t work,
+/* Relocates one group in committed steps, its kind converting to profile
+ * unless it is BTRFS_BALANCE_KEEP; report accumulates. */
+static enum btrfs_result
+bt_bl_relocate(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t group, size_t work, uint64_t profile,
     struct btrfs_balance_report *report)
 {
 	struct btrfs_fs *fs;
 	uint64_t steps;
 	uint64_t moved = 0;
 	int done = 0;
-	enum btrfs_result error;
+	enum btrfs_result error = BTRFS_OK;
 
-	if (environment == NULL || writer == NULL || report == NULL || work == 0) {
-		return BTRFS_INVALID_ARGUMENT;
-	}
-	bt_zero(report, sizeof(*report));
-	error = bt_bl_clean(environment, writer, report);
 	for (steps = 0; error == BTRFS_OK && !done; steps++) {
 		fs = NULL;
 		error = steps == BT_BALANCE_STEPS ? BTRFS_UNSUPPORTED : BTRFS_OK;
@@ -1223,19 +1251,140 @@ bt_relocate_group(const struct btrfs_environment *environment,
 			error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
 		}
 		if (error == BTRFS_OK) {
-			error = bt_bl_step(fs, writer, group, work, 0, report, &done, &moved);
+			error =
+			    bt_bl_step(fs, writer, group, work, 0, profile, report, &done, &moved);
 			/* A step too large for one transaction is retried one extent at a
 			 * time. */
 			if (error != BTRFS_OK && error != BTRFS_NOT_FOUND &&
 			    error != BTRFS_UNSUPPORTED && error != BTRFS_CORRUPT &&
 			    error != BTRFS_IO) {
-				error =
-				    bt_bl_step(fs, writer, group, work, 1, report, &done, &moved);
+				error = bt_bl_step(
+				    fs, writer, group, work, 1, profile, report, &done, &moved);
 			}
 		}
 		btrfs_unmount(fs);
 	}
 	return error;
+}
+
+enum btrfs_result
+bt_relocate_group(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t group, size_t work,
+    struct btrfs_balance_report *report)
+{
+	enum btrfs_result error;
+
+	if (environment == NULL || writer == NULL || report == NULL || work == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	bt_zero(report, sizeof(*report));
+	error = bt_bl_clean(environment, writer, report);
+	return error == BTRFS_OK
+	    ? bt_bl_relocate(environment, writer, group, work, BTRFS_BALANCE_KEEP, report)
+	    : error;
+}
+
+/* The arguments of a group's kind: a mixed group's are its data's. */
+static const struct btrfs_balance_kind *
+bt_bl_kind(const struct btrfs_balance_args *args, uint64_t type)
+{
+	if (type & BT_BLOCK_SYSTEM) {
+		return &args->system;
+	}
+	return type & BT_BLOCK_DATA ? &args->data : &args->metadata;
+}
+
+/* Linux's chunk_usage_filter and chunk_soft_convert_filter: whether the
+ * arguments of its kind select a group. */
+static int
+bt_bl_selects(const struct btrfs_balance_kind *kind, const struct btrfs_group *group)
+{
+	uint64_t threshold = kind->usage == 0 ? 1
+	    : kind->usage > 100
+	    ? group->length
+	    : group->length / 100 * kind->usage + group->length % 100 * kind->usage / 100;
+
+	if (!kind->enabled || group->used >= threshold) {
+		return 0;
+	}
+	return !(kind->soft && kind->convert != BTRFS_BALANCE_KEEP &&
+	    (group->flags & ~BT_BALANCE_KINDS) == kind->convert);
+}
+
+static int
+bt_bl_profile_valid(const struct btrfs_balance_kind *kind)
+{
+	return kind->convert == BTRFS_BALANCE_KEEP || kind->convert == BTRFS_BALANCE_SINGLE ||
+	    kind->convert == BTRFS_GROUP_DUP;
+}
+
+enum btrfs_result
+bt_balance(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
+    size_t work, struct btrfs_balance_report *report)
+{
+	const struct btrfs_balance_kind *kind;
+	struct btrfs_group *groups = NULL;
+	struct btrfs_fs *fs = NULL;
+	struct btrfs_info info;
+	size_t capacity = 0;
+	size_t count = 0;
+	size_t i;
+	enum btrfs_result error;
+
+	if (environment == NULL || writer == NULL || args == NULL || report == NULL || work == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	bt_zero(report, sizeof(*report));
+	if (!bt_bl_profile_valid(&args->data) || !bt_bl_profile_valid(&args->metadata) ||
+	    !bt_bl_profile_valid(&args->system)) {
+		return BTRFS_UNSUPPORTED;
+	}
+	error = bt_bl_clean(environment, writer, report);
+	if (error == BTRFS_OK) {
+		error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
+	}
+	/* Mixed groups hold both kinds: Linux requires the same arguments. */
+	if (error == BTRFS_OK) {
+		btrfs_get_info(fs, &info);
+		if ((info.incompat_features & BT_FEATURE_MIXED_GROUPS) != 0 &&
+		    (args->data.enabled != args->metadata.enabled ||
+			args->data.usage != args->metadata.usage ||
+			args->data.convert != args->metadata.convert ||
+			args->data.soft != args->metadata.soft)) {
+			error = BTRFS_INVALID_ARGUMENT;
+		}
+	}
+	if (error == BTRFS_OK) {
+		capacity = fs->chunk_count;
+		groups = environment->allocate(environment->context, capacity * sizeof(*groups));
+		error = groups == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+	}
+	if (error == BTRFS_OK) {
+		error = btrfs_get_groups(fs, groups, capacity, &count);
+	}
+	btrfs_unmount(fs);
+	/* The groups selected when the balance began, each once: chunks it
+	 * creates are not revisited. */
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		kind = bt_bl_kind(args, groups[i].flags);
+		if (bt_bl_selects(kind, &groups[i])) {
+			error = bt_bl_relocate(
+			    environment, writer, groups[i].logical, work, kind->convert, report);
+		}
+	}
+	if (groups != NULL) {
+		environment->release(environment->context, groups, capacity * sizeof(*groups));
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_balance(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
+    struct btrfs_balance_report *report)
+{
+	return bt_balance(environment, writer, args, BT_BALANCE_WORK, report);
 }
 
 enum btrfs_result

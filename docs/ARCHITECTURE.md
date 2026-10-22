@@ -592,10 +592,25 @@ refuses with NO_SPACE; the steps it committed before leave the same files.
 Refused before any write (UNSUPPORTED): a running quota rescan; a group with a
 v1 space-cache inode, and data a v1 cache inode names, which Linux deletes with
 its group;
-an extent with more references than one transaction moves (1,024). Balance
-filters, profile conversion and a native interface that starts a balance are
-not implemented. `btrfs-inspect IMAGE balance` lists the block groups and,
-with `--apply`, relocates the named groups or every group.
+an extent with more references than one transaction moves (1,024).
+
+`btrfs_balance` is Linux's `btrfs balance start`: per kind (data, metadata,
+system) it selects groups with Linux's usage filter (used bytes below a
+percentage of the group; 0 selects empty groups) and converts them to a
+profile, single or DUP, where `soft` leaves groups that already have it. The
+groups selected when it begins are relocated once each, so chunks it creates
+are not revisited; a mixed group takes the data arguments, which must equal
+the metadata ones, as Linux requires. While a kind converts, new chunks of it
+take the target profile (`bt_space_set_profile`, Linux's convert target in
+`btrfs_get_alloc_profile`) and every group of it with another profile takes
+no allocation, so data and metadata move only into groups of the target
+profile and the kind ends with it; the last group of the kind is replaced by
+one of the target profile. RAID profiles, which need more devices, are
+UNSUPPORTED. A native interface that starts a balance is not implemented.
+`btrfs-inspect IMAGE balance` lists the block groups and, with `--apply`,
+relocates the named groups, or those btrfs-progs-style filters select
+(`-d`, `-m`, `-s` with `usage=`, `convert=single|dup` and `soft`; `-m` also
+selects system groups unless `-s` is given), or every group.
 
 ## Format features
 

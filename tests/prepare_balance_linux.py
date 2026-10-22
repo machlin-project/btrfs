@@ -9,14 +9,18 @@ and print the manifest a second time, write a file, unmount and check once
 more. Run it on a clone of the image before and after the balance here: the
 manifests of both must be equal, and Linux's balance must leave them so.
 
+convert: on /dev/vda, Linux converts every kind to DUP itself and then runs
+its full balance, printing whether that balance completed.
+
 squota: format /dev/vda, write data in the top level and a subvolume, enable
 simple quotas, write more, and print the qgroups before and after a full
 balance: how Linux counts moved extents from before and after the enable.
 
 The manifest names every regular file and symlink below the mount with its
 mode, owner, size and SHA-256 (or symlink target), one line each, sorted;
-subvolumes appear as their directories. Under quotas, `btrfs qgroup show
---raw` is printed before and after Linux's balance.
+subvolumes appear as their directories. `btrfs filesystem df` (the profile of
+each kind) and, under quotas, `btrfs qgroup show --raw` are printed before
+and after Linux's balance.
 """
 
 import argparse
@@ -57,6 +61,7 @@ manifest() {
 
 qgroups() {
     btrfs qgroup show --raw /mnt 2>/dev/null | sed "s/^/BTRFS_BALANCE_QGROUP_$1:/" || true
+    btrfs filesystem df /mnt | sed "s/^/BTRFS_BALANCE_DF_$1:/"
 }
 """
 
@@ -114,8 +119,30 @@ poweroff -f
 """
 
 
+def convert_init() -> str:
+    """Linux's own conversion of every kind to DUP, then its full balance,
+    whose outcome it prints: what Linux does with the same volume."""
+    return PRELUDE + MANIFEST + """
+btrfs check --readonly /dev/vda
+mount -t btrfs -o noatime /dev/vda /mnt
+btrfs balance start -f -dconvert=dup -mconvert=dup -sconvert=dup /mnt
+qgroups CONVERTED
+if btrfs balance start --full-balance /mnt; then
+    echo BTRFS_BALANCE_LINUX_BALANCED
+else
+    echo BTRFS_BALANCE_LINUX_REFUSED
+fi
+umount /mnt
+btrfs check --readonly /dev/vda
+echo BTRFS_BALANCE_CONVERT_PASS
+trap - EXIT
+poweroff -f
+"""
+
+
 def prepare(root: Path, phase: str, archive: Path) -> None:
-    (root / "init").write_text(verify_init() if phase == "verify" else squota_init())
+    init = {"verify": verify_init, "squota": squota_init, "convert": convert_init}[phase]()
+    (root / "init").write_text(init)
     (root / "init").chmod(0o755)
     paths = subprocess.run(["find", ".", "-path", "./transaction", "-prune", "-o", "-path",
                             "./input", "-prune", "-o", "-print"],
@@ -130,7 +157,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True,
                         help="Disposable staged Alpine initrd root")
-    parser.add_argument("--phase", choices=("verify", "squota"), default="verify")
+    parser.add_argument("--phase", choices=("verify", "squota", "convert"), default="verify")
     parser.add_argument("--archive", type=Path, required=True)
     args = parser.parse_args()
     prepare(args.root.resolve(), args.phase, args.archive.resolve())
