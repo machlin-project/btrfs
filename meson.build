@@ -113,6 +113,9 @@ multidev_test = executable('btrfs-multidev-test', 'tests/multidev.c', 'tests/ref
 multidev_write_test = executable('btrfs-multidev-write-test', 'tests/multidev_write.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
+volume_devices_test = executable('btrfs-volume-devices-test', 'tests/volume_devices.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
 space_caches_test = executable('btrfs-space-caches-test', 'tests/space_caches.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
@@ -379,6 +382,17 @@ if fixtures != ''
     test('scrub-' + profile[0], scrub_test,
       args: (profile[0] == 'transactions' ? ['--faults'] : []) +
         [profile[0], meson.current_build_dir()] + images, timeout: 600, suite: 'images')
+  endforeach
+  # The native volume layer on several devices: grouped operations write
+  # every device; the volume reads the same from each and degraded.
+  foreach profile : [['multi-raid1', 2, 'redundant'], ['multi-raid5', 3, 'redundant'],
+      ['multi-raid6', 4, 'redundant'], ['multi-raid0', 3, 'striped']]
+    images = []
+    foreach index : range(profile[1])
+      images += join_paths(fixtures, profile[0] + '-' + index.to_string() + '.raw')
+    endforeach
+    test('volume-devices-' + profile[0], volume_devices_test,
+      args: [profile[2], meson.current_build_dir()] + images, timeout: 300, suite: 'images')
   endforeach
   # v1 space caches: an emptied group goes with its cache.
   test('space-caches', space_caches_test,

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "btrfs_xnu.h"
+#include "mount_args.h"
 #include <btrfs/codec.h>
 
 #include <libkern/zlib.h>
@@ -202,18 +203,19 @@ btrfs_xnu_compress(void *context, enum btrfs_compression codec, const void *inpu
 }
 
 static enum btrfs_result
-btrfs_xnu_read_aligned(struct btrfs_xnu_mount *mount, uint64_t offset, void *buffer, size_t length)
+btrfs_xnu_read_aligned(
+    struct btrfs_xnu_device *device, uint64_t offset, void *buffer, size_t length)
 {
 	buf_t request;
 	int error;
 
-	request = buf_alloc(mount->device);
+	request = buf_alloc(device->vnode);
 	if (request == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
 	buf_setflags(request, B_READ);
-	buf_setblkno(request, (daddr64_t)(offset / mount->device_block_size));
-	buf_setlblkno(request, (daddr64_t)(offset / mount->device_block_size));
+	buf_setblkno(request, (daddr64_t)(offset / device->block_size));
+	buf_setlblkno(request, (daddr64_t)(offset / device->block_size));
 	buf_setcount(request, (uint32_t)length);
 	buf_setsize(request, (uint32_t)length);
 	buf_setresid(request, (uint32_t)length);
@@ -232,39 +234,39 @@ btrfs_xnu_read_aligned(struct btrfs_xnu_mount *mount, uint64_t offset, void *buf
 static enum btrfs_result
 btrfs_xnu_resource_read(void *context, uint64_t offset, void *buffer, size_t length)
 {
-	struct btrfs_xnu_mount *mount = context;
+	struct btrfs_xnu_device *device = context;
 	uint8_t *destination = buffer;
 	uint8_t *edge = NULL;
 	size_t within;
 	size_t amount;
 	enum btrfs_result result = BTRFS_OK;
 
-	if (vnode_getwithref(mount->device) != 0) {
+	if (vnode_getwithref(device->vnode) != 0) {
 		return BTRFS_IO;
 	}
 	while (length != 0) {
-		within = (size_t)(offset % mount->device_block_size);
-		if (within == 0 && length >= mount->device_block_size) {
-			amount = length - length % mount->device_block_size;
+		within = (size_t)(offset % device->block_size);
+		if (within == 0 && length >= device->block_size) {
+			amount = length - length % device->block_size;
 			if (amount > MAXPHYS) {
 				amount = MAXPHYS;
 			}
 			/* Private iobufs preserve range I/O without overlapping cache keys. */
-			result = btrfs_xnu_read_aligned(mount, offset, destination, amount);
+			result = btrfs_xnu_read_aligned(device, offset, destination, amount);
 		} else {
 			if (edge == NULL) {
-				edge = _MALLOC(mount->device_block_size, M_TEMP, M_WAITOK | M_NULL);
+				edge = _MALLOC(device->block_size, M_TEMP, M_WAITOK | M_NULL);
 				if (edge == NULL) {
 					result = BTRFS_NO_MEMORY;
 					break;
 				}
 			}
-			amount = mount->device_block_size - within;
+			amount = device->block_size - within;
 			if (amount > length) {
 				amount = length;
 			}
 			result = btrfs_xnu_read_aligned(
-			    mount, offset - within, edge, mount->device_block_size);
+			    device, offset - within, edge, device->block_size);
 			if (result == BTRFS_OK) {
 				memcpy(destination, edge + within, amount);
 			}
@@ -279,30 +281,30 @@ btrfs_xnu_resource_read(void *context, uint64_t offset, void *buffer, size_t len
 	if (edge != NULL) {
 		_FREE(edge, M_TEMP);
 	}
-	vnode_put(mount->device);
+	vnode_put(device->vnode);
 	return result;
 }
 
 static enum btrfs_result
 btrfs_xnu_write_aligned(
-    struct btrfs_xnu_mount *mount, uint64_t offset, const void *buffer, size_t length)
+    struct btrfs_xnu_device *device, uint64_t offset, const void *buffer, size_t length)
 {
 	buf_t request;
 	int error;
 
-	request = buf_alloc(mount->device);
+	request = buf_alloc(device->vnode);
 	if (request == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
 	buf_setflags(request, B_WRITE);
-	buf_setblkno(request, (daddr64_t)(offset / mount->device_block_size));
-	buf_setlblkno(request, (daddr64_t)(offset / mount->device_block_size));
+	buf_setblkno(request, (daddr64_t)(offset / device->block_size));
+	buf_setlblkno(request, (daddr64_t)(offset / device->block_size));
 	buf_setcount(request, (uint32_t)length);
 	buf_setsize(request, (uint32_t)length);
 	buf_setresid(request, (uint32_t)length);
 	buf_setdataptr(request, (uintptr_t)buffer);
 	/* Completion of a write buffer ends the device's write accounting. */
-	vnode_startwrite(mount->device);
+	vnode_startwrite(device->vnode);
 	error = VNOP_STRATEGY(request);
 	if (error == 0) {
 		error = buf_biowait(request);
@@ -318,26 +320,26 @@ btrfs_xnu_write_aligned(
 static enum btrfs_result
 btrfs_xnu_resource_write(void *context, uint64_t offset, const void *bytes, size_t length)
 {
-	struct btrfs_xnu_mount *mount = context;
+	struct btrfs_xnu_device *device = context;
 	const uint8_t *source = bytes;
 	size_t amount;
 	enum btrfs_result result = BTRFS_OK;
 
-	if (offset % mount->device_block_size != 0 || length % mount->device_block_size != 0 ||
-	    offset > mount->device_bytes || length > mount->device_bytes - offset) {
+	if (offset % device->block_size != 0 || length % device->block_size != 0 ||
+	    offset > device->bytes || length > device->bytes - offset) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	if (vnode_getwithref(mount->device) != 0) {
+	if (vnode_getwithref(device->vnode) != 0) {
 		return BTRFS_IO;
 	}
 	while (length != 0 && result == BTRFS_OK) {
 		amount = length > MAXPHYS ? MAXPHYS : length;
-		result = btrfs_xnu_write_aligned(mount, offset, source, amount);
+		result = btrfs_xnu_write_aligned(device, offset, source, amount);
 		offset += amount;
 		source += amount;
 		length -= amount;
 	}
-	vnode_put(mount->device);
+	vnode_put(device->vnode);
 	return result;
 }
 
@@ -345,65 +347,65 @@ btrfs_xnu_resource_write(void *context, uint64_t offset, const void *bytes, size
 static enum btrfs_result
 btrfs_xnu_resource_flush(void *context)
 {
-	struct btrfs_xnu_mount *mount = context;
+	struct btrfs_xnu_device *device = context;
 	dk_synchronize_t synchronize;
 	vfs_context_t ioctl_context;
 	int error;
 
-	if (vnode_getwithref(mount->device) != 0) {
+	if (vnode_getwithref(device->vnode) != 0) {
 		return BTRFS_IO;
 	}
 	bzero(&synchronize, sizeof(synchronize));
 	ioctl_context = vfs_context_create(NULL);
 	error = VNOP_IOCTL(
-	    mount->device, DKIOCSYNCHRONIZE, (caddr_t)&synchronize, FWRITE, ioctl_context);
+	    device->vnode, DKIOCSYNCHRONIZE, (caddr_t)&synchronize, FWRITE, ioctl_context);
 	vfs_context_rele(ioctl_context);
-	vnode_put(mount->device);
+	vnode_put(device->vnode);
 	return error == 0 ? BTRFS_OK : BTRFS_IO;
 }
 
 static enum btrfs_result
 btrfs_xnu_device_read(void *context, uint64_t offset, void *buffer, size_t length)
 {
-	struct btrfs_xnu_mount *mount = context;
+	struct btrfs_xnu_device *device = context;
 	enum btrfs_result result;
 
-	if (mount->staging == NULL) {
+	if (device->staging == NULL) {
 		return btrfs_xnu_resource_read(context, offset, buffer, length);
 	}
-	lck_rw_lock_shared(mount->staging_lock);
-	result = btrfs_staging_read(mount->staging, offset, buffer, length);
-	lck_rw_unlock_shared(mount->staging_lock);
+	lck_rw_lock_shared(device->staging_lock);
+	result = btrfs_staging_read(device->staging, offset, buffer, length);
+	lck_rw_unlock_shared(device->staging_lock);
 	return result;
 }
 
 static enum btrfs_result
 btrfs_xnu_device_write(void *context, uint64_t offset, const void *bytes, size_t length)
 {
-	struct btrfs_xnu_mount *mount = context;
+	struct btrfs_xnu_device *device = context;
 	enum btrfs_result result;
 
-	if (offset % mount->device_block_size != 0 || length % mount->device_block_size != 0) {
+	if (offset % device->block_size != 0 || length % device->block_size != 0) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	lck_rw_lock_exclusive(mount->staging_lock);
-	result = btrfs_staging_write(mount->staging, offset, bytes, length);
-	lck_rw_unlock_exclusive(mount->staging_lock);
+	lck_rw_lock_exclusive(device->staging_lock);
+	result = btrfs_staging_write(device->staging, offset, bytes, length);
+	lck_rw_unlock_exclusive(device->staging_lock);
 	return result;
 }
 
 static enum btrfs_result
 btrfs_xnu_device_flush(void *context)
 {
-	struct btrfs_xnu_mount *mount = context;
+	struct btrfs_xnu_device *device = context;
 	enum btrfs_result result;
 
-	if (mount->staging == NULL) {
+	if (device->staging == NULL) {
 		return btrfs_xnu_resource_flush(context);
 	}
-	lck_rw_lock_exclusive(mount->staging_lock);
-	result = btrfs_staging_flush(mount->staging);
-	lck_rw_unlock_exclusive(mount->staging_lock);
+	lck_rw_lock_exclusive(device->staging_lock);
+	result = btrfs_staging_flush(device->staging);
+	lck_rw_unlock_exclusive(device->staging_lock);
 	return result;
 }
 
@@ -587,18 +589,112 @@ btrfs_xnu_stop_committer(struct btrfs_xnu_mount *mount)
 	lck_mtx_unlock(mount->nodes_lock);
 }
 
+/* A device's sector size and bytes, and for a writable mount, that it takes
+ * writes. */
+static int
+btrfs_xnu_geometry(
+    vnode_t vnode, int read_only, vfs_context_t context, uint32_t *block_size, uint64_t *bytes)
+{
+	uint64_t blocks = 0;
+	uint32_t writable = 0;
+	int error;
+
+	error = VNOP_IOCTL(vnode, DKIOCGETBLOCKSIZE, (caddr_t)block_size, 0, context);
+	if (error == 0) {
+		error = VNOP_IOCTL(vnode, DKIOCGETBLOCKCOUNT, (caddr_t)&blocks, 0, context);
+	}
+	if (error != 0) {
+		return error;
+	}
+	if (*block_size < DEV_BSIZE || *block_size > page_size ||
+	    (*block_size & (*block_size - 1)) != 0 || blocks > INT64_MAX / *block_size) {
+		return ENOTSUP;
+	}
+	*bytes = blocks * *block_size;
+	if (!read_only) {
+		error = VNOP_IOCTL(vnode, DKIOCISWRITABLE, (caddr_t)&writable, 0, context);
+		if (error != 0 || writable == 0) {
+			return EROFS;
+		}
+	}
+	return 0;
+}
+
+/* Opens a further device of the volume by the path at address, as the caller
+ * may open it (vnode_open authorizes it with the caller's credentials): a
+ * block device to read, and write unless read_only, held open until unmount.
+ * The core then requires it to hold a device of the same volume. */
+static int
+btrfs_xnu_open_device(struct btrfs_xnu_mount *mount, user_addr_t address, int read_only,
+    vfs_context_t context, struct btrfs_xnu_device *device)
+{
+	char *path;
+	size_t length = 0;
+	vnode_t vnode = NULLVP;
+	int mode = read_only ? FREAD : FREAD | FWRITE;
+	int error;
+
+	path = _MALLOC(MAXPATHLEN, M_TEMP, M_WAITOK | M_NULL);
+	if (path == NULL) {
+		return ENOMEM;
+	}
+	error = copyinstr(address, path, MAXPATHLEN, &length);
+	if (error == 0) {
+		error = vnode_open(path, mode, 0, 0, &vnode, context);
+	}
+	_FREE(path, M_TEMP);
+	if (error != 0) {
+		return error;
+	}
+	/* Its use count stays until btrfs_xnu_close_device. */
+	device->mount = mount;
+	device->vnode = vnode;
+	device->opened = mode;
+	error = vnode_vtype(vnode) == VBLK ? 0 : ENOTBLK;
+	if (error == 0) {
+		error = btrfs_xnu_geometry(
+		    vnode, read_only, context, &device->block_size, &device->bytes);
+	}
+	vnode_put(vnode);
+	return error;
+}
+
+/* Closes a device this mount opened (vnode_close drops its use count), or
+ * drops the reference on the device XNU opened. */
+static void
+btrfs_xnu_close_device(struct btrfs_xnu_device *device)
+{
+	vfs_context_t context;
+
+	if (device->vnode == NULLVP) {
+		return;
+	}
+	if (device->opened == 0) {
+		vnode_rele(device->vnode);
+	} else if (vnode_getwithref(device->vnode) == 0) {
+		context = vfs_context_create(NULL);
+		(void)vnode_close(device->vnode, device->opened, context);
+		vfs_context_rele(context);
+	}
+	device->vnode = NULLVP;
+}
+
 static void
 btrfs_xnu_free_mount(struct btrfs_xnu_mount *mount)
 {
+	size_t i;
+
 	btrfs_xnu_stop_committer(mount);
 	if (mount->committer != NULL) {
 		(void)thread_call_free(mount->committer);
 	}
 	btrfs_identity_destroy(mount->identities);
 	btrfs_volume_close(mount->volume);
-	btrfs_staging_destroy(mount->staging);
-	if (mount->staging_lock != NULL) {
-		lck_rw_free(mount->staging_lock, btrfs_xnu_locks);
+	for (i = 0; i < mount->device_count; i++) {
+		btrfs_staging_destroy(mount->devices[i].staging);
+		if (mount->devices[i].staging_lock != NULL) {
+			lck_rw_free(mount->devices[i].staging_lock, btrfs_xnu_locks);
+		}
 	}
 	/* After every view and stream of the mount is gone. */
 	btrfs_cache_destroy(mount->cache);
@@ -617,7 +713,10 @@ btrfs_xnu_free_mount(struct btrfs_xnu_mount *mount)
 	if (mount->volume_lock != NULL) {
 		lck_mtx_free(mount->volume_lock, btrfs_xnu_locks);
 	}
-	vnode_rele(mount->device);
+	/* The further devices this mount opened, then the mounted one. */
+	for (i = mount->device_count; i-- != 0;) {
+		btrfs_xnu_close_device(&mount->devices[i]);
+	}
 	_FREE(mount, M_TEMP);
 }
 
@@ -647,50 +746,65 @@ btrfs_xnu_clean_orphans(struct btrfs_xnu_mount *mount)
 	return btrfs_xnu_error(result);
 }
 
+/* The further devices mount_machlin_btrfs names after the mounted one; none
+ * when the data is not a known version. */
+static int
+btrfs_xnu_mount_arguments(
+    user_addr_t data, int read_only, vfs_context_t context, struct machlin_btrfs_devices *further)
+{
+	bzero(further, sizeof(*further));
+	if (data == USER_ADDR_NULL || !vfs_context_is64bit(context) ||
+	    copyin(data, further, sizeof(*further)) != 0 ||
+	    further->magic != MACHLIN_BTRFS_ARGS_MAGIC ||
+	    further->version != MACHLIN_BTRFS_ARGS_VERSION) {
+		bzero(further, sizeof(*further));
+		return 0;
+	}
+	if (further->count > BTRFS_MAX_DEVICES - 1 ||
+	    (further->flags & ~MACHLIN_BTRFS_ARGS_DEGRADED) != 0 ||
+	    ((further->flags & MACHLIN_BTRFS_ARGS_DEGRADED) != 0 && !read_only)) {
+		return EINVAL;
+	}
+	return 0;
+}
+
 static int
 btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context_t context)
 {
 	struct btrfs_xnu_mount *mount;
+	struct machlin_btrfs_devices further;
 	struct btrfs_environment environment;
+	struct btrfs_environment reader;
 	struct btrfs_write_environment writer;
+	struct btrfs_write_environment output;
 	struct btrfs_volume_locks locks;
 	struct btrfs_cache_locks cache_locks;
 	struct btrfs_staging_limits staging_limits = { BTRFS_STAGING_MAX_BYTES,
 		BTRFS_STAGING_MAX_RUN_BYTES, BTRFS_STAGING_MAX_RUNS };
+	struct btrfs_xnu_device *member;
 	struct btrfs_volume_view *view;
 	const struct btrfs_fs *fs;
 	struct btrfs_inode root;
 	struct vfsioattr io;
-	uint64_t blocks;
+	user64_addr_t path;
+	uint64_t bytes;
 	uint32_t block_size;
-	uint32_t writable = 0;
+	size_t i;
 	int read_only = (vfs_flags(mp) & MNT_RDONLY) != 0;
 	int error;
 
-	(void)data;
 	if (vfs_flags(mp) & MNT_UPDATE) {
 		return ENOTSUP;
 	}
 	if (device == NULL || vnode_vtype(device) != VBLK) {
 		return ENOTBLK;
 	}
-	error = VNOP_IOCTL(device, DKIOCGETBLOCKSIZE, (caddr_t)&block_size, 0, context);
+	error = btrfs_xnu_geometry(device, read_only, context, &block_size, &bytes);
+	if (error == 0) {
+		error = btrfs_xnu_mount_arguments(data, read_only, context, &further);
+	}
 	if (error != 0) {
 		return error;
-	}
-	error = VNOP_IOCTL(device, DKIOCGETBLOCKCOUNT, (caddr_t)&blocks, 0, context);
-	if (error != 0) {
-		return error;
-	}
-	if (block_size < DEV_BSIZE || block_size > page_size ||
-	    (block_size & (block_size - 1)) != 0 || blocks > INT64_MAX / block_size) {
-		return ENOTSUP;
-	}
-	if (!read_only) {
-		error = VNOP_IOCTL(device, DKIOCISWRITABLE, (caddr_t)&writable, 0, context);
-		if (error != 0 || writable == 0) {
-			return EROFS;
-		}
 	}
 	mount = _MALLOC(sizeof(*mount), M_TEMP, M_WAITOK | M_ZERO | M_NULL);
 	if (mount == NULL) {
@@ -704,31 +818,48 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	mount->mount = mp;
 	mount->device = device;
 	mount->device_block_size = block_size;
-	mount->device_bytes = blocks * block_size;
+	mount->device_bytes = bytes;
+	mount->devices[0] =
+	    (struct btrfs_xnu_device){ mount, device, block_size, bytes, 0, NULL, NULL };
+	mount->device_count = 1;
 	mount->nodes_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
 	mount->creation_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
 	mount->volume_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
 	mount->cache_lock = lck_mtx_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
-	if (!read_only) {
-		mount->staging_lock = lck_rw_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
-	}
 	mount->nodes =
 	    hashinit(MAX(desiredvnodes / BTRFS_XNU_VNODES_PER_BUCKET, BTRFS_XNU_MINIMUM_BUCKETS),
 		M_TEMP, &mount->nodes_mask);
 	if (mount->nodes_lock == NULL || mount->creation_lock == NULL ||
-	    mount->volume_lock == NULL || mount->cache_lock == NULL || mount->nodes == NULL ||
-	    (!read_only && mount->staging_lock == NULL)) {
+	    mount->volume_lock == NULL || mount->cache_lock == NULL || mount->nodes == NULL) {
 		btrfs_xnu_free_mount(mount);
 		return ENOMEM;
 	}
-	/* Durability needs a working cache flush before any write. */
-	if (!read_only && btrfs_xnu_device_flush(mount) != BTRFS_OK) {
+	/* The further devices, opened as the caller may open them. */
+	for (i = 0; error == 0 && i < further.count; i++) {
+		error = copyin(further.paths + i * sizeof(path), &path, sizeof(path));
+		if (error == 0) {
+			error = btrfs_xnu_open_device(mount, (user_addr_t)path, read_only, context,
+			    &mount->devices[mount->device_count]);
+			/* A device whose open failed after the lookup is closed too. */
+			mount->device_count++;
+		}
+	}
+	for (i = 0; error == 0 && !read_only && i < mount->device_count; i++) {
+		mount->devices[i].staging_lock = lck_rw_alloc_init(btrfs_xnu_locks, LCK_ATTR_NULL);
+		error = mount->devices[i].staging_lock == NULL ? ENOMEM : 0;
+	}
+	/* Durability needs a working cache flush on every device before any
+	 * write. */
+	for (i = 0; error == 0 && !read_only && i < mount->device_count; i++) {
+		error = btrfs_xnu_device_flush(&mount->devices[i]) == BTRFS_OK ? 0 : ENOTSUP;
+	}
+	if (error != 0) {
 		btrfs_xnu_free_mount(mount);
-		return ENOTSUP;
+		return error;
 	}
 	bzero(&environment, sizeof(environment));
-	environment.context = mount;
-	environment.size_bytes = mount->device_bytes;
+	environment.context = &mount->devices[0];
+	environment.size_bytes = mount->devices[0].bytes;
 	environment.read = btrfs_xnu_resource_read;
 	environment.allocate = btrfs_xnu_allocate;
 	environment.release = btrfs_xnu_release;
@@ -745,24 +876,49 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 	}
 	environment.cache = mount->cache;
 	bzero(&writer, sizeof(writer));
-	writer.context = mount;
+	writer.context = &mount->devices[0];
 	writer.write = btrfs_xnu_resource_write;
 	writer.flush = btrfs_xnu_resource_flush;
 	/* Files compress as their flags and property ask; no compress mount
 	 * option is offered. */
 	writer.compress = btrfs_xnu_compress;
 	writer.compression = BTRFS_COMPRESSION_NONE;
-	if (!read_only) {
+	/* Each device combines its own writes. */
+	for (i = 0; error == 0 && !read_only && i < mount->device_count; i++) {
+		member = &mount->devices[i];
+		reader = environment;
+		reader.context = member;
+		reader.size_bytes = member->bytes;
+		reader.cache = NULL;
+		bzero(&output, sizeof(output));
+		output.context = member;
+		output.write = btrfs_xnu_resource_write;
+		output.flush = btrfs_xnu_resource_flush;
 		error = btrfs_xnu_error(
-		    btrfs_staging_create(&environment, &writer, staging_limits, &mount->staging));
-		if (error != 0) {
-			btrfs_xnu_free_mount(mount);
-			return error;
-		}
+		    btrfs_staging_create(&reader, &output, staging_limits, &member->staging));
+	}
+	if (error != 0) {
+		btrfs_xnu_free_mount(mount);
+		return error;
+	}
+	if (!read_only) {
 		writer.write = btrfs_xnu_device_write;
 		writer.flush = btrfs_xnu_device_flush;
 	}
 	environment.read = btrfs_xnu_device_read;
+	/* The core reads and writes the further devices in the same order. */
+	for (i = 1; i < mount->device_count; i++) {
+		member = &mount->devices[i];
+		mount->readers[i - 1] =
+		    (struct btrfs_device){ member, member->bytes, btrfs_xnu_device_read };
+		mount->writers[i - 1] = (struct btrfs_write_device){ member, btrfs_xnu_device_write,
+			btrfs_xnu_device_flush };
+	}
+	environment.devices = mount->device_count > 1 ? mount->readers : NULL;
+	environment.device_count = mount->device_count - 1;
+	environment.degraded = (further.flags & MACHLIN_BTRFS_ARGS_DEGRADED) != 0;
+	writer.devices = mount->device_count > 1 ? mount->writers : NULL;
+	writer.device_count = mount->device_count - 1;
 	locks.context = mount;
 	locks.lock = btrfs_xnu_volume_lock;
 	locks.unlock = btrfs_xnu_volume_unlock;
@@ -782,8 +938,8 @@ btrfs_xnu_mount_volume(mount_t mp, vnode_t device, user_addr_t data, vfs_context
 		error = btrfs_xnu_error(
 		    btrfs_identity_create(&environment, root.id, &mount->identities));
 	}
-	if (error == 0 && mount->info.sector_size < block_size) {
-		error = ENOTSUP;
+	for (i = 0; error == 0 && i < mount->device_count; i++) {
+		error = mount->info.sector_size < mount->devices[i].block_size ? ENOTSUP : 0;
 	}
 	if (error == 0 && !read_only) {
 		error = btrfs_xnu_clean_orphans(mount);

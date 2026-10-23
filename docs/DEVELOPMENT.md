@@ -1240,6 +1240,25 @@ phase on a copy. The kernel's replay line is in the unified log
 (`log show --predicate 'eventMessage CONTAINS "tree-log replay"'`); the
 kernel message buffer is too small to keep it.
 
+### Native multi-device mounts
+
+`btrfs-volume-devices-test redundant|striped DIR DEVICE...` (`tests/volume_devices.c`,
+the `volume-devices-*` Meson tests on RAID1, RAID5, RAID6 and RAID0) drives the
+native volume layer on clones of a multi-device fixture: a writer short of a
+device and a degraded writer are refused, grouped operations write files
+across the stripes and sync, and the volume then reads the same mounted from
+each device, passes both audits and, for redundant profiles, reads every file
+read-only and degraded without each device.
+
+In the guest, attach each device image with `hdiutil attach -nomount`, then
+mount with the loaded module as Linux mounts one,
+`mount_machlin_btrfs [-w] -o device=/dev/diskM[,device=...] /dev/diskN MOUNT`,
+naming every further device; take the native manifest, write and unmount as
+for one device, copy the images back and check them with the Linux `verify`
+and `degraded` phases above. `-o degraded` (read-only) mounts without a
+device. The prepared guests were not on this host when the adapter gained
+this; it is accepted by compilation only until such a run.
+
 ### Native power cuts
 
 `tests/power_cut_macos.py` cuts the power of the same prepared guest while the

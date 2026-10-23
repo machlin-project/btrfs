@@ -1408,6 +1408,22 @@ leaves the volume usable (for example NO_SPACE), while one that fails after I/O
 makes it read-only for the rest of the mount, since only explicit superblock
 recovery may decide what became durable. A read-write open admits a first
 transaction, so copies needing recovery fail the mount rather than a later write.
+A volume on several devices takes a reader and a writer device for each
+further one, in the same order; the volume keeps copies of both tables and
+counts each device's writes and barriers through its own port.
+
+The XNU adapter mounts such a volume as Linux's `mount -o device=PATH` does:
+`mount_machlin_btrfs -o device=PATH,...` passes the further devices after the
+mounted one's path (`adapters/xnu/mount_args.h`, versioned, since XNU's local
+volume mount consumes the path itself), and the kext opens each with
+`vnode_open`, the caller's credentials deciding as for any open, reading it
+only for a read-only mount. Each device has its own geometry, I/O path and
+write staging; every device must answer a cache flush before a read-write
+mount, every one's sectors must fit the filesystem's, and the core accepts
+only devices of the volume, each once. `-o degraded` mounts read-only without
+some of them. Unmount closes them. FSKit takes one resource per volume
+(`FSUnaryFileSystem`; its multi-resource `FSFileSystem` is unavailable in the
+macOS 27 SDK), so the FSKit extension mounts volumes on one device only.
 
 `btrfs_volume_maintain` is the background work of Linux's cleaner and rescan
 worker, as one bounded step joined to the running transaction. The step drops

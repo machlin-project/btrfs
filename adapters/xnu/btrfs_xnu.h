@@ -34,8 +34,24 @@
 #define BTRFS_XNU_READDIR_BATCH (32U * 1024U)
 
 struct btrfs_xnu_node;
+struct btrfs_xnu_mount;
 
 LIST_HEAD(btrfs_xnu_node_head, btrfs_xnu_node);
+
+/* One device of the volume: the one XNU mounted, or a further one this mount
+ * opened, closed again at unmount. */
+struct btrfs_xnu_device {
+	struct btrfs_xnu_mount *mount;
+	vnode_t vnode;
+	uint32_t block_size;
+	uint64_t bytes;
+	/* The mode this mount opened it with; 0 for the device XNU opened. */
+	int opened;
+	/* Device write combining, below the core and UBC. Shared for reads;
+	 * exclusive for staging and a complete drain/device barrier. */
+	struct btrfs_staging *staging;
+	lck_rw_t *staging_lock;
+};
 
 struct btrfs_xnu_mount {
 	mount_t mount;
@@ -63,13 +79,15 @@ struct btrfs_xnu_mount {
 	 * inode when the count moved. */
 	uint64_t changes;
 	/* Verified tree nodes shared by every view; only this mount changes the
-	 * device while it is mounted. */
+	 * devices while it is mounted. */
 	struct btrfs_cache *cache;
 	lck_mtx_t *cache_lock;
-	/* Device write combining, below the core and UBC. Shared for reads;
-	 * exclusive for staging and a complete drain/device barrier. */
-	struct btrfs_staging *staging;
-	lck_rw_t *staging_lock;
+	/* The volume's devices, the mounted one first, and the further ones as
+	 * the core reads and writes them. */
+	struct btrfs_xnu_device devices[BTRFS_MAX_DEVICES];
+	size_t device_count;
+	struct btrfs_device readers[BTRFS_MAX_DEVICES - 1];
+	struct btrfs_write_device writers[BTRFS_MAX_DEVICES - 1];
 	/* Nodes by native number (nodes_lock); hashinit sizes it. */
 	struct btrfs_xnu_node_head *nodes;
 	u_long nodes_mask;

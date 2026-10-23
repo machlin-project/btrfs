@@ -158,8 +158,11 @@ is destroyed. `accept` is legal only after successful durable publication;
    verifies every copy and RAID5/6 parity and repairs from good copies and
    the data (`core/scrub.c`). Remaining there: a RAID5/6 row partly in use
    takes no new extents until it empties, which wastes up to a row per
-   allocation run where Linux's read-modify-write would fill it; multiple
-   devices for the native adapters, which open one; 64 KiB
+   allocation run where Linux's read-modify-write would fill it; a guest run
+   of the XNU adapter's multi-device mounts (`-o device=PATH`), which pass
+   the portable volume-layer tests and compile, but the prepared macOS guests
+   are not on this host; FSKit takes one resource per volume, a platform
+   limit; 64 KiB
    sectors against an image btrfs-progs formatted, whose check and restore
    accept what is written (`tests/large_sectors.c`), and a 64 KiB-page Linux
    kernel under QEMU mounts, balances and checks the images written and

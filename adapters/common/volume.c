@@ -17,6 +17,14 @@ struct volume_active {
 	uint8_t padding[VOLUME_LINE - sizeof(uint32_t)];
 };
 
+struct btrfs_volume;
+
+/* One further device of the volume, as the counted writer reaches it. */
+struct volume_port {
+	struct btrfs_volume *volume;
+	size_t index;
+};
+
 #ifdef BTRFS_VOLUME_TEST_HOOKS
 /* Tests widen the window between reading the current view and pinning it. */
 void (*btrfs_volume_test_pin_hook)(void);
@@ -37,6 +45,12 @@ struct btrfs_volume {
 	 * from an uncertain one when a commit fails. */
 	struct btrfs_write_environment counted;
 	struct btrfs_volume_locks locks;
+	/* The further devices of a volume on several: the reader's and the
+	 * writer's, copied, and the counting ones the transactions write. */
+	struct btrfs_device device_readers[BTRFS_MAX_DEVICES - 1];
+	struct btrfs_write_device device_writers[BTRFS_MAX_DEVICES - 1];
+	struct btrfs_write_device counted_devices[BTRFS_MAX_DEVICES - 1];
+	struct volume_port ports[BTRFS_MAX_DEVICES - 1];
 	/* Inode numbers and directory indexes stay unique for the mount. */
 	struct btrfs_counters *counters;
 	/* The last committed allocator state, so a begin need not reload it. */
@@ -89,6 +103,26 @@ volume_flush(void *context)
 
 	volume->issued++;
 	return volume->device.flush(volume->device.context);
+}
+
+static enum btrfs_result
+volume_device_write(void *context, uint64_t offset, const void *bytes, size_t size)
+{
+	struct volume_port *port = context;
+	const struct btrfs_write_device *device = &port->volume->device_writers[port->index];
+
+	port->volume->issued++;
+	return device->write(device->context, offset, bytes, size);
+}
+
+static enum btrfs_result
+volume_device_flush(void *context)
+{
+	struct volume_port *port = context;
+	const struct btrfs_write_device *device = &port->volume->device_writers[port->index];
+
+	port->volume->issued++;
+	return device->flush(device->context);
 }
 
 static enum btrfs_result
@@ -210,15 +244,26 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 	struct btrfs_volume *volume;
 	struct btrfs_transaction *transaction = NULL;
 	unsigned stripe;
+	size_t i;
 	enum btrfs_result error;
 
 	if (environment == NULL || locks == NULL || result == NULL ||
 	    (writer != NULL && (writer->write == NULL || writer->flush == NULL))) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	/* The volume counts and orders the writes of one device. */
-	if (writer != NULL && writer->device_count != 0) {
-		return BTRFS_UNSUPPORTED;
+	/* Every further device the reader names, and for a writer, a writer
+	 * device for each in the same order. */
+	if (environment->device_count > BTRFS_MAX_DEVICES - 1 ||
+	    (environment->device_count != 0 && environment->devices == NULL) ||
+	    (writer != NULL &&
+		(writer->device_count != environment->device_count ||
+		    (writer->device_count != 0 && writer->devices == NULL)))) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	for (i = 0; writer != NULL && i < writer->device_count; i++) {
+		if (writer->devices[i].write == NULL || writer->devices[i].flush == NULL) {
+			return BTRFS_INVALID_ARGUMENT;
+		}
 	}
 	*result = NULL;
 	volume = environment->allocate(environment->context, sizeof(*volume));
@@ -229,6 +274,11 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 		volume->active[stripe].count = 0;
 	}
 	volume->environment = *environment;
+	for (i = 0; i < environment->device_count; i++) {
+		volume->device_readers[i] = environment->devices[i];
+	}
+	volume->environment.devices =
+	    environment->device_count != 0 ? volume->device_readers : NULL;
 	volume->locks = *locks;
 	volume->tree = tree;
 	volume->current = NULL;
@@ -256,8 +306,17 @@ btrfs_volume_open(const struct btrfs_environment *environment,
 		volume->counted.compress = writer->compress != NULL ? volume_compress : NULL;
 		volume->counted.compression = writer->compression;
 		volume->counted.compress_force = writer->compress_force;
-		volume->counted.devices = NULL;
-		volume->counted.device_count = 0;
+		/* Each further device's writes count too, through its port. */
+		for (i = 0; i < writer->device_count; i++) {
+			volume->device_writers[i] = writer->devices[i];
+			volume->ports[i] = (struct volume_port){ volume, i };
+			volume->counted_devices[i] = (struct btrfs_write_device){ &volume->ports[i],
+				volume_device_write, volume_device_flush };
+		}
+		volume->device.devices = writer->device_count != 0 ? volume->device_writers : NULL;
+		volume->counted.devices =
+		    writer->device_count != 0 ? volume->counted_devices : NULL;
+		volume->counted.device_count = writer->device_count;
 	}
 	error = volume_view(volume, &volume->current);
 	if (error == BTRFS_OK && volume->writable) {
