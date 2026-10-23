@@ -113,4 +113,18 @@ const struct btrfs_fs *btrfs_volume_read(
     struct btrfs_volume *volume, struct btrfs_volume_view **view);
 void btrfs_volume_unread(struct btrfs_volume *volume, struct btrfs_volume_view *view);
 
+/* Linux's btrfs balance on the mounted volume: deleted subvolumes go first,
+ * then the groups btrfs_balance_plan selects on the current view are
+ * relocated one step per transaction of the volume, each published as a
+ * view, so readers keep reading the same files and no step reuses a block a
+ * pinned view still names. Refusals and report as btrfs_balance. */
+enum btrfs_result btrfs_volume_balance(struct btrfs_volume *volume,
+    const struct btrfs_balance_args *args, struct btrfs_balance_report *report);
+/* Linux's btrfs scrub on the mounted volume, with repair (a writable volume
+ * only) or without, in the writer's turn after the running transaction
+ * commits: btrfs_scrub reads that root set, and its repairs rewrite the
+ * bytes the trees name. */
+enum btrfs_result btrfs_volume_scrub(
+    struct btrfs_volume *volume, int repair, struct btrfs_scrub_report *report);
+
 #endif

@@ -60,6 +60,13 @@ def main() -> None:
                     "-Wall", "-Wextra", "-Werror", "-Wdeclaration-after-statement",
                     str(ROOT / "tools/mount_machlin_btrfs.c"), "-o", str(output / "mount_machlin_btrfs")],
                    check=True, env=environment)
+    # The volume's maintenance commands (balance, scrub) through its controls.
+    subprocess.run([clang, "-arch", "arm64" if args.arch == "arm64e" else args.arch,
+                    "-isysroot", sdk, "-mmacosx-version-min=26.4", "-std=c11", "-O2",
+                    "-Wall", "-Wextra", "-Werror", "-Wdeclaration-after-statement",
+                    "-I", str(ROOT / "include"), str(ROOT / "tools/machlin_btrfs.c"),
+                    str(ROOT / "tools/balance_args.c"), "-o", str(output / "machlin-btrfs")],
+                   check=True, env=environment)
     print(f"Unsigned kernel extension: {bundle.parent}")
     print("Compilation does not establish loadability or mounted filesystem acceptance.")
 

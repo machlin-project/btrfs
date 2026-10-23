@@ -778,9 +778,11 @@ env -i PATH="$PATH" BTRFS_FUZZ_IMAGE="$PWD/artifacts/fixtures/plain.raw" \
   -artifact_prefix=artifacts/fuzz-findings/ artifacts/fuzz-corpus
 CC=/opt/homebrew/opt/llvm/bin/clang meson setup .build-tsan \
   -Db_sanitize=thread -Dfixtures=artifacts/fixtures
-meson compile -C .build-tsan btrfs-concurrent btrfs-volume-test btrfs-extents-test
+meson compile -C .build-tsan btrfs-concurrent btrfs-volume-test btrfs-extents-test \
+  btrfs-volume-balance-test
 env -i PATH="$PATH" meson test -C .build-tsan --no-rebuild concurrent-readers \
-  native-volume-views native-volume-stress decompressed-extents --print-errorlogs
+  native-volume-views native-volume-stress decompressed-extents \
+  volume-balance-transactions-data volume-balance-multi-raid5 --print-errorlogs
 ```
 
 `native-volume-stress` runs four readers against the shared native volume layer
@@ -1258,6 +1260,20 @@ for one device, copy the images back and check them with the Linux `verify`
 and `degraded` phases above. `-o degraded` (read-only) mounts without a
 device. The prepared guests were not on this host when the adapter gained
 this; it is accepted by compilation only until such a run.
+
+`btrfs-volume-balance-test DIR IMAGE...` (`tests/volume_balance.c`, the
+`volume-balance-*` Meson tests on `transactions-data` and `multi-raid5`) runs
+`btrfs_volume_balance` over every group and then `btrfs_volume_scrub` with
+repair on a mounted volume while three threads digest its pinned views;
+every digest must equal the volume's before. In the guest, the superuser
+starts the same on a mount with `machlin-btrfs balance start [-d...] [-m...]
+[-s...] [-f] MOUNT` and `machlin-btrfs scrub start [-r] MOUNT` (built beside
+`mount_machlin_btrfs` by `make kext`), which print what they did; check the
+image afterwards with the Linux `verify` phase. `machlin-btrfs verity enable
+[--hash-alg=sha256|sha512] [--block-size=N] [--salt=HEX] FILE` and
+`machlin-btrfs verity measure FILE` enable and measure fs-verity on a file of
+the mount as `fsverity` does; the digest must equal `fsverity measure`'s on
+Linux for the same file, and the file must refuse opening for writing.
 
 ### Native power cuts
 

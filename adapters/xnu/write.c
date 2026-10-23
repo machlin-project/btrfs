@@ -10,6 +10,7 @@
  * commits its data once before it returns. A file's logical size covers cached
  * data that is not applied yet. */
 #include "btrfs_xnu.h"
+#include "fsctl.h"
 
 #include <mach/vm_prot.h>
 #include <sys/buf.h>
@@ -420,6 +421,13 @@ btrfs_xnu_truncate(struct btrfs_xnu_node *node, vnode_t vnode, uint64_t size, vf
 	btrfs_xnu_now(&now);
 	lck_mtx_lock(node->write_lock);
 	lck_mtx_lock(node->mount->nodes_lock);
+	/* An fs-verity enable keeps the data as it hashes it (ETXTBSY, as
+	 * Linux's get_write_access refuses). */
+	if (node->enabling) {
+		lck_mtx_unlock(node->mount->nodes_lock);
+		lck_mtx_unlock(node->write_lock);
+		return ETXTBSY;
+	}
 	old_size = node->size;
 	node->modified = now;
 	lck_mtx_unlock(node->mount->nodes_lock);
@@ -591,8 +599,216 @@ btrfs_xnu_seek(struct btrfs_xnu_node *node, vnode_t vnode, off_t *offset, int ho
 	return btrfs_xnu_error(found);
 }
 
+static void
+btrfs_xnu_balance_kind(
+    const struct machlin_btrfs_balance_kind *control, struct btrfs_balance_kind *kind)
+{
+	kind->enabled = control->enabled != 0;
+	kind->usage = control->usage;
+	kind->convert = control->convert;
+	kind->soft = control->soft != 0;
+}
+
+/* Linux's BTRFS_IOC_BALANCE_V2 and BTRFS_IOC_SCRUB on any file of the
+ * volume, for the superuser; each runs to its end. A scrub's findings are
+ * its report, not an error, as Linux reports them. */
+static int
+btrfs_xnu_maintenance(
+    struct btrfs_xnu_mount *mount, u_long command, caddr_t data, vfs_context_t context)
+{
+	struct machlin_btrfs_balance *balance = (struct machlin_btrfs_balance *)(void *)data;
+	struct machlin_btrfs_scrub *scrub = (struct machlin_btrfs_scrub *)(void *)data;
+	struct btrfs_balance_args args;
+	struct btrfs_balance_report report;
+	struct btrfs_scrub_report found;
+	enum btrfs_result result;
+
+	if (vfs_context_suser(context) != 0) {
+		return EPERM;
+	}
+	if (command == MACHLIN_BTRFS_FSCTL_SCRUB) {
+		if (scrub->repair != 0 && !btrfs_volume_writable(mount->volume)) {
+			return EROFS;
+		}
+		bzero(&found, sizeof(found));
+		result = btrfs_volume_scrub(mount->volume, scrub->repair != 0, &found);
+		scrub->tree_copies = found.tree_copies;
+		scrub->data_copies = found.data_copies;
+		scrub->unchecked = found.unchecked;
+		scrub->corrupted = found.corrupted;
+		scrub->unreadable = found.unreadable;
+		scrub->repaired = found.repaired;
+		scrub->unrepairable = found.unrepairable;
+		scrub->super_copies = found.super_copies;
+		scrub->super_errors = found.super_errors;
+		scrub->parity_rows = found.parity_rows;
+		scrub->parity_errors = found.parity_errors;
+		return result == BTRFS_CORRUPT ? 0 : btrfs_xnu_error(result);
+	}
+	if (!btrfs_volume_writable(mount->volume)) {
+		return EROFS;
+	}
+	bzero(&args, sizeof(args));
+	btrfs_xnu_balance_kind(&balance->data, &args.data);
+	btrfs_xnu_balance_kind(&balance->metadata, &args.metadata);
+	btrfs_xnu_balance_kind(&balance->system, &args.system);
+	args.force = balance->force != 0;
+	bzero(&report, sizeof(report));
+	result = btrfs_volume_balance(mount->volume, &args, &report);
+	balance->groups = report.groups;
+	balance->blocks = report.blocks;
+	balance->extents = report.extents;
+	balance->bytes = report.bytes;
+	balance->commits = report.commits;
+	return btrfs_xnu_error(result);
+}
+
+/* Data blocks one transaction of an fs-verity enable hashes, and the work
+ * an abandoned enable's rollback takes per transaction. */
+#define BTRFS_XNU_VERITY_BLOCKS 4096U
+#define BTRFS_XNU_VERITY_ROLLBACK 1024U
+/* Transactions an abandoned enable's rollback takes at most. */
+#define BTRFS_XNU_VERITY_ROLLBACKS 65536U
+
+/* Rolls back an enable that did not finish, as Linux's rollback_verity. */
+static void
+btrfs_xnu_verity_rollback(struct btrfs_xnu_mount *mount, struct btrfs_verity_build *build)
+{
+	struct btrfs_transaction *transaction;
+	size_t rounds;
+	int done = 0;
+	enum btrfs_result result = BTRFS_OK;
+
+	for (rounds = 0; result == BTRFS_OK && !done && rounds < BTRFS_XNU_VERITY_ROLLBACKS;
+	    rounds++) {
+		result = btrfs_volume_begin(mount->volume, &transaction);
+		if (result == BTRFS_OK) {
+			result = btrfs_transaction_verity_abort(
+			    transaction, build, BTRFS_XNU_VERITY_ROLLBACK, &done);
+			if (result == BTRFS_OK) {
+				result = btrfs_volume_commit(mount->volume, transaction);
+			} else {
+				btrfs_volume_abort(mount->volume, transaction);
+			}
+		}
+	}
+}
+
+/* FS_IOC_ENABLE_VERITY (fsverity_ioctl_enable): write access is authorized,
+ * nothing may have the file open for writing or mapped writable, its cached
+ * data reaches the volume first, and no open for writing starts until the
+ * Merkle tree, built over as many transactions as it takes, is finished or
+ * rolled back. */
+static int
+btrfs_xnu_enable_verity(struct btrfs_xnu_node *node, vnode_t vnode,
+    const struct machlin_btrfs_verity_enable *request, vfs_context_t context)
+{
+	struct btrfs_xnu_mount *mount = node->mount;
+	struct btrfs_verity_parameters parameters;
+	struct btrfs_verity_build *build = NULL;
+	struct btrfs_transaction *transaction;
+	struct btrfs_object_id id;
+	enum btrfs_result result = BTRFS_OK;
+	int finished = 0;
+	int done = 0;
+	int error;
+
+	if (vnode_vtype(vnode) != VREG) {
+		return vnode_vtype(vnode) == VDIR ? EISDIR : EINVAL;
+	}
+	if (!btrfs_volume_writable(mount->volume)) {
+		return EROFS;
+	}
+	if (request->salt_size > sizeof(request->salt)) {
+		return EMSGSIZE;
+	}
+	error = vnode_authorize(vnode, NULLVP, KAUTH_VNODE_WRITE_DATA, context);
+	if (error != 0) {
+		return error;
+	}
+	/* After a truncation in progress, none starts (btrfs_xnu_truncate). */
+	lck_mtx_lock(node->write_lock);
+	lck_mtx_lock(mount->nodes_lock);
+	error = node->enabling ? EBUSY : node->writers != 0 || node->mapped_writable ? ETXTBSY : 0;
+	node->enabling = error == 0;
+	id = node->inode.id;
+	lck_mtx_unlock(mount->nodes_lock);
+	lck_mtx_unlock(node->write_lock);
+	if (error != 0) {
+		return error;
+	}
+	/* The tree covers what the file holds, its cached pages included. */
+	error = btrfs_xnu_push_data(vnode, 1);
+	parameters = (struct btrfs_verity_parameters){ request->algorithm, request->block_size,
+		request->salt, request->salt_size, NULL, 0 };
+	while (error == 0 && result == BTRFS_OK && !finished) {
+		result = btrfs_volume_begin(mount->volume, &transaction);
+		if (result != BTRFS_OK) {
+			break;
+		}
+		if (build == NULL) {
+			result =
+			    btrfs_transaction_verity_begin(transaction, id, &parameters, &build);
+		}
+		if (result == BTRFS_OK && !done) {
+			result = btrfs_transaction_verity_step(
+			    transaction, build, BTRFS_XNU_VERITY_BLOCKS, &done);
+		}
+		if (result == BTRFS_OK && done) {
+			result = btrfs_transaction_verity_finish(transaction, build);
+			finished = result == BTRFS_OK;
+		}
+		if (result == BTRFS_OK) {
+			result = btrfs_volume_commit(mount->volume, transaction);
+		} else {
+			btrfs_volume_abort(mount->volume, transaction);
+		}
+	}
+	if (build != NULL && !finished) {
+		btrfs_xnu_verity_rollback(mount, build);
+	}
+	btrfs_verity_build_free(build);
+	lck_mtx_lock(mount->nodes_lock);
+	node->enabling = 0;
+	mount->changes++;
+	lck_mtx_unlock(mount->nodes_lock);
+	if (error == 0) {
+		error = btrfs_xnu_error(result);
+	}
+	return error == 0 ? btrfs_xnu_refresh(node) : error;
+}
+
+/* FS_IOC_MEASURE_VERITY. */
+static int
+btrfs_xnu_measure_verity(struct btrfs_xnu_node *node, struct machlin_btrfs_verity_digest *digest)
+{
+	const struct btrfs_fs *fs;
+	struct btrfs_volume_view *view;
+	struct btrfs_inode inode;
+	size_t length = 0;
+	unsigned algorithm = 0;
+	enum btrfs_result result;
+	int error;
+
+	error = btrfs_xnu_read_inode(node, &fs, &view, &inode);
+	if (error != 0) {
+		return error;
+	}
+	result = btrfs_verity_digest(
+	    fs, &inode, &algorithm, digest->digest, sizeof(digest->digest), &length);
+	btrfs_volume_unread(node->mount->volume, view);
+	if (result == BTRFS_NOT_FOUND) {
+		return ENODATA;
+	}
+	digest->algorithm = algorithm;
+	digest->size = (uint32_t)length;
+	return btrfs_xnu_error(result);
+}
+
 /* F_PUNCHHOLE: the range reads as zeros and its extents go; the size stays.
- * SEEK_HOLE and SEEK_DATA arrive here as file system controls too. */
+ * SEEK_HOLE and SEEK_DATA arrive here as file system controls too, and so do
+ * the volume's balance and scrub and a file's fs-verity enable and measure
+ * (adapters/xnu/fsctl.h). */
 int
 btrfs_xnu_ioctl(void *arguments)
 {
@@ -600,6 +816,20 @@ btrfs_xnu_ioctl(void *arguments)
 	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
 	const fpunchhole_t *hole = (const fpunchhole_t *)(void *)args->a_data;
 
+	if (args->a_command == MACHLIN_BTRFS_FSCTL_BALANCE ||
+	    args->a_command == MACHLIN_BTRFS_FSCTL_SCRUB) {
+		return btrfs_xnu_maintenance(
+		    node->mount, args->a_command, args->a_data, args->a_context);
+	}
+	if (args->a_command == MACHLIN_BTRFS_FSCTL_ENABLE_VERITY) {
+		return btrfs_xnu_enable_verity(node, args->a_vp,
+		    (const struct machlin_btrfs_verity_enable *)(void *)args->a_data,
+		    args->a_context);
+	}
+	if (args->a_command == MACHLIN_BTRFS_FSCTL_MEASURE_VERITY) {
+		return btrfs_xnu_measure_verity(
+		    node, (struct machlin_btrfs_verity_digest *)(void *)args->a_data);
+	}
 	if (args->a_command == BTRFS_XNU_FIOSEEKHOLE || args->a_command == BTRFS_XNU_FIOSEEKDATA) {
 		return btrfs_xnu_seek(node, args->a_vp, (off_t *)(void *)args->a_data,
 		    args->a_command == BTRFS_XNU_FIOSEEKHOLE);

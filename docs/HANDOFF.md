@@ -106,9 +106,10 @@ is destroyed. `accept` is legal only after successful durable publication;
    a shared block once for every tree reaching it, so every state holds the
    same files and sharing stays; `tests/balance.c` checks every group of the
    writable fixtures with their crash states and faults, and Linux checks and
-   balances the results again (`tests/prepare_balance_linux.py`). Remaining:
-   a native interface that starts a balance (`btrfs_balance` takes Linux's usage, convert
-   and soft filters and force); data reference edits
+   balances the results again (`tests/prepare_balance_linux.py`). A mounted
+   volume balances and scrubs while readers use it (`btrfs_volume_balance`,
+   `btrfs_volume_scrub`), which the XNU adapter's file system controls and
+   `machlin-btrfs` start; remaining: their guest run. Data reference edits
    from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
    new writer feature and keep the Linux oracle on the shared and keyed profiles.
@@ -126,9 +127,11 @@ is destroyed. `accept` is legal only after successful durable publication;
    compression twins compare every decision with files Linux wrote.
    fs-verity files are verified on every read, keep their data on writable
    volumes, and fs-verity is enabled in bounded steps whose interruption orphan
-   cleanup undoes, as Linux does (`core/verity.c`). Remaining: a 64 KiB-sector
-   fs-verity fixture (btrfs-progs cannot enable fs-verity), and LXNU's
-   FS_IOC_ENABLE_VERITY and keyring policy for builtin signatures.
+   cleanup undoes, as Linux does (`core/verity.c`); the XNU adapter enables
+   and measures it through file system controls (`machlin-btrfs verity`).
+   Remaining: a 64 KiB-sector fs-verity fixture, a guest run of those
+   controls, and LXNU's FS_IOC_ENABLE_VERITY and keyring policy for builtin
+   signatures.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
    siblings, and data and metadata chunks grow from unallocated device space

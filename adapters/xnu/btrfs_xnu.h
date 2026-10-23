@@ -120,6 +120,13 @@ struct btrfs_xnu_node {
 	int orphan;
 	/* The first failed commit of cached data, reported by fsync. */
 	int write_error;
+	/* Opens for writing, and whether a writable mapping may remain
+	 * (nodes_lock): an fs-verity enable needs neither, as Linux's
+	 * deny_write_access, and while it runs (enabling) no open for writing
+	 * starts. */
+	uint32_t writers;
+	int mapped_writable;
+	int enabling;
 	/* Serializes writers and truncation of the file's logical size. Strategy
 	 * writes never take it: cluster_write may push them while it is held. */
 	lck_mtx_t *write_lock;

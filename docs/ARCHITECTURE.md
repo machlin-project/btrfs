@@ -702,8 +702,24 @@ one of the target profile. As Linux's `btrfs_balance` refuses them
 (INVALID_ARGUMENT), a target needs the fewest devices its profile allocates
 on (`validate_convert_profile`), and metadata or system groups convert to a
 profile without a second copy or parity, while some of them have one, only
-with `force` (Linux's `--force`). A native interface that starts a
-balance is not implemented. `btrfs-inspect IMAGE balance` lists the block
+with `force` (Linux's `--force`).
+
+A mounted volume balances as Linux's kernel does while files stay in use
+(`btrfs_volume_balance`): deleted subvolumes go first through the volume's
+maintenance, `btrfs_balance_plan` selects the groups on the current view, and
+each relocation step is one transaction of the volume
+(`btrfs_transaction_relocate` inside `btrfs_volume_begin` and
+`btrfs_volume_commit`) published as a view. Readers keep reading the same files
+throughout, and every step waits, as every volume transaction does, until no
+view older than its base is pinned, so no reader meets a block a step reused.
+`btrfs_volume_scrub` runs `btrfs_scrub` in the writer's turn after the running
+transaction commits; its repairs rewrite the bytes the trees name. The XNU
+adapter offers both as file system controls on any file of the mount for the
+superuser (`adapters/xnu/fsctl.h`, as Linux's `BTRFS_IOC_BALANCE_V2` and
+`BTRFS_IOC_SCRUB` need `CAP_SYS_ADMIN`), which `machlin-btrfs balance start`
+and `machlin-btrfs scrub start` issue with btrfs-progs' options. FSKit gives a
+client no control of a mounted volume, so the FSKit extension offers neither.
+`btrfs-inspect IMAGE balance` lists the block
 groups and, with `--apply`, relocates the named groups, or those
 btrfs-progs-style filters select (`-f`, and `-d`, `-m`, `-s` with `usage=`,
 `convert=PROFILE` and `soft`; `-m` also selects system groups unless `-s` is
@@ -908,8 +924,18 @@ between begin and finish, as Linux's `deny_write_access` does, and refuses a
 second enable of the file (EBUSY). An enable cut short by a crash leaves tree
 items and an orphan item on a linked file; orphan cleanup deletes the inode's
 fs-verity items before that orphan item, as `btrfs_orphan_cleanup` calls
-`btrfs_drop_verity_items`. The native adapters have no interface that enables
-fs-verity; LXNU's FS_IOC_ENABLE_VERITY belongs to the XNU fork.
+`btrfs_drop_verity_items`. The XNU adapter enables and measures fs-verity
+through file system controls (`adapters/xnu/fsctl.h`; `machlin-btrfs verity
+enable` and `measure`, with fsverity-utils' options and output), doing what
+Linux's ioctl does around the core: write access is authorized, a file open
+for writing or mapped writable is refused (ETXTBSY, `deny_write_access`; the
+adapter counts writers in open and close and writable mappings until their
+last one goes), cached pages are written back, and until the tree is
+finished, over as many volume transactions as it takes, or rolled back, no
+open for writing, writable mapping or truncation starts; a second enable is
+EBUSY. Builtin signatures are not taken: Linux checks them against its
+`.fs-verity` keyring, which has no counterpart here. FSKit offers no such
+control. LXNU's FS_IOC_ENABLE_VERITY belongs to the XNU fork.
 
 ## Quotas
 

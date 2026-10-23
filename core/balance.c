@@ -1092,37 +1092,35 @@ bt_bl_convert(struct btrfs_transaction *transaction, size_t chunk, uint64_t prof
 	return error;
 }
 
-/* One committed step: extents of the group move until the work reaches
- * work (one extent when single), or the emptied group goes (*done); with a
- * profile other than BTRFS_BALANCE_KEEP, its kind converts to it. On the
- * device named limited (none for 0) no new chunk takes a stripe ending past
- * limit. *moved counts the extents moved. */
+/* The work of one step inside transaction: extents of the group move until
+ * the work reaches work (one extent when single), or the emptied group goes
+ * (*done); with a profile other than BTRFS_BALANCE_KEEP, its kind converts to
+ * it. On the device named limited (none for 0) no new chunk takes a stripe
+ * ending past limit. *moved counts the extents moved; counts adds the group
+ * when done and the blocks, extents and bytes moved. */
 static enum btrfs_result
-bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, uint64_t group,
-    size_t work, int single, uint64_t profile, uint64_t limited, uint64_t limit,
-    struct btrfs_balance_report *report, int *done, uint64_t *moved)
+bt_bl_step_in(struct btrfs_transaction *transaction, uint64_t group, size_t work, int single,
+    uint64_t profile, uint64_t limited, uint64_t limit, struct btrfs_balance_report *counts,
+    int *done, uint64_t *moved)
 {
+	const struct btrfs_fs *base = transaction->base;
 	size_t device;
-	struct btrfs_transaction *transaction = NULL;
 	struct bt_balance balance;
 	struct bt_key extent = { 0 };
 	uint64_t position;
 	size_t chunk = 0;
 	int found = 1;
-	enum btrfs_result error;
+	enum btrfs_result error = BTRFS_OK;
 
 	*done = 0;
 	*moved = 0;
 	bt_zero(&balance, sizeof(balance));
-	error = btrfs_transaction_begin(fs, writer, &transaction);
-	if (error == BTRFS_OK) {
-		transaction->balancing = 1;
-		chunk = bt_chunk_containing(&transaction->fs, group);
-		if (chunk == transaction->fs.chunk_count ||
-		    transaction->fs.chunks[chunk].logical != group ||
-		    transaction->fs.chunks[chunk].removed) {
-			error = BTRFS_NOT_FOUND;
-		}
+	transaction->balancing = 1;
+	chunk = bt_chunk_containing(&transaction->fs, group);
+	if (chunk == transaction->fs.chunk_count ||
+	    transaction->fs.chunks[chunk].logical != group ||
+	    transaction->fs.chunks[chunk].removed) {
+		error = BTRFS_NOT_FOUND;
 	}
 	if (error == BTRFS_OK && limited != 0) {
 		device = bt_tx_device_index(transaction, limited);
@@ -1152,8 +1150,8 @@ bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, ui
 		balance.transaction = transaction;
 		balance.start = group;
 		balance.end = group + transaction->fs.chunks[chunk].length;
-		balance.generation = fs->info.generation + 1;
-		error = bt_bl_allocate(&fs->env, &balance, fs->info.node_size);
+		balance.generation = base->info.generation + 1;
+		error = bt_bl_allocate(&base->env, &balance, base->info.node_size);
 	}
 	for (position = group; error == BTRFS_OK && found;) {
 		error = bt_bl_next(&balance, position, &extent, &found);
@@ -1164,7 +1162,7 @@ bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, ui
 			error = extent.offset < BT_MAX_LEVEL
 			    ? bt_bl_tree_block(&balance, extent.objectid, (uint8_t)extent.offset)
 			    : BTRFS_CORRUPT;
-			position = extent.objectid + fs->info.node_size;
+			position = extent.objectid + base->info.node_size;
 		} else {
 			error = bt_bl_data(&balance, extent);
 			position = extent.objectid + extent.offset;
@@ -1182,16 +1180,43 @@ bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, ui
 	}
 	if (error == BTRFS_OK) {
 		transaction->changed = 1;
+		counts->groups += (uint64_t)*done;
+		counts->blocks += balance.blocks;
+		counts->extents += balance.extents;
+		counts->bytes += balance.bytes;
+	}
+	bt_bl_free(&base->env, &balance, base->info.node_size);
+	return error;
+}
+
+/* One committed step of bt_bl_step_in in a transaction of its own. */
+static enum btrfs_result
+bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, uint64_t group,
+    size_t work, int single, uint64_t profile, uint64_t limited, uint64_t limit,
+    struct btrfs_balance_report *report, int *done, uint64_t *moved)
+{
+	struct btrfs_transaction *transaction = NULL;
+	struct btrfs_balance_report counts;
+	enum btrfs_result error;
+
+	*done = 0;
+	*moved = 0;
+	bt_zero(&counts, sizeof(counts));
+	error = btrfs_transaction_begin(fs, writer, &transaction);
+	if (error == BTRFS_OK) {
+		error = bt_bl_step_in(transaction, group, work, single, profile, limited, limit,
+		    &counts, done, moved);
+	}
+	if (error == BTRFS_OK) {
 		error = btrfs_transaction_commit(transaction);
 	}
 	if (error == BTRFS_OK) {
-		report->groups += (uint64_t)*done;
-		report->blocks += balance.blocks;
-		report->extents += balance.extents;
-		report->bytes += balance.bytes;
+		report->groups += counts.groups;
+		report->blocks += counts.blocks;
+		report->extents += counts.extents;
+		report->bytes += counts.bytes;
 		report->commits++;
 	}
-	bt_bl_free(&fs->env, &balance, fs->info.node_size);
 	btrfs_transaction_destroy(transaction);
 	return error;
 }
@@ -1406,6 +1431,9 @@ bt_bl_target(const struct btrfs_balance_kind *kind, size_t devices, int *redunda
 /* Linux's btrfs_balance argument checks against the mounted volume: valid
  * targets, and metadata or system redundancy reduced only with force while
  * some group of the kind has it. */
+/* Linux's btrfs_balance argument checks against the mounted volume: valid
+ * targets, and metadata or system redundancy reduced only with force while
+ * some group of the kind has it. */
 static enum btrfs_result
 bt_bl_arguments(const struct btrfs_fs *fs, const struct btrfs_balance_args *args)
 {
@@ -1441,35 +1469,22 @@ bt_bl_arguments(const struct btrfs_fs *fs, const struct btrfs_balance_args *args
 }
 
 enum btrfs_result
-bt_balance(const struct btrfs_environment *environment,
-    const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
-    size_t work, struct btrfs_balance_report *report)
+btrfs_balance_plan(const struct btrfs_fs *fs, const struct btrfs_balance_args *args,
+    uint64_t *groups, uint64_t *profiles, size_t capacity, size_t *count)
 {
 	const struct btrfs_balance_kind *kind;
-	struct btrfs_group *groups = NULL;
-	struct btrfs_fs *fs = NULL;
+	struct btrfs_group *listed = NULL;
 	struct btrfs_info info;
-	size_t capacity = 0;
-	size_t count = 0;
+	size_t listed_count = 0;
 	size_t i;
 	enum btrfs_result error;
 
-	if (environment == NULL || writer == NULL || args == NULL || report == NULL || work == 0) {
+	if (fs == NULL || args == NULL || count == NULL ||
+	    (capacity != 0 && (groups == NULL || profiles == NULL))) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
-	bt_zero(report, sizeof(*report));
-	error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
-	if (error == BTRFS_OK) {
-		error = bt_bl_arguments(fs, args);
-	}
-	btrfs_unmount(fs);
-	fs = NULL;
-	if (error == BTRFS_OK) {
-		error = bt_bl_clean(environment, writer, report);
-	}
-	if (error == BTRFS_OK) {
-		error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
-	}
+	*count = 0;
+	error = bt_bl_arguments(fs, args);
 	/* Mixed groups hold both kinds: Linux requires the same arguments. */
 	if (error == BTRFS_OK) {
 		btrfs_get_info(fs, &info);
@@ -1481,26 +1496,107 @@ bt_balance(const struct btrfs_environment *environment,
 			error = BTRFS_INVALID_ARGUMENT;
 		}
 	}
+	if (error == BTRFS_OK && fs->chunk_count != 0) {
+		listed = fs->env.allocate(fs->env.context, fs->chunk_count * sizeof(*listed));
+		error = listed == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+	}
+	if (error == BTRFS_OK && listed != NULL) {
+		error = btrfs_get_groups(fs, listed, fs->chunk_count, &listed_count);
+	}
+	for (i = 0; error == BTRFS_OK && i < listed_count; i++) {
+		kind = bt_bl_kind(args, listed[i].flags);
+		if (!bt_bl_selects(kind, &listed[i])) {
+			continue;
+		}
+		if (*count == capacity) {
+			error = BTRFS_RANGE;
+			break;
+		}
+		groups[*count] = listed[i].logical;
+		profiles[*count] = kind->convert;
+		(*count)++;
+	}
+	if (listed != NULL) {
+		fs->env.release(fs->env.context, listed, fs->chunk_count * sizeof(*listed));
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_transaction_relocate(struct btrfs_transaction *transaction, uint64_t group, uint64_t profile,
+    size_t work, struct btrfs_balance_report *report, int *done)
+{
+	uint64_t moved = 0;
+	enum btrfs_result error;
+
+	if (transaction == NULL || report == NULL || done == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*done = 0;
+	if (transaction->failure != BTRFS_OK || transaction->finished) {
+		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
+	}
+	error = bt_bl_step_in(transaction, group, work == 0 ? 1 : work, work == 0, profile, 0, 0,
+	    report, done, &moved);
+	/* A refused step leaves partial changes: the caller aborts. */
+	if (error != BTRFS_OK) {
+		transaction->failure = error;
+	}
+	return error;
+}
+
+enum btrfs_result
+bt_balance(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
+    size_t work, struct btrfs_balance_report *report)
+{
+	struct btrfs_fs *fs = NULL;
+	uint64_t *groups = NULL;
+	uint64_t *profiles = NULL;
+	size_t capacity = 0;
+	size_t count = 0;
+	size_t i;
+	enum btrfs_result error;
+
+	if (environment == NULL || writer == NULL || args == NULL || report == NULL || work == 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	bt_zero(report, sizeof(*report));
+	error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
+	if (error == BTRFS_OK) {
+		error = btrfs_balance_plan(fs, args, NULL, NULL, 0, &count);
+		error = error == BTRFS_RANGE ? BTRFS_OK : error;
+	}
+	btrfs_unmount(fs);
+	fs = NULL;
+	if (error == BTRFS_OK) {
+		error = bt_bl_clean(environment, writer, report);
+	}
+	if (error == BTRFS_OK) {
+		error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
+	}
 	if (error == BTRFS_OK) {
 		capacity = fs->chunk_count;
 		groups = environment->allocate(environment->context, capacity * sizeof(*groups));
-		error = groups == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+		profiles =
+		    environment->allocate(environment->context, capacity * sizeof(*profiles));
+		error = groups == NULL || profiles == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
 	}
 	if (error == BTRFS_OK) {
-		error = btrfs_get_groups(fs, groups, capacity, &count);
+		error = btrfs_balance_plan(fs, args, groups, profiles, capacity, &count);
 	}
 	btrfs_unmount(fs);
 	/* The groups selected when the balance began, each once: chunks it
 	 * creates are not revisited. */
 	for (i = 0; error == BTRFS_OK && i < count; i++) {
-		kind = bt_bl_kind(args, groups[i].flags);
-		if (bt_bl_selects(kind, &groups[i])) {
-			error = bt_bl_relocate(environment, writer, groups[i].logical, work,
-			    kind->convert, 0, 0, report);
-		}
+		error =
+		    bt_bl_relocate(environment, writer, groups[i], work, profiles[i], 0, 0, report);
 	}
 	if (groups != NULL) {
 		environment->release(environment->context, groups, capacity * sizeof(*groups));
+	}
+	if (profiles != NULL) {
+		environment->release(environment->context, profiles, capacity * sizeof(*profiles));
 	}
 	return error;
 }

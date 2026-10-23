@@ -45,7 +45,8 @@ codec_test = executable('btrfs-codec-test', 'tests/codec.c', include_directories
 test('extent-codecs', codec_test, suite: 'core', timeout: 600)
 posix = static_library('btrfs_posix', 'adapters/posix/image.c',
   include_directories: inc, dependencies: [zlib, zstd], c_args: codec_flags, link_with: codec)
-inspect = executable('btrfs-inspect', 'tools/inspect.c', include_directories: inc,
+inspect = executable('btrfs-inspect', 'tools/inspect.c', 'tools/balance_args.c',
+  include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 executable('btrfs-bench', 'tools/bench.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
@@ -114,6 +115,9 @@ multidev_write_test = executable('btrfs-multidev-write-test', 'tests/multidev_wr
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
 volume_devices_test = executable('btrfs-volume-devices-test', 'tests/volume_devices.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
+volume_balance_test = executable('btrfs-volume-balance-test', 'tests/volume_balance.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [volume, posix, core], dependencies: [zlib, zstd, dependency('threads')])
 space_caches_test = executable('btrfs-space-caches-test', 'tests/space_caches.c',
@@ -394,6 +398,14 @@ if fixtures != ''
     test('volume-devices-' + profile[0], volume_devices_test,
       args: [profile[2], meson.current_build_dir()] + images, timeout: 300, suite: 'images')
   endforeach
+  # Balance and scrub on a mounted volume while readers digest its views.
+  test('volume-balance-transactions-data', volume_balance_test,
+    args: [meson.current_build_dir(), join_paths(fixtures, 'transactions-data.raw')],
+    timeout: 600, suite: 'images')
+  test('volume-balance-multi-raid5', volume_balance_test,
+    args: [meson.current_build_dir()] + [join_paths(fixtures, 'multi-raid5-0.raw'),
+      join_paths(fixtures, 'multi-raid5-1.raw'), join_paths(fixtures, 'multi-raid5-2.raw')],
+    timeout: 600, suite: 'images')
   # v1 space caches: an emptied group goes with its cache.
   test('space-caches', space_caches_test,
     args: [join_paths(fixtures, 'space-caches.raw'), meson.current_build_dir()],

@@ -270,13 +270,6 @@ btrfs_xnu_unsupported(void *arguments)
 }
 
 static int
-btrfs_xnu_noop(void *arguments)
-{
-	(void)arguments;
-	return 0;
-}
-
-static int
 btrfs_xnu_lookup(void *arguments)
 {
 	struct vnop_lookup_args *args = arguments;
@@ -406,8 +399,59 @@ btrfs_xnu_open(void *arguments)
 	}
 	lck_mtx_lock(node->mount->nodes_lock);
 	flags = node->inode.flags;
+	error = (flags & BTRFS_INODE_FLAG_VERITY) != 0 ? EPERM : node->enabling ? ETXTBSY : 0;
+	if (error == 0) {
+		node->writers++;
+	}
 	lck_mtx_unlock(node->mount->nodes_lock);
-	return (flags & BTRFS_INODE_FLAG_VERITY) != 0 ? EPERM : 0;
+	return error;
+}
+
+/* VFS sends one close for each open. */
+static int
+btrfs_xnu_close(void *arguments)
+{
+	struct vnop_close_args *args = arguments;
+	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+
+	if ((args->a_fflag & FWRITE) != 0) {
+		lck_mtx_lock(node->mount->nodes_lock);
+		if (node->writers != 0) {
+			node->writers--;
+		}
+		lck_mtx_unlock(node->mount->nodes_lock);
+	}
+	return 0;
+}
+
+/* A mapping that may write keeps the file busy for an fs-verity enable until
+ * its last mapping goes (vnop_mnomap). FWRITE and PROT_WRITE share a value. */
+static int
+btrfs_xnu_mmap(void *arguments)
+{
+	struct vnop_mmap_args *args = arguments;
+	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+	int error = 0;
+
+	if ((args->a_fflags & FWRITE) != 0) {
+		lck_mtx_lock(node->mount->nodes_lock);
+		error = node->enabling ? ETXTBSY : 0;
+		node->mapped_writable |= error == 0;
+		lck_mtx_unlock(node->mount->nodes_lock);
+	}
+	return error;
+}
+
+static int
+btrfs_xnu_mnomap(void *arguments)
+{
+	struct vnop_mnomap_args *args = arguments;
+	struct btrfs_xnu_node *node = vnode_fsnode(args->a_vp);
+
+	lck_mtx_lock(node->mount->nodes_lock);
+	node->mapped_writable = 0;
+	lck_mtx_unlock(node->mount->nodes_lock);
+	return 0;
 }
 
 static int
@@ -883,13 +927,13 @@ btrfs_xnu_reclaim(void *arguments)
 
 static struct vnodeopv_entry_desc btrfs_xnu_operations[] = {
 	{ &vnop_default_desc, btrfs_xnu_unsupported }, { &vnop_lookup_desc, btrfs_xnu_lookup },
-	{ &vnop_open_desc, btrfs_xnu_open }, { &vnop_close_desc, btrfs_xnu_noop },
+	{ &vnop_open_desc, btrfs_xnu_open }, { &vnop_close_desc, btrfs_xnu_close },
 	{ &vnop_getattr_desc, btrfs_xnu_getattr }, { &vnop_read_desc, btrfs_xnu_read },
 	{ &vnop_readdir_desc, btrfs_xnu_readdir }, { &vnop_readlink_desc, btrfs_xnu_readlink },
 	{ &vnop_blockmap_desc, btrfs_xnu_blockmap }, { &vnop_blktooff_desc, btrfs_xnu_blktooff },
 	{ &vnop_offtoblk_desc, btrfs_xnu_offtoblk }, { &vnop_strategy_desc, btrfs_xnu_strategy },
 	{ &vnop_pagein_desc, btrfs_xnu_pagein }, { &vnop_pageout_desc, btrfs_xnu_pageout },
-	{ &vnop_mmap_desc, btrfs_xnu_noop }, { &vnop_mnomap_desc, btrfs_xnu_noop },
+	{ &vnop_mmap_desc, btrfs_xnu_mmap }, { &vnop_mnomap_desc, btrfs_xnu_mnomap },
 	{ &vnop_fsync_desc, btrfs_xnu_fsync }, { &vnop_inactive_desc, btrfs_xnu_inactive },
 	{ &vnop_reclaim_desc, btrfs_xnu_reclaim }, { &vnop_pathconf_desc, btrfs_xnu_pathconf },
 	{ &vnop_create_desc, btrfs_xnu_create }, { &vnop_getxattr_desc, btrfs_xnu_getxattr },

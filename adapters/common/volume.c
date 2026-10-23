@@ -983,3 +983,150 @@ btrfs_volume_unread(struct btrfs_volume *volume, struct btrfs_volume_view *view)
 	}
 	volume->locks.unlock(volume->locks.context);
 }
+
+/* Maintenance steps a balance takes before it plans, at most: deleted
+ * subvolumes go first, as btrfs_balance drops them. */
+#define VOLUME_BALANCE_CLEAN_STEPS 65536U
+/* Transaction work after which a balance step commits, as btrfs_balance's. */
+#define VOLUME_BALANCE_WORK 1024U
+/* Steps one group's relocation takes at most. */
+#define VOLUME_BALANCE_STEPS 65536U
+
+/* One group's relocation in volume transactions, each published as a view;
+ * a step too large for a transaction is retried one extent at a time. */
+static enum btrfs_result
+volume_relocate(struct btrfs_volume *volume, uint64_t group, uint64_t profile,
+    struct btrfs_balance_report *report)
+{
+	struct btrfs_transaction *transaction;
+	size_t steps;
+	size_t work;
+	int done = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (steps = 0; error == BTRFS_OK && !done; steps++) {
+		if (steps == VOLUME_BALANCE_STEPS) {
+			return BTRFS_UNSUPPORTED;
+		}
+		work = VOLUME_BALANCE_WORK;
+		error = btrfs_volume_begin(volume, &transaction);
+		if (error == BTRFS_OK) {
+			error = btrfs_transaction_relocate(
+			    transaction, group, profile, work, report, &done);
+			if (error != BTRFS_OK && error != BTRFS_NOT_FOUND &&
+			    error != BTRFS_UNSUPPORTED && error != BTRFS_CORRUPT &&
+			    error != BTRFS_IO) {
+				btrfs_volume_abort(volume, transaction);
+				work = 0;
+				error = btrfs_volume_begin(volume, &transaction);
+				if (error == BTRFS_OK) {
+					error = btrfs_transaction_relocate(
+					    transaction, group, profile, work, report, &done);
+				}
+			}
+		}
+		if (error == BTRFS_OK) {
+			error = btrfs_volume_commit(volume, transaction);
+			report->commits += error == BTRFS_OK;
+		} else if (transaction != NULL) {
+			btrfs_volume_abort(volume, transaction);
+		}
+		/* A group gone meanwhile is done. */
+		if (error == BTRFS_NOT_FOUND) {
+			error = BTRFS_OK;
+			done = 1;
+		}
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_volume_balance(struct btrfs_volume *volume, const struct btrfs_balance_args *args,
+    struct btrfs_balance_report *report)
+{
+	const struct btrfs_environment *environment = &volume->environment;
+	struct btrfs_volume_view *view;
+	const struct btrfs_fs *fs;
+	uint64_t *groups = NULL;
+	uint64_t *profiles = NULL;
+	size_t capacity = 0;
+	size_t count = 0;
+	size_t steps;
+	size_t i;
+	int pending = 1;
+	enum btrfs_result error = BTRFS_OK;
+
+	if (args == NULL || report == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	*report = (struct btrfs_balance_report){ 0 };
+	if (!volume->writable) {
+		return BTRFS_READ_ONLY;
+	}
+	for (steps = 0; error == BTRFS_OK && pending; steps++) {
+		error = steps == VOLUME_BALANCE_CLEAN_STEPS
+		    ? BTRFS_UNSUPPORTED
+		    : btrfs_volume_maintain(volume, &pending);
+	}
+	if (error == BTRFS_OK) {
+		error = btrfs_volume_sync(volume, btrfs_volume_pending(volume));
+	}
+	if (error == BTRFS_OK) {
+		fs = btrfs_volume_pin(volume, &view);
+		/* Every group may be selected. */
+		error = btrfs_get_groups(fs, NULL, 0, &capacity);
+		error = error == BTRFS_RANGE ? BTRFS_OK : error;
+		if (error == BTRFS_OK && capacity != 0) {
+			groups =
+			    environment->allocate(environment->context, capacity * sizeof(*groups));
+			profiles = environment->allocate(
+			    environment->context, capacity * sizeof(*profiles));
+			error = groups == NULL || profiles == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+		}
+		if (error == BTRFS_OK) {
+			error = btrfs_balance_plan(fs, args, groups, profiles, capacity, &count);
+		}
+		btrfs_volume_unpin(volume, view);
+	}
+	/* The groups selected when the balance began, each once. */
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		error = volume_relocate(volume, groups[i], profiles[i], report);
+	}
+	if (groups != NULL) {
+		environment->release(environment->context, groups, capacity * sizeof(*groups));
+	}
+	if (profiles != NULL) {
+		environment->release(environment->context, profiles, capacity * sizeof(*profiles));
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_volume_scrub(struct btrfs_volume *volume, int repair, struct btrfs_scrub_report *report)
+{
+	enum btrfs_result error;
+
+	if (report == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (repair && !volume->writable) {
+		return BTRFS_READ_ONLY;
+	}
+	/* The scrub reads a committed root set no transaction changes meanwhile;
+	 * repairs rewrite the bytes the trees name, which readers keep reading. */
+	volume->locks.lock(volume->locks.context);
+	volume_take_turn(volume);
+	error = volume->failure;
+	volume->locks.unlock(volume->locks.context);
+	if (error == BTRFS_OK && volume->writable) {
+		error = volume_commit_running(volume);
+	}
+	if (error == BTRFS_OK) {
+		volume->issued = 0;
+		error = btrfs_scrub(&volume->environment, repair ? &volume->counted : NULL, report);
+	}
+	volume->locks.lock(volume->locks.context);
+	volume_give_turn(volume);
+	volume->locks.unlock(volume->locks.context);
+	return error;
+}

@@ -224,6 +224,24 @@ enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
     struct btrfs_balance_report *report);
 
+/* The block groups btrfs_balance would relocate on fs, in address order,
+ * after Linux's argument checks (INVALID_ARGUMENT), each with the profile its
+ * kind converts to (BTRFS_BALANCE_KEEP otherwise); RANGE beyond capacity, with
+ * *count the groups up to it. A balance through a native volume relocates
+ * each with btrfs_transaction_relocate. */
+enum btrfs_result btrfs_balance_plan(const struct btrfs_fs *fs,
+    const struct btrfs_balance_args *args, uint64_t *groups, uint64_t *profiles, size_t capacity,
+    size_t *count);
+/* One step of btrfs_relocate_group inside transaction, which the caller (a
+ * native volume) began and commits: extents of the group at group move until
+ * the transaction's work reaches work (one extent for 0), or, when none is
+ * left, the emptied group goes (*done); a profile other than
+ * BTRFS_BALANCE_KEEP converts its kind. report adds the group when done and
+ * the blocks, extents and bytes moved. NOT_FOUND names no group; any refusal
+ * fails the transaction, which the caller aborts. */
+enum btrfs_result btrfs_transaction_relocate(struct btrfs_transaction *transaction, uint64_t group,
+    uint64_t profile, size_t work, struct btrfs_balance_report *report, int *done);
+
 struct btrfs_scrub_report {
 	/* Copies read and verified: of tree blocks, and of data sectors with
 	 * checksums. */
