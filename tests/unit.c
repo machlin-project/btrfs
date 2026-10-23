@@ -453,19 +453,28 @@ parity_reads(
 /* RAID5 and RAID6 rebuilds against an independent model of the parity:
  * every copy reads every data unit while all devices are there, and with the
  * unit's device lost, the copy that does without it (P; Q without P; P and
- * Q without a second data stripe) still does. */
+ * Q without a second data stripe) still does. The parity a commit computes
+ * for each row is the model's, and each unit of each row, data, P or Q,
+ * rebuilds from the row's others without its device, as a replace of a
+ * missing device takes it. */
 static void
 parity_contract(void)
 {
 	static struct parity_device memory[PARITY_MAX_STRIPES];
 	static uint8_t data[PARITY_ROWS * PARITY_MAX_STRIPES * BT_STRIPE_LENGTH];
+	static uint8_t units[BT_RAID56_UNITS * BT_STRIPE_LENGTH];
+	static uint8_t p[BT_STRIPE_LENGTH];
+	static uint8_t q[BT_STRIPE_LENGTH];
+	static uint8_t rebuilt[BT_STRIPE_LENGTH];
 	static const unsigned shapes[][2] = { { 5, 1 }, { 6, 2 } };
+	const uint8_t *rows[PARITY_MAX_STRIPES];
 	struct bt_device devices[PARITY_MAX_STRIPES];
 	struct parity_field field;
 	struct btrfs_fs fs;
 	uint64_t profile;
 	uint64_t length;
 	uint64_t unit;
+	uint64_t row;
 	uint32_t state = 0x2545f491U;
 	unsigned stripes;
 	unsigned parity;
@@ -544,6 +553,28 @@ parity_contract(void)
 				}
 			}
 			devices[target].read = parity_read;
+		}
+		for (row = 0; row < PARITY_ROWS; row++) {
+			for (i = 0; i < count; i++) {
+				rows[i] = data + (row * count + i) * BT_STRIPE_LENGTH;
+			}
+			bt_raid56_parity(profile, rows, count, p, q, BT_STRIPE_LENGTH);
+			assert(memcmp(p,
+				   memory[(row + count) % stripes].bytes + row * BT_STRIPE_LENGTH,
+				   BT_STRIPE_LENGTH) == 0);
+			assert(parity == 1 ||
+			    memcmp(q,
+				memory[(row + count + 1) % stripes].bytes + row * BT_STRIPE_LENGTH,
+				BT_STRIPE_LENGTH) == 0);
+			for (i = 0; i < stripes; i++) {
+				devices[i].read = NULL;
+				memset(rebuilt, 0, sizeof(rebuilt));
+				assert(bt_raid56_unit(&fs, &fs.chunks[0], row, i, rebuilt, units) ==
+				    BTRFS_OK);
+				assert(memcmp(rebuilt, memory[i].bytes + row * BT_STRIPE_LENGTH,
+					   BT_STRIPE_LENGTH) == 0);
+				devices[i].read = parity_read;
+			}
 		}
 		free(fs.chunks);
 	}
@@ -814,6 +845,6 @@ main(void)
 	parity_contract();
 	btrfs_unmount(NULL);
 	puts("wire encoding, CRC32C known vector, key order, names, chunk table, chunk profiles, "
-	     "RAID5/6 rebuilds and invalid API inputs: PASS");
+	     "RAID5/6 parity and rebuilds and invalid API inputs: PASS");
 	return 0;
 }

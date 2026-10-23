@@ -22,6 +22,12 @@ given profiles with its own balance (forced), then balance every group,
 reporting whether that completes, print the chunk profiles and check: the
 control for conversions this implementation made.
 
+degraded: on images this implementation wrote, mount the volume read-only
+and degraded without each set of up to --missing devices (every other one
+named, nothing else registered) and print the manifest each time: every file
+reads through Linux's own RAID5/6 rebuild from P and Q, verified against its
+checksums, so a manifest equal to the model's confirms the parity written.
+
 devices: on a copy of a volume with one more, blank image after its devices,
 have Linux add that device, print the device and chunk trees' device items
 and each device's superblock, check, remove the device --remove names, print
@@ -35,6 +41,7 @@ subvolumes appear as their directories.
 
 import argparse
 import hashlib
+import itertools
 import json
 from pathlib import Path
 import subprocess
@@ -187,6 +194,25 @@ poweroff -f
 """
 
 
+def degraded_init(count: int, missing: int) -> str:
+    mounts = []
+    for size in range(1, missing + 1):
+        for omitted in itertools.combinations(range(count), size):
+            present = [f"/dev/vd{chr(ord('a') + i)}" for i in range(count) if i not in omitted]
+            tag = "".join(chr(ord('a') + i) for i in omitted)
+            options = ",".join(f"device={device}" for device in present)
+            mounts.append(f"""btrfs device scan --forget
+mount -t btrfs -o ro,degraded,{options} {present[0]} /mnt
+manifest | sed 's/^BTRFS_MULTI_MANIFEST:/BTRFS_MULTI_DEGRADED_{tag}:/'
+umount /mnt
+echo BTRFS_MULTI_DEGRADED_DONE:{tag}
+""")
+    return PRELUDE + MANIFEST + "".join(mounts) + """echo BTRFS_MULTI_DEGRADED_PASS
+trap - EXIT
+poweroff -f
+"""
+
+
 def convert_init(data: str, metadata: str) -> str:
     return PRELUDE + MANIFEST + f"""
 btrfs device scan
@@ -257,7 +283,7 @@ poweroff -f
 
 
 def prepare(root: Path, phase: str, profile: str, archive: Path, data: str = "",
-            metadata: str = "", remove: int = 0) -> None:
+            metadata: str = "", remove: int = 0, missing: int = 0) -> None:
     count, profile_data, profile_metadata = PROFILES[profile]
     inputs = root / "input"
     inputs.mkdir(parents=True, exist_ok=True)
@@ -270,6 +296,8 @@ def prepare(root: Path, phase: str, profile: str, archive: Path, data: str = "",
         init = convert_init(data, metadata)
     elif phase == "devices":
         init = devices_init(count, remove)
+    elif phase == "degraded":
+        init = degraded_init(count, missing)
     else:
         init = verify_init(count)
     (root / "init").write_text(init)
@@ -290,7 +318,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True,
                         help="Disposable staged Alpine initrd root")
-    parser.add_argument("--phase", choices=("create", "verify", "convert", "devices"),
+    parser.add_argument("--phase",
+                        choices=("create", "verify", "convert", "devices", "degraded"),
                         required=True)
     parser.add_argument("--profile", choices=PROFILES, required=True)
     parser.add_argument("--archive", type=Path, required=True)
@@ -298,13 +327,17 @@ def main() -> None:
     parser.add_argument("--metadata", default="", help="convert: the metadata target profile")
     parser.add_argument("--remove", type=int, default=0,
                         help="devices: the device id to remove after adding one")
+    parser.add_argument("--missing", type=int, default=0,
+                        help="degraded: the most devices left out at once (1 or 2)")
     args = parser.parse_args()
     if args.phase == "convert" and not (args.data and args.metadata):
         parser.error("convert needs --data and --metadata")
     if args.phase == "devices" and args.remove <= 0:
         parser.error("devices needs --remove")
+    if args.phase == "degraded" and args.missing not in (1, 2):
+        parser.error("degraded needs --missing 1 or 2")
     prepare(args.root.resolve(), args.phase, args.profile, args.archive.resolve(), args.data,
-            args.metadata, args.remove)
+            args.metadata, args.remove, args.missing)
 
 
 if __name__ == "__main__":

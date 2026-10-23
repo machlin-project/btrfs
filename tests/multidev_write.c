@@ -12,20 +12,24 @@
  * superblock recovery, which never selects anything else, and passes the
  * reference audit; some of them take a further transaction. The volume
  * reads the same mounted from each device. A writer without each device is
- * an invalid argument and a degraded mount is refused; volumes with RAID5/6
- * chunks are refused before any write. Then a balance relocates every group,
+ * an invalid argument and a degraded mount is refused, before any write;
+ * RAID5/6 volumes write only rows that held nothing when the transaction
+ * began, with their parity at commit. Then a balance relocates every group,
  * the last of each kind after a chunk placed across the devices as Linux's
  * btrfs_create_chunk places it takes its place (on a full volume a group may
  * be refused for space): the files read the same, every state a power cut
  * leaves at its barriers reads the same, and some of those states recover
  * the relocation and balance again. Conversions follow: metadata without a
  * second copy is refused unless forced, as are a profile needing more
- * devices and RAID5, before any write; then data and metadata convert to
+ * devices, before any write; then data and metadata convert to
  * other profiles the devices allow, every group ends with them, and the
  * conversion's crash states are checked as the balance's. With --grow, a sixth transaction
  * preallocates beyond the free data space instead and writes into the new
  * chunks, which are placed across the devices as Linux places them; its crash
- * states are checked as the others. With an export directory, the written
+ * states are checked as the others. With --commits, the test ends after the
+ * five commits. With --devices, devices join, shrink,
+ * are replaced and leave; with --parity too, after a conversion to RAID6
+ * data and RAID5 metadata once a device joined. With an export directory, the written
  * devices and the model's manifest go there for Linux. */
 #include "../adapters/posix/image.h"
 #include "internal.h"
@@ -562,9 +566,15 @@ write_file(struct btrfs_transaction *transaction, struct file *file, uint64_t of
 {
 	struct btrfs_time time = { SECONDS, 0 };
 	size_t end = (size_t)offset + size;
+	enum btrfs_result result;
 
-	REQUIRE(btrfs_transaction_write(transaction, object(transaction, file->path), offset, bytes,
-		    size, time) == BTRFS_OK);
+	result = btrfs_transaction_write(
+	    transaction, object(transaction, file->path), offset, bytes, size, time);
+	if (result != BTRFS_OK) {
+		fprintf(stderr, "writing %zu bytes at %llu of %s: %s\n", size,
+		    (unsigned long long)offset, file->path, btrfs_result_string(result));
+		exit(1);
+	}
 	if (end > file->size) {
 		file->bytes = realloc(file->bytes, end);
 		REQUIRE(file->bytes != NULL);
@@ -952,18 +962,17 @@ profile_of(const struct btrfs_fs *fs, uint64_t kind)
 }
 
 /* Conversions the device count allows, to a profile each kind does not have
- * yet: data to RAID1 or RAID0 on two devices, RAID1C3 or RAID1 on three,
- * RAID10 or RAID1C4 on four; metadata and system groups to DUP or RAID1, to
- * RAID1 or RAID1C3, to RAID1C4 or RAID10. */
+ * yet: data to RAID1 or RAID0 on two devices, RAID5 or RAID1C3 on three,
+ * RAID6 or RAID10 on four; metadata and system groups to DUP or RAID1, to
+ * RAID5 or RAID1C3, to RAID1C4 or RAID6. */
 static void
 conversion_args(
     struct volume *volume, struct btrfs_balance_args *args, uint64_t *data, uint64_t *metadata)
 {
 	static const uint64_t targets[3][4] = {
 		{ BTRFS_GROUP_RAID1, BTRFS_GROUP_RAID0, BTRFS_GROUP_DUP, BTRFS_GROUP_RAID1 },
-		{ BTRFS_GROUP_RAID1C3, BTRFS_GROUP_RAID1, BTRFS_GROUP_RAID1, BTRFS_GROUP_RAID1C3 },
-		{ BTRFS_GROUP_RAID10, BTRFS_GROUP_RAID1C4, BTRFS_GROUP_RAID1C4,
-		    BTRFS_GROUP_RAID10 },
+		{ BTRFS_GROUP_RAID5, BTRFS_GROUP_RAID1C3, BTRFS_GROUP_RAID5, BTRFS_GROUP_RAID1C3 },
+		{ BTRFS_GROUP_RAID6, BTRFS_GROUP_RAID10, BTRFS_GROUP_RAID1C4, BTRFS_GROUP_RAID6 },
 	};
 	struct btrfs_fs *fs;
 	const uint64_t *choice;
@@ -981,8 +990,8 @@ conversion_args(
 }
 
 /* Conversions Linux's btrfs_balance refuses, before any write: metadata
- * without its second copy unless forced, a profile needing more devices,
- * and RAID5, which this writer does not write. */
+ * without its second copy unless forced and profiles needing more
+ * devices. */
 static void
 check_conversion_refusals(struct volume *volume)
 {
@@ -1010,8 +1019,12 @@ check_conversion_refusals(struct volume *volume)
 		REQUIRE(
 		    btrfs_balance(&environment, &writer, &args, &report) == BTRFS_INVALID_ARGUMENT);
 	}
-	args.data = (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_GROUP_RAID5, 0 };
-	REQUIRE(btrfs_balance(&environment, &writer, &args, &report) == BTRFS_UNSUPPORTED);
+	if (volume->members < 3) {
+		args.data =
+		    (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_GROUP_RAID6, 0 };
+		REQUIRE(
+		    btrfs_balance(&environment, &writer, &args, &report) == BTRFS_INVALID_ARGUMENT);
+	}
 	REQUIRE(volume->count == count);
 }
 
@@ -1222,15 +1235,57 @@ replace_device(struct volume *volume, struct model *model, size_t position, size
 	    volume, first, volume->count, &before, expected, seed, states, recoveries, later);
 }
 
+/* With --parity: once a fourth device joined, data converts to RAID6 and
+ * metadata and system groups to RAID5, so that the missing device is rebuilt
+ * from parity and the other changes move parity groups. */
+static void
+convert_parity(struct volume *volume, struct model *model, const struct namespace_digest *expected,
+    size_t *copies)
+{
+	struct btrfs_environment environment;
+	struct btrfs_write_environment writer;
+	struct btrfs_device readers[MAX_DEVICES - 1];
+	struct btrfs_write_device writers[MAX_DEVICES - 1];
+	struct btrfs_balance_report report;
+	struct btrfs_balance_args args;
+	struct namespace_digest digest;
+	struct btrfs_fs *fs;
+	size_t i;
+	enum btrfs_result result;
+
+	memset(&args, 0, sizeof(args));
+	args.data = (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_GROUP_RAID6, 0 };
+	args.metadata = (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_GROUP_RAID5, 0 };
+	args.system = args.metadata;
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	result = btrfs_balance(&environment, &writer, &args, &report);
+	if (result != BTRFS_OK) {
+		fprintf(stderr, "converting to parity after %llu groups: %s\n",
+		    (unsigned long long)report.groups, btrfs_result_string(result));
+		exit(1);
+	}
+	mount_volume(volume, 0, &fs);
+	for (i = 0; i < fs->chunk_count; i++) {
+		REQUIRE((fs->chunks[i].type & BT_BLOCK_PROFILES) ==
+		    ((fs->chunks[i].type & BT_BLOCK_DATA) != 0 ? BTRFS_GROUP_RAID6
+							       : BTRFS_GROUP_RAID5));
+	}
+	check_model(fs, model, "converted to parity", copies);
+	REQUIRE(namespace_content_digest(fs, &digest) == 0 && digest.hash == expected->hash &&
+	    digest.objects == expected->objects && digest.bytes == expected->bytes);
+	btrfs_unmount(fs);
+}
+
 /* With --devices: the spare image joins the volume (its device item as
  * Linux's btrfs_init_new_device writes one), a device of the volume cannot
- * join again, a device shrinks and grows back, with Linux's resize refusals,
+ * join again, with parity the groups convert to RAID6 and RAID5, a device
+ * shrinks and grows back, with Linux's resize refusals,
  * the other spares replace a present device and a missing one, then the
  * device the volume is mounted from leaves, every group moving off it; each
  * reads as before and their crash states are checked. */
 static void
 devices_phase(struct volume *volume, struct model *model, const struct namespace_digest *expected,
-    uint32_t *seed, size_t *states, size_t *recoveries, size_t *later, size_t *copies)
+    int parity, uint32_t *seed, size_t *states, size_t *recoveries, size_t *later, size_t *copies)
 {
 	struct btrfs_environment environment;
 	struct btrfs_write_environment writer;
@@ -1302,6 +1357,9 @@ devices_phase(struct volume *volume, struct model *model, const struct namespace
 	btrfs_unmount(fs);
 	check_device_crashes(
 	    volume, first, count, &before, expected, seed, states, recoveries, later);
+	if (parity) {
+		convert_parity(volume, model, expected, copies);
+	}
 
 	/* The device whose stripes reach furthest shrinks to just below its
 	 * highest one, so that its group moves, and grows back to its whole
@@ -1403,9 +1461,9 @@ devices_phase(struct volume *volume, struct model *model, const struct namespace
 	    volume, first, volume->count, &before, expected, seed, states, recoveries, later);
 }
 
-/* Writable admission refuses what it cannot write: a writer without each
- * device, a degraded mount and RAID5/6 chunks, before any write. */
-static int
+/* Writable admission refuses what it cannot write, a writer without each
+ * device and a degraded mount, before any write. */
+static void
 check_refusals(struct volume *volume, struct btrfs_fs *fs)
 {
 	struct btrfs_environment environment;
@@ -1418,7 +1476,6 @@ check_refusals(struct volume *volume, struct btrfs_fs *fs)
 	size_t needed;
 	size_t fewest = 1;
 	size_t i;
-	int striped_parity = 0;
 
 	volume_environment(volume, 0, &environment, &writer, readers, writers);
 	writer.device_count--;
@@ -1430,27 +1487,20 @@ check_refusals(struct volume *volume, struct btrfs_fs *fs)
 	writer.device_count--;
 	REQUIRE(btrfs_transaction_begin(degraded, &writer, &transaction) == BTRFS_UNSUPPORTED);
 	btrfs_unmount(degraded);
-	for (i = 0; i < fs->chunk_count; i++) {
-		striped_parity |= (fs->chunks[i].type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0;
-	}
 	volume_environment(volume, 0, &environment, &writer, readers, writers);
-	if (striped_parity) {
-		REQUIRE(btrfs_transaction_begin(fs, &writer, &transaction) == BTRFS_UNSUPPORTED);
-	}
-	/* Removing a device: refused where a profile in use needs every device,
-	 * and for RAID5/6 volumes; an unknown id is NOT_FOUND. */
+	/* Removing a device: refused where a profile in use needs every device;
+	 * an unknown id is NOT_FOUND. */
 	for (i = 0; i < fs->chunk_count; i++) {
 		needed = profile_devices(fs->chunks[i].type & BT_BLOCK_PROFILES);
 		fewest = needed > fewest ? needed : fewest;
 	}
-	if (fewest > volume->members - 1 || striped_parity) {
+	if (fewest > volume->members - 1) {
 		REQUIRE(btrfs_device_remove(&environment, &writer, fs->devices[0].id, &report) ==
-		    (fewest > volume->members - 1 ? BTRFS_INVALID_ARGUMENT : BTRFS_UNSUPPORTED));
+		    BTRFS_INVALID_ARGUMENT);
 	}
 	REQUIRE(
 	    btrfs_device_remove(&environment, &writer, UNKNOWN_DEVICE, &report) == BTRFS_NOT_FOUND);
 	REQUIRE(transaction == NULL && volume->count == 0);
-	return striped_parity;
 }
 
 int
@@ -1512,6 +1562,8 @@ main(int argc, char **argv)
 	int spare_file;
 	int grow = 0;
 	int spare = 0;
+	int parity = 0;
+	int commits_only = 0;
 	enum btrfs_result balanced;
 	size_t i;
 	int done = 0;
@@ -1521,11 +1573,20 @@ main(int argc, char **argv)
 		commit_count = COMMITS + 1;
 		argv++;
 		argc--;
+	} else if (argc > 1 && strcmp(argv[1], "--commits") == 0) {
+		commits_only = 1;
+		argv++;
+		argc--;
 	} else if (argc > 2 && strcmp(argv[1], "--devices") == 0) {
 		spare = 1;
 		spare_directory = argv[2];
 		argv += 2;
 		argc -= 2;
+		if (argc > 1 && strcmp(argv[1], "--parity") == 0) {
+			parity = 1;
+			argv++;
+			argc--;
+		}
 	}
 	REQUIRE(argc >= 6);
 	devices = (size_t)(argc - 4);
@@ -1551,16 +1612,7 @@ main(int argc, char **argv)
 	volume.members -= spare ? SPARES : 0;
 	mount_volume(&volume, 0, &fs);
 	check_model(fs, &model, "fixture", &copies);
-	if (check_refusals(&volume, fs)) {
-		btrfs_unmount(fs);
-		REQUIRE(image.live_allocations == 0);
-		btrfs_image_close(&image);
-		printf("multi-device writes: %zu devices with RAID5/6 chunks; a writer without "
-		       "each device, a degraded mount and the volume itself are refused before "
-		       "any write PASS\n",
-		    devices);
-		return 0;
-	}
+	check_refusals(&volume, fs);
 	btrfs_get_info(fs, &info);
 	commits[0] = (struct commit){ info.generation, { 0 }, 0, 0 };
 	REQUIRE(namespace_content_digest(fs, &commits[0].digest) == 0);
@@ -1700,8 +1752,8 @@ main(int argc, char **argv)
 		check_crashes(&volume, commits, i, &seed, &states, &recoveries, &resumed);
 	}
 	if (spare) {
-		devices_phase(&volume, &model, &commits[commit_count].digest, &seed, &device_states,
-		    &recoveries, &later_states, &copies);
+		devices_phase(&volume, &model, &commits[commit_count].digest, parity, &seed,
+		    &device_states, &recoveries, &later_states, &copies);
 		finish(&volume, &model, argv, paths, &image);
 		for (i = 0; i < SPARES; i++) {
 			REQUIRE(unlink(spare_paths[i]) == 0);
@@ -1709,15 +1761,26 @@ main(int argc, char **argv)
 		printf(
 		    "multi-device devices: %zu devices, %zu files; five commits read back as the "
 		    "model holds them and pass both audits (%zu checksummed copies); %zu crash "
-		    "states read as a commit, %zu taking a further transaction; a device joined, "
+		    "states read as a commit, %zu taking a further transaction; a device joined,%s "
 		    "another shrank below its highest group and grew back, a present and a missing "
 		    "device were replaced, and the first device left, every group moving off it, "
 		    "reading the same, as do %zu of their crash states (%zu with the devices "
 		    "after; "
 		    "%zu states after superblock recovery in all); refusals before any write "
 		    "PASS\n",
-		    devices, model.count, copies, states, resumed, device_states, later_states,
-		    recoveries);
+		    devices, model.count, copies, states, resumed,
+		    parity ? " the groups converted to RAID6 data and RAID5 metadata," : "",
+		    device_states, later_states, recoveries);
+		return 0;
+	}
+	if (commits_only) {
+		finish(&volume, &model, argv, paths, &image);
+		printf("multi-device commits: %zu devices, %zu files; five commits read back as "
+		       "the model holds them and pass both audits (%zu checksummed copies); the "
+		       "volume reads the same from each device; %zu crash states read as a commit "
+		       "(%zu after superblock recovery) and pass the reference audit, %zu taking a "
+		       "further transaction PASS\n",
+		    devices, model.count, copies, states, recoveries, resumed);
 		return 0;
 	}
 	if (grow) {

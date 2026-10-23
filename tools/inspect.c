@@ -412,7 +412,8 @@ relocate(const char *path, int argc, char **argv)
 #define INSPECT_GROUPS 4096U
 
 /* Explicit scrub: every copy of every tree block and checksummed data sector
- * verified; with --apply, copies that fail are rewritten from good ones. */
+ * and the parity of RAID5/6 rows verified; with --apply, copies that fail
+ * are rewritten from good ones and parity from the data. */
 static int
 scrub(const char *path, int argc, char **argv)
 {
@@ -436,10 +437,12 @@ scrub(const char *path, int argc, char **argv)
 	printf("{\"result\":\"%s\",\"apply\":%s,\"tree_copies\":%" PRIu64
 	       ",\"data_copies\":%" PRIu64 ",\"unchecked\":%" PRIu64 ",\"corrupted\":%" PRIu64
 	       ",\"unreadable\":%" PRIu64 ",\"repaired\":%" PRIu64 ",\"unrepairable\":%" PRIu64
-	       ",\"super_copies\":%" PRIu64 ",\"super_errors\":%" PRIu64 "}\n",
+	       ",\"super_copies\":%" PRIu64 ",\"super_errors\":%" PRIu64 ",\"parity_rows\":%" PRIu64
+	       ",\"parity_errors\":%" PRIu64 "}\n",
 	    btrfs_result_string(error), apply ? "true" : "false", report.tree_copies,
 	    report.data_copies, report.unchecked, report.corrupted, report.unreadable,
-	    report.repaired, report.unrepairable, report.super_copies, report.super_errors);
+	    report.repaired, report.unrepairable, report.super_copies, report.super_errors,
+	    report.parity_rows, report.parity_errors);
 	btrfs_image_close(&image);
 	if (image.live_allocations != 0 || image.live_bytes != 0) {
 		fprintf(stderr, "allocation leak\n");

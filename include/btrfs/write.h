@@ -215,9 +215,8 @@ struct btrfs_balance_args {
  * so its groups end with the target profile. As Linux's btrfs_balance
  * refuses them (INVALID_ARGUMENT), a target needs its profile's fewest
  * devices, and metadata or system groups lose their redundancy only with
- * force. Converting to RAID5 or RAID6 is UNSUPPORTED. The first refusal ends
- * the balance, the groups relocated before it stay so, and report counts them
- * all. */
+ * force. The first refusal ends the balance, the groups relocated before it
+ * stay so, and report counts them all. */
 enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
     struct btrfs_balance_report *report);
@@ -240,6 +239,10 @@ struct btrfs_scrub_report {
 	 * btrfs_recover_supers resolves. */
 	uint64_t super_copies;
 	uint64_t super_errors;
+	/* RAID5/6 rows whose parity was checked, and sectors of their P and Q
+	 * that did not equal the data's parity. */
+	uint64_t parity_rows;
+	uint64_t parity_errors;
 };
 
 /* Explicit, exclusive scrub, as Linux's btrfs scrub: every copy of every tree
@@ -249,9 +252,12 @@ struct btrfs_scrub_report {
  * UNSUPPORTED), each copy that does not verify or cannot be read is rewritten
  * in place from a copy that verifies, followed by a barrier on each device
  * written; a NULL writer only inspects. RAID5/6 rebuilds from parity repair
- * a data stripe; parity itself is not verified. CORRUPT when some block or
- * sector has no copy that verifies, a superblock copy fails, or copies fail
- * without a writer; report counts them. */
+ * a data stripe. Then, as Linux's scrub_raid56_parity_stripe, each RAID5/6
+ * row holding extents is read again and its P and Q compared with the
+ * data's parity at each sector offset where the extents of its data units
+ * all verify; with a writer, those that differ are rewritten. CORRUPT when
+ * some block or sector has no copy that verifies, a superblock copy fails,
+ * or copies or parity fail without a writer; report counts them. */
 enum btrfs_result btrfs_scrub(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, struct btrfs_scrub_report *report);
 
@@ -291,9 +297,11 @@ enum btrfs_result btrfs_device_remove(const struct btrfs_environment *environmen
  * then lose their magic. Nothing else on the volume changes, and its trees
  * stay as they are. On a degraded mount without the device (every other
  * device present), each stripe comes from a stripe holding the same bytes
- * (RAID1, RAID1C3, RAID1C4, a RAID10 pair; UNSUPPORTED for others) and the
- * superblocks from another device's with the device's item; a stripe the
- * device cannot read comes from there too. A target smaller than the device,
+ * (RAID1, RAID1C3, RAID1C4, a RAID10 pair) or for RAID5/6 is rebuilt row by
+ * row from the row's other stripes (UNSUPPORTED for single, DUP and RAID0),
+ * and the superblocks from another device's with the device's item; a stripe
+ * the device cannot read comes from there too. Superblock copies a stripe
+ * covers are not copied with it. A target smaller than the device,
  * or already a device of the volume, is INVALID_ARGUMENT. Until the call
  * returns both may name the device; only one of them may then be given. The
  * operation is exclusive: no transaction runs meanwhile. */
@@ -319,8 +327,14 @@ enum btrfs_result btrfs_device_resize(const struct btrfs_environment *environmen
  * free-space and block-group trees, fs-verity, quotas and simple quotas, and
  * mixed groups whose nodes are one sector, on one device or on several: every
  * device of the volume present (not degraded), a writer device for each
- * further one (INVALID_ARGUMENT otherwise), and any profile but RAID5/6; new
- * chunks are placed across the devices as Linux places them. Every device
+ * further one (INVALID_ARGUMENT otherwise), and any profile; new chunks are
+ * placed across the devices as Linux places them. In RAID5/6 chunks a
+ * transaction allocates only in rows that held nothing when it began or that
+ * it began itself, writes their data stripes only, never overwrites a
+ * committed extent in place (a NODATACOW or preallocated range is copied),
+ * and writes the rows' P and Q at commit with the metadata, before the first
+ * barrier: no committed block's parity ever changes, so a torn write cannot
+ * leave one unrecoverable (the write hole). Every device
  * must hold at least two superblock copies that agree with the mounted primary;
  * otherwise begin returns RECOVERY_REQUIRED. Unsupported layouts return
  * before any media write. Native adapters open read-write only on request,
@@ -379,12 +393,14 @@ enum btrfs_result btrfs_transaction_write_inline(struct btrfs_transaction *trans
  * privilege decision. Partially covered sectors are read from this
  * transaction's own view and rewritten; data is copied on write except into
  * preallocated and unshared NODATACOW extents, which are written in place as
- * Linux does. Old extents keep their references until commit drops them and
- * are never reused before the next transaction. New data reaches the device as
- * its extents are created; the commit's first barrier makes it durable before
- * any metadata names it. Checksums follow the inode's NODATASUM flag; files
- * compress as Linux decides. Inline files become regular extents. Writes past
- * an unaligned EOF clear the old EOF sector's tail; truncation clears the new
+ * Linux does (in RAID5/6 chunks only those this transaction created). The
+ * range's data space is checked first (NO_SPACE); as Linux's reserve_space,
+ * a range written in place in every sector needs none, so a full volume
+ * still takes writes into preallocated space. Old extents keep their references until commit drops
+ * them and are never reused before the next transaction. New data reaches the device as its extents
+ * are created; the commit's first barrier makes it durable before any metadata names it. Checksums
+ * follow the inode's NODATASUM flag; files compress as Linux decides. Inline files become regular
+ * extents. Writes past an unaligned EOF clear the old EOF sector's tail; truncation clears the new
  * EOF sector's tail and drops coverage beyond it. Without NO_HOLES, a file
  * grown by a write or truncation has the new range covered by hole items. */
 enum btrfs_result btrfs_transaction_write(struct btrfs_transaction *transaction,

@@ -372,6 +372,9 @@ size_t bt_chunk_position(const struct btrfs_fs *fs, uint64_t logical);
 size_t bt_chunk_containing(const struct btrfs_fs *fs, uint64_t logical);
 enum btrfs_result bt_chunk_add(
     struct btrfs_fs *fs, struct bt_key key, const void *data, size_t length, int bootstrap);
+/* Whether logical lies in a RAID5/6 chunk, whose further copies are
+ * rebuilds from parity rather than stripes to write. */
+int bt_chunk_parity(const struct btrfs_fs *fs, uint64_t logical);
 /* The length of each of the chunk's stripes: its device extents' length. */
 uint64_t bt_chunk_stripe_length(const struct bt_chunk *chunk);
 /* Maps a logical range on one copy (mirror below *mirrors) of a chunk of
@@ -395,10 +398,22 @@ enum btrfs_result bt_read_copy(const struct btrfs_fs *fs, uint64_t logical, void
     size_t length, uint64_t kind, unsigned mirror, size_t *span, unsigned *mirrors);
 /* Copies a RAID5 or RAID6 chunk of stripes offers a read. */
 unsigned bt_raid56_copies(uint64_t profile, unsigned stripes);
+/* The parity of one row of a RAID5/6 chunk from its count data units, each
+ * length bytes, in row order: P their XOR, and for RAID6 Q the sum of
+ * g^index times each in lib/raid6's GF(2^8). */
+void bt_raid56_parity(uint64_t profile, const uint8_t *const *data, unsigned count, uint8_t *p,
+    uint8_t *q, size_t length);
 /* Rebuilds length bytes at within of a RAID5/6 chunk, inside one 64 KiB
  * stripe, as copy mirror (1 or above) of its data stripe. */
 enum btrfs_result bt_raid56_rebuild(const struct btrfs_fs *fs, const struct bt_chunk *chunk,
     uint64_t within, uint8_t *out, size_t length, unsigned mirror);
+/* Rebuilds the 64 KiB unit stripe holds in row of a RAID5/6 chunk from the
+ * row's other stripes, as for a missing device: a data unit from P and the
+ * other data units, P or Q from the data units again. units holds
+ * BT_RAID56_UNITS stripe lengths. */
+#define BT_RAID56_UNITS (BT_MAX_STRIPES + 1U)
+enum btrfs_result bt_raid56_unit(const struct btrfs_fs *fs, const struct bt_chunk *chunk,
+    uint64_t row, unsigned stripe, uint8_t *out, uint8_t *units);
 /* A root owner that asks for whichever owner the node's header names; the
  * node is verified otherwise as any other. */
 #define BT_OWNER_ANY UINT64_MAX

@@ -483,19 +483,23 @@ offsets and size, and requires a missing device, a FOREIGN volume's image in
 place of the last device and a writer without the further devices to be
 refused; the `multi-*` Meson tests run it.
 
-`btrfs-multidev-write-test [--grow|--devices DIR] NAME MANIFEST EXPORT|- DEVICE...`
+`btrfs-multidev-write-test [--grow|--commits|--devices DIR [--parity]] NAME MANIFEST EXPORT|- DEVICE...`
 (`tests/multidev_write.c`) writes five transactions to a recording of the
 devices, checks every file against a model after each commit, then every state
 a power cut leaves at a barrier or superblock write of each commit (with all,
 only the durable, or a random part of each device's pending writes on media)
-after superblock recovery; it requires a writer without each device, a degraded
-mount and RAID5/6 volumes to be refused before any write. It then balances
-every group and checks the balance's crash states the same way, some of them
-recovering the relocation and balancing again, requires Linux's conversion
-refusals (metadata to single without force, a profile needing more devices,
-RAID5) before any write, and converts data and metadata to other profiles the
-device count allows (RAID0, RAID1, RAID1C3, RAID10, RAID1C4, DUP), checking
-that conversion's crash states too; `--grow` (for `multi-grow`)
+after superblock recovery; it requires a writer without each device and a
+degraded mount to be refused before any write. RAID5/6 volumes are written
+too, into rows that held nothing when each transaction began. It then
+balances every group and checks the balance's crash states the same way, some
+of them recovering the relocation and balancing again, requires Linux's
+conversion refusals (metadata to single without force, a profile needing more
+devices) before any write, and converts data and metadata to other profiles
+the device count allows (data to RAID0 or RAID1 on two devices, RAID5 or
+RAID1C3 on three, RAID6 or RAID10 on four; metadata to DUP or RAID1, RAID5 or
+RAID1C3, RAID1C4 or RAID6), checking that conversion's crash states too;
+`--commits` ends after the five commits (for Linux to check writes into its
+own RAID5/6 chunks); `--grow` (for `multi-grow`)
 instead preallocates beyond the free data space in a sixth transaction, so
 that new data chunks are placed across the devices, and checks its crash
 states. `--devices DIR` (for `multi-spare`) instead creates three sparse spare
@@ -504,7 +508,10 @@ be refused, shrinks the device whose stripes reach furthest to just below its
 highest one and grows it back (with Linux's resize refusals), replaces a
 present device and then, on a degraded mount, a missing one with the other
 spares, removes the device the volume is mounted from, and checks the crash
-states of each with the device set before and after; with EXPORT the spare
+states of each with the device set before and after; `--parity` converts
+data to RAID6 and metadata to RAID5 once the first spare joined, so that the
+missing device is rebuilt from parity (`multi-spare-parity-writes`); with
+EXPORT the spare
 go there too, and Linux then gets the volume's devices first and the removed
 and replaced present ones last, which it must not register (the image of the
 device replaced while missing stays away, as a failed disk would). The `multi-*-writes` Meson
@@ -534,21 +541,50 @@ allocator) and an empty `cmp`. `BTRFS_MULTI_REBALANCED` reports that Linux's
 balance completed; `BTRFS_MULTI_REBALANCE_REFUSED` prints its error and the
 volume's usage, as a full volume may refuse for space.
 
+Linux's scrub rewrites RAID5/6 parity that differs without reporting it, so
+parity this implementation wrote is checked by reading through Linux's own
+rebuild instead. Run the `degraded` phase first, since `verify` writes:
+
+```sh
+python3 ../btrfs/tests/prepare_multidev_linux.py --root artifacts/btrfs-reference/root-multi \
+  --phase degraded --profile multi-raid6 --missing 2 \
+  --archive artifacts/btrfs-reference/multi-raid6-degraded.cpio
+.cache/linux-reference/linux-vm-disks .cache/linux-reference/Image \
+  artifacts/btrfs-reference/multi-raid6-degraded.cpio 2 512 \
+  'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  ../btrfs/artifacts/EXPORT/multi-raid6-{0,1,2,3}.raw > ../btrfs/logs/multi-raid6-degraded.log 2>&1
+for tag in $(grep -a -o 'BTRFS_MULTI_DEGRADED_DONE:[a-z]*' ../btrfs/logs/multi-raid6-degraded.log | cut -d: -f2); do
+  grep -a "^BTRFS_MULTI_DEGRADED_$tag:" ../btrfs/logs/multi-raid6-degraded.log | \
+    sed "s/^BTRFS_MULTI_DEGRADED_$tag://" | tr -d '\r' | \
+    cmp - ../btrfs/artifacts/EXPORT/multi-raid6.expected.tsv
+done
+```
+
+Require `BTRFS_MULTI_DEGRADED_PASS` and an empty `cmp` for every set of left
+out devices (`--missing 1` for RAID5, `2` for RAID6, as the metadata profile
+allows): Linux mounts read-only and degraded without them, naming only the
+others, and reads every file through its rebuild from P and Q, verified
+against its checksums.
+
 ## Scrub
 
 `btrfs-scrub-test [--keep] NAME DIR IMAGE...` (`tests/scrub.c`) clones a
 volume's devices into DIR, scrubs it clean, then corrupts one copy of every
 seventh tree block that has another copy and of every seventh checksummed data
 sector where it lies (never two RAID5/6 data stripes of one row at one
-offset), and one superblock copy. A scrub without a writer must find every
-corrupted copy and write nothing; with a writer it must repair every one with
-a good copy and leave the rest; superblock recovery rewrites the superblock
+offset), the P or Q sector of RAID5/6 rows at the offsets of other data
+sectors (never where a data stripe of the row is corrupted), and one
+superblock copy. A clean volume's RAID5/6 rows must hold Linux's parity. A
+scrub without a writer must find every corrupted copy and parity sector and
+write nothing; with a writer it must repair every one with a good copy, and
+the parity from the data, and leave the rest; superblock recovery rewrites the superblock
 copy; then the volume reads as before and passes the reference audit. The
 `scrub-*` Meson tests run it on RAID1, RAID10, RAID1C4, RAID0 (data without
 another copy), RAID5, RAID6, DUP (`checksums-blake2`) and single
 (`transactions`) volumes and delete the clones; `--keep` leaves them for
 Linux, whose `verify` phase scrubs read-only first
-(`BTRFS_MULTI_SCRUB_CLEAN`).
+(`BTRFS_MULTI_SCRUB_CLEAN`) and whose `degraded` phase reads RAID5/6 clones,
+their parity repaired, through its rebuild.
 
 ## Balance
 

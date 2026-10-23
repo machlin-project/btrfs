@@ -3,10 +3,13 @@
  * several. A clean volume scrubs clean. Then one copy of every seventh tree
  * block and of every seventh checksummed data sector is corrupted where it
  * lies on its device (only tree blocks with another copy, so the volume
- * still mounts), and one superblock copy, never two RAID5/6 data stripes of
- * one row at one offset: a scrub without a writer finds
- * every corrupted copy and writes nothing; with a writer it rewrites each
- * from a copy that verifies (a RAID5/6 data stripe from its rebuild), so a
+ * still mounts), and one superblock copy; of RAID5/6 rows, the P or Q sector
+ * at the offset of another checksummed data sector in seven, never at an
+ * offset of a row with a corrupted data stripe, and never two data stripes
+ * of one row at one offset. A clean volume's rows hold Linux's parity. A
+ * scrub without a writer finds every corrupted copy and parity sector and
+ * writes nothing; with a writer it rewrites each from a copy that verifies
+ * (a RAID5/6 data stripe from its rebuild, parity from the data), so a
  * further scrub finds only what had no other copy, the volume reads as
  * before and, where everything had another copy, the reference audit, which
  * reads every copy, passes. The superblock copy is left to superblock
@@ -41,8 +44,11 @@
 #define CORRUPT_BYTE 0x5aU
 /* The copy of the superblock corrupted: the first secondary. */
 #define SUPER_MIRROR 1U
-/* RAID5/6 rows with a corrupted data stripe, at most. */
+/* RAID5/6 rows with a corrupted data stripe or parity, at most. */
 #define MAX_ROWS 65536U
+/* Of the checksummed data sectors, which of every CORRUPTION_STRIDE marks a
+ * RAID5/6 row offset whose parity is corrupted. */
+#define PARITY_RESIDUE 3U
 
 struct volume {
 	char paths[MAX_DEVICES][PATH_BYTES];
@@ -55,8 +61,11 @@ struct expectation {
 	uint64_t unrepairable;
 	uint64_t tree;
 	uint64_t data;
+	/* P and Q sectors corrupted. */
+	uint64_t parity;
 	/* The rows (chunk, row, offset in the stripe) of RAID5/6 data stripes
-	 * corrupted: a second one there would leave the rebuild nothing. */
+	 * or parity corrupted: a second one there would leave the rebuild
+	 * nothing. */
 	uint64_t rows[MAX_ROWS][2];
 	size_t row_count;
 };
@@ -125,6 +134,30 @@ physical_copies(const struct btrfs_fs *fs, uint64_t logical)
 	return (chunk->type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0 ? 1U : chunk->mirrors;
 }
 
+static int
+parity_chunk(const struct btrfs_fs *fs, uint64_t logical)
+{
+	return (fs->chunks[bt_chunk_containing(fs, logical)].type &
+		   (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0;
+}
+
+/* Corrupts the sector of P (which 0) or Q (1) of the RAID5/6 row holding
+ * logical, at its offset in its data stripe. */
+static void
+corrupt_parity(
+    const struct volume *volume, const struct btrfs_fs *fs, uint64_t logical, unsigned which)
+{
+	const struct bt_chunk *chunk = &fs->chunks[bt_chunk_containing(fs, logical)];
+	uint64_t within = logical - chunk->logical;
+	uint64_t data = chunk->length / bt_chunk_stripe_length(chunk);
+	uint64_t row = within / BT_STRIPE_LENGTH / data;
+	unsigned stripe = (unsigned)((row + data + which) % chunk->stripes);
+
+	corrupt_device(volume, chunk->devices[stripe],
+	    chunk->physical[stripe] + row * BT_STRIPE_LENGTH + within % BT_STRIPE_LENGTH,
+	    fs->info.sector_size);
+}
+
 /* Whether a RAID5/6 sector's row already has a corrupted data stripe at
  * its offset; records it otherwise. Other profiles never share. */
 static int
@@ -189,8 +222,10 @@ corrupt(const struct volume *volume, struct expectation *expected)
 	uint64_t flags;
 	unsigned copies;
 	unsigned redundant;
+	unsigned parities;
 	size_t blocks = 0;
 	size_t sectors = 0;
+	size_t position;
 	enum btrfs_result result;
 
 	memset(expected, 0, sizeof(*expected));
@@ -223,8 +258,23 @@ corrupt(const struct volume *volume, struct expectation *expected)
 			for (sector = record.key.objectid;
 			    sector < record.key.objectid + record.key.offset;
 			    sector += fs->info.sector_size) {
-				if (!has_checksum(fs, sector) ||
-				    sectors++ % CORRUPTION_STRIDE != 0 ||
+				if (!has_checksum(fs, sector)) {
+					continue;
+				}
+				position = sectors++;
+				if (position % CORRUPTION_STRIDE == PARITY_RESIDUE &&
+				    parity_chunk(fs, sector) && !row_taken(fs, expected, sector)) {
+					parities =
+					    fs->chunks[bt_chunk_containing(fs, sector)].type &
+						BT_BLOCK_RAID6
+					    ? 2U
+					    : 1U;
+					corrupt_parity(volume, fs, sector,
+					    (unsigned)(position / CORRUPTION_STRIDE % parities));
+					expected->parity++;
+					continue;
+				}
+				if (position % CORRUPTION_STRIDE != 0 ||
 				    row_taken(fs, expected, sector)) {
 					continue;
 				}
@@ -360,9 +410,10 @@ main(int argc, char **argv)
 		volume.path_list[i] = volume.paths[i];
 	}
 
-	/* A clean volume scrubs clean, read-only and with a writer. */
+	/* A clean volume scrubs clean, read-only and with a writer; its
+	 * RAID5/6 rows hold Linux's parity. */
 	REQUIRE(scrub(&volume, 0, &clean) == BTRFS_OK && clean.corrupted == 0 &&
-	    clean.unreadable == 0 && clean.super_errors == 0);
+	    clean.unreadable == 0 && clean.super_errors == 0 && clean.parity_errors == 0);
 	REQUIRE(scrub(&volume, 1, &report) == BTRFS_OK && report.repaired == 0);
 	digest_of(&volume, &before, 1);
 	if (faults) {
@@ -370,23 +421,25 @@ main(int argc, char **argv)
 	}
 
 	corrupt(&volume, &expected);
-	REQUIRE(expected.corrupted != 0);
-	/* Without a writer: every corrupted copy found, nothing written. */
+	REQUIRE(expected.corrupted != 0 && (expected.parity != 0) == (clean.parity_rows != 0));
+	/* Without a writer: every corrupted copy and parity sector found,
+	 * nothing written. */
 	REQUIRE(scrub(&volume, 0, &report) == BTRFS_CORRUPT);
 	REQUIRE(report.corrupted == expected.corrupted &&
 	    report.unrepairable == expected.unrepairable && report.repaired == 0 &&
 	    report.tree_copies == clean.tree_copies && report.data_copies == clean.data_copies &&
-	    report.super_errors == 1);
+	    report.super_errors == 1 && report.parity_errors == expected.parity);
 	REQUIRE(
 	    scrub(&volume, 0, &report) == BTRFS_CORRUPT && report.corrupted == expected.corrupted);
-	/* With a writer: every copy with a good one is rewritten; the
-	 * superblock copy still fails. */
+	/* With a writer: every copy with a good one and every parity sector is
+	 * rewritten; the superblock copy still fails. */
 	REQUIRE(scrub(&volume, 1, &report) == BTRFS_CORRUPT);
-	REQUIRE(report.repaired == expected.corrupted - expected.unrepairable &&
-	    report.unrepairable == expected.unrepairable && report.super_errors == 1);
+	REQUIRE(report.repaired == expected.corrupted - expected.unrepairable + expected.parity &&
+	    report.unrepairable == expected.unrepairable && report.super_errors == 1 &&
+	    report.parity_errors == expected.parity);
 	REQUIRE(scrub(&volume, 0, &report) == BTRFS_CORRUPT);
 	REQUIRE(report.corrupted == expected.unrepairable && report.repaired == 0 &&
-	    report.super_errors == 1);
+	    report.super_errors == 1 && report.parity_errors == 0);
 	recover(&volume);
 	REQUIRE(
 	    scrub(&volume, 0, &report) == (expected.unrepairable != 0 ? BTRFS_CORRUPT : BTRFS_OK) &&
@@ -400,13 +453,15 @@ main(int argc, char **argv)
 		REQUIRE(unlink(volume.paths[i]) == 0);
 	}
 	printf("scrub %s: %zu devices, %llu tree block and %llu data sector copies verified, %llu "
-	       "data sectors without checksums; %llu tree block and %llu data sector copies "
-	       "corrupted, all found without writing, %llu repaired from another copy and %llu "
-	       "with none left as found; a superblock copy left to recovery; %zu allocation and "
-	       "%zu read failures fail the scrub cleanly PASS\n",
+	       "data sectors without checksums, %llu RAID5/6 rows holding Linux's parity; %llu "
+	       "tree block and %llu data sector copies and %llu parity sectors corrupted, all "
+	       "found without writing, %llu copies repaired from another copy and %llu with "
+	       "none left as found, the parity rewritten; a superblock copy left to recovery; "
+	       "%zu allocation and %zu read failures fail the scrub cleanly PASS\n",
 	    name, volume.devices, (unsigned long long)clean.tree_copies,
 	    (unsigned long long)clean.data_copies, (unsigned long long)clean.unchecked,
-	    (unsigned long long)expected.tree, (unsigned long long)expected.data,
+	    (unsigned long long)clean.parity_rows, (unsigned long long)expected.tree,
+	    (unsigned long long)expected.data, (unsigned long long)expected.parity,
 	    (unsigned long long)(expected.corrupted - expected.unrepairable),
 	    (unsigned long long)expected.unrepairable, allocation_points, read_points);
 	return 0;

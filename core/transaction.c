@@ -266,19 +266,13 @@ btrfs_transaction_begin_mapped(const struct btrfs_fs *base,
 		return BTRFS_UNSUPPORTED;
 	}
 	/* Every device of the volume is written, through the writer's device
-	 * of the same order; a degraded mount is not. RAID5/6 chunks would need
-	 * their parity rewritten with their data. */
+	 * of the same order; a degraded mount is not. */
 	if (environment->device_count != base->env.device_count) {
 		return BTRFS_INVALID_ARGUMENT;
 	}
 	if (base->env.degraded || base->device_count != base->device_capacity ||
 	    base->device_count != environment->device_count + 1) {
 		return BTRFS_UNSUPPORTED;
-	}
-	for (i = 0; i < base->chunk_count; i++) {
-		if ((base->chunks[i].type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0) {
-			return BTRFS_UNSUPPORTED;
-		}
 	}
 	/* An unmerged balance needs relocation recovery first. */
 	error = bt_tx_relocating(base, &relocating);
@@ -1590,6 +1584,9 @@ bt_tx_writes(struct btrfs_transaction *transaction, struct bt_tx_write *writes, 
 			if (error != BTRFS_OK) {
 				return error;
 			}
+			if (bt_chunk_parity(&transaction->fs, block.address)) {
+				mirrors = 1;
+			}
 			if (*count == capacity || place.span != block.size) {
 				return BTRFS_CORRUPT;
 			}
@@ -1679,6 +1676,98 @@ bt_tx_write_nodes(struct btrfs_transaction *transaction)
 	return error;
 }
 
+/* Writes P (and Q) of row of a RAID5/6 chunk from its data units as they
+ * lie on the devices, which this transaction wrote or which held nothing
+ * when it began. */
+static enum btrfs_result
+bt_tx_parity_row(struct btrfs_transaction *transaction, const struct bt_chunk *chunk, uint64_t row,
+    uint8_t *units)
+{
+	const struct btrfs_fs *fs = &transaction->fs;
+	const uint8_t *data[BT_MAX_STRIPES];
+	struct bt_tx_device *target;
+	uint64_t profile = chunk->type & BT_BLOCK_PROFILES;
+	unsigned stripes = chunk->stripes;
+	unsigned count = stripes - (profile == BT_BLOCK_RAID5 ? 1U : 2U);
+	unsigned stripe;
+	unsigned d;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (d = 0; error == BTRFS_OK && d < count; d++) {
+		stripe = (unsigned)((row + d) % stripes);
+		data[d] = units + d * BT_STRIPE_LENGTH;
+		error = bt_read_device(fs, chunk->devices[stripe],
+		    chunk->physical[stripe] + row * BT_STRIPE_LENGTH, units + d * BT_STRIPE_LENGTH,
+		    BT_STRIPE_LENGTH);
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	bt_raid56_parity(profile, data, count, units + count * BT_STRIPE_LENGTH,
+	    units + (count + 1) * BT_STRIPE_LENGTH, BT_STRIPE_LENGTH);
+	for (d = count; error == BTRFS_OK && d < stripes; d++) {
+		stripe = (unsigned)((row + d) % stripes);
+		target = &transaction->targets[chunk->devices[stripe]];
+		error =
+		    target->write(target->context, chunk->physical[stripe] + row * BT_STRIPE_LENGTH,
+			units + d * BT_STRIPE_LENGTH, BT_STRIPE_LENGTH);
+	}
+	return error;
+}
+
+/* The parity of every row of a RAID5/6 chunk this transaction allocated in,
+ * after the data and nodes it holds are written and before the first
+ * barrier: those rows held nothing when it began (bt_space_clean), so no
+ * committed block's parity changes. */
+static enum btrfs_result
+bt_tx_write_parity(struct btrfs_transaction *transaction)
+{
+	const struct btrfs_environment *env = &transaction->base->env;
+	const struct bt_space_change *change;
+	const struct bt_chunk *chunk;
+	uint8_t *units = NULL;
+	uint64_t length;
+	uint64_t row;
+	uint64_t first;
+	uint64_t last;
+	uint64_t done = UINT64_MAX;
+	size_t done_chunk = 0;
+	size_t size = (BT_MAX_STRIPES + 2) * BT_STRIPE_LENGTH;
+	size_t i;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (i = 0; error == BTRFS_OK && i < bt_space_change_count(transaction->space); i++) {
+		change = bt_space_change(transaction->space, i);
+		chunk = &transaction->fs.chunks[change->chunk];
+		if (!change->allocate || (chunk->type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) == 0 ||
+		    change->length == 0) {
+			continue;
+		}
+		if (units == NULL) {
+			units = env->allocate(env->context, size);
+			if (units == NULL) {
+				return BTRFS_NO_MEMORY;
+			}
+		}
+		length = chunk->length / bt_chunk_stripe_length(chunk) * BT_STRIPE_LENGTH;
+		first = (change->start - chunk->logical) / length;
+		last = (change->start + change->length - 1 - chunk->logical) / length;
+		for (row = first; error == BTRFS_OK && row <= last; row++) {
+			/* Consecutive changes mostly share rows. */
+			if (done_chunk == change->chunk && done == row) {
+				continue;
+			}
+			error = bt_tx_parity_row(transaction, chunk, row, units);
+			done_chunk = change->chunk;
+			done = row;
+		}
+	}
+	if (units != NULL) {
+		env->release(env->context, units, size);
+	}
+	return error;
+}
+
 /* Whether the commit writes the superblocks of the volume's device of this
  * index in its secondary and primary phases: every device but an added one,
  * written before them, and a leaving one. */
@@ -1696,9 +1785,13 @@ bt_tx_persist(struct btrfs_transaction *transaction)
 	uint32_t device;
 	unsigned mirror;
 
-	/* New data was written when its extents were created; it and the
-	 * metadata naming it are durable on every device at the first barrier. */
+	/* New data was written when its extents were created; it, the metadata
+	 * naming it and the parity of their RAID5/6 rows are durable on every
+	 * device at the first barrier. */
 	error = bt_tx_write_nodes(transaction);
+	if (error == BTRFS_OK) {
+		error = bt_tx_write_parity(transaction);
+	}
 	if (error != BTRFS_OK) {
 		return error;
 	}

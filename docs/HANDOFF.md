@@ -107,8 +107,7 @@ is destroyed. `accept` is legal only after successful durable publication;
    same files and sharing stays; `tests/balance.c` checks every group of the
    writable fixtures with their crash states and faults, and Linux checks and
    balances the results again (`tests/prepare_balance_linux.py`). Remaining:
-   balance with v1 space caches, conversion to RAID5/6, and a native
-   interface that starts one (`btrfs_balance` takes Linux's usage, convert
+   balance with v1 space caches and a native interface that starts one (`btrfs_balance` takes Linux's usage, convert
    and soft filters and force); data reference edits
    from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
@@ -148,15 +147,19 @@ is destroyed. `accept` is legal only after successful durable publication;
    are read and written against fixtures a 16 KiB-page Linux wrote. Volumes
    of several devices are read with every Linux profile (`core/chunk.c`,
    `tests/multidev.c`), degraded and with RAID5/6 data rebuilt from parity
-   (`core/raid56.c`), and written in the chunks they hold with every profile
-   but RAID5/6, every copy on its device, each device's superblocks with its
-   own item, recovered across devices, new chunks placed across them as
-   Linux 6.12 places them and balanced (`tests/multidev_write.c`);
-   balance converts to every profile but RAID5/6 with Linux's refusals,
-   devices are added, resized, replaced (also missing ones, from mirrors) and
-   removed (`core/device.c`), and scrub verifies every copy and repairs from
-   good ones (`core/scrub.c`); remaining there: RAID5/6 writes with their
-   parity, parity scrub and rebuilding missing RAID5/6 devices; 64 KiB
+   (`core/raid56.c`), and written with every profile, every copy on its
+   device, RAID5/6 rows only while they hold no committed block, with their
+   parity at commit (no write hole; ARCHITECTURE.md, Volumes), each device's
+   superblocks with its own item, recovered across devices, new chunks placed
+   across them as Linux 6.12 places them and balanced
+   (`tests/multidev_write.c`); balance converts to every profile with
+   Linux's refusals, devices are added, resized, replaced (also missing
+   ones, from mirrors or parity) and removed (`core/device.c`), and scrub
+   verifies every copy and RAID5/6 parity and repairs from good copies and
+   the data (`core/scrub.c`). Remaining there: a RAID5/6 row partly in use
+   takes no new extents until it empties, which wastes up to a row per
+   allocation run where Linux's read-modify-write would fill it; multiple
+   devices for the native adapters, which open one; 64 KiB
    sectors against an image btrfs-progs formatted, whose check and restore
    accept what is written (`tests/large_sectors.c`). Remaining: a Linux
    kernel's verdict on 64 KiB sectors, which needs a 64 KiB-page kernel that

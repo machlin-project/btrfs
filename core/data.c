@@ -579,6 +579,12 @@ bt_tx_write_data(
 			    length - done < BT_DATA_WRITE ? (size_t)(length - done) : BT_DATA_WRITE;
 			error = bt_map_place(&transaction->fs, logical + done, piece, BT_BLOCK_DATA,
 			    mirror, &place, &mirrors);
+			/* A RAID5/6 extent is written to its data stripes; the commit
+			 * writes its rows' parity. */
+			if (error == BTRFS_OK &&
+			    bt_chunk_parity(&transaction->fs, logical + done)) {
+				mirrors = 1;
+			}
 			if (error == BTRFS_OK) {
 				piece = place.span;
 				target = &transaction->targets[place.device];
@@ -1011,7 +1017,10 @@ bt_tx_replace(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 /* Whether [position, end) of item may be written in place, as Linux's
  * run_delalloc_nocow decides: a preallocated extent, or a regular one of a
  * NODATACOW file, uncompressed, newer than the tree's last snapshot, referenced
- * only by this file's items for it, and without checksums in the range. */
+ * only by this file's items for it, and without checksums in the range. A
+ * committed extent in a RAID5/6 chunk is copied instead: rewriting it would
+ * change parity other committed blocks of its rows depend on, which a torn
+ * write could leave wrong (the write hole). */
 static enum btrfs_result
 bt_tx_nocow(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     const struct bt_disk_inode *inode, uint64_t ino, const struct bt_file_item *item,
@@ -1033,7 +1042,9 @@ bt_tx_nocow(struct btrfs_transaction *transaction, const struct bt_owned_root *t
 		    (bt_u64(inode->flags) & BT_INODE_NODATACOW) == 0)) ||
 	    key.objectid == 0 || extent->header.compression != 0 ||
 	    extent->header.encryption != 0 || bt_u16(extent->header.encoding) != 0 ||
-	    bt_u64(extent->header.generation) <= bt_u64(tree->item.legacy.last_snapshot)) {
+	    bt_u64(extent->header.generation) <= bt_u64(tree->item.legacy.last_snapshot) ||
+	    (bt_chunk_parity(&transaction->fs, key.objectid) &&
+		bt_u64(extent->header.generation) <= transaction->base->info.generation)) {
 		return BTRFS_OK;
 	}
 	bt_zero(&reference, sizeof(reference));
@@ -1455,6 +1466,39 @@ bt_tx_data_begin(struct btrfs_transaction *transaction, struct btrfs_object_id i
 	return error;
 }
 
+/* Whether every byte of [start, end) of a NODATACOW or PREALLOC file lies in
+ * an extent bt_tx_nocow lets a write rewrite in place, as Linux's
+ * btrfs_check_nocow_lock finds before writing without a data reservation. */
+static enum btrfs_result
+bt_tx_nocow_range(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    const struct bt_disk_inode *inode, uint64_t ino, uint64_t start, uint64_t end, int *all)
+{
+	struct bt_file_item item;
+	uint64_t position;
+	uint64_t next;
+	int found = 0;
+	int in_place = 0;
+	enum btrfs_result error = BTRFS_OK;
+
+	*all = (bt_u64(inode->flags) & (BT_INODE_NODATACOW | BT_INODE_PREALLOC)) != 0;
+	for (position = start; error == BTRFS_OK && *all && position < end; position = next) {
+		error = bt_tx_file_item(transaction, tree, ino, position, end, &item, &found);
+		if (error != BTRFS_OK) {
+			break;
+		}
+		if (!found || item.key.offset > position ||
+		    item.extent.header.type == BT_EXTENT_INLINE) {
+			*all = 0;
+			break;
+		}
+		next = item.end < end ? item.end : end;
+		error =
+		    bt_tx_nocow(transaction, tree, inode, ino, &item, position, next, &in_place);
+		*all = in_place;
+	}
+	return error;
+}
+
 /* Whether the filesystem has NO_HOLES: a hole takes no item. */
 static int
 bt_tx_no_holes(const struct btrfs_transaction *transaction)
@@ -1483,6 +1527,7 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	uint64_t end;
 	uint64_t tail;
 	int stored = 0;
+	int in_place = 0;
 	enum btrfs_result error;
 
 	if (transaction == NULL || (bytes == NULL && size != 0) ||
@@ -1506,11 +1551,25 @@ btrfs_transaction_write(struct btrfs_transaction *transaction, struct btrfs_obje
 	final = offset + size > old_size ? offset + size : old_size;
 	/* The whole range's data space is checked before any change, as Linux
 	 * reserves it at write time, leaving what metadata may still need;
-	 * compression may need less. */
+	 * compression may need less. Without it, as Linux's reserve_space, a
+	 * range written in place in every sector needs none (a write into
+	 * preallocated space on a full volume); the sector holding an unaligned
+	 * EOF before it is rewritten too. */
 	bt_tx_hold_metadata(transaction);
 	if (!bt_space_data_available(
 		transaction->space, size + 2 * sector - (uint64_t)size % sector)) {
-		return BTRFS_NO_SPACE;
+		start = offset > old_size && old_size % sector != 0 ? old_size - old_size % sector
+								    : offset - offset % sector;
+		end = offset + size + (sector - (offset + size) % sector) % sector;
+		error = inline_end != 0 || final <= sector
+		    ? BTRFS_OK
+		    : bt_tx_nocow_range(transaction, tree, &inode, id.inode, start, end, &in_place);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+		if (!in_place) {
+			return BTRFS_NO_SPACE;
+		}
 	}
 	/* btrfs_qgroup_reserve_data: the written sectors count against the
 	 * subvolume's qgroups and every qgroup above them, and so does a node

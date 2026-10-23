@@ -12,9 +12,13 @@ acknowledged fsync through power cuts of their guest; FSKit set-id metadata is
 not accepted.
 It reads filesystems on one device or several (RAID0, RAID1, RAID1C3,
 RAID1C4, RAID10, RAID5 and RAID6 as well as SINGLE and DUP chunks; it writes
-all but RAID5 and RAID6, every copy on its device, places new chunks across
-the devices as Linux's allocator does, adds, removes, resizes and replaces devices, and scrubs
-every copy, repairing those a good copy covers) with CRC32C, XXH64, SHA-256 or BLAKE2b checksums, 4–64 KiB sectors and nodes, inodes, byte-exact names,
+every one, each copy on its device and RAID5/6 rows only while they hold no
+committed block, with their parity at commit, so that a torn write never
+changes a committed block's parity; it places new chunks across the devices
+as Linux's allocator does, converts between profiles, adds, removes, resizes
+and replaces devices, rebuilding a missing one from mirrors or parity, and
+scrubs every copy and RAID5/6 parity, repairing what a good copy or the data
+covers) with CRC32C, XXH64, SHA-256 or BLAKE2b checksums, 4–64 KiB sectors and nodes, inodes, byte-exact names,
 directories, hard links, symlinks, inline and regular extents, sparse and
 preallocated data, raw xattrs, subvolumes and snapshots, and verifies fs-verity
 files against their Merkle trees on every read. Every adapter reads

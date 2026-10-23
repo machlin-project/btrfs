@@ -329,9 +329,9 @@ if fixtures != ''
     timeout: 300, suite: 'images')
   # Volumes Linux wrote across several devices: every profile reads as
   # Linux's manifest says, from any of its devices, and the kernel's chunks
-  # are planned again as it placed them; writes and a balance with their
-  # crash states, RAID5/6 refused; on unequal devices, new data chunks; a
-  # device added and another removed.
+  # are planned again as it placed them; writes, a balance and conversions
+  # with their crash states; on unequal devices, new data chunks; devices
+  # added, resized, replaced and removed.
   foreach profile : [['multi-raid1', 2, []], ['multi-raid1c3', 3, []],
       ['multi-raid1c4', 4, []], ['multi-raid10', 4, []], ['multi-raid0', 3, []],
       ['multi-raid5', 3, []], ['multi-raid6', 4, []], ['multi-single', 2, []],
@@ -346,6 +346,14 @@ if fixtures != ''
     test(profile[0] + '-writes', multidev_write_test,
       args: profile[2] + [profile[0], join_paths(fixtures, profile[0] + '.expected.tsv'),
         '-'] + images, timeout: 1200, suite: 'images')
+    # The device changes again on RAID6 data and RAID5 metadata: the
+    # missing device is rebuilt from parity.
+    if profile[0] == 'multi-spare'
+      test('multi-spare-parity-writes', multidev_write_test,
+        args: profile[2] + ['--parity', profile[0],
+          join_paths(fixtures, profile[0] + '.expected.tsv'), '-'] + images,
+        timeout: 2400, suite: 'images')
+    endif
   endforeach
   # Scrub: one copy of every seventh tree block and checksummed data sector
   # corrupted, found, and rewritten from a good copy where there is one.

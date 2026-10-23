@@ -1388,9 +1388,8 @@ bt_bl_selects(const struct btrfs_balance_kind *kind, const struct btrfs_group *g
 	    (group->flags & ~BT_BALANCE_KINDS) == kind->convert);
 }
 
-/* Linux's validate_convert_profile: a target is one profile, one this
- * writer allocates (RAID5 and RAID6 are UNSUPPORTED), on no fewer devices
- * than it needs (INVALID_ARGUMENT). */
+/* Linux's validate_convert_profile: a target is one profile, on no fewer
+ * devices than it needs (INVALID_ARGUMENT). */
 static enum btrfs_result
 bt_bl_target(const struct btrfs_balance_kind *kind, size_t devices, int *redundant)
 {
@@ -1402,9 +1401,6 @@ bt_bl_target(const struct btrfs_balance_kind *kind, size_t devices, int *redunda
 	}
 	if (bt_space_profile(kind->convert, &fewest, redundant) != BTRFS_OK) {
 		return BTRFS_INVALID_ARGUMENT;
-	}
-	if ((kind->convert & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0) {
-		return BTRFS_UNSUPPORTED;
 	}
 	return fewest > devices ? BTRFS_INVALID_ARGUMENT : BTRFS_OK;
 }

@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* A full volume through the native volume layer, on a clone of a Linux image:
  * a file grows by grouped writes until NO_SPACE, synced every few pieces as a
- * writer fsyncs, the last round applying in part; then files with
+ * writer fsyncs, the last round applying in part; a file preallocated before
+ * still takes a write, in place without data space as Linux writes it; then files with
  * large xattrs fill the metadata until NO_SPACE; the volume stays healthy.
  * Deleting the large file then runs in eviction steps that may take the
  * metadata reserve, committed as room requires, a new file fits, and a fresh
@@ -38,6 +39,9 @@
 #define BALLAST_SYNC_FILES 64U
 #define BALLAST_LIMIT_FILES 100000U
 #define AFTER_BYTES 4096U
+/* Preallocated before the fill and written once the volume is full. */
+#define RESERVED_BYTES FILL_PIECE_BYTES
+#define RESERVED_BYTE 0x3cU
 
 struct locks {
 	pthread_mutex_t mutex;
@@ -166,6 +170,7 @@ main(int argc, char **argv)
 	struct btrfs_transaction *transaction;
 	struct btrfs_object_id filler;
 	struct btrfs_object_id after;
+	struct btrfs_object_id reserved;
 	struct btrfs_inode inode;
 	struct btrfs_info info;
 	struct btrfs_fs *fs;
@@ -174,6 +179,7 @@ main(int argc, char **argv)
 	char path[4096];
 	uint8_t *data;
 	uint8_t back[AFTER_BYTES];
+	uint8_t *kept;
 	uint64_t filled = 0;
 	uint64_t full_used;
 	size_t completed;
@@ -196,6 +202,12 @@ main(int argc, char **argv)
 	callbacks = (struct btrfs_volume_locks){ &locks, lock, unlock, wait_on, wake };
 	REQUIRE(btrfs_volume_open(&image.environment, &writer, &callbacks, BTRFS_TOP_LEVEL_TREE,
 		    &volume) == BTRFS_OK);
+	REQUIRE(create(volume, "reserved", &reserved) == BTRFS_OK);
+	REQUIRE(btrfs_volume_join(volume, OPERATION_NODES, &transaction) == BTRFS_OK);
+	REQUIRE(btrfs_transaction_fallocate(transaction, reserved, 0, 0, RESERVED_BYTES, time) ==
+	    BTRFS_OK);
+	btrfs_volume_leave(volume, transaction);
+	sync_volume(volume);
 	REQUIRE(create(volume, "filler", &filler) == BTRFS_OK);
 	for (piece = 0; piece < FILL_LIMIT_PIECES; piece++) {
 		result = write_piece(
@@ -209,6 +221,11 @@ main(int argc, char **argv)
 		}
 	}
 	REQUIRE(result == BTRFS_NO_SPACE && btrfs_volume_failure(volume) == BTRFS_OK);
+	sync_volume(volume);
+	/* As Linux's reserve_space falls back to btrfs_check_nocow_lock, the
+	 * preallocated range is written in place without data space. */
+	memset(data, RESERVED_BYTE, RESERVED_BYTES);
+	REQUIRE(write_piece(volume, reserved, 0, data, RESERVED_BYTES) == BTRFS_OK);
 	sync_volume(volume);
 	for (files = 0; files < BALLAST_LIMIT_FILES; files++) {
 		result = ballast(volume, files, data);
@@ -242,14 +259,22 @@ main(int argc, char **argv)
 	REQUIRE(btrfs_image_lookup(fs, "/after-full", &inode) == BTRFS_OK);
 	REQUIRE(btrfs_read(fs, &inode, 0, back, sizeof(back), &completed) == BTRFS_OK);
 	REQUIRE(completed == AFTER_BYTES && memcmp(back, data, AFTER_BYTES) == 0);
+	kept = malloc(RESERVED_BYTES);
+	REQUIRE(kept != NULL);
+	REQUIRE(btrfs_image_lookup(fs, "/reserved", &inode) == BTRFS_OK);
+	REQUIRE(btrfs_read(fs, &inode, 0, kept, RESERVED_BYTES, &completed) == BTRFS_OK);
+	memset(data, RESERVED_BYTE, RESERVED_BYTES);
+	REQUIRE(completed == RESERVED_BYTES && memcmp(kept, data, RESERVED_BYTES) == 0);
+	free(kept);
 	btrfs_get_info(fs, &info);
 	REQUIRE(info.used_bytes + filled / 2 < full_used);
 	btrfs_unmount(fs);
 	btrfs_image_close(&image);
 	REQUIRE(unlink(path) == 0);
 	free(data);
-	printf("full volume: %llu MiB written and %u xattr files until NO_SPACE, %llu MiB used; "
-	       "after deletion %llu MiB used and a new file written PASS\n",
+	printf("full volume: %llu MiB written until NO_SPACE, then a preallocated file in "
+	       "place, and %u xattr files until NO_SPACE, %llu MiB used; after deletion %llu "
+	       "MiB used and a new file written PASS\n",
 	    (unsigned long long)(filled >> 20), files, (unsigned long long)(full_used >> 20),
 	    (unsigned long long)(info.used_bytes >> 20));
 	return 0;

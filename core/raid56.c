@@ -53,24 +53,47 @@ bt_gf_inverse(uint8_t value)
 	return bt_gf_pow(value, BT_GF_INVERSE_EXPONENT);
 }
 
+/* Every byte value times factor. */
+#define BT_GF_VALUES 256U
+
+static void
+bt_gf_table(uint8_t *table, uint8_t factor)
+{
+	unsigned value;
+
+	for (value = 0; value < BT_GF_VALUES; value++) {
+		table[value] = bt_gf_mul((uint8_t)value, factor);
+	}
+}
+
 /* out ^= factor * in, bytewise. */
 static void
 bt_gf_add_scaled(uint8_t *out, const uint8_t *in, size_t length, uint8_t factor)
 {
+	uint8_t table[BT_GF_VALUES];
 	size_t i;
 
+	if (factor == 1) {
+		for (i = 0; i < length; i++) {
+			out[i] ^= in[i];
+		}
+		return;
+	}
+	bt_gf_table(table, factor);
 	for (i = 0; i < length; i++) {
-		out[i] ^= factor == 1 ? in[i] : bt_gf_mul(in[i], factor);
+		out[i] ^= table[in[i]];
 	}
 }
 
 static void
 bt_gf_scale(uint8_t *bytes, size_t length, uint8_t factor)
 {
+	uint8_t table[BT_GF_VALUES];
 	size_t i;
 
+	bt_gf_table(table, factor);
 	for (i = 0; i < length; i++) {
-		bytes[i] = bt_gf_mul(bytes[i], factor);
+		bytes[i] = table[bytes[i]];
 	}
 }
 
@@ -170,4 +193,65 @@ bt_raid56_rebuild(const struct btrfs_fs *fs, const struct bt_chunk *chunk, uint6
 	}
 	fs->env.release(fs->env.context, scratch, length);
 	return error;
+}
+
+void
+bt_raid56_parity(uint64_t profile, const uint8_t *const *data, unsigned count, uint8_t *p,
+    uint8_t *q, size_t length)
+{
+	unsigned d;
+
+	bt_zero(p, length);
+	if (profile == BT_BLOCK_RAID6) {
+		bt_zero(q, length);
+	}
+	for (d = 0; d < count; d++) {
+		bt_gf_add_scaled(p, data[d], length, 1);
+		if (profile == BT_BLOCK_RAID6) {
+			bt_gf_add_scaled(
+			    q, data[d], length, bt_gf_pow(BT_GF_GENERATOR, (unsigned)d));
+		}
+	}
+}
+
+enum btrfs_result
+bt_raid56_unit(const struct btrfs_fs *fs, const struct bt_chunk *chunk, uint64_t row,
+    unsigned stripe, uint8_t *out, uint8_t *units)
+{
+	const uint8_t *data[BT_MAX_STRIPES];
+	uint64_t profile = chunk->type & BT_BLOCK_PROFILES;
+	unsigned stripes = chunk->stripes;
+	unsigned count = stripes - (profile == BT_BLOCK_RAID5 ? 1U : 2U);
+	unsigned position = (unsigned)((stripe + stripes - row % stripes) % stripes);
+	unsigned d;
+	enum btrfs_result error = BTRFS_OK;
+
+	/* The row's data units and P, but the one the stripe holds. */
+	for (d = 0; error == BTRFS_OK && d <= count; d++) {
+		if (d != position) {
+			error = bt_raid56_read(fs, chunk, (unsigned)((row + d) % stripes), row, 0,
+			    units + d * BT_STRIPE_LENGTH, BT_STRIPE_LENGTH);
+		}
+	}
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	for (d = 0; d < count; d++) {
+		data[d] = units + d * BT_STRIPE_LENGTH;
+	}
+	if (position < count) {
+		/* A data unit: P and the other data units. */
+		bt_copy(out, units + count * BT_STRIPE_LENGTH, BT_STRIPE_LENGTH);
+		for (d = 0; d < count; d++) {
+			if (d != position) {
+				bt_gf_add_scaled(out, data[d], BT_STRIPE_LENGTH, 1);
+			}
+		}
+		return BTRFS_OK;
+	}
+	/* P or Q: the data units' parity again. */
+	bt_raid56_parity(profile, data, count,
+	    position == count ? out : units + count * BT_STRIPE_LENGTH,
+	    position == count ? units + (count + 1) * BT_STRIPE_LENGTH : out, BT_STRIPE_LENGTH);
+	return BTRFS_OK;
 }

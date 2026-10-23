@@ -95,6 +95,15 @@ bt_chunk_data_stripes(uint64_t profile, unsigned stripes, unsigned sub_stripes)
 	return profile == BT_BLOCK_RAID6 ? stripes - 2 : 1;
 }
 
+int
+bt_chunk_parity(const struct btrfs_fs *fs, uint64_t logical)
+{
+	size_t index = bt_chunk_containing(fs, logical);
+
+	return index < fs->chunk_count &&
+	    (fs->chunks[index].type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0;
+}
+
 uint64_t
 bt_chunk_stripe_length(const struct bt_chunk *chunk)
 {

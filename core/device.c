@@ -415,7 +415,7 @@ btrfs_device_resize(const struct btrfs_environment *environment,
 
 /* The stripe of a chunk that holds what stripe holds, on another present
  * device: any other copy of RAID1, RAID1C3 and RAID1C4, the partner of a
- * RAID10 pair; none for other profiles (UNSUPPORTED). */
+ * RAID10 pair; none for single, DUP and RAID0 (UNSUPPORTED). */
 static enum btrfs_result
 bt_replace_mirror(
     const struct btrfs_fs *fs, const struct bt_chunk *chunk, unsigned stripe, unsigned *mirror)
@@ -441,25 +441,52 @@ bt_replace_mirror(
 	return BTRFS_IO;
 }
 
+/* Clears what a piece of a stripe at physical holds of the device's
+ * superblock copies: a stripe may cover one, and the target names itself a
+ * device of the volume only by the copies written after every stripe. */
+static void
+bt_replace_mask(uint64_t physical, uint8_t *buffer, size_t piece)
+{
+	uint64_t start;
+	uint64_t end;
+	unsigned mirror;
+
+	for (mirror = 0; mirror < BT_SUPER_MIRRORS; mirror++) {
+		start = bt_super_offset(mirror);
+		end = start + BT_SUPER_SIZE;
+		if (start >= physical + piece || end <= physical) {
+			continue;
+		}
+		start = start > physical ? start : physical;
+		end = end < physical + piece ? end : physical + piece;
+		bt_zero(buffer + (start - physical), (size_t)(end - start));
+	}
+}
+
 /* Copies every stripe the device of index holds to output at the same
  * offset: from the device, or where it is missing or cannot be read, from
- * a stripe holding the same bytes on another device. */
+ * a stripe holding the same bytes on another device, or for RAID5/6 rebuilt
+ * row by row from the other stripes; superblock copies the stripes cover
+ * are not copied. */
 static enum btrfs_result
 bt_replace_copy(const struct btrfs_fs *fs, size_t index, const struct btrfs_write_device *output,
     uint8_t *buffer)
 {
 	const struct bt_chunk *chunk;
+	uint8_t *units = NULL;
 	uint64_t length;
 	uint64_t offset;
 	size_t piece;
 	size_t i;
 	unsigned stripe;
 	unsigned mirror;
+	int parity;
 	enum btrfs_result error = BTRFS_OK;
 
 	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
 		chunk = &fs->chunks[i];
 		length = bt_chunk_stripe_length(chunk);
+		parity = (chunk->type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0;
 		for (stripe = 0; error == BTRFS_OK && stripe < chunk->stripes; stripe++) {
 			if (chunk->devices[stripe] != index) {
 				continue;
@@ -468,11 +495,21 @@ bt_replace_copy(const struct btrfs_fs *fs, size_t index, const struct btrfs_writ
 				piece = length - offset < BT_REPLACE_PIECE
 				    ? (size_t)(length - offset)
 				    : (size_t)BT_REPLACE_PIECE;
+				/* A RAID5/6 stripe goes a row's unit at a time. */
+				piece = parity ? (size_t)BT_STRIPE_LENGTH : piece;
 				error = fs->devices[index].read == NULL
 				    ? BTRFS_IO
 				    : bt_read_device(fs, (uint32_t)index,
 					  chunk->physical[stripe] + offset, buffer, piece);
-				if (error == BTRFS_IO) {
+				if (error == BTRFS_IO && parity && units == NULL) {
+					units = fs->env.allocate(
+					    fs->env.context, BT_RAID56_UNITS * BT_STRIPE_LENGTH);
+					error = units == NULL ? BTRFS_NO_MEMORY : BTRFS_IO;
+				}
+				if (error == BTRFS_IO && parity) {
+					error = bt_raid56_unit(fs, chunk, offset / BT_STRIPE_LENGTH,
+					    stripe, buffer, units);
+				} else if (error == BTRFS_IO) {
 					error = bt_replace_mirror(fs, chunk, stripe, &mirror);
 					if (error == BTRFS_OK) {
 						error = bt_read_device(fs, chunk->devices[mirror],
@@ -481,11 +518,16 @@ bt_replace_copy(const struct btrfs_fs *fs, size_t index, const struct btrfs_writ
 					}
 				}
 				if (error == BTRFS_OK) {
+					bt_replace_mask(
+					    chunk->physical[stripe] + offset, buffer, piece);
 					error = output->write(output->context,
 					    chunk->physical[stripe] + offset, buffer, piece);
 				}
 			}
 		}
+	}
+	if (units != NULL) {
+		fs->env.release(fs->env.context, units, BT_RAID56_UNITS * BT_STRIPE_LENGTH);
 	}
 	return error;
 }

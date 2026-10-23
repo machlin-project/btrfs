@@ -131,8 +131,7 @@ from Q and the other data stripes, and from P and Q with each other data
 stripe of the row lost too; a read or check takes the first that verifies.
 No repair is written.
 
-The writer writes every profile but RAID5 and RAID6, whose data and parity
-would have to change together. Admission needs every device of the volume (a
+The writer writes every profile. Admission needs every device of the volume (a
 degraded mount is refused, UNSUPPORTED) and a write environment with a writer
 device for each further device in the reader environment's order
 (INVALID_ARGUMENT otherwise); the device table keeps the environment's order,
@@ -145,6 +144,27 @@ extent and shrinks the used bytes of the stripe's device. Each device's
 superblocks carry that device's item (its used bytes as the chunk tree
 records them); every other field is the volume's. New chunks are placed
 across the devices as Linux places them (Block-group growth).
+
+RAID5 and RAID6 rows change their parity with their data, and Linux's
+read-modify-write of a partial row leaves a window, the write hole, in which a
+torn write makes the parity of committed blocks sharing the row wrong, so that
+a later lost device rebuilds them wrong. This writer never changes the
+parity of a committed block instead. A transaction allocates in a RAID5/6
+chunk only within rows that held nothing when it began, or rows it began
+filling itself (`bt_space_clean`; frees stay pinned until commit, so a range
+free during the transaction was free when it began); a partly used row's free
+space waits until the row empties, and the space checks count only what the
+rule leaves. New nodes and data go to their data stripes alone. A committed
+extent in a RAID5/6 chunk is never written in place: a NODATACOW or
+preallocated range is copied on write as a shared one is
+(`bt_tx_nocow`). At commit, after the nodes, every row the transaction
+allocated in has its P (and Q) computed from its data units as they lie on the
+devices and written (`bt_tx_write_parity`), before the first barrier, so the
+rows are whole on every device before any superblock names them. A crash
+before that leaves only rows no committed tree names; the next transaction
+treats them as empty and writes their parity again. Superblock copies that
+fall in a row exclude the whole row from allocation, as Linux's
+`btrfs_rmap_block` does, so their writes change no extent's parity.
 
 A cursor retains one heap buffer per tree level. Internal keys are numerically
 ordered by object ID, type and offset. Each child must match its parent's first
@@ -657,7 +677,8 @@ an extent with more references than one transaction moves (1,024).
 `btrfs_balance` is Linux's `btrfs balance start`: per kind (data, metadata,
 system) it selects groups with Linux's usage filter (used bytes below a
 percentage of the group; 0 selects empty groups) and converts them to a
-profile, single, DUP, RAID0, RAID1, RAID1C3, RAID1C4 or RAID10, where `soft`
+profile, single, DUP, RAID0, RAID1, RAID1C3, RAID1C4, RAID10, RAID5 or
+RAID6, where `soft`
 leaves groups that already have it. The
 groups selected when it begins are relocated once each, so chunks it creates
 are not revisited; a mixed group takes the data arguments, which must equal
@@ -670,8 +691,7 @@ one of the target profile. As Linux's `btrfs_balance` refuses them
 (INVALID_ARGUMENT), a target needs the fewest devices its profile allocates
 on (`validate_convert_profile`), and metadata or system groups convert to a
 profile without a second copy or parity, while some of them have one, only
-with `force` (Linux's `--force`). RAID5 and RAID6 targets, whose writes this
-writer does not make, are UNSUPPORTED. A native interface that starts a
+with `force` (Linux's `--force`). A native interface that starts a
 balance is not implemented. `btrfs-inspect IMAGE balance` lists the block
 groups and, with `--apply`, relocates the named groups, or those
 btrfs-progs-style filters select (`-f`, and `-d`, `-m`, `-s` with `usage=`,
@@ -734,9 +754,15 @@ and no other device changes, so every crash point leaves the volume of the old
 device or of the new one, which superblock recovery accepts with either. On a
 degraded mount without the device, its stripes come from stripes holding the
 same bytes on present devices (any other RAID1, RAID1C3 or RAID1C4 copy, the
-RAID10 partner) and its superblocks from another device's with its chunk-tree
-item, which also gives its size; other profiles cannot be rebuilt there
-(UNSUPPORTED). A stripe the present device cannot read comes from a mirror too.
+RAID10 partner), for RAID5/6 rebuilt a row's 64 KiB unit at a time from the
+row's other units (a data unit from P and the other data units, P and Q from
+the data units again, `bt_raid56_unit`), and its superblocks from another
+device's with its chunk-tree item, which also gives its size; single, DUP and
+RAID0 cannot be rebuilt there (UNSUPPORTED). A stripe the present device
+cannot read comes from a mirror or its row too. Superblock copies a stripe
+covers are cleared in what the target receives: a crash before the barrier
+that follows the stripes must not leave the target a valid superblock of the
+volume while its stripes are incomplete.
 The target must hold the device's size and must not belong to the volume
 (INVALID_ARGUMENT). Linux's dev-replace item, which tracks a running replace
 for its resumption, is not written: this replace never runs across a mount.
@@ -756,9 +782,17 @@ verifies, the bytes the committed trees already name, and every device written
 gets a barrier; nothing else changes, so a crash during repair leaves the
 volume as it was or with more good copies. A RAID5/6 block or sector is read
 from its data stripe; its rebuilds from parity are read only when that fails
-and repair the data stripe, which parity still matches. Parity itself is not
-verified. CORRUPT reports a block or sector no copy of which verifies, a
-superblock copy that fails, or failed copies without a writer. `btrfs-inspect IMAGE scrub [--apply]` offers
+and repair the data stripe, which parity still matches. Then, as Linux's
+`scrub_raid56_parity_stripe`, a second walk of the extent tree reads each
+RAID5/6 row holding an extent again, whole, after those repairs, verifies
+what the row's extents hold there (each checksummed data sector, each tree
+block), and compares P and Q with the parity of the data units at each sector
+offset where an extent lies and everything at that offset verifies; with a
+writer, a P or Q sector that differs is rewritten from the data. Rows without
+extents, such as those holding superblock copies, are not checked: no write
+keeps their parity. CORRUPT reports a block or sector no copy of which
+verifies, a superblock copy that fails, or failed copies or parity without a
+writer. `btrfs-inspect IMAGE scrub [--apply]` offers
 it for image files.
 
 ## Format features

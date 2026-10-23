@@ -355,10 +355,15 @@ bt_mut_new(struct bt_mutation *mutation, struct bt_root root, const void *source
 		error = BTRFS_CORRUPT;
 		goto unreserve;
 	}
-	/* Every copy lies whole on one device: a node never crosses a stripe. */
+	/* Every copy lies whole on one device: a node never crosses a stripe. A
+	 * RAID5/6 node's one copy is its data stripe; the commit writes its
+	 * row's parity. */
 	for (i = 0; i < mirrors; i++) {
 		error = bt_map_place(mutation->base, address, mutation->view.info.node_size, kind,
 		    i, &places[i], &mirrors);
+		if (error == BTRFS_OK && bt_chunk_parity(mutation->base, address)) {
+			mirrors = 1;
+		}
 		if (error == BTRFS_OK &&
 		    (mirrors > BT_MAX_COPIES || places[i].span != mutation->view.info.node_size ||
 			bt_mut_find_shadow(mutation, places[i].device, places[i].physical) !=
