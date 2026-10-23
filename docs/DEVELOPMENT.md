@@ -295,8 +295,9 @@ a copy of it whose `modules/` holds `virtio_console.ko`, `virtio_blk.ko`,
 kernel's console is a module, so a guest sees no output before init loads it.
 Build those profiles with `--root artifacts/btrfs-reference/root-16k` and the
 16 KiB `Image`; `mkfs.btrfs` there formats with `-s 16384`. Apple CPUs implement
-no 64 KiB translation granule, so no Linux kernel here mounts 64 KiB sectors;
-their fixture comes from btrfs-progs alone (64 KiB sectors, below).
+no 64 KiB translation granule, so no Linux kernel here mounts 64 KiB sectors
+natively; their fixture comes from btrfs-progs, and a 64 KiB-page kernel runs
+under QEMU's emulation to check images (64 KiB sectors, below).
 
 For each profile, run the following **from the absolute lab directory**, replacing
 `plain` consistently and using 128 MiB for `transactions-full`. The image creation
@@ -317,10 +318,11 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all thirty-three
+Linux checks and a completed VM exit before consuming the image. Repeat all thirty-four
 profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for
-`transactions-convert` and `transactions-space-cache`, whose data groups must reach the
-100 MiB Linux needs before it writes a v1 cache,
+`transactions-convert`, `transactions-space-cache` and `space-caches`, whose data groups must reach the
+100 MiB Linux needs before it writes a v1 cache (`space-caches` preallocates into a
+third one, whose data holds all three caches),
 2 GiB for `transactions-scale`, 257 GiB for `transactions-copies`, created with
 `truncate` so they stay sparse and never copied byte by byte), then run the portable image and
 transaction suites. It hashes each complete image before and after reading,
@@ -447,6 +449,42 @@ extracts every file with `btrfs restore -s -m -x -S` and prints the restored
 manifest, which must equal the model's byte for byte; `restore` reports that
 tmpfs cannot hold the `btrfs.compression` property and continues.
 
+A Linux kernel with 64 KiB pages runs under QEMU's TCG, whose `-cpu max`
+emulates the 64 KiB granule. Ubuntu 24.04 builds one, `generic-64k`, with
+Btrfs as a module. In a new directory `.cache/linux-reference-64k/download`,
+fetch from `https://ports.ubuntu.com/ubuntu-ports` the `InRelease` of
+`noble-updates` and `noble-security`, check each with the Ubuntu archive key
+(fingerprint `F6EC B376 2474 EDA9 D21B 7022 8719 20D1 991B C93C`, from
+`keyserver.ubuntu.com`, in a scratch keyring), then their
+`main/binary-arm64/Packages.xz` against `InRelease`, and
+`linux-image-unsigned-6.8.0-147-generic-64k` and
+`linux-modules-6.8.0-147-generic-64k` against `Packages.xz`. Extract both
+packages' `data.tar` elsewhere; `.cache/linux-reference-64k/Image` is the
+gunzipped `boot/vmlinuz-6.8.0-147-generic-64k`. `root-64k` is an APFS clone of
+`root-balance` whose `modules/` holds `xor-neon`, `xor`, `raid6_pq`,
+`libcrc32c`, `xxhash_generic`, `blake2b_generic` and `btrfs`, decompressed from
+the `.ko.zst` files, with `modules/order` naming them in that order; the
+console and virtio block drivers are built in. Build the balance check
+(`prepare_balance_linux.py --root artifacts/btrfs-reference/root-64k`, see
+Balance) and run it on clones of `sectors-64k.raw`, of the `large-sectors`
+output and of `btrfs-balance-test sectors-64k.raw 64 DIR`'s balanced image:
+
+```sh
+qemu-system-aarch64 -M virt -cpu max -accel tcg -m 2048 -smp 2 -nographic -no-reboot \
+  -kernel .cache/linux-reference-64k/Image \
+  -initrd artifacts/btrfs-reference/balance-verify-64k.cpio \
+  -append 'console=hvc0 rdinit=/init panic=-1 loglevel=4' \
+  -device virtio-serial-device -chardev stdio,id=console,signal=off \
+  -device virtconsole,chardev=console \
+  -drive file=CLONE.raw,if=none,format=raw,id=disk0 -device virtio-blk-device,drive=disk0 \
+  -serial none -monitor none > LOG 2>&1
+```
+
+Require `BTRFS_BALANCE_VERIFY_PASS` and `6.8.0-147-generic-64k` in each log,
+the btrfs-progs fixture's `BEFORE` manifest equal to `sectors-64k.expected.tsv`,
+the written image's `BEFORE` and `AFTER` equal to its model's `.tsv`, and the
+balanced image's equal to the fixture's.
+
 ## Multi-device volumes
 
 `tests/prepare_multidev_linux.py` prepares volumes a Linux kernel writes
@@ -499,10 +537,13 @@ the device count allows (data to RAID0 or RAID1 on two devices, RAID5 or
 RAID1C3 on three, RAID6 or RAID10 on four; metadata to DUP or RAID1, RAID5 or
 RAID1C3, RAID1C4 or RAID6), checking that conversion's crash states too;
 `--commits` ends after the five commits (for Linux to check writes into its
-own RAID5/6 chunks); `--grow` (for `multi-grow`)
-instead preallocates beyond the free data space in a sixth transaction, so
-that new data chunks are placed across the devices, and checks its crash
-states. `--devices DIR` (for `multi-spare`) instead creates three sparse spare
+own RAID5/6 chunks); `--grow` (for `multi-grow`, and `multi-raid5` in
+`multi-raid5-growth-writes`) instead preallocates beyond the free data space in
+a sixth transaction, so that new data chunks are placed across the devices,
+writes 1 MiB into the middle of that committed preallocation in a seventh,
+which must stay in place on the full volume, then requires a sector sharing a
+row with it to be copied (or refused for space) on RAID5/6 and written in place
+elsewhere, without committing it, and checks the crash states of both commits. `--devices DIR` (for `multi-spare`) instead creates three sparse spare
 images in DIR, adds the first to the volume, requires adding a member again to
 be refused, shrinks the device whose stripes reach furthest to just below its
 highest one and grows it back (with Linux's resize refusals), replaces a
@@ -600,10 +641,20 @@ to the end. Then all groups are relocated in turn; with EXPORT that image is
 written there as `balanced-PID.raw`. `--convert` converts every kind to DUP
 (checking the crash states of that conversion), data back to single with
 `soft`, then runs the usage and soft filters, exporting `dup-PID.raw` and
-`converted-PID.raw`. `--unsupported` expects refusals before
-any write (v1 space caches); `--faults` fails every write,
+`converted-PID.raw`. On images with v1 space caches it requires each
+relocated group's own cache gone with its header and inode, a cache whose data
+the group held truncated to size 0 with its header kept, and every other cache
+as it was; `--faults` fails every write,
 barrier and allocation of each group's relocation in turn. The `balance-*`
 Meson tests run it on the writable fixtures.
+
+`btrfs-space-caches-test IMAGE DIR [EXPORT]` (`tests/space_caches.c`, Meson test
+`space-caches` on `space-caches.raw`) removes the file filling the first two
+cached data groups, then requires `btrfs_transaction_remove_unused_groups` to
+remove the emptied group with its cache (header, inode and data extent), the
+other caches unchanged, the volume reading as after the removal and both
+audits passing; with EXPORT the clone stays there for the balance check
+above.
 
 `tests/prepare_balance_linux.py` builds the Linux check: on `/dev/vda` it runs
 `btrfs check --readonly --check-data-csum`, mounts, prints the manifest

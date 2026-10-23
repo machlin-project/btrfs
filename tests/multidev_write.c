@@ -25,8 +25,10 @@
  * other profiles the devices allow, every group ends with them, and the
  * conversion's crash states are checked as the balance's. With --grow, a sixth transaction
  * preallocates beyond the free data space instead and writes into the new
- * chunks, which are placed across the devices as Linux places them; its crash
- * states are checked as the others. With --commits, the test ends after the
+ * chunks, which are placed across the devices as Linux places them, and a
+ * seventh writes into the middle of that committed preallocation, in place on
+ * the full volume (in RAID5/6 rows that hold nothing else committed); their
+ * crash states are checked as the others. With --commits, the test ends after the
  * five commits. With --devices, devices join, shrink,
  * are replaced and leave; with --parity too, after a conversion to RAID6
  * data and RAID5 metadata once a device joined. With an export directory, the written
@@ -91,6 +93,10 @@
 #define GROW_BEYOND (UINT64_C(96) << 20)
 #define GROW_WRITE_BYTES (1024U * 1024U)
 #define GROW_WRITE_BEFORE_END (2U * 1024U * 1024U)
+/* A later write into the middle of that preallocation, on the full volume,
+ * at a multiple of every row length. */
+#define GROW_MIDDLE_ALIGN (UINT64_C(16) << 20)
+#define GROW_SECTOR 4096U
 #define MAX_GROUPS 256U
 /* Random parts of the pending writes tried at each crash position. */
 #define RANDOM_STATES 1U
@@ -557,6 +563,50 @@ fill(uint8_t *bytes, size_t size, unsigned seed, int text)
 		state ^= state << 5;
 		bytes[i] = text ? (uint8_t)("abcdefgh \n"[state % 10]) : (uint8_t)state;
 	}
+}
+
+/* Whether the volume has RAID5/6 data groups. */
+static int
+parity_volume(const struct btrfs_fs *fs)
+{
+	size_t i;
+
+	for (i = 0; i < fs->chunk_count; i++) {
+		if ((fs->chunks[i].type & BT_BLOCK_DATA) != 0 &&
+		    (fs->chunks[i].type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) != 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* The logical address of byte offset of the file at path, as its file
+ * extent item maps it. */
+static uint64_t
+extent_at(struct btrfs_fs *fs, const char *path, uint64_t offset)
+{
+	const struct bt_disk_extent *file;
+	struct btrfs_inode inode;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_root root;
+	uint64_t logical;
+
+	REQUIRE(btrfs_image_lookup(fs, path, &inode) == BTRFS_OK);
+	REQUIRE(bt_find_root(fs, inode.id.tree, &root) == BTRFS_OK);
+	bt_cursor_init(&cursor, fs, root);
+	REQUIRE(bt_cursor_seek(&cursor,
+		    (struct bt_key){
+			.objectid = inode.id.inode, .offset = offset, .type = BT_EXTENT_DATA },
+		    1) == BTRFS_OK);
+	REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+	file = (const void *)record.data;
+	REQUIRE(record.key.objectid == inode.id.inode && record.key.type == BT_EXTENT_DATA &&
+	    record.size == sizeof(*file) && record.key.offset <= offset &&
+	    offset - record.key.offset < bt_u64(file->length));
+	logical = bt_u64(file->disk_bytenr) + bt_u64(file->offset) + (offset - record.key.offset);
+	bt_cursor_fini(&cursor);
+	return logical;
 }
 
 /* Writes bytes at offset in the volume and the model. */
@@ -1509,7 +1559,7 @@ main(int argc, char **argv)
 	static uint8_t data[LARGE_BYTES];
 	static struct model model;
 	struct btrfs_time time = { SECONDS, 0 };
-	struct commit commits[COMMITS + 2];
+	struct commit commits[COMMITS + 3];
 	struct btrfs_group groups[MAX_GROUPS];
 	struct btrfs_transaction *transaction;
 	struct btrfs_image image;
@@ -1554,6 +1604,10 @@ main(int argc, char **argv)
 	uint64_t highest;
 	uint64_t free_data = 0;
 	uint64_t grown_bytes;
+	uint64_t middle;
+	uint64_t placed;
+	const char *shared_row = "";
+	enum btrfs_result result;
 	size_t device_states = 0;
 	size_t later_states = 0;
 	struct stat status;
@@ -1570,7 +1624,7 @@ main(int argc, char **argv)
 
 	if (argc > 1 && strcmp(argv[1], "--grow") == 0) {
 		grow = 1;
-		commit_count = COMMITS + 1;
+		commit_count = COMMITS + 2;
 		argv++;
 		argc--;
 	} else if (argc > 1 && strcmp(argv[1], "--commits") == 0) {
@@ -1737,6 +1791,42 @@ main(int argc, char **argv)
 			    (fs->chunks[i].type & BT_BLOCK_DATA) != 0;
 		}
 		REQUIRE(grown > 0);
+
+		/* Into the middle of the committed preallocation, a sector past a
+		 * row's start, which the full volume takes in place, RAID5/6 rows
+		 * too while they hold nothing else committed: the extent there
+		 * stays where it is. */
+		middle = grown_bytes / 2 / GROW_MIDDLE_ALIGN * GROW_MIDDLE_ALIGN;
+		placed = extent_at(fs, "/written/grown", middle);
+		commits[COMMITS + 2].first = volume.count;
+		begin(&volume, fs, &transaction);
+		fill(data, GROW_WRITE_BYTES, 8, 0);
+		write_file(transaction, file, middle + GROW_SECTOR, data, GROW_WRITE_BYTES);
+		commit(&volume, transaction, &fs, &model, &commits[COMMITS + 2],
+		    "preallocation commit", &copies);
+		REQUIRE(extent_at(fs, "/written/grown", middle) == placed &&
+		    extent_at(fs, "/written/grown", middle + GROW_SECTOR) == placed + GROW_SECTOR);
+		/* The sector before it shares a row with that committed data: a
+		 * RAID5/6 row is not written in place then, so the full volume
+		 * refuses it for space unless it lands elsewhere; other profiles
+		 * write it in place. Nothing of it is committed. */
+		begin(&volume, fs, &transaction);
+		fill(data, GROW_SECTOR, 9, 0);
+		result = btrfs_transaction_write(transaction, object(transaction, "/written/grown"),
+		    middle, data, GROW_SECTOR, time);
+		if (parity_volume(fs)) {
+			REQUIRE(result == BTRFS_NO_SPACE ||
+			    (result == BTRFS_OK &&
+				extent_at((struct btrfs_fs *)btrfs_transaction_reader(transaction),
+				    "/written/grown", middle) != placed));
+			shared_row = result == BTRFS_NO_SPACE ? "refused for space" : "copied";
+		} else {
+			REQUIRE(result == BTRFS_OK &&
+			    extent_at((struct btrfs_fs *)btrfs_transaction_reader(transaction),
+				"/written/grown", middle) == placed);
+			shared_row = "written in place";
+		}
+		btrfs_transaction_destroy(transaction);
 	}
 
 	/* Mounted from each device, the volume reads the same. */
@@ -1785,14 +1875,16 @@ main(int argc, char **argv)
 	}
 	if (grow) {
 		finish(&volume, &model, argv, paths, &image);
-		printf("multi-device growth: %zu devices, %zu files; six commits read back as the "
-		       "model holds them and pass both audits (%zu checksummed copies), the last "
-		       "preallocating %llu bytes beyond the free data space into %zu new data "
-		       "chunks; the volume reads the same from each device; %zu crash states read "
-		       "as a commit (%zu after superblock recovery) and pass the reference audit, "
-		       "%zu taking a further transaction PASS\n",
-		    devices, model.count, copies, (unsigned long long)GROW_BEYOND, grown, states,
-		    recoveries, resumed);
+		printf(
+		    "multi-device growth: %zu devices, %zu files; seven commits read back as the "
+		    "model holds them and pass both audits (%zu checksummed copies), the sixth "
+		    "preallocating %llu bytes beyond the free data space into %zu new data "
+		    "chunks, the seventh writing into that preallocation in place, and a sector "
+		    "sharing a row with that write %s; the volume reads the same from each "
+		    "device; %zu crash states read as a commit (%zu after superblock recovery) "
+		    "and pass the reference audit, %zu taking a further transaction PASS\n",
+		    devices, model.count, copies, (unsigned long long)GROW_BEYOND, grown,
+		    shared_row, states, recoveries, resumed);
 		return 0;
 	}
 

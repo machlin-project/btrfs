@@ -155,11 +155,18 @@ filling itself (`bt_space_clean`; frees stay pinned until commit, so a range
 free during the transaction was free when it began); a partly used row's free
 space waits until the row empties, and the space checks count only what the
 rule leaves. New nodes and data go to their data stripes alone. A committed
-extent in a RAID5/6 chunk is never written in place: a NODATACOW or
-preallocated range is copied on write as a shared one is
-(`bt_tx_nocow`). At commit, after the nodes, every row the transaction
-allocated in has its P (and Q) computed from its data units as they lie on the
-devices and written (`bt_tx_write_parity`), before the first barrier, so the
+extent in a RAID5/6 chunk is written in place only where every row the write
+touches lies inside a preallocated extent and holds nothing a commit names but
+its unwritten preallocation: the file's items over the row's bytes are
+preallocated or this transaction's (`bt_tx_rows_unwritten`; the extent's
+references are the file's at one offset, so its bytes appear nowhere else). A
+torn write there, or of the row's parity, changes nothing a rebuild must
+return, and a preallocated file keeps taking writes on a full volume. A
+NODATACOW range, or a row shared with written data, is copied on write as a
+shared one is (`bt_tx_nocow`). At commit, after the nodes, every row the
+transaction allocated in or wrote in place has its P (and Q) computed from its
+data units as they lie on the devices and written (`bt_tx_write_parity`),
+before the first barrier, so the
 rows are whole on every device before any superblock names them. A crash
 before that leaves only rows no committed tree names; the next transaction
 treats them as empty and writes their parity again. Superblock copies that
@@ -669,10 +676,14 @@ go at commit, as in the cleaner pass; the last group of its type and profile
 first gets a successor chunk of that profile, as Linux allocates one before it
 relocates the last. A volume without room for the group's extents elsewhere
 refuses with NO_SPACE; the steps it committed before leave the same files.
-Refused before any write (UNSUPPORTED): a running quota rescan; a group with a
-v1 space-cache inode, and data a v1 cache inode names, which Linux deletes with
-its group;
-an extent with more references than one transaction moves (1,024).
+A v1 space cache goes as Linux's relocation and group removal take it: the
+group's own cache inode is truncated when its relocation begins
+(`delete_block_group_cache`), data another group's cache inode names is not
+moved but that inode is truncated to size 0, keeping its free-space header
+(`delete_v1_space_cache`), and the group's removal deletes its cache inode
+and header (`btrfs_remove_block_group`); the truncated extents go with their
+references at commit. Refused before any write (UNSUPPORTED): a running quota
+rescan; an extent with more references than one transaction moves (1,024).
 
 `btrfs_balance` is Linux's `btrfs balance start`: per kind (data, metadata,
 system) it selects groups with Linux's usage filter (used bytes below a
@@ -826,7 +837,9 @@ A v1 free-space cache (`space_cache=v1`) is not maintained. Every commit leaves
 reads as a stale cache: its next v1 mount clears and rebuilds each group's
 cache (`btrfs_read_block_groups`). A zero `cache_generation`, which names no
 v1 cache, stays zero. Cache inodes and their extents in the root tree are
-ordinary references to the writer, and a group that has one is not removed.
+ordinary references to the writer; a removed group's cache goes with it and a
+relocation truncates the caches whose data it would move (Balance), as on
+Linux.
 
 ## fs-verity
 

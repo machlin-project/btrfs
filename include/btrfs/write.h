@@ -173,9 +173,12 @@ struct btrfs_balance_report {
  * names. Every committed state holds the same files. Deleted subvolumes are
  * dropped first. The last group of its kind gets a new chunk of its profile
  * before it goes. Under simple quotas a moved tree block counts as new, as on
- * Linux, and moved data does not. A group whose v1 space cache would have to
- * go or a running quota rescan is UNSUPPORTED, and so is an extent with more
- * references than one transaction moves; NOT_FOUND names no group. Pending tree logs and
+ * Linux, and moved data does not. v1 space caches go as Linux's relocation
+ * takes them: the group's own is truncated first and removed with the group
+ * (cache inode and free-space header), and a cache inode whose data the group
+ * holds is truncated to size 0 instead of moving it. A running quota rescan
+ * is UNSUPPORTED, and so is an extent with more references than one
+ * transaction moves; NOT_FOUND names no group. Pending tree logs and
  * interrupted balances are recovered first (RECOVERY_REQUIRED). */
 enum btrfs_result btrfs_relocate_group(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, uint64_t group,
@@ -330,9 +333,10 @@ enum btrfs_result btrfs_device_resize(const struct btrfs_environment *environmen
  * further one (INVALID_ARGUMENT otherwise), and any profile; new chunks are
  * placed across the devices as Linux places them. In RAID5/6 chunks a
  * transaction allocates only in rows that held nothing when it began or that
- * it began itself, writes their data stripes only, never overwrites a
- * committed extent in place (a NODATACOW or preallocated range is copied),
- * and writes the rows' P and Q at commit with the metadata, before the first
+ * it began itself, writes their data stripes only, overwrites a committed
+ * extent in place only in rows holding nothing committed but its unwritten
+ * preallocation (a NODATACOW range or a row shared with written data is
+ * copied), and writes those rows' P and Q at commit with the metadata, before the first
  * barrier: no committed block's parity ever changes, so a torn write cannot
  * leave one unrecoverable (the write hole). Every device
  * must hold at least two superblock copies that agree with the mounted primary;
@@ -393,7 +397,8 @@ enum btrfs_result btrfs_transaction_write_inline(struct btrfs_transaction *trans
  * privilege decision. Partially covered sectors are read from this
  * transaction's own view and rewritten; data is copied on write except into
  * preallocated and unshared NODATACOW extents, which are written in place as
- * Linux does (in RAID5/6 chunks only those this transaction created). The
+ * Linux does (in RAID5/6 chunks, a committed one only in rows holding nothing
+ * committed but its unwritten preallocation). The
  * range's data space is checked first (NO_SPACE); as Linux's reserve_space,
  * a range written in place in every sector needs none, so a full volume
  * still takes writes into preallocated space. Old extents keep their references until commit drops
@@ -612,10 +617,12 @@ enum btrfs_result btrfs_transaction_delete_subvolume(struct btrfs_transaction *t
 /* Removes block groups that held nothing when the transaction began and that
  * it has not allocated from, as Linux's cleaner does with
  * btrfs_delete_unused_bgs (a group emptied in this transaction waits for the
- * next one). The last group of each type and profile stays, and so does a group
- * with a v1 space-cache inode. Their chunk and device extents, block group and
- * free-space items go at commit; their device space is free from the next
- * transaction on. removed counts them. */
+ * next one). The last group of each type and profile stays. A removed group's
+ * v1 space cache, its inode and free-space header in the root tree, goes with
+ * it (btrfs_remove_block_group), the cache's data with its reference. Their
+ * chunk and device extents, block group and free-space items go at commit;
+ * their device space is free from the next transaction on. removed counts
+ * them. */
 enum btrfs_result btrfs_transaction_remove_unused_groups(
     struct btrfs_transaction *transaction, size_t *removed);
 /* Drops deleted subvolumes, as Linux's cleaner does with btrfs_drop_snapshot:

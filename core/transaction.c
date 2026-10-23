@@ -1715,10 +1715,83 @@ bt_tx_parity_row(struct btrfs_transaction *transaction, const struct bt_chunk *c
 	return error;
 }
 
-/* The parity of every row of a RAID5/6 chunk this transaction allocated in,
- * after the data and nodes it holds are written and before the first
- * barrier: those rows held nothing when it began (bt_space_clean), so no
- * committed block's parity changes. */
+/* The length of a RAID5/6 chunk's rows: its data stripes' units. */
+static uint64_t
+bt_tx_row_length(const struct bt_chunk *chunk)
+{
+	return chunk->length / bt_chunk_stripe_length(chunk) * BT_STRIPE_LENGTH;
+}
+
+enum btrfs_result
+bt_tx_note_parity(struct btrfs_transaction *transaction, uint64_t logical, uint64_t length)
+{
+	const struct btrfs_environment *env = &transaction->base->env;
+	const struct btrfs_fs *fs = &transaction->fs;
+	const struct bt_chunk *chunk;
+	size_t index = bt_chunk_containing(fs, logical);
+	uint64_t *grown;
+	uint64_t row_length;
+	uint64_t start;
+	uint64_t last;
+	size_t capacity;
+	size_t low;
+	size_t high;
+	size_t middle;
+	size_t i;
+
+	if (length == 0 || index == fs->chunk_count ||
+	    (fs->chunks[index].type & (BT_BLOCK_RAID5 | BT_BLOCK_RAID6)) == 0) {
+		return BTRFS_OK;
+	}
+	chunk = &fs->chunks[index];
+	row_length = bt_tx_row_length(chunk);
+	start = chunk->logical + (logical - chunk->logical) / row_length * row_length;
+	last = chunk->logical + (logical + length - 1 - chunk->logical) / row_length * row_length;
+	for (; start <= last; start += row_length) {
+		low = 0;
+		high = transaction->parity_row_count;
+		while (low < high) {
+			middle = low + (high - low) / 2;
+			if (transaction->parity_rows[middle] < start) {
+				low = middle + 1;
+			} else {
+				high = middle;
+			}
+		}
+		if (low < transaction->parity_row_count && transaction->parity_rows[low] == start) {
+			continue;
+		}
+		if (transaction->parity_row_count == transaction->parity_row_capacity) {
+			capacity = transaction->parity_row_capacity == 0
+			    ? BT_PARITY_ROWS
+			    : transaction->parity_row_capacity * 2;
+			grown = env->allocate(env->context, capacity * sizeof(*grown));
+			if (grown == NULL) {
+				return BTRFS_NO_MEMORY;
+			}
+			if (transaction->parity_rows != NULL) {
+				bt_copy(grown, transaction->parity_rows,
+				    transaction->parity_row_count * sizeof(*grown));
+				env->release(env->context, transaction->parity_rows,
+				    transaction->parity_row_capacity * sizeof(*grown));
+			}
+			transaction->parity_rows = grown;
+			transaction->parity_row_capacity = capacity;
+		}
+		for (i = transaction->parity_row_count; i > low; i--) {
+			transaction->parity_rows[i] = transaction->parity_rows[i - 1];
+		}
+		transaction->parity_rows[low] = start;
+		transaction->parity_row_count++;
+	}
+	return BTRFS_OK;
+}
+
+/* The parity of every row of a RAID5/6 chunk this transaction allocated in or
+ * wrote in place, after the data and nodes it holds are written and before
+ * the first barrier: those rows held nothing when it began (bt_space_clean),
+ * or nothing committed but the unwritten preallocation written in place
+ * (bt_tx_nocow), so no committed block's parity changes. */
 static enum btrfs_result
 bt_tx_write_parity(struct btrfs_transaction *transaction)
 {
@@ -1749,7 +1822,7 @@ bt_tx_write_parity(struct btrfs_transaction *transaction)
 				return BTRFS_NO_MEMORY;
 			}
 		}
-		length = chunk->length / bt_chunk_stripe_length(chunk) * BT_STRIPE_LENGTH;
+		length = bt_tx_row_length(chunk);
 		first = (change->start - chunk->logical) / length;
 		last = (change->start + change->length - 1 - chunk->logical) / length;
 		for (row = first; error == BTRFS_OK && row <= last; row++) {
@@ -1761,6 +1834,23 @@ bt_tx_write_parity(struct btrfs_transaction *transaction)
 			done_chunk = change->chunk;
 			done = row;
 		}
+	}
+	for (i = 0; error == BTRFS_OK && i < transaction->parity_row_count; i++) {
+		done_chunk = bt_chunk_containing(&transaction->fs, transaction->parity_rows[i]);
+		if (done_chunk == transaction->fs.chunk_count) {
+			error = BTRFS_CORRUPT;
+			break;
+		}
+		chunk = &transaction->fs.chunks[done_chunk];
+		if (units == NULL) {
+			units = env->allocate(env->context, size);
+			if (units == NULL) {
+				return BTRFS_NO_MEMORY;
+			}
+		}
+		error = bt_tx_parity_row(transaction, chunk,
+		    (transaction->parity_rows[i] - chunk->logical) / bt_tx_row_length(chunk),
+		    units);
 	}
 	if (units != NULL) {
 		env->release(env->context, units, size);
@@ -2016,6 +2106,10 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 		    (transaction->base->device_count + 1) * sizeof(*transaction->targets));
 	}
 	bt_tx_release_data(transaction);
+	if (transaction->parity_rows != NULL) {
+		env->release(env->context, transaction->parity_rows,
+		    transaction->parity_row_capacity * sizeof(*transaction->parity_rows));
+	}
 	bt_qgroup_end(transaction);
 	bt_mutation_destroy(transaction->mutation);
 	bt_space_destroy(transaction->space);

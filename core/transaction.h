@@ -17,6 +17,8 @@
 #define BT_TRANSACTION_CHUNKS 64U
 /* Queued file reference changes of one transaction. */
 #define BT_TRANSACTION_REFERENCES 65536U
+/* RAID5/6 rows written in place a transaction first notes room for. */
+#define BT_PARITY_ROWS 64U
 #define BT_INLINE_WRITE_LIMIT 2048U
 /* Linux's limit on one uncompressed data extent. */
 #define BT_DATA_EXTENT (UINT64_C(128) * 1024 * 1024)
@@ -182,6 +184,12 @@ struct btrfs_transaction {
 	size_t ref_count;
 	/* Tree nodes the queued reference changes edit at commit, estimated. */
 	size_t ref_nodes;
+	/* RAID5/6 rows (their logical starts, ascending) written in place, whose
+	 * P and Q the commit writes again with those of the rows it allocated in
+	 * (bt_tx_write_parity). */
+	uint64_t *parity_rows;
+	size_t parity_row_count;
+	size_t parity_row_capacity;
 	/* The nodes the current operation declared (btrfs_transaction_room). */
 	size_t operation_nodes;
 	/* Deleted inodes whose eviction exceeded an unlink's own budget; each
@@ -242,12 +250,28 @@ enum btrfs_result bt_tx_children(struct btrfs_transaction *transaction, const ui
 struct bt_root *bt_tx_groups(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_edit(struct btrfs_transaction *transaction, struct bt_root *root,
     struct bt_key key, const void *data, size_t size, enum bt_edit edit);
+/* Notes the RAID5/6 rows [logical, logical + length) of a chunk was written
+ * in place in, for the commit to write their parity again. */
+enum btrfs_result bt_tx_note_parity(
+    struct btrfs_transaction *transaction, uint64_t logical, uint64_t length);
 /* Queues a file reference change for bt_tx_apply_refs. */
 enum btrfs_result bt_tx_queue(struct btrfs_transaction *transaction, struct bt_key extent,
     const struct bt_backref *reference, int add);
 /* Applies queued file references; a data extent whose last reference goes
  * loses its checksums and its block-group space. */
 enum btrfs_result bt_tx_apply_refs(struct btrfs_transaction *transaction);
+/* Linux's v1 space cache of a group (core/group.c): inode ino of the root
+ * tree loses its file extent items and their data references, as
+ * btrfs_truncate_free_space_cache truncates it to size 0, and with remove
+ * every item, as evicting it after btrfs_remove_free_space_inode does. */
+enum btrfs_result bt_group_cache_drop(
+    struct btrfs_transaction *transaction, uint64_t ino, int remove);
+/* Truncates the cache inode of the group at logical, if it has one, as
+ * relocation does before it moves the group's extents. */
+enum btrfs_result bt_group_cache_truncate(struct btrfs_transaction *transaction, uint64_t logical);
+/* Removes the cache inode and its free-space header of the group at logical
+ * with the group, as btrfs_remove_block_group does. */
+enum btrfs_result bt_group_cache_remove(struct btrfs_transaction *transaction, uint64_t logical);
 /* Deletes the items of every group marked removed (core/group.c). */
 enum btrfs_result bt_tx_remove_groups(struct btrfs_transaction *transaction);
 enum btrfs_result bt_tx_drop_range(struct btrfs_transaction *transaction,

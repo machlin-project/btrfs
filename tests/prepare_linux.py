@@ -28,6 +28,7 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-block-group-tree": (16384, "dup", ""),
             "transactions-mixed": (4096, "single", ""),
             "transactions-space-cache": (4096, "single", ""),
+            "space-caches": (4096, "single", ""),
             "transactions-quota": (16384, "dup", ""),
             "transactions-squota": (16384, "dup", ""),
             "transactions-verity": (16384, "dup", ""),
@@ -52,7 +53,8 @@ DATA_PROFILES = {"transactions-holes": "dup", "checksums-blake2": "dup"}
 MKFS_FEATURES = {"transactions-holes": "-O ^no-holes",
                  "transactions-block-group-tree": "-O block-group-tree",
                  "transactions-mixed": "--mixed",
-                 "transactions-space-cache": "-R ^free-space-tree"}
+                 "transactions-space-cache": "-R ^free-space-tree",
+                 "space-caches": "-R ^free-space-tree"}
 # Format features beyond mkfs defaults, each confirmed in Linux's own dumps: a
 # metadata UUID set by btrfstune after Linux wrote the volume (tree blocks keep
 # the old fsid, the superblock names a new one), mixed data and metadata
@@ -62,10 +64,14 @@ MKFS_FEATURES = {"transactions-holes": "-O ^no-holes",
 FEATURE_PROFILES = ("transactions-metadata-uuid", "transactions-mixed",
                     "transactions-space-cache", "transactions-quota", "transactions-squota",
                     "transactions-verity")
-MOUNT_OPTIONS = {"transactions-space-cache": "space_cache=v1"}
+MOUNT_OPTIONS = {"transactions-space-cache": "space_cache=v1", "space-caches": "space_cache=v1"}
 # Linux writes no v1 cache for a block group below 100 MiB (cache_save_setup);
 # on 1 GiB its data groups are 112 MiB.
 SPACE_CACHE_DEVICE_BYTES = 1024 * 1024 * 1024
+# The space-caches profile preallocates past the first such data group, so a
+# second one joins it; Linux caches both, a cache's data in any data group,
+# so relocating one group meets the other's cache data.
+SPACE_CACHES_PREALLOC_BYTES = 120 * 1024 * 1024
 # Above the 80 MiB the data scenarios write in one transaction.
 QUOTA_LIMIT_BYTES = 128 * 1024 * 1024
 # A level-1 qgroup holding the data subvolume and its writable snapshot, with an
@@ -144,6 +150,7 @@ DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
                 "checksums-blake2": 512 * 1024 * 1024,
                 "transactions-convert": 1024 * 1024 * 1024,
                 "transactions-space-cache": SPACE_CACHE_DEVICE_BYTES,
+                "space-caches": SPACE_CACHE_DEVICE_BYTES,
                 "transactions-copies": COPIES_DEVICE_BYTES,
                 "transactions-scale": SCALE_DEVICE_BYTES}
 # A leaf-sized xattr gives each metadata filler inode its own 4 KiB leaf.
@@ -762,6 +769,20 @@ test "$(btrfs inspect-internal dump-tree -t extent /dev/vda | grep -c ' BLOCK_GR
         fill += '''
 btrfs filesystem df /mnt | grep -F Data+Metadata'''
         after = '''btrfs inspect-internal dump-super /dev/vda | grep -w MIXED_GROUPS'''
+    if profile == "space-caches":
+        fill = f'''fallocate -l {SPACE_CACHES_PREALLOC_BYTES} /mnt/groups
+btrfs filesystem sync /mnt
+btrfs filesystem df /mnt'''
+        after = '''btrfs inspect-internal dump-super /dev/vda > /tmp/super.txt
+test "$(awk '$1 == "cache_generation" {print $2}' /tmp/super.txt)" = \\
+     "$(awk '$1 == "generation" {print $2}' /tmp/super.txt)"
+btrfs inspect-internal dump-tree -t root /dev/vda > /tmp/root.txt
+grep -A 3 'key (FREE_SPACE UNTYPED' /tmp/root.txt | sed 's/^/BTRFS_REFERENCE_CACHE_HEADER:/'
+grep -A 4 'EXTENT_DATA' /tmp/root.txt | sed 's/^/BTRFS_REFERENCE_CACHE_DATA:/'
+btrfs inspect-internal dump-tree -t chunk /dev/vda | grep -B 1 'type DATA' | sed 's/^/BTRFS_REFERENCE_DATA_CHUNK:/'
+caches=$(grep -c 'key (FREE_SPACE UNTYPED' /tmp/root.txt || true)
+echo BTRFS_REFERENCE_SPACE_CACHES:$caches
+test "$caches" -ge 2'''
     if profile == "transactions-space-cache":
         after = '''btrfs inspect-internal dump-super /dev/vda > /tmp/super.txt
 grep -E '^(generation|cache_generation|compat_ro_flags)' /tmp/super.txt

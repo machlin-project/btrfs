@@ -11,9 +11,9 @@
  * relocate again to the same end. Then every group of the image is relocated
  * in turn; with an export directory, that image goes there for Linux. Small
  * steps (the work argument) give many crash states. A volume without room
- * refuses a group (NO_SPACE) reading the same; with --unsupported, groups
- * whose relocation is unsupported (a v1 space cache) must be
- * refused before any write, and one at least is. */
+ * refuses a group (NO_SPACE) reading the same. A v1 space cache goes with
+ * its group, and one whose data the group held is truncated, as Linux's
+ * relocation leaves them. */
 #include "../adapters/posix/image.h"
 #include "internal.h"
 #include "namespace_audit.h"
@@ -38,6 +38,9 @@
 #define MAX_BARRIERS 65536U
 #define OVERLAY_GROWTH 1024U
 #define MAX_GROUPS 256U
+/* v1 space caches an image holds, and data extents of each, at most. */
+#define MAX_CACHES 64U
+#define MAX_CACHE_EXTENTS 16U
 /* Crash states of one group's relocation that relocate again to the end. */
 #define RESUMED_STATES 6U
 #define EXPORT_PATH 4096U
@@ -77,6 +80,16 @@ struct expected {
 	size_t data_extents;
 	uint64_t data_bytes;
 	int quotas;
+};
+
+/* A v1 space cache: its group, its inode in the root tree and the data
+ * extents that inode names. */
+struct cache {
+	uint64_t group;
+	uint64_t inode;
+	uint64_t size;
+	uint64_t data[MAX_CACHE_EXTENTS];
+	size_t data_count;
 };
 
 static enum btrfs_result
@@ -210,8 +223,152 @@ overlay_free(struct overlay *overlay)
 	free(overlay->barriers);
 }
 
-/* File tree blocks, data extents and their bytes: a relocation that keeps
- * sharing moves each of them and creates none. */
+/* Whether a data extent belongs to a v1 space-cache inode: a file extent
+ * item of the root tree names it. Relocation deletes those caches, as
+ * Linux's does. */
+static int
+cache_extent(const struct btrfs_fs *fs, uint64_t logical)
+{
+	const struct bt_disk_extent *file;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	int found = 0;
+	enum btrfs_result result;
+
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	result = bt_cursor_seek(&cursor, (struct bt_key){ 0 }, 0);
+	while (result == BTRFS_OK && !found) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		file = (const void *)record.data;
+		found = record.key.type == BT_EXTENT_DATA && record.size >= sizeof(*file) &&
+		    file->header.type != BT_EXTENT_INLINE && bt_u64(file->disk_bytenr) == logical;
+		result = bt_cursor_next(&cursor);
+	}
+	REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND);
+	bt_cursor_fini(&cursor);
+	return found;
+}
+
+/* The image's v1 space caches: each free-space header of the root tree, the
+ * inode it names and that inode's data extents. */
+static size_t
+list_caches(const struct btrfs_fs *fs, struct cache *caches)
+{
+	const struct bt_disk_free_space_header *header;
+	const struct bt_disk_extent *file;
+	const struct bt_disk_inode *inode;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	size_t count = 0;
+	size_t i;
+	enum btrfs_result result;
+
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	result = bt_cursor_seek(&cursor, (struct bt_key){ BT_FREE_SPACE_OBJECTID, 0, 0 }, 0);
+	while (result == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		if (record.key.objectid != BT_FREE_SPACE_OBJECTID) {
+			break;
+		}
+		REQUIRE(
+		    record.key.type == 0 && record.size == sizeof(*header) && count < MAX_CACHES);
+		header = (const void *)record.data;
+		caches[count].group = record.key.offset;
+		caches[count].inode = bt_key_decode(&header->location).objectid;
+		caches[count].data_count = 0;
+		count++;
+		result = bt_cursor_next(&cursor);
+	}
+	REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND);
+	bt_cursor_fini(&cursor);
+	for (i = 0; i < count; i++) {
+		bt_cursor_init(&cursor, fs, fs->root_tree);
+		result = bt_cursor_seek(&cursor, (struct bt_key){ caches[i].inode, 0, 0 }, 0);
+		while (result == BTRFS_OK) {
+			REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+			if (record.key.objectid != caches[i].inode) {
+				break;
+			}
+			if (record.key.type == BT_INODE_ITEM) {
+				REQUIRE(record.size == sizeof(*inode));
+				inode = (const void *)record.data;
+				caches[i].size = bt_u64(inode->size);
+			}
+			file = (const void *)record.data;
+			if (record.key.type == BT_EXTENT_DATA && record.size == sizeof(*file) &&
+			    bt_u64(file->disk_bytenr) != 0) {
+				REQUIRE(caches[i].data_count < MAX_CACHE_EXTENTS);
+				caches[i].data[caches[i].data_count++] = bt_u64(file->disk_bytenr);
+			}
+			result = bt_cursor_next(&cursor);
+		}
+		REQUIRE(result == BTRFS_OK || result == BTRFS_NOT_FOUND);
+		bt_cursor_fini(&cursor);
+	}
+	return count;
+}
+
+/* Whether any item of the root tree has objectid. */
+static int
+root_items(const struct btrfs_fs *fs, uint64_t objectid)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	int found = 0;
+
+	bt_cursor_init(&cursor, fs, fs->root_tree);
+	if (bt_cursor_seek(&cursor, (struct bt_key){ .objectid = objectid }, 0) == BTRFS_OK) {
+		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
+		found = record.key.objectid == objectid;
+	}
+	bt_cursor_fini(&cursor);
+	return found;
+}
+
+/* After group was relocated, as Linux's relocation and group removal leave
+ * the caches: the group's own cache is gone with its header and inode, a cache whose
+ * data the group held is truncated to size 0 and keeps its header, any other
+ * is as it was. Counts the caches removed and truncated. */
+static void
+check_caches(const struct btrfs_fs *fs, const struct cache *caches, size_t count, uint64_t group,
+    size_t *removed, size_t *truncated)
+{
+	struct cache after[MAX_CACHES];
+	const struct cache *found;
+	size_t chunk;
+	size_t remaining;
+	size_t i;
+	size_t j;
+	int held;
+
+	remaining = list_caches(fs, after);
+	for (i = 0; i < count; i++) {
+		found = NULL;
+		for (j = 0; j < remaining; j++) {
+			found = after[j].group == caches[i].group ? &after[j] : found;
+		}
+		held = 0;
+		for (j = 0; j < caches[i].data_count; j++) {
+			chunk = bt_chunk_containing(fs, caches[i].data[j]);
+			held |= chunk == fs->chunk_count;
+		}
+		if (caches[i].group == group) {
+			REQUIRE(found == NULL && !root_items(fs, caches[i].inode));
+			(*removed)++;
+		} else if (held) {
+			REQUIRE(found != NULL && found->inode == caches[i].inode &&
+			    found->size == 0 && found->data_count == 0);
+			(*truncated)++;
+		} else {
+			REQUIRE(found != NULL && found->inode == caches[i].inode &&
+			    found->size == caches[i].size &&
+			    found->data_count == caches[i].data_count);
+		}
+	}
+}
+
+/* File tree blocks, data extents of files and their bytes: a relocation that
+ * keeps sharing moves each of them and creates none. */
 static void
 count_extents(
     const struct btrfs_fs *fs, size_t *file_blocks, size_t *data_extents, uint64_t *data_bytes)
@@ -235,7 +392,7 @@ count_extents(
 	while (result == BTRFS_OK) {
 		REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK);
 		item = (const void *)record.data;
-		if (record.key.type == BT_EXTENT_ITEM) {
+		if (record.key.type == BT_EXTENT_ITEM && !cache_extent(fs, record.key.objectid)) {
 			(*data_extents)++;
 			*data_bytes += record.key.offset;
 		} else if (record.key.type == BT_METADATA_ITEM) {
@@ -576,11 +733,13 @@ main(int argc, char **argv)
 	char path[EXPORT_PATH];
 	enum btrfs_result result;
 	uint64_t groups[MAX_GROUPS];
+	struct cache caches[MAX_CACHES];
 	int refused[MAX_GROUPS] = { 0 };
 	size_t refusals = 0;
-	size_t unsupported_groups = 0;
 	size_t fault_points = 0;
-	int unsupported = 0;
+	size_t cache_count;
+	size_t caches_removed = 0;
+	size_t caches_truncated = 0;
 	int faults = 0;
 	int convert = 0;
 	size_t group_count;
@@ -591,11 +750,6 @@ main(int argc, char **argv)
 	size_t g;
 	size_t i;
 
-	if (argc > 1 && strcmp(argv[1], "--unsupported") == 0) {
-		unsupported = 1;
-		argc--;
-		argv++;
-	}
 	if (argc > 1 && strcmp(argv[1], "--faults") == 0) {
 		faults = 1;
 		argc--;
@@ -622,6 +776,7 @@ main(int argc, char **argv)
 	for (g = 0; g < group_count; g++) {
 		groups[g] = fs->chunks[g].logical;
 	}
+	cache_count = list_caches(fs, caches);
 	btrfs_unmount(fs);
 	memset(&total, 0, sizeof(total));
 	if (convert) {
@@ -649,15 +804,6 @@ main(int argc, char **argv)
 		overlay_init(&recorded, &image);
 		overlay_environment(&recorded, &environment, &writer);
 		result = bt_relocate_group(&environment, &writer, groups[g], work, &report);
-		/* A group whose relocation is unsupported is refused before any
-		 * write. */
-		if (result == BTRFS_UNSUPPORTED && unsupported) {
-			REQUIRE(recorded.count == 0 && recorded.barrier_count == 0);
-			overlay_free(&recorded);
-			refused[g] = 1;
-			unsupported_groups++;
-			continue;
-		}
 		/* A volume without room for the group's extents elsewhere refuses
 		 * the relocation, as Linux's balance does, reading the same. */
 		if (result == BTRFS_NO_SPACE) {
@@ -680,6 +826,8 @@ main(int argc, char **argv)
 		REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
 		REQUIRE(!group_present(fs, groups[g]));
 		check_state(fs, &expected, 1, "relocated");
+		check_caches(
+		    fs, caches, cache_count, groups[g], &caches_removed, &caches_truncated);
 		btrfs_unmount(fs);
 		REQUIRE(bt_relocate_group(&environment, &writer, groups[g], work, &again) ==
 		    BTRFS_NOT_FOUND);
@@ -719,8 +867,7 @@ main(int argc, char **argv)
 		result = refused[g]
 		    ? BTRFS_NO_SPACE
 		    : bt_relocate_group(&environment, &writer, groups[g], work, &report);
-		REQUIRE(result == BTRFS_OK || result == BTRFS_NO_SPACE ||
-		    (unsupported && result == BTRFS_UNSUPPORTED));
+		REQUIRE(result == BTRFS_OK || result == BTRFS_NO_SPACE);
 		refused[g] = result != BTRFS_OK;
 	}
 	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, &fs) == BTRFS_OK);
@@ -737,14 +884,14 @@ main(int argc, char **argv)
 	overlay_free(&recorded);
 	REQUIRE(image.live_allocations == 0);
 	btrfs_image_close(&image);
-	REQUIRE(!unsupported || unsupported_groups > 0);
-	printf("balance: %zu unsupported groups refused without a write\n", unsupported_groups);
 	printf("balance: %zu groups relocated one by one (%llu tree blocks, %llu data extents of "
 	       "%llu bytes, %llu commits) read as before with sharing kept, %zu refused for "
-	       "space; %zu crash states read the same (%zu after superblock recovery), %zu of "
-	       "them relocated again; all groups in turn PASS\n",
-	    group_count - refusals - unsupported_groups, (unsigned long long)total.blocks,
+	       "space; %zu v1 space caches removed with their groups and %zu truncated with "
+	       "their data's; %zu crash states read the same (%zu after superblock recovery), "
+	       "%zu of them relocated again; all groups in turn PASS\n",
+	    group_count - refusals, (unsigned long long)total.blocks,
 	    (unsigned long long)total.extents, (unsigned long long)total.bytes,
-	    (unsigned long long)total.commits, refusals, states, recoveries, resumed);
+	    (unsigned long long)total.commits, refusals, caches_removed, caches_truncated, states,
+	    recoveries, resumed);
 	return 0;
 }

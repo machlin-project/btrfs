@@ -107,7 +107,7 @@ is destroyed. `accept` is legal only after successful durable publication;
    same files and sharing stays; `tests/balance.c` checks every group of the
    writable fixtures with their crash states and faults, and Linux checks and
    balances the results again (`tests/prepare_balance_linux.py`). Remaining:
-   balance with v1 space caches and a native interface that starts one (`btrfs_balance` takes Linux's usage, convert
+   a native interface that starts a balance (`btrfs_balance` takes Linux's usage, convert
    and soft filters and force); data reference edits
    from file writes must join the same
    ordered pass with additions before drops. Keep running the audit after every
@@ -161,9 +161,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    allocation run where Linux's read-modify-write would fill it; multiple
    devices for the native adapters, which open one; 64 KiB
    sectors against an image btrfs-progs formatted, whose check and restore
-   accept what is written (`tests/large_sectors.c`). Remaining: a Linux
-   kernel's verdict on 64 KiB sectors, which needs a 64 KiB-page kernel that
-   no Apple CPU runs.
+   accept what is written (`tests/large_sectors.c`), and a 64 KiB-page Linux
+   kernel under QEMU mounts, balances and checks the images written and
+   balanced here (DEVELOPMENT.md, 64 KiB sectors).
 5. **Extend namespace mutations.** Create of every type, link, unlink/rmdir with
    orphan items for open inodes, eviction and orphan cleanup, atomic rename
    (replacement, cross-directory, between names of one inode), xattrs and the

@@ -1014,13 +1014,81 @@ bt_tx_replace(struct btrfs_transaction *transaction, struct bt_owned_root *tree,
 	return error;
 }
 
+/* Whether every RAID5/6 row that [position, end) of item's preallocated
+ * extent touches lies inside the extent and holds nothing a commit names but
+ * the extent's unwritten preallocation: the file's items over the row's bytes
+ * are preallocated or this transaction's. A torn write of such a row, or of
+ * its parity, changes no committed byte that a rebuild must return. As the
+ * extent's references are this file's at one offset (bt_tx_nocow), its bytes
+ * appear nowhere else. */
+static enum btrfs_result
+bt_tx_rows_unwritten(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
+    uint64_t ino, const struct bt_file_item *item, uint64_t position, uint64_t end, int *unwritten)
+{
+	const struct bt_disk_extent *extent = &item->extent;
+	const struct btrfs_fs *fs = &transaction->fs;
+	const struct bt_chunk *chunk;
+	struct bt_file_item other;
+	uint64_t bytenr = bt_u64(extent->disk_bytenr);
+	uint64_t bytes = bt_u64(extent->disk_bytes);
+	uint64_t base;
+	uint64_t row_length;
+	uint64_t first;
+	uint64_t last;
+	uint64_t logical;
+	uint64_t file;
+	uint64_t file_end;
+	uint64_t steps;
+	size_t index = bt_chunk_containing(fs, bytenr);
+	int found = 1;
+	enum btrfs_result error = BTRFS_OK;
+
+	*unwritten = 0;
+	if (index == fs->chunk_count || item->key.offset < bt_u64(extent->offset) ||
+	    bytes > UINT64_MAX - (item->key.offset - bt_u64(extent->offset))) {
+		return BTRFS_OK;
+	}
+	chunk = &fs->chunks[index];
+	row_length = chunk->length / bt_chunk_stripe_length(chunk) * BT_STRIPE_LENGTH;
+	/* The file offset of the extent's first byte. */
+	base = item->key.offset - bt_u64(extent->offset);
+	logical = bytenr + bt_u64(extent->offset) + (position - item->key.offset);
+	first = chunk->logical + (logical - chunk->logical) / row_length * row_length;
+	last = chunk->logical +
+	    (logical + (end - position) - 1 - chunk->logical) / row_length * row_length +
+	    row_length;
+	if (first < bytenr || last > bytenr + bytes) {
+		return BTRFS_OK;
+	}
+	*unwritten = 1;
+	file_end = base + (last - bytenr);
+	for (file = base + (first - bytenr), steps = 0;
+	    error == BTRFS_OK && *unwritten && found && file < file_end;
+	    file = other.end, steps++) {
+		if (steps == BT_MAX_TREE_ITEMS) {
+			*unwritten = 0;
+			break;
+		}
+		error = bt_tx_file_item(transaction, tree, ino, file, file_end, &other, &found);
+		if (error == BTRFS_OK && found && other.extent.header.type != BT_EXTENT_INLINE &&
+		    bt_u64(other.extent.disk_bytenr) == bytenr) {
+			*unwritten = other.extent.header.type == BT_EXTENT_PREALLOC ||
+			    bt_u64(other.extent.header.generation) >
+				transaction->base->info.generation;
+		}
+	}
+	return error;
+}
+
 /* Whether [position, end) of item may be written in place, as Linux's
  * run_delalloc_nocow decides: a preallocated extent, or a regular one of a
  * NODATACOW file, uncompressed, newer than the tree's last snapshot, referenced
  * only by this file's items for it, and without checksums in the range. A
- * committed extent in a RAID5/6 chunk is copied instead: rewriting it would
- * change parity other committed blocks of its rows depend on, which a torn
- * write could leave wrong (the write hole). */
+ * committed extent in a RAID5/6 chunk is written in place only where its rows
+ * hold nothing committed but its unwritten preallocation
+ * (bt_tx_rows_unwritten); elsewhere it is copied: rewriting it would change
+ * parity other committed blocks of its rows depend on, which a torn write
+ * could leave wrong (the write hole). */
 static enum btrfs_result
 bt_tx_nocow(struct btrfs_transaction *transaction, const struct bt_owned_root *tree,
     const struct bt_disk_inode *inode, uint64_t ino, const struct bt_file_item *item,
@@ -1034,6 +1102,8 @@ bt_tx_nocow(struct btrfs_transaction *transaction, const struct bt_owned_root *t
 	uint64_t flags = 0;
 	uint64_t count = 0;
 	int checksummed = 0;
+	int committed_parity;
+	int unwritten = 0;
 	enum btrfs_result error;
 
 	*in_place = 0;
@@ -1042,9 +1112,12 @@ bt_tx_nocow(struct btrfs_transaction *transaction, const struct bt_owned_root *t
 		    (bt_u64(inode->flags) & BT_INODE_NODATACOW) == 0)) ||
 	    key.objectid == 0 || extent->header.compression != 0 ||
 	    extent->header.encryption != 0 || bt_u16(extent->header.encoding) != 0 ||
-	    bt_u64(extent->header.generation) <= bt_u64(tree->item.legacy.last_snapshot) ||
-	    (bt_chunk_parity(&transaction->fs, key.objectid) &&
-		bt_u64(extent->header.generation) <= transaction->base->info.generation)) {
+	    bt_u64(extent->header.generation) <= bt_u64(tree->item.legacy.last_snapshot)) {
+		return BTRFS_OK;
+	}
+	committed_parity = bt_chunk_parity(&transaction->fs, key.objectid) &&
+	    bt_u64(extent->header.generation) <= transaction->base->info.generation;
+	if (committed_parity && extent->header.type != BT_EXTENT_PREALLOC) {
 		return BTRFS_OK;
 	}
 	bt_zero(&reference, sizeof(reference));
@@ -1060,6 +1133,13 @@ bt_tx_nocow(struct btrfs_transaction *transaction, const struct bt_owned_root *t
 	}
 	if (error != BTRFS_OK || refs != count) {
 		return error;
+	}
+	if (committed_parity) {
+		error =
+		    bt_tx_rows_unwritten(transaction, tree, ino, item, position, end, &unwritten);
+		if (error != BTRFS_OK || !unwritten) {
+			return error;
+		}
 	}
 	error = bt_csum_exists(transaction->mutation, transaction->checksums.root,
 	    key.objectid + bt_u64(extent->offset) + (position - item->key.offset), end - position,
@@ -1085,6 +1165,10 @@ bt_tx_write_in_place(struct btrfs_transaction *transaction, struct bt_owned_root
 	enum btrfs_result error;
 
 	error = bt_tx_write_data(transaction, logical, bytes, end - position);
+	/* Rows of RAID5/6 chunks get their parity again at commit. */
+	if (error == BTRFS_OK) {
+		error = bt_tx_note_parity(transaction, logical, end - position);
+	}
 	if (error != BTRFS_OK || item->extent.header.type != BT_EXTENT_PREALLOC) {
 		return error;
 	}

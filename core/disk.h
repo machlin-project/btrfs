@@ -405,6 +405,13 @@ struct bt_disk_free_space_info {
 	struct bt_le32 extent_count, flags;
 };
 
+/* A v1 space cache's header in the root tree, keyed (FREE_SPACE_OBJECTID, 0,
+ * group start): the cache inode's key and the cache's generation and counts. */
+struct bt_disk_free_space_header {
+	struct bt_disk_key location;
+	struct bt_le64 generation, entries, bitmaps;
+};
+
 struct bt_disk_block_group {
 	struct bt_le64 used_bytes, chunk_objectid, flags;
 };
@@ -455,6 +462,7 @@ _Static_assert(sizeof(struct bt_disk_super) == BT_SUPER_SIZE, "superblock layout
 _Static_assert(sizeof(struct bt_disk_root_backup) == 168, "backup root layout");
 _Static_assert(offsetof(struct bt_disk_super, system_array) == 811, "system array layout");
 _Static_assert(sizeof(struct bt_disk_key) == 17, "key layout");
+_Static_assert(sizeof(struct bt_disk_free_space_header) == 41, "space cache header layout");
 _Static_assert(sizeof(struct bt_disk_header) == 101, "tree header layout");
 _Static_assert(sizeof(struct bt_disk_inode_extref) == 18, "extended reference layout");
 _Static_assert(sizeof(struct bt_disk_chunk) == 48, "chunk layout");

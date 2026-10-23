@@ -113,6 +113,9 @@ multidev_test = executable('btrfs-multidev-test', 'tests/multidev.c', 'tests/ref
 multidev_write_test = executable('btrfs-multidev-write-test', 'tests/multidev_write.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
+space_caches_test = executable('btrfs-space-caches-test', 'tests/space_caches.c',
+  'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
+  link_with: [posix, core], dependencies: [zlib, zstd])
 scrub_test = executable('btrfs-scrub-test', 'tests/scrub.c', 'tests/references.c',
   'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
   dependencies: [zlib, zstd])
@@ -346,6 +349,14 @@ if fixtures != ''
     test(profile[0] + '-writes', multidev_write_test,
       args: profile[2] + [profile[0], join_paths(fixtures, profile[0] + '.expected.tsv'),
         '-'] + images, timeout: 1200, suite: 'images')
+    # On RAID5, the growth's new chunk is a RAID5 one, and the write into
+    # the committed preallocation goes in place into rows holding nothing
+    # else committed.
+    if profile[0] == 'multi-raid5'
+      test('multi-raid5-growth-writes', multidev_write_test,
+        args: ['--grow', profile[0], join_paths(fixtures, profile[0] + '.expected.tsv'),
+          '-'] + images, timeout: 1200, suite: 'images')
+    endif
     # The device changes again on RAID6 data and RAID5 metadata: the
     # missing device is rebuilt from parity.
     if profile[0] == 'multi-spare'
@@ -369,9 +380,13 @@ if fixtures != ''
       args: (profile[0] == 'transactions' ? ['--faults'] : []) +
         [profile[0], meson.current_build_dir()] + images, timeout: 600, suite: 'images')
   endforeach
+  # v1 space caches: an emptied group goes with its cache.
+  test('space-caches', space_caches_test,
+    args: [join_paths(fixtures, 'space-caches.raw'), meson.current_build_dir()],
+    timeout: 300, suite: 'images')
   # Balance: every block group relocated on its own, with its crash states,
   # then all in turn; the files read as before and sharing stays. A full
-  # volume refuses for space, a v1 space cache before any write.
+  # volume refuses for space; v1 space caches go with their groups.
   foreach profile : ['transactions', 'transactions-shared', 'transactions-namespace',
       'transactions-dup', 'transactions-data', 'transactions-quota', 'transactions-squota',
       'transactions-mixed',
@@ -379,7 +394,7 @@ if fixtures != ''
       'transactions-verity', 'transactions-keyed', 'transactions-fst',
       'transactions-metadata-uuid', 'transactions-grow', 'transactions-full',
       'transactions-16k', 'sectors-16k', 'sectors-64k', 'checksums-xxhash', 'checksums-blake2',
-      'codecs', 'default-subvolume']
+      'codecs', 'default-subvolume', 'transactions-space-cache', 'space-caches']
     test('balance-' + profile, balance_test,
       args: [join_paths(fixtures, profile + '.raw'), '64'], timeout: 900, suite: 'images')
   endforeach
@@ -394,9 +409,6 @@ if fixtures != ''
   test('balance-faults', balance_test,
     args: ['--faults', join_paths(fixtures, 'transactions.raw'), '64'], timeout: 900,
     suite: 'images')
-  test('balance-refused-transactions-space-cache', balance_test,
-    args: ['--unsupported', join_paths(fixtures, 'transactions-space-cache.raw'), '64'],
-    timeout: 300, suite: 'images')
   test('inline-transactions-block-group-tree', transaction_test,
     args: [join_paths(fixtures, 'transactions-block-group-tree.raw')], timeout: 300,
     suite: 'images')

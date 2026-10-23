@@ -827,7 +827,10 @@ bt_bl_copy_data(struct bt_balance *balance, uint64_t from, uint64_t to, uint64_t
 }
 
 /* Moves a data extent: its bytes and checksums to a copy, every file extent
- * item naming it to the copy, and its extent item with its references. */
+ * item naming it to the copy, and its extent item with its references. The
+ * data of a v1 space-cache inode of the root tree is not moved: as Linux's
+ * delete_v1_space_cache, the inode is truncated, and the extent goes with its
+ * references at commit. */
 static enum btrfs_result
 bt_bl_data(struct bt_balance *balance, struct bt_key extent)
 {
@@ -844,6 +847,7 @@ bt_bl_data(struct bt_balance *balance, struct bt_key extent)
 	uint64_t leaf;
 	size_t count = 0;
 	size_t items = 0;
+	size_t cache = 0;
 	size_t i;
 	enum btrfs_result error;
 
@@ -860,14 +864,21 @@ bt_bl_data(struct bt_balance *balance, struct bt_key extent)
 		extent.offset > balance->end - extent.objectid)) {
 		error = BTRFS_CORRUPT;
 	}
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		cache += refs[i].type == BT_EXTENT_DATA_REF && refs[i].root == BT_ROOT_TREE;
+	}
+	if (error == BTRFS_OK && cache != 0) {
+		/* A cache inode's extent has no other owner. */
+		error = cache == count ? BTRFS_OK : BTRFS_UNSUPPORTED;
+		for (i = 0; error == BTRFS_OK && i < count; i++) {
+			error = bt_group_cache_drop(transaction, refs[i].inode, 0);
+		}
+		return error;
+	}
 	/* Every item is found before any leaf moves, as moves change the
 	 * leaves the references name. */
 	for (i = 0; error == BTRFS_OK && i < count; i++) {
-		/* The data of a v1 space cache inode of the root tree, which
-		 * Linux deletes with its group, stays where it is here. */
-		if (refs[i].type == BT_EXTENT_DATA_REF && refs[i].root == BT_ROOT_TREE) {
-			error = BTRFS_UNSUPPORTED;
-		} else if (refs[i].type == BT_EXTENT_DATA_REF) {
+		if (refs[i].type == BT_EXTENT_DATA_REF) {
 			error = bt_bl_data_leaves(
 			    balance, &refs[i], extent.objectid, refs, count, &items);
 		} else if (refs[i].type == BT_SHARED_DATA_REF) {
@@ -960,25 +971,6 @@ bt_bl_next(struct bt_balance *balance, uint64_t position, struct bt_key *extent,
 	return error == BTRFS_NOT_FOUND ? BTRFS_OK : error;
 }
 
-/* Whether the root tree names a v1 space-cache inode for the group, which
- * Linux deletes with it (btrfs_remove_free_space_inode); this writer does
- * not delete one. */
-static enum btrfs_result
-bt_bl_cached(struct btrfs_transaction *transaction, uint64_t logical)
-{
-	struct bt_key key = { BT_FREE_SPACE_OBJECTID, logical, 0 };
-	uint8_t header[64];
-	size_t length;
-	enum btrfs_result error;
-
-	error = bt_mutation_find(
-	    transaction->mutation, transaction->roots, key, header, sizeof(header), &length);
-	if (error == BTRFS_NOT_FOUND) {
-		return BTRFS_OK;
-	}
-	return error == BTRFS_OK || error == BTRFS_RANGE ? BTRFS_UNSUPPORTED : error;
-}
-
 /* Takes the emptied group out, as btrfs_remove_chunk: its items go at
  * commit. When it is the last of its kind with its profile, or with the
  * profile a conversion gives the kind, a new chunk of them takes its place
@@ -1005,6 +997,10 @@ bt_bl_remove(struct btrfs_transaction *transaction, size_t chunk, uint64_t profi
 	}
 	if (error == BTRFS_OK) {
 		error = bt_space_check_system(transaction->space);
+	}
+	/* Its v1 space cache goes with it (btrfs_remove_block_group). */
+	if (error == BTRFS_OK) {
+		error = bt_group_cache_remove(transaction, group->logical);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_space_retire(transaction->space, chunk);
@@ -1141,8 +1137,10 @@ bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, ui
 	    bt_qgroup_rescanning(transaction)) {
 		error = BTRFS_UNSUPPORTED;
 	}
+	/* The group's own v1 space cache is truncated first, as Linux's
+	 * relocation deletes it (delete_block_group_cache). */
 	if (error == BTRFS_OK) {
-		error = bt_bl_cached(transaction, group);
+		error = bt_group_cache_truncate(transaction, group);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_space_readonly(transaction->space, chunk);
