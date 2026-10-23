@@ -725,6 +725,22 @@ size and used bytes of a device whose copies all predate the selection from
 the selection's chunk tree, and only then requires the devices' sizes to sum
 to the volume's.
 
+`btrfs_device_replace` is Linux's `btrfs replace`, done while nothing else
+runs. Since Linux's replace leaves the target with the replaced device's id
+and UUID, the target becomes that device: it receives every stripe the device
+holds at the same offsets, a barrier, then the device's superblock copies, a
+barrier; only then do the replaced device's copies lose their magic. No tree
+and no other device changes, so every crash point leaves the volume of the old
+device or of the new one, which superblock recovery accepts with either. On a
+degraded mount without the device, its stripes come from stripes holding the
+same bytes on present devices (any other RAID1, RAID1C3 or RAID1C4 copy, the
+RAID10 partner) and its superblocks from another device's with its chunk-tree
+item, which also gives its size; other profiles cannot be rebuilt there
+(UNSUPPORTED). A stripe the present device cannot read comes from a mirror too.
+The target must hold the device's size and must not belong to the volume
+(INVALID_ARGUMENT). Linux's dev-replace item, which tracks a running replace
+for its resumption, is not written: this replace never runs across a mount.
+
 ## Scrub
 
 `btrfs_scrub` is Linux's `btrfs scrub`, an explicit, exclusive operation: it

@@ -409,3 +409,240 @@ btrfs_device_resize(const struct btrfs_environment *environment,
 	btrfs_unmount(fs);
 	return error;
 }
+
+/* Bytes a device replace copies per read and write. */
+#define BT_REPLACE_PIECE (UINT64_C(1) << 20)
+
+/* The stripe of a chunk that holds what stripe holds, on another present
+ * device: any other copy of RAID1, RAID1C3 and RAID1C4, the partner of a
+ * RAID10 pair; none for other profiles (UNSUPPORTED). */
+static enum btrfs_result
+bt_replace_mirror(
+    const struct btrfs_fs *fs, const struct bt_chunk *chunk, unsigned stripe, unsigned *mirror)
+{
+	uint64_t profile = chunk->type & BT_BLOCK_PROFILES;
+	unsigned i;
+
+	if (profile == BT_BLOCK_RAID10) {
+		*mirror = stripe ^ 1U;
+		return fs->devices[chunk->devices[*mirror]].read != NULL ? BTRFS_OK : BTRFS_IO;
+	}
+	if (profile != BT_BLOCK_RAID1 && profile != BT_BLOCK_RAID1C3 &&
+	    profile != BT_BLOCK_RAID1C4) {
+		return BTRFS_UNSUPPORTED;
+	}
+	for (i = 0; i < chunk->stripes; i++) {
+		if (i != stripe && chunk->devices[i] != chunk->devices[stripe] &&
+		    fs->devices[chunk->devices[i]].read != NULL) {
+			*mirror = i;
+			return BTRFS_OK;
+		}
+	}
+	return BTRFS_IO;
+}
+
+/* Copies every stripe the device of index holds to output at the same
+ * offset: from the device, or where it is missing or cannot be read, from
+ * a stripe holding the same bytes on another device. */
+static enum btrfs_result
+bt_replace_copy(const struct btrfs_fs *fs, size_t index, const struct btrfs_write_device *output,
+    uint8_t *buffer)
+{
+	const struct bt_chunk *chunk;
+	uint64_t length;
+	uint64_t offset;
+	size_t piece;
+	size_t i;
+	unsigned stripe;
+	unsigned mirror;
+	enum btrfs_result error = BTRFS_OK;
+
+	for (i = 0; error == BTRFS_OK && i < fs->chunk_count; i++) {
+		chunk = &fs->chunks[i];
+		length = bt_chunk_stripe_length(chunk);
+		for (stripe = 0; error == BTRFS_OK && stripe < chunk->stripes; stripe++) {
+			if (chunk->devices[stripe] != index) {
+				continue;
+			}
+			for (offset = 0; error == BTRFS_OK && offset < length; offset += piece) {
+				piece = length - offset < BT_REPLACE_PIECE
+				    ? (size_t)(length - offset)
+				    : (size_t)BT_REPLACE_PIECE;
+				error = fs->devices[index].read == NULL
+				    ? BTRFS_IO
+				    : bt_read_device(fs, (uint32_t)index,
+					  chunk->physical[stripe] + offset, buffer, piece);
+				if (error == BTRFS_IO) {
+					error = bt_replace_mirror(fs, chunk, stripe, &mirror);
+					if (error == BTRFS_OK) {
+						error = bt_read_device(fs, chunk->devices[mirror],
+						    chunk->physical[mirror] + offset, buffer,
+						    piece);
+					}
+				}
+				if (error == BTRFS_OK) {
+					error = output->write(output->context,
+					    chunk->physical[stripe] + offset, buffer, piece);
+				}
+			}
+		}
+	}
+	return error;
+}
+
+/* The device's item in the chunk tree: what a missing device's size and
+ * superblocks come from. */
+static enum btrfs_result
+bt_replace_item(const struct btrfs_fs *fs, size_t index, struct bt_disk_device *item)
+{
+	struct bt_cursor cursor;
+	struct bt_record record;
+	struct bt_key key = { BT_DEV_ITEMS_OBJECTID, fs->devices[index].id, BT_DEV_ITEM };
+	enum btrfs_result error;
+
+	bt_cursor_init(&cursor, fs, fs->chunk_tree);
+	error = bt_cursor_seek(&cursor, key, 0);
+	if (error == BTRFS_OK) {
+		(void)bt_cursor_record(&cursor, &record);
+		error = bt_key_compare(record.key, key) != 0 || record.size != sizeof(*item)
+		    ? BTRFS_CORRUPT
+		    : BTRFS_OK;
+		if (error == BTRFS_OK) {
+			bt_copy(item, record.data, sizeof(*item));
+			error = bt_equal(item->uuid, fs->devices[index].uuid, BTRFS_UUID_SIZE)
+			    ? BTRFS_OK
+			    : BTRFS_CORRUPT;
+		}
+	}
+	bt_cursor_fini(&cursor);
+	return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
+}
+
+/* The superblock copies the replaced device of size held, onto output: its
+ * own, or where it is missing, another device's with its device item, as
+ * recovery builds them. */
+static enum btrfs_result
+bt_replace_supers(const struct btrfs_fs *fs, size_t index, uint64_t size,
+    const struct bt_disk_device *item, const struct btrfs_write_device *output,
+    struct bt_disk_super *super)
+{
+	size_t other;
+	unsigned mirror;
+	enum btrfs_result error = BTRFS_OK;
+
+	/* Secondaries first, the primary last. */
+	for (mirror = BT_SUPER_MIRRORS; error == BTRFS_OK && mirror-- != 0;) {
+		if (!bt_super_present(size, mirror)) {
+			continue;
+		}
+		if (fs->devices[index].read != NULL) {
+			error = bt_read_device(
+			    fs, (uint32_t)index, bt_super_offset(mirror), super, sizeof(*super));
+		} else {
+			for (other = 0; other < fs->device_count && fs->devices[other].read == NULL;
+			    other++) {
+			}
+			error = bt_read_device(
+			    fs, (uint32_t)other, BT_SUPER_OFFSET, super, sizeof(*super));
+			if (error == BTRFS_OK) {
+				super->device = *item;
+				bt_put64(&super->log_root, 0);
+				super->log_level = 0;
+			}
+		}
+		if (error == BTRFS_OK) {
+			error = bt_super_check(super, bt_super_offset(mirror)) == BTRFS_OK ||
+				fs->devices[index].read == NULL
+			    ? BTRFS_OK
+			    : BTRFS_CORRUPT;
+		}
+		if (error == BTRFS_OK) {
+			bt_super_seal(super, bt_super_offset(mirror));
+			error = output->write(
+			    output->context, bt_super_offset(mirror), super, sizeof(*super));
+		}
+	}
+	return error;
+}
+
+enum btrfs_result
+btrfs_device_replace(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t id, const struct btrfs_device *target,
+    const struct btrfs_write_device *output)
+{
+	struct btrfs_environment uncached;
+	struct bt_disk_super *super = NULL;
+	struct bt_disk_device item;
+	struct btrfs_fs *fs = NULL;
+	uint8_t *buffer = NULL;
+	uint64_t size = 0;
+	size_t index = 0;
+	size_t i;
+	int present = 0;
+	enum btrfs_result error;
+
+	if (environment == NULL || writer == NULL || target == NULL || target->read == NULL ||
+	    output == NULL || output->write == NULL || output->flush == NULL ||
+	    writer->device_count != environment->device_count) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	uncached = *environment;
+	uncached.cache = NULL;
+	error = btrfs_mount(&uncached, BTRFS_TOP_LEVEL_TREE, &fs);
+	if (error == BTRFS_OK) {
+		for (index = 0; index < fs->device_count && fs->devices[index].id != id; index++) {
+		}
+		error = index == fs->device_count ? BTRFS_NOT_FOUND : BTRFS_OK;
+	}
+	/* Every other device is present; the target holds the device's size and
+	 * is not a device of the volume already. */
+	for (i = 0; error == BTRFS_OK && i < fs->device_count; i++) {
+		error = i != index && fs->devices[i].read == NULL ? BTRFS_UNSUPPORTED : BTRFS_OK;
+	}
+	if (error == BTRFS_OK) {
+		present = fs->devices[index].read != NULL;
+		error = bt_replace_item(fs, index, &item);
+	}
+	if (error == BTRFS_OK) {
+		size = bt_u64(item.total_bytes);
+		error = target->size_bytes < size ? BTRFS_INVALID_ARGUMENT : BTRFS_OK;
+	}
+	if (error == BTRFS_OK) {
+		super = fs->env.allocate(fs->env.context, sizeof(*super));
+		buffer = fs->env.allocate(fs->env.context, BT_REPLACE_PIECE);
+		error = super == NULL || buffer == NULL ? BTRFS_NO_MEMORY : BTRFS_OK;
+	}
+	if (error == BTRFS_OK) {
+		error = target->read(target->context, BT_SUPER_OFFSET, super, sizeof(*super));
+	}
+	if (error == BTRFS_OK && bt_super_check(super, BT_SUPER_OFFSET) == BTRFS_OK &&
+	    bt_equal(super->fsid, fs->info.uuid, BTRFS_UUID_SIZE)) {
+		error = BTRFS_INVALID_ARGUMENT;
+	}
+	/* The stripes, a barrier, the superblocks, a barrier: the target holds
+	 * the device whole before it names itself one. */
+	if (error == BTRFS_OK) {
+		error = bt_replace_copy(fs, index, output, buffer);
+	}
+	if (error == BTRFS_OK) {
+		error = output->flush(output->context);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_replace_supers(fs, index, size, &item, output, super);
+	}
+	if (error == BTRFS_OK) {
+		error = output->flush(output->context);
+	}
+	if (super != NULL) {
+		fs->env.release(fs->env.context, super, sizeof(*super));
+	}
+	if (buffer != NULL) {
+		fs->env.release(fs->env.context, buffer, BT_REPLACE_PIECE);
+	}
+	btrfs_unmount(fs);
+	/* The replaced device leaves once the target holds it. */
+	if (error == BTRFS_OK && present) {
+		error = bt_device_scratch(environment, writer, index, size);
+	}
+	return error;
+}

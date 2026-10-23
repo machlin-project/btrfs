@@ -498,14 +498,16 @@ device count allows (RAID0, RAID1, RAID1C3, RAID10, RAID1C4, DUP), checking
 that conversion's crash states too; `--grow` (for `multi-grow`)
 instead preallocates beyond the free data space in a sixth transaction, so
 that new data chunks are placed across the devices, and checks its crash
-states. `--devices DIR` (for `multi-spare`) instead creates a sparse spare
-image in DIR, adds it to the volume, requires adding a member again to be
-refused, shrinks the device whose stripes reach furthest to just below its
-highest one and grows it back (with Linux's resize refusals), removes the
-device the volume is mounted from, and checks the crash states of each with
-the device set before and after; with EXPORT the spare
-goes there too, and Linux then gets the remaining devices first and the
-removed one last, which it must not register. The `multi-*-writes` Meson
+states. `--devices DIR` (for `multi-spare`) instead creates three sparse spare
+images in DIR, adds the first to the volume, requires adding a member again to
+be refused, shrinks the device whose stripes reach furthest to just below its
+highest one and grows it back (with Linux's resize refusals), replaces a
+present device and then, on a degraded mount, a missing one with the other
+spares, removes the device the volume is mounted from, and checks the crash
+states of each with the device set before and after; with EXPORT the spare
+go there too, and Linux then gets the volume's devices first and the removed
+and replaced present ones last, which it must not register (the image of the
+device replaced while missing stays away, as a failed disk would). The `multi-*-writes` Meson
 tests run it without export. The `devices` phase of the Linux script (with
 `--remove ID`, on a copy and a blank image after its devices) is Linux's own
 add and remove, printing device items, statistics items, superblock fields

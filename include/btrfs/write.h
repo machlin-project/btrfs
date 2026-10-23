@@ -283,6 +283,24 @@ enum btrfs_result btrfs_device_add(const struct btrfs_environment *environment,
 enum btrfs_result btrfs_device_remove(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, uint64_t id, struct btrfs_balance_report *report);
 
+/* Linux's btrfs replace of the device named id by target, written through
+ * output: as Linux's replace gives the target the device's id and UUID, the
+ * target receives every stripe the device holds, at the same offsets, and
+ * then its superblock copies, each behind a barrier, so that it holds the
+ * device whole before it names itself one; the device's superblock copies
+ * then lose their magic. Nothing else on the volume changes, and its trees
+ * stay as they are. On a degraded mount without the device (every other
+ * device present), each stripe comes from a stripe holding the same bytes
+ * (RAID1, RAID1C3, RAID1C4, a RAID10 pair; UNSUPPORTED for others) and the
+ * superblocks from another device's with the device's item; a stripe the
+ * device cannot read comes from there too. A target smaller than the device,
+ * or already a device of the volume, is INVALID_ARGUMENT. Until the call
+ * returns both may name the device; only one of them may then be given. The
+ * operation is exclusive: no transaction runs meanwhile. */
+enum btrfs_result btrfs_device_replace(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t id, const struct btrfs_device *target,
+    const struct btrfs_write_device *output);
+
 /* Linux's btrfs filesystem resize of the device named id to size bytes,
  * rounded down to whole sectors (btrfs_ioctl_resize): at least 256 MiB
  * (INVALID_ARGUMENT) and at most the device holds (RANGE). Growing records

@@ -101,6 +101,8 @@
 #define ADDED_UUID 0x7aU
 #define RESIZE_TOO_SMALL ((UINT64_C(256) << 20) - 4096U)
 #define RESIZE_BELOW (UINT64_C(1) << 20)
+/* With --devices: spare images, which join and replace devices. */
+#define SPARES 3U
 
 struct file {
 	char path[MANIFEST_LINE];
@@ -1079,9 +1081,9 @@ profile_devices(uint64_t profile)
 	}
 }
 
-/* A state a crash left while devices joined or left: recovered with the
- * devices after the change when its newest superblock names them, else with
- * those before it. */
+/* A state a crash left while devices joined, left or were replaced:
+ * recovered with the devices after the change when they hold its newest
+ * superblock, else with those before it. */
 static void
 mount_member_state(struct volume *state, const struct volume *before, const struct volume *after,
     struct btrfs_fs **fs, size_t *recoveries)
@@ -1097,7 +1099,7 @@ mount_member_state(struct volume *state, const struct volume *before, const stru
 	memcpy(state->member, after->member, sizeof(state->member));
 	volume_environment(state, 0, &environment, &writer, readers, writers);
 	result = btrfs_recover_supers(&environment, NULL, 0, &report);
-	if (result == BTRFS_INVALID_ARGUMENT || result == BTRFS_UNSUPPORTED) {
+	if (result != BTRFS_OK && result != BTRFS_RECOVERY_REQUIRED) {
 		state->members = before->members;
 		memcpy(state->member, before->member, sizeof(state->member));
 	}
@@ -1156,11 +1158,76 @@ magic_cleared(struct volume *volume, size_t image, unsigned mirror)
 	return memcmp(magic, zero, sizeof(magic)) == 0;
 }
 
+/* The id of the volume's device at member position. */
+static uint64_t
+removed_id_of(struct volume *volume, size_t position)
+{
+	struct btrfs_fs *fs;
+	uint64_t id;
+
+	mount_volume(volume, 0, &fs);
+	id = fs->devices[position].id;
+	btrfs_unmount(fs);
+	return id;
+}
+
+/* The device at member position is replaced by the image target: present,
+ * or missing from a degraded mount, its stripes then from their mirrors.
+ * The target takes its id; the volume reads as before, a replaced present
+ * device loses its superblock magic, and the crash states are checked. */
+static void
+replace_device(struct volume *volume, struct model *model, size_t position, size_t target,
+    int missing, const struct namespace_digest *expected, uint32_t *seed, size_t *states,
+    size_t *recoveries, size_t *later, size_t *copies)
+{
+	struct btrfs_environment environment;
+	struct btrfs_write_environment writer;
+	struct btrfs_device readers[MAX_DEVICES - 1];
+	struct btrfs_write_device writers[MAX_DEVICES - 1];
+	struct namespace_digest digest;
+	struct btrfs_fs *fs;
+	static struct volume before;
+	uint64_t id = removed_id_of(volume, position);
+	size_t source = volume->member[position];
+	size_t first = volume->count;
+	enum btrfs_result result;
+
+	before.members = volume->members;
+	memcpy(before.member, volume->member, sizeof(before.member));
+	if (missing) {
+		memmove(volume->member + position, volume->member + position + 1,
+		    (volume->members - position - 1) * sizeof(volume->member[0]));
+		volume->members--;
+	}
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	environment.degraded = missing;
+	result = btrfs_device_replace(
+	    &environment, &writer, id, &volume->readers[target - 1], &volume->writers[target - 1]);
+	if (result != BTRFS_OK) {
+		fprintf(stderr, "replacing device %llu%s: %s\n", (unsigned long long)id,
+		    missing ? " (missing)" : "", btrfs_result_string(result));
+		exit(1);
+	}
+	volume->members = before.members;
+	memcpy(volume->member, before.member, sizeof(volume->member));
+	volume->member[position] = target;
+	mount_volume(volume, 0, &fs);
+	REQUIRE(fs->device_count == volume->members && fs->devices[position].id == id);
+	check_model(fs, model, missing ? "missing device replaced" : "device replaced", copies);
+	REQUIRE(namespace_content_digest(fs, &digest) == 0 && digest.hash == expected->hash &&
+	    digest.objects == expected->objects && digest.bytes == expected->bytes);
+	btrfs_unmount(fs);
+	REQUIRE(missing || (magic_cleared(volume, source, 0) && magic_cleared(volume, source, 1)));
+	check_device_crashes(
+	    volume, first, volume->count, &before, expected, seed, states, recoveries, later);
+}
+
 /* With --devices: the spare image joins the volume (its device item as
  * Linux's btrfs_init_new_device writes one), a device of the volume cannot
  * join again, a device shrinks and grows back, with Linux's resize refusals,
- * then the device the volume is mounted from leaves, every group moving off
- * it; each reads as before and their crash states are checked. */
+ * the other spares replace a present device and a missing one, then the
+ * device the volume is mounted from leaves, every group moving off it; each
+ * reads as before and their crash states are checked. */
 static void
 devices_phase(struct volume *volume, struct model *model, const struct namespace_digest *expected,
     uint32_t *seed, size_t *states, size_t *recoveries, size_t *later, size_t *copies)
@@ -1185,7 +1252,7 @@ devices_phase(struct volume *volume, struct model *model, const struct namespace
 	uint64_t resized;
 	uint64_t shrunk = 0;
 	uint64_t size;
-	size_t spare = volume->devices - 1;
+	size_t spare = volume->devices - SPARES;
 	size_t first;
 	size_t count;
 	size_t leaving;
@@ -1288,6 +1355,21 @@ devices_phase(struct volume *volume, struct model *model, const struct namespace
 		check_device_crashes(volume, first, volume->count, &before, expected, seed, states,
 		    recoveries, later);
 	}
+
+	/* A present device and then a missing one are replaced by the other
+	 * spares; a device of the volume cannot replace one, nor an unknown
+	 * device be replaced. */
+	count = volume->count;
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	REQUIRE(btrfs_device_replace(&environment, &writer, removed_id_of(volume, 1), &readers[0],
+		    &writers[0]) == BTRFS_INVALID_ARGUMENT);
+	REQUIRE(btrfs_device_replace(&environment, &writer, UNKNOWN_DEVICE, &volume->readers[spare],
+		    &volume->writers[spare]) == BTRFS_NOT_FOUND);
+	REQUIRE(volume->count == count);
+	replace_device(
+	    volume, model, 1, spare + 1, 0, expected, seed, states, recoveries, later, copies);
+	replace_device(
+	    volume, model, 2, spare + 2, 1, expected, seed, states, recoveries, later, copies);
 
 	/* The device the volume is mounted from leaves. */
 	mount_volume(volume, 0, &fs);
@@ -1426,7 +1508,7 @@ main(int argc, char **argv)
 	size_t later_states = 0;
 	struct stat status;
 	const char *spare_directory = NULL;
-	char spare_path[EXPORT_PATH];
+	char spare_paths[SPARES][EXPORT_PATH];
 	int spare_file;
 	int grow = 0;
 	int spare = 0;
@@ -1447,25 +1529,26 @@ main(int argc, char **argv)
 	}
 	REQUIRE(argc >= 6);
 	devices = (size_t)(argc - 4);
-	REQUIRE(devices + (size_t)spare <= MAX_DEVICES);
+	REQUIRE(devices + (spare ? SPARES : 0) <= MAX_DEVICES);
 	for (i = 0; i < devices; i++) {
 		paths[i] = argv[4 + i];
 	}
-	/* The spare: a new sparse image the size of the first device. */
-	if (spare) {
+	/* The spares: new sparse images the size of the first device. */
+	for (i = 0; spare && i < SPARES; i++) {
 		REQUIRE(stat(paths[0], &status) == 0);
-		REQUIRE(snprintf(spare_path, sizeof(spare_path), "%s/multi-spare-%ld.raw",
-			    spare_directory, (long)getpid()) < (int)sizeof(spare_path));
-		spare_file = open(spare_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+		REQUIRE(
+		    snprintf(spare_paths[i], sizeof(spare_paths[i]), "%s/multi-spare-%ld-%zu.raw",
+			spare_directory, (long)getpid(), i) < (int)sizeof(spare_paths[i]));
+		spare_file = open(spare_paths[i], O_RDWR | O_CREAT | O_EXCL, 0600);
 		REQUIRE(spare_file >= 0 && ftruncate(spare_file, status.st_size) == 0 &&
 		    close(spare_file) == 0);
-		paths[devices++] = spare_path;
+		paths[devices++] = spare_paths[i];
 	}
 	read_manifest(argv[2], &model);
 	REQUIRE(btrfs_image_open_devices(paths, devices, &image) == 0);
 	volume_init(&volume, &image);
-	/* The last image waits to join the volume. */
-	volume.members -= (size_t)spare;
+	/* The spares wait to join the volume. */
+	volume.members -= spare ? SPARES : 0;
 	mount_volume(&volume, 0, &fs);
 	check_model(fs, &model, "fixture", &copies);
 	if (check_refusals(&volume, fs)) {
@@ -1620,15 +1703,19 @@ main(int argc, char **argv)
 		devices_phase(&volume, &model, &commits[commit_count].digest, &seed, &device_states,
 		    &recoveries, &later_states, &copies);
 		finish(&volume, &model, argv, paths, &image);
-		REQUIRE(unlink(spare_path) == 0);
+		for (i = 0; i < SPARES; i++) {
+			REQUIRE(unlink(spare_paths[i]) == 0);
+		}
 		printf(
 		    "multi-device devices: %zu devices, %zu files; five commits read back as the "
 		    "model holds them and pass both audits (%zu checksummed copies); %zu crash "
 		    "states read as a commit, %zu taking a further transaction; a device joined, "
-		    "another shrank below its highest group and grew back, and the first device "
-		    "left, every group moving off it, reading the same, as do %zu of their crash "
-		    "states (%zu with the devices after; %zu states after superblock recovery in "
-		    "all); refusals before any write PASS\n",
+		    "another shrank below its highest group and grew back, a present and a missing "
+		    "device were replaced, and the first device left, every group moving off it, "
+		    "reading the same, as do %zu of their crash states (%zu with the devices "
+		    "after; "
+		    "%zu states after superblock recovery in all); refusals before any write "
+		    "PASS\n",
 		    devices, model.count, copies, states, resumed, device_states, later_states,
 		    recoveries);
 		return 0;
