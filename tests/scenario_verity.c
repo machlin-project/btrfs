@@ -30,7 +30,8 @@
 /* Parameters Linux refuses. */
 #define ODD_BLOCK_SIZE 3000U
 #define SMALL_BLOCK_SIZE 512U
-#define LARGE_BLOCK_SIZE 8192U
+/* A block larger than the volume's sectors, which Linux refuses. */
+#define LARGE_BLOCK_SECTORS 2U
 #define UNKNOWN_ALGORITHM 3U
 #define LARGE_SALT_BYTES (VERITY_SALT_BYTES + 1U)
 #define LARGE_SIGNATURE_BYTES (BT_VERITY_DESCRIPTOR_MAX - 256U + 1U)
@@ -246,7 +247,7 @@ verity_refusal_plan(struct context *context)
 	c = sha256;
 	c.block = SMALL_BLOCK_SIZE;
 	plan_refused_enable(&plan, 1, "/random", &c, BTRFS_INVALID_ARGUMENT);
-	c.block = LARGE_BLOCK_SIZE;
+	c.block = LARGE_BLOCK_SECTORS * context->sector_size;
 	plan_refused_enable(&plan, 1, "/random", &c, BTRFS_INVALID_ARGUMENT);
 	c = sha256;
 	c.algorithm = UNKNOWN_ALGORITHM;

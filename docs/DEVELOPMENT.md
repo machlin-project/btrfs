@@ -318,7 +318,7 @@ cp artifacts/btrfs-reference/plain.json ../btrfs/artifacts/fixtures/plain.json
 ```
 
 Require the exact `BTRFS_REFERENCE_PASS:plain` marker, no failure marker, successful
-Linux checks and a completed VM exit before consuming the image. Repeat all thirty-four
+Linux checks and a completed VM exit before consuming the image. Repeat all thirty-five
 profiles (512 MiB for `transactions-holes` and `checksums-blake2`, 1 GiB for
 `transactions-convert`, `transactions-space-cache` and `space-caches`, whose data groups must reach the
 100 MiB Linux needs before it writes a v1 cache (`space-caches` preallocates into a
@@ -484,6 +484,17 @@ Require `BTRFS_BALANCE_VERIFY_PASS` and `6.8.0-147-generic-64k` in each log,
 the btrfs-progs fixture's `BEFORE` manifest equal to `sectors-64k.expected.tsv`,
 the written image's `BEFORE` and `AFTER` equal to its model's `.tsv`, and the
 balanced image's equal to the fixture's.
+
+The same kernel makes `verity-64k`, the fs-verity profile on 64 KiB sectors
+and nodes (512 MiB): `prepare_linux.py --root artifacts/btrfs-reference/root-64k
+--profile verity-64k`, a new 512 MiB image created exclusively, and the QEMU
+command above with that archive and image; require
+`BTRFS_REFERENCE_PASS:verity-64k` and copy its `.json` beside the image.
+Exported transaction cases (`btrfs-transaction-test --export DIR --verity
+verity-64k.raw`) go to the Linux oracle the same way, with the working and
+pristine copies as two `virtio-blk-device` drives
+(`prepare_transactions_linux.py --root artifacts/btrfs-reference/root-64k
+--device-bytes 536870912`); require `BTRFS_TRANSACTION_PASS` with every case.
 
 ## Multi-device volumes
 

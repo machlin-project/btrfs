@@ -309,6 +309,12 @@ if fixtures != ''
   test('verity-transactions', transaction_test,
     args: ['--verity', join_paths(fixtures, 'transactions-verity.raw')], timeout: 900,
     suite: 'images')
+  # The same on 64 KiB sectors, which a 64 KiB-page Linux kernel wrote.
+  test('inline-transactions-verity-64k', transaction_test,
+    args: [join_paths(fixtures, 'verity-64k.raw')], timeout: 300, suite: 'images')
+  test('verity-transactions-64k', transaction_test,
+    args: ['--verity', join_paths(fixtures, 'verity-64k.raw')], timeout: 900,
+    suite: 'images')
   test('verity-feature', transaction_test,
     args: ['--verity', join_paths(fixtures, 'transactions.raw')], timeout: 300,
     suite: 'images')

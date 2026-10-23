@@ -32,13 +32,15 @@ PROFILES = {"plain": (16384, "dup", ""), "small-nodes": (4096, "single", ""),
             "transactions-quota": (16384, "dup", ""),
             "transactions-squota": (16384, "dup", ""),
             "transactions-verity": (16384, "dup", ""),
+            "verity-64k": (65536, "dup", ""),
             "sectors-16k": (16384, "dup", ""), "transactions-16k": (16384, "dup", ""),
             "transactions-twins": (16384, "dup", ""),
             "transactions-16k-twins": (16384, "dup", "")}
 # Profiles with sectors above 4 KiB, which only a kernel whose pages are at
-# least as large mounts: the staged 16 KiB-page root and kernel build them
+# least as large mounts: the staged 16 KiB-page root and kernel build the
+# 16 KiB ones, and the 64 KiB-page kernel under QEMU the 64 KiB one
 # (docs/DEVELOPMENT.md).
-SECTOR_SIZES = {"sectors-16k": 16384, "transactions-16k": 16384,
+SECTOR_SIZES = {"sectors-16k": 16384, "transactions-16k": 16384, "verity-64k": 65536,
                 "transactions-16k-twins": 16384}
 # Writable profiles without a free-space tree; transactions-fst keeps mkfs
 # defaults and therefore maintains one.
@@ -83,7 +85,10 @@ QUOTA_GROUP_LIMIT_BYTES = 160 * 1024 * 1024
 CHECKSUMS = {"checksums-xxhash": "xxhash", "checksums-sha256": "sha256",
              "checksums-blake2": "blake2"}
 DATA_PAYLOAD = ("transactions-data", "transactions-fst", "transactions-holes", *CHECKSUMS,
-                *FEATURE_PROFILES, "transactions-16k")
+                *FEATURE_PROFILES, "transactions-16k", "verity-64k")
+# The fs-verity payload, also on 64 KiB sectors, which only a kernel with
+# 64 KiB pages mounts: QEMU's emulation runs one (docs/DEVELOPMENT.md).
+VERITY_PROFILES = ("transactions-verity", "verity-64k")
 HOLES_GROWN_BYTES = 1048576
 # The convert profile keeps mkfs defaults (a free-space tree) on 1 GiB, so data
 # block groups span enough bitmaps for both of Linux's conversion thresholds.
@@ -146,6 +151,7 @@ SCALE_LARGE_MIB = 1024
 COPIES_DEVICE_BYTES = 257 * 1024 * 1024 * 1024
 THIRD_SUPER_OFFSET = 256 * 1024 * 1024 * 1024
 DEVICE_BYTES = {"transactions-full": 128 * 1024 * 1024,
+                "verity-64k": 512 * 1024 * 1024,
                 "transactions-holes": 512 * 1024 * 1024,
                 "checksums-blake2": 512 * 1024 * 1024,
                 "transactions-convert": 1024 * 1024 * 1024,
@@ -791,7 +797,7 @@ test "$(awk '$1 == "cache_generation" {print $2}' /tmp/super.txt)" = \\
 caches=$(btrfs inspect-internal dump-tree -t root /dev/vda | grep -c 'key (FREE_SPACE UNTYPED' || true)
 echo BTRFS_REFERENCE_SPACE_CACHES:$caches
 test "$caches" -gt 0'''
-    if profile == "transactions-verity":
+    if profile in VERITY_PROFILES:
         # fs-verity's ioctl refuses writable descriptors, so each file is
         # closed before it is enabled; writes, appends and truncation then
         # fail as Linux refuses them.
@@ -933,7 +939,7 @@ poweroff -f
                 "compression": compression, "device_bytes": device_bytes, "files": {
                     name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                     for name, data in {**contents, **extra}.items()}}
-    if profile == "transactions-verity":
+    if profile in VERITY_PROFILES:
         manifest["verity"] = verity
     archive.with_suffix(".json").write_text(json.dumps(manifest, indent=2) + "\n")
 

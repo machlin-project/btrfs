@@ -129,9 +129,9 @@ is destroyed. `accept` is legal only after successful durable publication;
    volumes, and fs-verity is enabled in bounded steps whose interruption orphan
    cleanup undoes, as Linux does (`core/verity.c`); the XNU adapter enables
    and measures it through file system controls (`machlin-btrfs verity`).
-   Remaining: a 64 KiB-sector fs-verity fixture, a guest run of those
-   controls, and LXNU's FS_IOC_ENABLE_VERITY and keyring policy for builtin
-   signatures.
+   On 64 KiB sectors a 64 KiB-page Linux kernel wrote the fixture and checks
+   what is written. Remaining: a guest run of those controls, and LXNU's
+   FS_IOC_ENABLE_VERITY and keyring policy for builtin signatures.
 4. **Finish allocation features.** The free-space tree is verified and kept in
    step with every allocation (`core/fst.c`), the editor merges underfull
    siblings, and data and metadata chunks grow from unallocated device space
