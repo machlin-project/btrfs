@@ -678,6 +678,40 @@ btrfs-progs-style filters select (`-f`, and `-d`, `-m`, `-s` with `usage=`,
 `convert=PROFILE` and `soft`; `-m` also selects system groups unless `-s` is
 given), or every group.
 
+## Devices joining and leaving
+
+`btrfs_device_add` is Linux's `btrfs device add` (`btrfs_init_new_device`) in
+one transaction on the volume's present devices: the new device takes the
+next device id (`find_next_devid`) and the caller's UUID, its device item in
+the chunk tree records its size in whole sectors with sector-size alignment
+and no bytes used (`btrfs_add_dev_item`), and the superblocks' device count
+and total grow. Its statistics item is left to Linux, which writes one at its
+next commit, as after its own add. No chunk takes the device in that
+transaction. A device whose superblock already names the volume is refused
+(INVALID_ARGUMENT), as are one holding fewer than two superblock copies and a
+seventeenth device (UNSUPPORTED). The commit writes every superblock copy of
+the new device, with its own item, and a barrier before any other device's
+superblock names it, so that recovery finds it whenever another device does:
+a crash before then leaves the old volume, which recovery selects without the
+new device (with it, the newest copy names one device less, INVALID_ARGUMENT),
+and any later crash leaves a newest copy on the new device, from which
+recovery completes the commit.
+
+`btrfs_device_remove` is Linux's `btrfs device remove` (`btrfs_rm_device`).
+It refuses removing the last device or one a profile in use needs
+(`btrfs_check_raid_min_devices`, INVALID_ARGUMENT), then relocates every group
+with a stripe on the device, the one whose stripe lies highest there first,
+as `btrfs_shrink_device` does, each relocation keeping the device out of
+allocation (`bt_space_exclude_device`, as Linux takes it off its allocation
+list), until none is left. A last transaction deletes the device item, which
+then has no bytes used; the other devices' superblocks name one device less
+and a smaller total, and the leaving device's superblocks are not written.
+After that commit every superblock copy of the removed device loses its magic
+(`btrfs_scratch_superblocks`), so scans no longer find it. Its statistics item
+stays, as Linux leaves it. A crash before the last commit is durable leaves
+the volume with the device, which recovery without it refuses (UNSUPPORTED, a
+device is missing); afterwards recovery without it completes the commit.
+
 ## Format features
 
 A metadata UUID (METADATA_UUID, `btrfstune -m`) separates the filesystem's

@@ -222,6 +222,34 @@ enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
     struct btrfs_balance_report *report);
 
+/* Linux's btrfs device add (btrfs_init_new_device): the device, read through
+ * device and written through output, joins the volume the environment and
+ * writer name (every device of it) with the next device id (*id) and uuid,
+ * the caller's random UUID; its device item records its size in whole
+ * sectors, and every superblock the volume's new device count and size. The
+ * new device's superblock copies are written before any other device's
+ * superblock names it. Afterwards the volume needs every device to mount,
+ * the new one last in the environment's order. A device holding fewer than
+ * two superblock copies, or one more than BTRFS_MAX_DEVICES, is UNSUPPORTED;
+ * one whose superblock already names this volume INVALID_ARGUMENT. */
+enum btrfs_result btrfs_device_add(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, const struct btrfs_device *device,
+    const struct btrfs_write_device *output, const uint8_t uuid[BTRFS_UUID_SIZE], uint64_t *id);
+
+/* Linux's btrfs device remove (btrfs_rm_device): every block group with a
+ * stripe on the device named id is relocated, the highest-placed first and
+ * none onto that device (btrfs_shrink_device), in committed steps report
+ * counts; then the device's item goes and every other device's superblocks
+ * name one device less, and the removed device's superblock copies lose their
+ * magic (btrfs_scratch_superblocks). Removing the last device, or one a
+ * profile in use needs (btrfs_check_raid_min_devices), is INVALID_ARGUMENT;
+ * an unknown id NOT_FOUND. A crash leaves a volume of either device set:
+ * superblock recovery with the remaining devices is UNSUPPORTED (a device is
+ * missing) until the removal's last commit is durable on one of them, and
+ * then succeeds. */
+enum btrfs_result btrfs_device_remove(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t id, struct btrfs_balance_report *report);
+
 /* Admission: any of Linux's four checksum algorithms, skinny metadata, the
  * free-space and block-group trees, fs-verity, quotas and simple quotas, and
  * mixed groups whose nodes are one sector, on one device or on several: every

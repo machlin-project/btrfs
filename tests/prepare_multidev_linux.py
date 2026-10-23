@@ -21,6 +21,12 @@ given profiles with its own balance (forced), then balance every group,
 reporting whether that completes, print the chunk profiles and check: the
 control for conversions this implementation made.
 
+devices: on a copy of a volume with one more, blank image after its devices,
+have Linux add that device, print the device and chunk trees' device items
+and each device's superblock, check, remove the device --remove names, print
+them again with the manifest, and check: the reference for adding and
+removing devices.
+
 The manifest names every regular file and symlink below the mount with its
 mode, owner, size and SHA-256 (or symlink target), one line each, sorted;
 subvolumes appear as their directories.
@@ -47,10 +53,13 @@ PROFILES = {
     # Devices of unequal size with unallocated space, for chunks a writer
     # creates across them.
     "multi-grow": (3, "raid1", "raid1c3"),
+    # Room to add a device and remove another.
+    "multi-spare": (3, "raid1", "raid1"),
 }
 # Device sizes of profiles whose devices differ.
 DEVICE_SIZES = {
     "multi-grow": (512 << 20, 384 << 20, 320 << 20),
+    "multi-spare": (512 << 20, 512 << 20, 512 << 20),
 }
 
 
@@ -200,8 +209,49 @@ poweroff -f
 """
 
 
+DEVICE_STATE = r"""
+# $1 names the state, $2 a device of the volume.
+device_state() {
+    btrfs inspect-internal dump-tree -t dev $2 | grep -E 'DEV_STATS|PERSISTENT' | sed "s/^/BTRFS_MULTI_DEV_TREE_$1:/"
+    btrfs inspect-internal dump-tree -t chunk $2 | grep -A 8 'DEV_ITEM' | sed "s/^/BTRFS_MULTI_CHUNK_TREE_$1:/"
+    for device in /dev/vd?; do
+        for offset in 65536 67108864; do
+            printf 'BTRFS_MULTI_MAGIC_%s:%s:%s:' $1 $device $offset
+            dd if=$device bs=1 skip=$((offset + 64)) count=8 2>/dev/null | od -An -c | tr -d ' \n'
+            echo
+        done
+        btrfs inspect-internal dump-super $device 2>/dev/null | grep -E '^(magic|generation|total_bytes|bytes_used|num_devices|dev_item)|^dev_item' | sed "s|^|BTRFS_MULTI_SUPER_$1:$device:|" || true
+    done
+}
+"""
+
+
+def devices_init(count: int, remove: int) -> str:
+    # The added device stays: the states after removal are read from it.
+    added = f"/dev/vd{chr(ord('a') + count)}"
+    return PRELUDE + MANIFEST + DEVICE_STATE + f"""
+btrfs device scan
+mount -t btrfs -o noatime /dev/vda /mnt
+btrfs device add -f {added} /mnt
+sync
+umount /mnt
+device_state ADDED {added}
+btrfs check --readonly --check-data-csum {added}
+mount -t btrfs -o noatime {added} /mnt
+btrfs device remove {remove} /mnt
+sync
+manifest
+umount /mnt
+device_state REMOVED {added}
+btrfs check --readonly --check-data-csum {added}
+echo BTRFS_MULTI_DEVICES_PASS
+trap - EXIT
+poweroff -f
+"""
+
+
 def prepare(root: Path, phase: str, profile: str, archive: Path, data: str = "",
-            metadata: str = "") -> None:
+            metadata: str = "", remove: int = 0) -> None:
     count, profile_data, profile_metadata = PROFILES[profile]
     inputs = root / "input"
     inputs.mkdir(parents=True, exist_ok=True)
@@ -212,6 +262,8 @@ def prepare(root: Path, phase: str, profile: str, archive: Path, data: str = "",
         init = create_init(count, profile_data, profile_metadata, sizes)
     elif phase == "convert":
         init = convert_init(data, metadata)
+    elif phase == "devices":
+        init = devices_init(count, remove)
     else:
         init = verify_init(count)
     (root / "init").write_text(init)
@@ -232,16 +284,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True,
                         help="Disposable staged Alpine initrd root")
-    parser.add_argument("--phase", choices=("create", "verify", "convert"), required=True)
+    parser.add_argument("--phase", choices=("create", "verify", "convert", "devices"),
+                        required=True)
     parser.add_argument("--profile", choices=PROFILES, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--data", default="", help="convert: the data target profile")
     parser.add_argument("--metadata", default="", help="convert: the metadata target profile")
+    parser.add_argument("--remove", type=int, default=0,
+                        help="devices: the device id to remove after adding one")
     args = parser.parse_args()
     if args.phase == "convert" and not (args.data and args.metadata):
         parser.error("convert needs --data and --metadata")
+    if args.phase == "devices" and args.remove <= 0:
+        parser.error("devices needs --remove")
     prepare(args.root.resolve(), args.phase, args.profile, args.archive.resolve(), args.data,
-            args.metadata)
+            args.metadata, args.remove)
 
 
 if __name__ == "__main__":

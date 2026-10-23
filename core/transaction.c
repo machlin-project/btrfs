@@ -137,11 +137,12 @@ bt_tx_targets(struct btrfs_transaction *transaction)
 	enum btrfs_result error = BTRFS_OK;
 
 	transaction->targets = base->env.allocate(
-	    base->env.context, base->device_count * sizeof(*transaction->targets));
+	    base->env.context, (base->device_count + 1) * sizeof(*transaction->targets));
 	if (transaction->targets == NULL) {
 		return BTRFS_NO_MEMORY;
 	}
-	bt_zero(transaction->targets, base->device_count * sizeof(*transaction->targets));
+	bt_zero(transaction->targets, (base->device_count + 1) * sizeof(*transaction->targets));
+	transaction->target_count = base->device_count;
 	for (i = 0; error == BTRFS_OK && i < base->device_count; i++) {
 		target = &transaction->targets[i];
 		if (i == 0) {
@@ -162,6 +163,7 @@ bt_tx_targets(struct btrfs_transaction *transaction)
 			error = BTRFS_STALE;
 		}
 		target->item = target->original.device;
+		target->size = base->devices[i].size;
 	}
 	return error;
 }
@@ -1501,7 +1503,7 @@ bt_tx_barrier(struct btrfs_transaction *transaction)
 	size_t i;
 	enum btrfs_result error = BTRFS_OK;
 
-	for (i = 0; error == BTRFS_OK && i < transaction->fs.device_count; i++) {
+	for (i = 0; error == BTRFS_OK && i < transaction->target_count; i++) {
 		target = &transaction->targets[i];
 		error = target->flush(target->context);
 	}
@@ -1677,10 +1679,19 @@ bt_tx_write_nodes(struct btrfs_transaction *transaction)
 	return error;
 }
 
+/* Whether the commit writes the superblocks of the volume's device of this
+ * index in its secondary and primary phases: every device but an added one,
+ * written before them, and a leaving one. */
+static int
+bt_tx_publishes(const struct btrfs_transaction *transaction, uint32_t device)
+{
+	return device < transaction->fs.device_count && device + 1 != transaction->leaving;
+}
+
 static enum btrfs_result
 bt_tx_persist(struct btrfs_transaction *transaction)
 {
-	const struct btrfs_fs *fs = &transaction->fs;
+	struct bt_tx_device *added = &transaction->targets[transaction->fs.device_count];
 	enum btrfs_result error;
 	uint32_t device;
 	unsigned mirror;
@@ -1695,14 +1706,32 @@ bt_tx_persist(struct btrfs_transaction *transaction)
 	if (error != BTRFS_OK) {
 		return error;
 	}
+	/* An added device holds every copy of the new generation before any other
+	 * device's superblock names it, so that recovery always finds it. */
+	for (mirror = BT_SUPER_MIRRORS; transaction->adding && mirror-- != 0;) {
+		if (bt_super_present(added->size, mirror)) {
+			error = bt_tx_publish(
+			    transaction, (uint32_t)transaction->fs.device_count, mirror);
+			if (error != BTRFS_OK) {
+				return error;
+			}
+		}
+	}
+	if (transaction->adding) {
+		error = bt_tx_barrier(transaction);
+		if (error != BTRFS_OK) {
+			return error;
+		}
+	}
 	/* Secondary copies of every device, barrier, primaries, barrier. Until the
 	 * second barrier the untouched primaries hold the acknowledged generation;
 	 * afterwards the durable secondaries hold the new one. A torn copy, or
 	 * primaries of two generations, are resolved only by explicit recovery;
 	 * the immutable reader never silently selects a mirror. */
 	for (mirror = BT_SUPER_MIRRORS - 1; mirror != 0; mirror--) {
-		for (device = 0; device < fs->device_count; device++) {
-			if (bt_super_present(fs->devices[device].size, mirror)) {
+		for (device = 0; device < transaction->fs.device_count; device++) {
+			if (bt_tx_publishes(transaction, device) &&
+			    bt_super_present(transaction->targets[device].size, mirror)) {
 				error = bt_tx_publish(transaction, device, mirror);
 				if (error != BTRFS_OK) {
 					return error;
@@ -1711,8 +1740,10 @@ bt_tx_persist(struct btrfs_transaction *transaction)
 		}
 	}
 	error = bt_tx_barrier(transaction);
-	for (device = 0; error == BTRFS_OK && device < fs->device_count; device++) {
-		error = bt_tx_publish(transaction, device, 0);
+	for (device = 0; error == BTRFS_OK && device < transaction->fs.device_count; device++) {
+		if (bt_tx_publishes(transaction, device)) {
+			error = bt_tx_publish(transaction, device, 0);
+		}
 	}
 	return error == BTRFS_OK ? bt_tx_barrier(transaction) : error;
 }
@@ -1889,7 +1920,7 @@ btrfs_transaction_destroy(struct btrfs_transaction *transaction)
 	env = &transaction->base->env;
 	if (transaction->targets != NULL) {
 		env->release(env->context, transaction->targets,
-		    transaction->base->device_count * sizeof(*transaction->targets));
+		    (transaction->base->device_count + 1) * sizeof(*transaction->targets));
 	}
 	bt_tx_release_data(transaction);
 	bt_qgroup_end(transaction);

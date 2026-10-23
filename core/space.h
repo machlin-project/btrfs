@@ -57,6 +57,9 @@ enum btrfs_result bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t 
  * room; UNSUPPORTED for a profile Linux does not allocate. */
 enum btrfs_result bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total,
     uint64_t type, uint64_t minimum, uint64_t cap, struct bt_chunk *chunk);
+/* No new chunk takes a stripe on the volume's device of this index for the
+ * rest of the transaction. */
+void bt_space_exclude_device(struct bt_space *space, size_t device);
 /* Linux's btrfs_raid_array for a profile: the fewest devices it allocates
  * on, and whether it keeps a block through one lost copy (two copies or
  * parity). UNSUPPORTED for anything else. */

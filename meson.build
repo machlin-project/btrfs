@@ -13,6 +13,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/rename.c', 'core/subvolume.c', 'core/drop.c',
   'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c',
   'core/verity.c', 'core/heuristic.c', 'core/relocation.c', 'core/balance.c',
+  'core/device.c',
   'core/raid56.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
@@ -326,11 +327,12 @@ if fixtures != ''
   # Volumes Linux wrote across several devices: every profile reads as
   # Linux's manifest says, from any of its devices, and the kernel's chunks
   # are planned again as it placed them; writes and a balance with their
-  # crash states, RAID5/6 refused; on unequal devices, new data chunks.
+  # crash states, RAID5/6 refused; on unequal devices, new data chunks; a
+  # device added and another removed.
   foreach profile : [['multi-raid1', 2, []], ['multi-raid1c3', 3, []],
       ['multi-raid1c4', 4, []], ['multi-raid10', 4, []], ['multi-raid0', 3, []],
       ['multi-raid5', 3, []], ['multi-raid6', 4, []], ['multi-single', 2, []],
-      ['multi-grow', 3, ['--grow']]]
+      ['multi-grow', 3, ['--grow']], ['multi-spare', 3, ['--devices', meson.current_build_dir()]]]
     images = []
     foreach index : range(profile[1])
       images += join_paths(fixtures, profile[0] + '-' + index.to_string() + '.raw')

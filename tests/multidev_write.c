@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/clonefile.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define REQUIRE(condition)                                                                         \
@@ -93,6 +94,10 @@
 #define RESUMED_BALANCES 3U
 /* Linux's usage filter above 100 selects every group. */
 #define BALANCE_EVERY_GROUP 101U
+/* No device of a volume has this id. */
+#define UNKNOWN_DEVICE UINT64_C(1000)
+/* With --devices, the UUID of the device added. */
+#define ADDED_UUID 0x7aU
 
 struct file {
 	char path[MANIFEST_LINE];
@@ -133,6 +138,10 @@ struct port {
 struct volume {
 	struct btrfs_image *image;
 	size_t devices;
+	/* The images of the volume's devices, in the environment's order: all
+	 * of them unless a spare waits to be added or a device left. */
+	size_t members;
+	size_t member[MAX_DEVICES];
 	struct event *events;
 	uint8_t *visible;
 	size_t count;
@@ -255,8 +264,10 @@ volume_init(struct volume *volume, struct btrfs_image *image)
 	memset(volume, 0, sizeof(*volume));
 	volume->image = image;
 	volume->devices = image->environment.device_count + 1;
+	volume->members = volume->devices;
 	for (i = 0; i < volume->devices; i++) {
 		volume->ports[i] = (struct port){ volume, (uint32_t)i };
+		volume->member[i] = i;
 	}
 	for (i = 1; i < volume->devices; i++) {
 		volume->readers[i - 1] = (struct btrfs_device){ &volume->ports[i],
@@ -266,8 +277,15 @@ volume_init(struct volume *volume, struct btrfs_image *image)
 	}
 }
 
-/* The environments of the volume; first names the device it is mounted
- * from, the others follow in turn. */
+static uint64_t
+image_size(const struct volume *volume, size_t image)
+{
+	return image == 0 ? volume->image->environment.size_bytes
+			  : volume->readers[image - 1].size_bytes;
+}
+
+/* The environments of the volume's devices; first names the member it is
+ * mounted from, the others follow in turn. */
 static void
 volume_environment(struct volume *volume, size_t first, struct btrfs_environment *environment,
     struct btrfs_write_environment *writer, struct btrfs_device *readers,
@@ -276,28 +294,26 @@ volume_environment(struct volume *volume, size_t first, struct btrfs_environment
 	size_t device;
 	size_t i;
 
+	device = volume->member[first];
 	*environment = volume->image->environment;
-	environment->context = &volume->ports[first];
-	environment->size_bytes = first == 0 ? volume->image->environment.size_bytes
-					     : volume->readers[first - 1].size_bytes;
+	environment->context = &volume->ports[device];
+	environment->size_bytes = image_size(volume, device);
 	environment->read = volume_read;
 	environment->allocate = volume_allocate;
 	environment->release = volume_release;
-	*writer = (struct btrfs_write_environment){ &volume->ports[first], volume_write,
+	*writer = (struct btrfs_write_environment){ &volume->ports[device], volume_write,
 		volume_flush, btrfs_image_compress, BTRFS_COMPRESSION_NONE, 0, NULL, 0 };
-	for (i = 1; i < volume->devices; i++) {
-		device = (first + i) % volume->devices;
+	for (i = 1; i < volume->members; i++) {
+		device = volume->member[(first + i) % volume->members];
 		readers[i - 1] = (struct btrfs_device){ &volume->ports[device],
-			device == 0 ? volume->image->environment.size_bytes
-				    : volume->readers[device - 1].size_bytes,
-			volume_read };
+			image_size(volume, device), volume_read };
 		writers[i - 1] = (struct btrfs_write_device){ &volume->ports[device], volume_write,
 			volume_flush };
 	}
-	environment->devices = volume->devices > 1 ? readers : NULL;
-	environment->device_count = volume->devices - 1;
-	writer->devices = volume->devices > 1 ? writers : NULL;
-	writer->device_count = volume->devices - 1;
+	environment->devices = volume->members > 1 ? readers : NULL;
+	environment->device_count = volume->members - 1;
+	writer->devices = volume->members > 1 ? writers : NULL;
+	writer->device_count = volume->members - 1;
 }
 
 /* A crash state: the first count events of source, those visible marks on
@@ -306,6 +322,8 @@ static void
 volume_fork(struct volume *fork, const struct volume *source, size_t count, const uint8_t *visible)
 {
 	volume_init(fork, source->image);
+	fork->members = source->members;
+	memcpy(fork->member, source->member, sizeof(fork->member));
 	fork->capacity = count + EVENT_GROWTH;
 	fork->events = malloc(fork->capacity * sizeof(*fork->events));
 	fork->visible = malloc(fork->capacity);
@@ -638,9 +656,15 @@ mount_volume(struct volume *volume, size_t first, struct btrfs_fs **fs)
 	struct btrfs_write_environment writer;
 	struct btrfs_device readers[MAX_DEVICES - 1];
 	struct btrfs_write_device writers[MAX_DEVICES - 1];
+	enum btrfs_result result;
 
 	volume_environment(volume, first, &environment, &writer, readers, writers);
-	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, fs) == BTRFS_OK);
+	result = btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, fs);
+	if (result != BTRFS_OK) {
+		fprintf(stderr, "mount of %zu devices: %s\n", volume->members,
+		    btrfs_result_string(result));
+		exit(1);
+	}
 }
 
 static void
@@ -936,8 +960,8 @@ conversion_args(
 	struct btrfs_fs *fs;
 	const uint64_t *choice;
 
-	REQUIRE(volume->devices >= 2 && volume->devices <= 4);
-	choice = targets[volume->devices - 2];
+	REQUIRE(volume->members >= 2 && volume->members <= 4);
+	choice = targets[volume->members - 2];
 	mount_volume(volume, 0, &fs);
 	*data = profile_of(fs, BT_BLOCK_DATA) != choice[0] ? choice[0] : choice[1];
 	*metadata = profile_of(fs, BT_BLOCK_METADATA) != choice[2] ? choice[2] : choice[3];
@@ -972,7 +996,7 @@ check_conversion_refusals(struct volume *volume)
 	REQUIRE(btrfs_balance(&environment, &writer, &args, &report) == BTRFS_INVALID_ARGUMENT);
 	args.metadata = keep;
 	args.system = keep;
-	if (volume->devices < 4) {
+	if (volume->members < 4) {
 		args.data =
 		    (struct btrfs_balance_kind){ 1, BALANCE_EVERY_GROUP, BTRFS_GROUP_RAID1C4, 0 };
 		REQUIRE(
@@ -985,7 +1009,8 @@ check_conversion_refusals(struct volume *volume)
 
 /* Applies the volume's writes to clones of its device images. */
 static void
-export_volume(const struct volume *volume, char **paths, const char *directory, const char *name)
+export_volume(
+    const struct volume *volume, const char *const *paths, const char *directory, const char *name)
 {
 	char path[EXPORT_PATH];
 	const struct event *event;
@@ -1013,12 +1038,13 @@ export_volume(const struct volume *volume, char **paths, const char *directory, 
 /* Exports the volume and the model's manifest when asked, and releases
  * them. */
 static void
-finish(struct volume *volume, struct model *model, char **argv, struct btrfs_image *image)
+finish(struct volume *volume, struct model *model, char **argv, const char *const *paths,
+    struct btrfs_image *image)
 {
 	char manifest[EXPORT_PATH];
 
 	if (strcmp(argv[3], "-") != 0) {
-		export_volume(volume, argv + 4, argv[3], argv[1]);
+		export_volume(volume, paths, argv[3], argv[1]);
 		REQUIRE(snprintf(manifest, sizeof(manifest), "%s/%s.expected.tsv", argv[3],
 			    argv[1]) < (int)sizeof(manifest));
 		write_manifest(model, manifest);
@@ -1026,6 +1052,207 @@ finish(struct volume *volume, struct model *model, char **argv, struct btrfs_ima
 	volume_free(volume);
 	REQUIRE(image->live_allocations == 0);
 	btrfs_image_close(image);
+}
+
+/* The fewest devices a profile allocates on (Linux's devs_min). */
+static size_t
+profile_devices(uint64_t profile)
+{
+	switch (profile) {
+	case BTRFS_GROUP_RAID1:
+	case BTRFS_GROUP_RAID10:
+	case BTRFS_GROUP_RAID5:
+		return 2;
+	case BTRFS_GROUP_RAID1C3:
+	case BTRFS_GROUP_RAID6:
+		return 3;
+	case BTRFS_GROUP_RAID1C4:
+		return 4;
+	default:
+		return 1;
+	}
+}
+
+/* A state a crash left while devices joined or left: recovered with the
+ * devices after the change when its newest superblock names them, else with
+ * those before it. */
+static void
+mount_member_state(struct volume *state, const struct volume *before, const struct volume *after,
+    struct btrfs_fs **fs, size_t *recoveries)
+{
+	struct btrfs_environment environment;
+	struct btrfs_write_environment writer;
+	struct btrfs_device readers[MAX_DEVICES - 1];
+	struct btrfs_write_device writers[MAX_DEVICES - 1];
+	struct btrfs_recovery_report report;
+	enum btrfs_result result;
+
+	state->members = after->members;
+	memcpy(state->member, after->member, sizeof(state->member));
+	volume_environment(state, 0, &environment, &writer, readers, writers);
+	result = btrfs_recover_supers(&environment, NULL, 0, &report);
+	if (result == BTRFS_INVALID_ARGUMENT || result == BTRFS_UNSUPPORTED) {
+		state->members = before->members;
+		memcpy(state->member, before->member, sizeof(state->member));
+	}
+	mount_state(state, fs, recoveries);
+}
+
+/* Every state a crash leaves at a barrier or superblock write while a device
+ * joins or leaves reads as before, with the devices before or after, after
+ * superblock recovery, and passes the reference audit. */
+static void
+check_device_crashes(struct volume *volume, size_t first, size_t end, const struct volume *before,
+    const struct namespace_digest *expected, uint32_t *seed, size_t *states, size_t *recoveries,
+    size_t *later)
+{
+	struct namespace_digest digest;
+	struct volume crash;
+	struct btrfs_fs *fs;
+	uint8_t *visible = malloc(end + 1);
+	size_t copies;
+	size_t position;
+	unsigned policy;
+
+	REQUIRE(visible != NULL);
+	for (position = first; position <= end; position++) {
+		if (position != first && position != end &&
+		    volume->events[position].bytes != NULL &&
+		    !superblock_write(&volume->events[position])) {
+			continue;
+		}
+		for (policy = 0; policy < 2 + RANDOM_STATES; policy++) {
+			crash_visibility(volume, position, policy, seed, visible);
+			volume_fork(&crash, volume, position, visible);
+			mount_member_state(&crash, before, volume, &fs, recoveries);
+			*later += crash.members == volume->members;
+			REQUIRE(namespace_content_digest(fs, &digest) == 0 &&
+			    digest.hash == expected->hash && digest.objects == expected->objects &&
+			    digest.bytes == expected->bytes);
+			audit(fs, "device crash state", &copies);
+			btrfs_unmount(fs);
+			volume_free(&crash);
+			(*states)++;
+		}
+	}
+	free(visible);
+}
+
+/* The superblock magic bytes of a copy of an image. */
+static int
+magic_cleared(struct volume *volume, size_t image, unsigned mirror)
+{
+	uint8_t magic[8];
+	uint8_t zero[sizeof(magic)] = { 0 };
+
+	REQUIRE(volume_read(&volume->ports[image], bt_super_offset(mirror) + 64, magic,
+		    sizeof(magic)) == BTRFS_OK);
+	return memcmp(magic, zero, sizeof(magic)) == 0;
+}
+
+/* With --devices: the spare image joins the volume (its device item as
+ * Linux's btrfs_init_new_device writes one), a device of the volume cannot
+ * join again, then the device the volume is mounted from leaves, every group
+ * moving off it; both read as before and their crash states are checked. */
+static void
+devices_phase(struct volume *volume, struct model *model, const struct namespace_digest *expected,
+    uint32_t *seed, size_t *states, size_t *recoveries, size_t *later, size_t *copies)
+{
+	struct btrfs_environment environment;
+	struct btrfs_write_environment writer;
+	struct btrfs_device readers[MAX_DEVICES - 1];
+	struct btrfs_write_device writers[MAX_DEVICES - 1];
+	struct btrfs_balance_report report;
+	struct namespace_digest digest;
+	struct bt_disk_device item;
+	struct btrfs_info info;
+	struct btrfs_fs *fs;
+	struct bt_cursor cursor;
+	struct bt_record record;
+	static struct volume before;
+	uint8_t uuid[BTRFS_UUID_SIZE];
+	uint64_t highest = 0;
+	uint64_t total;
+	uint64_t added = 0;
+	uint64_t removed;
+	uint64_t size;
+	size_t spare = volume->devices - 1;
+	size_t first;
+	size_t count;
+	size_t leaving;
+	size_t i;
+
+	memset(uuid, ADDED_UUID, sizeof(uuid));
+	mount_volume(volume, 0, &fs);
+	for (i = 0; i < fs->device_count; i++) {
+		highest = fs->devices[i].id > highest ? fs->devices[i].id : highest;
+	}
+	btrfs_get_info(fs, &info);
+	total = info.total_bytes;
+	size = image_size(volume, spare) & ~((uint64_t)info.sector_size - 1);
+	btrfs_unmount(fs);
+	first = volume->count;
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	REQUIRE(btrfs_device_add(&environment, &writer, &volume->readers[spare - 1],
+		    &volume->writers[spare - 1], uuid, &added) == BTRFS_OK);
+	REQUIRE(added == highest + 1);
+	before.members = volume->members;
+	memcpy(before.member, volume->member, sizeof(before.member));
+	volume->member[volume->members++] = spare;
+	count = volume->count;
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	REQUIRE(btrfs_device_add(&environment, &writer, &readers[0], &writers[0], uuid, &highest) ==
+	    BTRFS_INVALID_ARGUMENT);
+	REQUIRE(volume->count == count);
+	mount_volume(volume, 0, &fs);
+	btrfs_get_info(fs, &info);
+	REQUIRE(fs->device_count == volume->members && info.total_bytes == total + size);
+	bt_cursor_init(&cursor, fs, fs->chunk_tree);
+	REQUIRE(bt_cursor_seek(&cursor,
+		    (struct bt_key){ BT_DEV_ITEMS_OBJECTID, added, BT_DEV_ITEM }, 0) == BTRFS_OK);
+	REQUIRE(bt_cursor_record(&cursor, &record) == BTRFS_OK && record.size == sizeof(item));
+	memcpy(&item, record.data, sizeof(item));
+	bt_cursor_fini(&cursor);
+	REQUIRE(bt_u64(item.id) == added && bt_u64(item.total_bytes) == size &&
+	    bt_u64(item.used_bytes) == 0 && bt_u32(item.io_align) == info.sector_size &&
+	    bt_u32(item.io_width) == info.sector_size &&
+	    bt_u32(item.sector_size) == info.sector_size && bt_u64(item.type) == 0 &&
+	    memcmp(item.uuid, uuid, sizeof(uuid)) == 0);
+	check_model(fs, model, "device added", copies);
+	btrfs_unmount(fs);
+	check_device_crashes(
+	    volume, first, count, &before, expected, seed, states, recoveries, later);
+
+	/* The device the volume is mounted from leaves. */
+	mount_volume(volume, 0, &fs);
+	removed = fs->devices[0].id;
+	size = fs->devices[0].size;
+	btrfs_get_info(fs, &info);
+	total = info.total_bytes;
+	btrfs_unmount(fs);
+	leaving = volume->member[0];
+	first = volume->count;
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	REQUIRE(btrfs_device_remove(&environment, &writer, removed, &report) == BTRFS_OK);
+	REQUIRE(report.groups > 0);
+	before.members = volume->members;
+	memcpy(before.member, volume->member, sizeof(before.member));
+	memmove(
+	    volume->member, volume->member + 1, (volume->members - 1) * sizeof(volume->member[0]));
+	volume->members--;
+	mount_volume(volume, 0, &fs);
+	btrfs_get_info(fs, &info);
+	REQUIRE(fs->device_count == volume->members && info.total_bytes == total - size);
+	for (i = 0; i < fs->chunk_count; i++) {
+		REQUIRE(fs->chunks[i].stripes > 0);
+	}
+	check_model(fs, model, "device removed", copies);
+	REQUIRE(namespace_content_digest(fs, &digest) == 0 && digest.hash == expected->hash &&
+	    digest.objects == expected->objects && digest.bytes == expected->bytes);
+	btrfs_unmount(fs);
+	REQUIRE(magic_cleared(volume, leaving, 0) && magic_cleared(volume, leaving, 1));
+	check_device_crashes(
+	    volume, first, volume->count, &before, expected, seed, states, recoveries, later);
 }
 
 /* Writable admission refuses what it cannot write: a writer without each
@@ -1038,7 +1265,10 @@ check_refusals(struct volume *volume, struct btrfs_fs *fs)
 	struct btrfs_device readers[MAX_DEVICES - 1];
 	struct btrfs_write_device writers[MAX_DEVICES - 1];
 	struct btrfs_transaction *transaction = NULL;
+	struct btrfs_balance_report report;
 	struct btrfs_fs *degraded;
+	size_t needed;
+	size_t fewest = 1;
 	size_t i;
 	int striped_parity = 0;
 
@@ -1059,6 +1289,18 @@ check_refusals(struct volume *volume, struct btrfs_fs *fs)
 	if (striped_parity) {
 		REQUIRE(btrfs_transaction_begin(fs, &writer, &transaction) == BTRFS_UNSUPPORTED);
 	}
+	/* Removing a device: refused where a profile in use needs every device,
+	 * and for RAID5/6 volumes; an unknown id is NOT_FOUND. */
+	for (i = 0; i < fs->chunk_count; i++) {
+		needed = profile_devices(fs->chunks[i].type & BT_BLOCK_PROFILES);
+		fewest = needed > fewest ? needed : fewest;
+	}
+	if (fewest > volume->members - 1 || striped_parity) {
+		REQUIRE(btrfs_device_remove(&environment, &writer, fs->devices[0].id, &report) ==
+		    (fewest > volume->members - 1 ? BTRFS_INVALID_ARGUMENT : BTRFS_UNSUPPORTED));
+	}
+	REQUIRE(
+	    btrfs_device_remove(&environment, &writer, UNKNOWN_DEVICE, &report) == BTRFS_NOT_FOUND);
 	REQUIRE(transaction == NULL && volume->count == 0);
 	return striped_parity;
 }
@@ -1114,7 +1356,14 @@ main(int argc, char **argv)
 	uint64_t highest;
 	uint64_t free_data = 0;
 	uint64_t grown_bytes;
+	size_t device_states = 0;
+	size_t later_states = 0;
+	struct stat status;
+	const char *spare_directory = NULL;
+	char spare_path[EXPORT_PATH];
+	int spare_file;
 	int grow = 0;
+	int spare = 0;
 	enum btrfs_result balanced;
 	size_t i;
 	int done = 0;
@@ -1124,16 +1373,33 @@ main(int argc, char **argv)
 		commit_count = COMMITS + 1;
 		argv++;
 		argc--;
+	} else if (argc > 2 && strcmp(argv[1], "--devices") == 0) {
+		spare = 1;
+		spare_directory = argv[2];
+		argv += 2;
+		argc -= 2;
 	}
 	REQUIRE(argc >= 6);
 	devices = (size_t)(argc - 4);
-	REQUIRE(devices <= MAX_DEVICES);
+	REQUIRE(devices + (size_t)spare <= MAX_DEVICES);
 	for (i = 0; i < devices; i++) {
 		paths[i] = argv[4 + i];
+	}
+	/* The spare: a new sparse image the size of the first device. */
+	if (spare) {
+		REQUIRE(stat(paths[0], &status) == 0);
+		REQUIRE(snprintf(spare_path, sizeof(spare_path), "%s/multi-spare-%ld.raw",
+			    spare_directory, (long)getpid()) < (int)sizeof(spare_path));
+		spare_file = open(spare_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+		REQUIRE(spare_file >= 0 && ftruncate(spare_file, status.st_size) == 0 &&
+		    close(spare_file) == 0);
+		paths[devices++] = spare_path;
 	}
 	read_manifest(argv[2], &model);
 	REQUIRE(btrfs_image_open_devices(paths, devices, &image) == 0);
 	volume_init(&volume, &image);
+	/* The last image waits to join the volume. */
+	volume.members -= (size_t)spare;
 	mount_volume(&volume, 0, &fs);
 	check_model(fs, &model, "fixture", &copies);
 	if (check_refusals(&volume, fs)) {
@@ -1274,7 +1540,7 @@ main(int argc, char **argv)
 
 	/* Mounted from each device, the volume reads the same. */
 	btrfs_unmount(fs);
-	for (i = 1; i < devices; i++) {
+	for (i = 1; i < volume.members; i++) {
 		mount_volume(&volume, i, &fs);
 		REQUIRE(namespace_content_digest(fs, &digest) == 0 &&
 		    digest.hash == commits[commit_count].digest.hash &&
@@ -1284,8 +1550,24 @@ main(int argc, char **argv)
 	for (i = 1; i <= commit_count; i++) {
 		check_crashes(&volume, commits, i, &seed, &states, &recoveries, &resumed);
 	}
+	if (spare) {
+		devices_phase(&volume, &model, &commits[commit_count].digest, &seed, &device_states,
+		    &recoveries, &later_states, &copies);
+		finish(&volume, &model, argv, paths, &image);
+		REQUIRE(unlink(spare_path) == 0);
+		printf(
+		    "multi-device devices: %zu devices, %zu files; five commits read back as the "
+		    "model holds them and pass both audits (%zu checksummed copies); %zu crash "
+		    "states read as a commit, %zu taking a further transaction; a device joined "
+		    "and the first device left, every group moving off it, reading the same, as "
+		    "do %zu of their crash states (%zu with the devices after; %zu states after "
+		    "superblock recovery in all); refusals before any write PASS\n",
+		    devices, model.count, copies, states, resumed, device_states, later_states,
+		    recoveries);
+		return 0;
+	}
 	if (grow) {
-		finish(&volume, &model, argv, &image);
+		finish(&volume, &model, argv, paths, &image);
 		printf("multi-device growth: %zu devices, %zu files; six commits read back as the "
 		       "model holds them and pass both audits (%zu checksummed copies), the last "
 		       "preallocating %llu bytes beyond the free data space into %zu new data "
@@ -1343,7 +1625,7 @@ main(int argc, char **argv)
 	btrfs_unmount(fs);
 	check_balance_crashes(&volume, convert_first, convert_end, &args, &commits[COMMITS].digest,
 	    &seed, &convert_states, &recoveries, &rebalanced);
-	finish(&volume, &model, argv, &image);
+	finish(&volume, &model, argv, paths, &image);
 	printf("multi-device writes: %zu devices, %zu files; five commits read back as the model "
 	       "holds them and pass both audits (%zu checksummed copies), %zu unused groups "
 	       "removed; the volume reads the same from each device; %zu crash states read as a "

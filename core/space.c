@@ -54,6 +54,9 @@ struct bt_space {
 	 * ahead for a volume of several devices. */
 	struct bt_gap *trials;
 	size_t trial_capacity;
+	/* Devices (bits of their indexes) no new chunk takes, as Linux takes a
+	 * device being removed off its allocation list. */
+	uint32_t excluded;
 	/* Bytes used per chunk; used_capacity entries (the chunk table's). Before
 	 * a chunk is loaded its block-group item gives it. */
 	uint64_t *used;
@@ -908,6 +911,12 @@ bt_raid_attr(uint64_t profile)
 	return NULL;
 }
 
+void
+bt_space_exclude_device(struct bt_space *space, size_t device)
+{
+	space->excluded |= UINT32_C(1) << device;
+}
+
 enum btrfs_result
 bt_space_profile(uint64_t profile, unsigned *devices, int *redundant)
 {
@@ -1233,7 +1242,8 @@ bt_space_plan_view(
 
 	for (i = 0; i < fs->device_count; i++) {
 		devices[i] = (struct bt_plan_device){ space->devices[i].items,
-			space->devices[i].count, fs->devices[i].id, fs->devices[i].size, 0 };
+			(space->excluded & (UINT32_C(1) << i)) != 0 ? 0 : space->devices[i].count,
+			fs->devices[i].id, fs->devices[i].size, 0 };
 		if (scratch != NULL && devices[i].count != 0) {
 			bt_copy(scratch + copied, devices[i].holes,
 			    devices[i].count * sizeof(*scratch));

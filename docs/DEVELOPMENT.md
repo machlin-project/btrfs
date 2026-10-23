@@ -451,9 +451,10 @@ tmpfs cannot hold the `btrfs.compression` property and continues.
 
 `tests/prepare_multidev_linux.py` prepares volumes a Linux kernel writes
 across several 256 MiB devices (`multi-raid1`, `-raid1c3`, `-raid1c4`,
-`-raid10`, `-raid0`, `-raid5`, `-raid6`, `-single`), and `multi-grow`, RAID1
+`-raid10`, `-raid0`, `-raid5`, `-raid6`, `-single`), `multi-grow`, RAID1
 data and RAID1C3 metadata on devices of 512, 384 and 320 MiB with unallocated
-space: `create` formats
+space, and `multi-spare`, RAID1 on three 512 MiB devices with room to add and
+remove one: `create` formats
 `/dev/vda`, `/dev/vdb`, ... with the profile's data and metadata profiles,
 mounts, writes the payload, unmounts, runs `btrfs check --check-data-csum`
 and prints the chunk profiles and the manifest. They need the lab runner
@@ -482,7 +483,7 @@ offsets and size, and requires a missing device, a FOREIGN volume's image in
 place of the last device and a writer without the further devices to be
 refused; the `multi-*` Meson tests run it.
 
-`btrfs-multidev-write-test [--grow] NAME MANIFEST EXPORT|- DEVICE...`
+`btrfs-multidev-write-test [--grow|--devices DIR] NAME MANIFEST EXPORT|- DEVICE...`
 (`tests/multidev_write.c`) writes five transactions to a recording of the
 devices, checks every file against a model after each commit, then every state
 a power cut leaves at a barrier or superblock write of each commit (with all,
@@ -497,7 +498,16 @@ device count allows (RAID0, RAID1, RAID1C3, RAID10, RAID1C4, DUP), checking
 that conversion's crash states too; `--grow` (for `multi-grow`)
 instead preallocates beyond the free data space in a sixth transaction, so
 that new data chunks are placed across the devices, and checks its crash
-states. The `multi-*-writes` Meson tests run it without export. With an EXPORT directory
+states. `--devices DIR` (for `multi-spare`) instead creates a sparse spare
+image in DIR, adds it to the volume, requires adding a member again to be
+refused, removes the device the volume is mounted from, and checks the crash
+states of both with the device set before and after; with EXPORT the spare
+goes there too, and Linux then gets the remaining devices first and the
+removed one last, which it must not register. The `multi-*-writes` Meson
+tests run it without export. The `devices` phase of the Linux script (with
+`--remove ID`, on a copy and a blank image after its devices) is Linux's own
+add and remove, printing device items, statistics items, superblock fields
+and each copy's magic, for comparison. With an EXPORT directory
 (new and empty), it clones the devices there as `NAME-N.raw`, applies its
 writes and writes the model's manifest as `NAME.expected.tsv`; Linux then
 checks them with the `verify` phase (from `lab/`):
