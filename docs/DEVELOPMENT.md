@@ -500,8 +500,10 @@ instead preallocates beyond the free data space in a sixth transaction, so
 that new data chunks are placed across the devices, and checks its crash
 states. `--devices DIR` (for `multi-spare`) instead creates a sparse spare
 image in DIR, adds it to the volume, requires adding a member again to be
-refused, removes the device the volume is mounted from, and checks the crash
-states of both with the device set before and after; with EXPORT the spare
+refused, shrinks the device whose stripes reach furthest to just below its
+highest one and grows it back (with Linux's resize refusals), removes the
+device the volume is mounted from, and checks the crash states of each with
+the device set before and after; with EXPORT the spare
 goes there too, and Linux then gets the remaining devices first and the
 removed one last, which it must not register. The `multi-*-writes` Meson
 tests run it without export. The `devices` phase of the Linux script (with

@@ -1098,12 +1098,12 @@ bt_bl_convert(struct btrfs_transaction *transaction, size_t chunk, uint64_t prof
 
 /* One committed step: extents of the group move until the work reaches
  * work (one extent when single), or the emptied group goes (*done); with a
- * profile other than BTRFS_BALANCE_KEEP, its kind converts to it. No new
- * chunk takes the device named excluded (none for 0). *moved counts the
- * extents moved. */
+ * profile other than BTRFS_BALANCE_KEEP, its kind converts to it. On the
+ * device named limited (none for 0) no new chunk takes a stripe ending past
+ * limit. *moved counts the extents moved. */
 static enum btrfs_result
 bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, uint64_t group,
-    size_t work, int single, uint64_t profile, uint64_t excluded,
+    size_t work, int single, uint64_t profile, uint64_t limited, uint64_t limit,
     struct btrfs_balance_report *report, int *done, uint64_t *moved)
 {
 	size_t device;
@@ -1128,12 +1128,12 @@ bt_bl_step(struct btrfs_fs *fs, const struct btrfs_write_environment *writer, ui
 			error = BTRFS_NOT_FOUND;
 		}
 	}
-	if (error == BTRFS_OK && excluded != 0) {
-		device = bt_tx_device_index(transaction, excluded);
+	if (error == BTRFS_OK && limited != 0) {
+		device = bt_tx_device_index(transaction, limited);
 		if (device == transaction->fs.device_count) {
 			error = BTRFS_NOT_FOUND;
 		} else {
-			bt_space_exclude_device(transaction->space, device);
+			bt_space_limit_device(transaction->space, device, limit);
 		}
 	}
 	/* A running rescan counts extents behind its progress. */
@@ -1240,12 +1240,12 @@ bt_bl_clean(const struct btrfs_environment *environment,
 }
 
 /* Relocates one group in committed steps, its kind converting to profile
- * unless it is BTRFS_BALANCE_KEEP, no new chunk taking the device named
- * excluded (none for 0); report accumulates. */
+ * unless it is BTRFS_BALANCE_KEEP, no new chunk taking a stripe past limit on
+ * the device named limited (none for 0); report accumulates. */
 static enum btrfs_result
 bt_bl_relocate(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, uint64_t group, size_t work, uint64_t profile,
-    uint64_t excluded, struct btrfs_balance_report *report)
+    uint64_t limited, uint64_t limit, struct btrfs_balance_report *report)
 {
 	struct btrfs_fs *fs;
 	uint64_t steps;
@@ -1260,15 +1260,15 @@ bt_bl_relocate(const struct btrfs_environment *environment,
 			error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
 		}
 		if (error == BTRFS_OK) {
-			error = bt_bl_step(
-			    fs, writer, group, work, 0, profile, excluded, report, &done, &moved);
+			error = bt_bl_step(fs, writer, group, work, 0, profile, limited, limit,
+			    report, &done, &moved);
 			/* A step too large for one transaction is retried one extent at a
 			 * time. */
 			if (error != BTRFS_OK && error != BTRFS_NOT_FOUND &&
 			    error != BTRFS_UNSUPPORTED && error != BTRFS_CORRUPT &&
 			    error != BTRFS_IO) {
-				error = bt_bl_step(fs, writer, group, work, 1, profile, excluded,
-				    report, &done, &moved);
+				error = bt_bl_step(fs, writer, group, work, 1, profile, limited,
+				    limit, report, &done, &moved);
 			}
 		}
 		btrfs_unmount(fs);
@@ -1289,14 +1289,14 @@ bt_relocate_group(const struct btrfs_environment *environment,
 	bt_zero(report, sizeof(*report));
 	error = bt_bl_clean(environment, writer, report);
 	return error == BTRFS_OK
-	    ? bt_bl_relocate(environment, writer, group, work, BTRFS_BALANCE_KEEP, 0, report)
+	    ? bt_bl_relocate(environment, writer, group, work, BTRFS_BALANCE_KEEP, 0, 0, report)
 	    : error;
 }
 
-/* The group with a stripe on the device named id whose stripe there lies
- * highest; NOT_FOUND when none has. */
+/* The group with a stripe on the device named id ending past limit whose
+ * stripe there lies highest; NOT_FOUND when none has. */
 static enum btrfs_result
-bt_bl_device_group(const struct btrfs_fs *fs, uint64_t id, uint64_t *group)
+bt_bl_device_group(const struct btrfs_fs *fs, uint64_t id, uint64_t limit, uint64_t *group)
 {
 	const struct bt_chunk *chunk;
 	uint64_t highest = 0;
@@ -1314,6 +1314,7 @@ bt_bl_device_group(const struct btrfs_fs *fs, uint64_t id, uint64_t *group)
 		chunk = &fs->chunks[i];
 		for (stripe = 0; stripe < chunk->stripes; stripe++) {
 			if (chunk->devices[stripe] == device &&
+			    chunk->physical[stripe] + bt_chunk_stripe_length(chunk) > limit &&
 			    (!found || chunk->physical[stripe] > highest)) {
 				highest = chunk->physical[stripe];
 				*group = chunk->logical;
@@ -1326,35 +1327,35 @@ bt_bl_device_group(const struct btrfs_fs *fs, uint64_t id, uint64_t *group)
 
 enum btrfs_result
 bt_relocate_device(const struct btrfs_environment *environment,
-    const struct btrfs_write_environment *writer, uint64_t id, size_t work,
+    const struct btrfs_write_environment *writer, uint64_t id, uint64_t limit, size_t work,
     struct btrfs_balance_report *report)
 {
 	struct btrfs_fs *fs;
 	uint64_t group = 0;
 	uint64_t groups;
-	uint64_t limit = 0;
+	uint64_t bound = 0;
 	enum btrfs_result error;
 
 	error = bt_bl_clean(environment, writer, report);
-	/* Each relocation takes one group off the device and puts none on it,
+	/* Each relocation takes one group off the range and puts none there,
 	 * so at most as many as the volume held at first. */
 	for (groups = 0; error == BTRFS_OK; groups++) {
 		fs = NULL;
 		error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
 		if (error == BTRFS_OK) {
-			limit = groups == 0 ? fs->chunk_count : limit;
-			error = bt_bl_device_group(fs, id, &group);
+			bound = groups == 0 ? fs->chunk_count : bound;
+			error = bt_bl_device_group(fs, id, limit, &group);
 		}
 		btrfs_unmount(fs);
 		if (error == BTRFS_NOT_FOUND) {
 			return BTRFS_OK;
 		}
-		if (error == BTRFS_OK && groups == limit) {
+		if (error == BTRFS_OK && groups == bound) {
 			error = BTRFS_CORRUPT;
 		}
 		if (error == BTRFS_OK) {
-			error = bt_bl_relocate(
-			    environment, writer, group, work, BTRFS_BALANCE_KEEP, id, report);
+			error = bt_bl_relocate(environment, writer, group, work, BTRFS_BALANCE_KEEP,
+			    id, limit, report);
 		}
 	}
 	return error;
@@ -1500,8 +1501,8 @@ bt_balance(const struct btrfs_environment *environment,
 	for (i = 0; error == BTRFS_OK && i < count; i++) {
 		kind = bt_bl_kind(args, groups[i].flags);
 		if (bt_bl_selects(kind, &groups[i])) {
-			error = bt_bl_relocate(
-			    environment, writer, groups[i].logical, work, kind->convert, 0, report);
+			error = bt_bl_relocate(environment, writer, groups[i].logical, work,
+			    kind->convert, 0, 0, report);
 		}
 	}
 	if (groups != NULL) {

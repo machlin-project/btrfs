@@ -283,6 +283,20 @@ enum btrfs_result btrfs_device_add(const struct btrfs_environment *environment,
 enum btrfs_result btrfs_device_remove(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, uint64_t id, struct btrfs_balance_report *report);
 
+/* Linux's btrfs filesystem resize of the device named id to size bytes,
+ * rounded down to whole sectors (btrfs_ioctl_resize): at least 256 MiB
+ * (INVALID_ARGUMENT) and at most the device holds (RANGE). Growing records
+ * the size in the device's items and the superblocks' total in one commit
+ * (btrfs_grow_device); shrinking first relocates every group with a stripe
+ * past the new end, the highest first, none of them going there
+ * (btrfs_shrink_device), in committed steps report counts, then records the
+ * size. The device's superblock copies follow its size. NOT_FOUND names no
+ * device; a volume without room is refused for space with its groups
+ * relocated so far. */
+enum btrfs_result btrfs_device_resize(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t id, uint64_t size,
+    struct btrfs_balance_report *report);
+
 /* Admission: any of Linux's four checksum algorithms, skinny metadata, the
  * free-space and block-group trees, fs-verity, quotas and simple quotas, and
  * mixed groups whose nodes are one sector, on one device or on several: every

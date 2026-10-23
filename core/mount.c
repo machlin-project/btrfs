@@ -112,7 +112,7 @@ bt_super_sibling(const struct bt_disk_super *super, const struct bt_disk_super *
  * names must be there, as Linux requires without -o degraded; a device whose
  * generation differs missed commits (STALE). */
 static enum btrfs_result
-bt_mount_devices(struct btrfs_fs *fs, const struct bt_disk_super *super)
+bt_mount_devices(struct btrfs_fs *fs, const struct bt_disk_super *super, int sizes)
 {
 	const struct btrfs_device *source;
 	struct bt_disk_super *other;
@@ -180,7 +180,7 @@ bt_mount_devices(struct btrfs_fs *fs, const struct bt_disk_super *super)
 	}
 	fs->env.release(fs->env.context, other, sizeof(*other));
 	/* Missing devices' sizes are unknown until their chunks name them. */
-	if (error == BTRFS_OK && fs->device_count == fs->device_capacity &&
+	if (error == BTRFS_OK && sizes && fs->device_count == fs->device_capacity &&
 	    total != fs->info.total_bytes) {
 		error = BTRFS_CORRUPT;
 	}
@@ -255,7 +255,7 @@ bt_load_chunks(struct btrfs_fs *fs)
 
 enum btrfs_result
 bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk_super *super,
-    uint64_t offset, uint64_t tree, int logged, struct btrfs_fs **result)
+    uint64_t offset, uint64_t tree, unsigned flags, struct btrfs_fs **result)
 {
 	struct btrfs_fs *fs;
 	struct btrfs_object_id id;
@@ -269,7 +269,7 @@ bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk
 	bt_zero(fs, sizeof(*fs));
 	fs->env = *environment;
 	fs->cache_limit = UINT64_MAX;
-	error = bt_super_decode(fs, super, offset, logged);
+	error = bt_super_decode(fs, super, offset, (flags & BT_MOUNT_LOGGED) != 0);
 	if (error == BTRFS_OK) {
 		fs->chunks = environment->allocate(
 		    environment->context, BT_INITIAL_CHUNKS * sizeof(*fs->chunks));
@@ -279,7 +279,7 @@ bt_mount_super(const struct btrfs_environment *environment, const struct bt_disk
 		}
 	}
 	if (error == BTRFS_OK) {
-		error = bt_mount_devices(fs, super);
+		error = bt_mount_devices(fs, super, (flags & BT_MOUNT_SIZES) == 0);
 	}
 	if (error == BTRFS_OK) {
 		error = bt_bootstrap_chunks(fs, super);

@@ -196,6 +196,7 @@ device_state(const struct btrfs_fs *fs, size_t end, uint32_t d, struct bt_gap *h
 	device->holes = holes;
 	device->id = fs->devices[d].id;
 	device->size = fs->devices[d].size;
+	device->end = UINT64_MAX;
 }
 
 /* Every chunk Linux's kernel made, after mkfs's, planned again from the

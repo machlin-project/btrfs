@@ -1932,8 +1932,8 @@ btrfs_replay_log(const struct btrfs_environment *environment,
 	}
 	if (error == BTRFS_OK) {
 		report->generation = bt_u64(super->generation);
-		error = bt_mount_super(
-		    environment, super, BT_SUPER_OFFSET, BTRFS_TOP_LEVEL_TREE, 1, &fs);
+		error = bt_mount_super(environment, super, BT_SUPER_OFFSET, BTRFS_TOP_LEVEL_TREE,
+		    BT_MOUNT_LOGGED, &fs);
 	}
 	environment->release(environment->context, super, sizeof(*super));
 	/* As Linux's mount, the log replays before relocation recovery: file

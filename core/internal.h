@@ -357,10 +357,14 @@ int bt_super_same_but_log(const struct bt_disk_super *copy, const struct bt_disk
 /* Superblocks two devices of one volume hold for one commit: every field
  * but their offsets, checksums and device items is equal. */
 int bt_super_same_volume(const struct bt_disk_super *a, const struct bt_disk_super *b);
-/* logged admits a pending tree log, recorded in log_root and log_level, for
- * its replay; any other mount refuses it (RECOVERY_REQUIRED). */
+/* BT_MOUNT_LOGGED admits a pending tree log, recorded in log_root and
+ * log_level, for its replay; any other mount refuses it (RECOVERY_REQUIRED).
+ * BT_MOUNT_SIZES leaves the devices' sizes, which must sum to the volume's,
+ * to the caller: superblock recovery takes some from the chunk tree. */
+#define BT_MOUNT_LOGGED 1U
+#define BT_MOUNT_SIZES 2U
 enum btrfs_result bt_mount_super(const struct btrfs_environment *environment,
-    const struct bt_disk_super *super, uint64_t offset, uint64_t tree, int logged,
+    const struct bt_disk_super *super, uint64_t offset, uint64_t tree, unsigned flags,
     struct btrfs_fs **result);
 /* Index of the first chunk at or after logical; chunk_count if none. */
 size_t bt_chunk_position(const struct btrfs_fs *fs, uint64_t logical);

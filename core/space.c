@@ -54,9 +54,11 @@ struct bt_space {
 	 * ahead for a volume of several devices. */
 	struct bt_gap *trials;
 	size_t trial_capacity;
-	/* Devices (bits of their indexes) no new chunk takes, as Linux takes a
-	 * device being removed off its allocation list. */
-	uint32_t excluded;
+	/* Devices (bits of their indexes) new chunks take only below their
+	 * limit: none of a device being removed, which Linux takes off its
+	 * allocation list, nothing past the new end of one being shrunk. */
+	uint32_t limited;
+	uint64_t limits[BT_MAX_DEVICES];
 	/* Bytes used per chunk; used_capacity entries (the chunk table's). Before
 	 * a chunk is loaded its block-group item gives it. */
 	uint64_t *used;
@@ -912,9 +914,10 @@ bt_raid_attr(uint64_t profile)
 }
 
 void
-bt_space_exclude_device(struct bt_space *space, size_t device)
+bt_space_limit_device(struct bt_space *space, size_t device, uint64_t end)
 {
-	space->excluded |= UINT32_C(1) << device;
+	space->limited |= UINT32_C(1) << device;
+	space->limits[device] = end;
 }
 
 enum btrfs_result
@@ -1105,7 +1108,10 @@ bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total
 		largest = 0;
 		offset = 0;
 		for (j = 0; j < device->count; j++) {
-			length = device->holes[j].end - device->holes[j].start;
+			length =
+			    device->holes[j].end < device->end ? device->holes[j].end : device->end;
+			length =
+			    length > device->holes[j].start ? length - device->holes[j].start : 0;
 			if (length >= want) {
 				largest = want;
 				offset = device->holes[j].start;
@@ -1242,8 +1248,9 @@ bt_space_plan_view(
 
 	for (i = 0; i < fs->device_count; i++) {
 		devices[i] = (struct bt_plan_device){ space->devices[i].items,
-			(space->excluded & (UINT32_C(1) << i)) != 0 ? 0 : space->devices[i].count,
-			fs->devices[i].id, fs->devices[i].size, 0 };
+			space->devices[i].count, fs->devices[i].id, fs->devices[i].size, 0,
+			(space->limited & (UINT32_C(1) << i)) != 0 ? space->limits[i]
+								   : UINT64_MAX };
 		if (scratch != NULL && devices[i].count != 0) {
 			bt_copy(scratch + copied, devices[i].holes,
 			    devices[i].count * sizeof(*scratch));

@@ -15,13 +15,15 @@ struct bt_gap {
 };
 
 /* One device as chunk planning sees it: its unallocated ranges, ascending
- * and disjoint, its id, its size and the bytes its device extents hold. */
+ * and disjoint, its id, its size, the bytes its device extents hold, and
+ * where its allocation ends (no stripe goes past it). */
 struct bt_plan_device {
 	struct bt_gap *holes;
 	size_t count;
 	uint64_t id;
 	uint64_t size;
 	uint64_t used;
+	uint64_t end;
 };
 
 struct bt_space_change {
@@ -57,9 +59,9 @@ enum btrfs_result bt_space_grow(struct bt_space *space, uint64_t kind, uint64_t 
  * room; UNSUPPORTED for a profile Linux does not allocate. */
 enum btrfs_result bt_space_plan(const struct bt_plan_device *devices, size_t count, uint64_t total,
     uint64_t type, uint64_t minimum, uint64_t cap, struct bt_chunk *chunk);
-/* No new chunk takes a stripe on the volume's device of this index for the
- * rest of the transaction. */
-void bt_space_exclude_device(struct bt_space *space, size_t device);
+/* No new chunk takes a stripe on the volume's device of this index that
+ * ends past end (none for 0) for the rest of the transaction. */
+void bt_space_limit_device(struct bt_space *space, size_t device, uint64_t end);
 /* Linux's btrfs_raid_array for a profile: the fewest devices it allocates
  * on, and whether it keeps a block through one lost copy (two copies or
  * parity). UNSUPPORTED for anything else. */

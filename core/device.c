@@ -1,7 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Devices joining and leaving a volume, as Linux's btrfs device add
- * (btrfs_init_new_device) and btrfs device remove (btrfs_rm_device). */
+ * (btrfs_init_new_device) and btrfs device remove (btrfs_rm_device), and
+ * changing size, as btrfs filesystem resize (btrfs_grow_device,
+ * btrfs_shrink_device). */
 #include "transaction.h"
+
+/* Linux's btrfs_ioctl_resize refuses smaller devices. */
+#define BT_RESIZE_MINIMUM (UINT64_C(256) << 20)
 
 enum btrfs_result
 bt_tx_add_device(struct btrfs_transaction *transaction, const struct btrfs_device *device,
@@ -257,7 +262,7 @@ btrfs_device_remove(const struct btrfs_environment *environment,
 	fs = NULL;
 	/* The device's groups move to the other devices first. */
 	if (error == BTRFS_OK) {
-		error = bt_relocate_device(environment, writer, id, BT_BALANCE_WORK, report);
+		error = bt_relocate_device(environment, writer, id, 0, BT_BALANCE_WORK, report);
 	}
 	if (error == BTRFS_OK) {
 		error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
@@ -278,5 +283,129 @@ btrfs_device_remove(const struct btrfs_environment *environment,
 	if (error == BTRFS_OK) {
 		error = bt_device_scratch(environment, writer, index, size);
 	}
+	return error;
+}
+
+enum btrfs_result
+bt_tx_resize_device(struct btrfs_transaction *transaction, uint64_t id, uint64_t size)
+{
+	struct bt_disk_device item;
+	const struct btrfs_fs *fs;
+	const struct bt_chunk *chunk;
+	struct bt_key key = { BT_DEV_ITEMS_OBJECTID, id, BT_DEV_ITEM };
+	uint64_t old;
+	uint64_t total;
+	size_t index;
+	size_t length;
+	size_t i;
+	unsigned stripe;
+	enum btrfs_result error;
+
+	if (transaction == NULL) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	if (transaction->failure != BTRFS_OK || transaction->finished) {
+		return transaction->failure == BTRFS_OK ? BTRFS_READ_ONLY : transaction->failure;
+	}
+	fs = &transaction->fs;
+	index = bt_tx_device_index(transaction, id);
+	if (index == fs->device_count) {
+		return BTRFS_NOT_FOUND;
+	}
+	if (transaction->adding || transaction->leaving != 0 || size % fs->info.sector_size != 0) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	/* No stripe may lie past the new end. */
+	for (i = 0; i < fs->chunk_count; i++) {
+		chunk = &fs->chunks[i];
+		for (stripe = 0; stripe < chunk->stripes; stripe++) {
+			if (chunk->devices[stripe] == index &&
+			    chunk->physical[stripe] + bt_chunk_stripe_length(chunk) > size) {
+				return BTRFS_INVALID_ARGUMENT;
+			}
+		}
+	}
+	error = bt_mutation_find(
+	    transaction->mutation, transaction->chunks, key, &item, sizeof(item), &length);
+	if (error != BTRFS_OK) {
+		return error == BTRFS_NOT_FOUND ? BTRFS_CORRUPT : error;
+	}
+	old = bt_u64(item.total_bytes);
+	total = bt_u64(transaction->super.total_bytes);
+	if (length != sizeof(item) || old > total || bt_u64(item.used_bytes) > size ||
+	    (size > old && size - old > UINT64_MAX - total)) {
+		return BTRFS_CORRUPT;
+	}
+	/* btrfs_update_device and the superblock's total. */
+	bt_put64(&item.total_bytes, size);
+	error = bt_tx_edit(transaction, &transaction->chunks, key, &item, sizeof(item), BT_REPLACE);
+	if (error != BTRFS_OK) {
+		return error;
+	}
+	bt_put64(&transaction->super.total_bytes, total - old + size);
+	transaction->targets[index].item.total_bytes = item.total_bytes;
+	transaction->targets[index].size = size;
+	transaction->changed = 1;
+	return BTRFS_OK;
+}
+
+enum btrfs_result
+btrfs_device_resize(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, uint64_t id, uint64_t size,
+    struct btrfs_balance_report *report)
+{
+	struct btrfs_transaction *transaction = NULL;
+	struct btrfs_fs *fs = NULL;
+	uint64_t old = 0;
+	uint64_t available = 0;
+	size_t index = 0;
+	enum btrfs_result error;
+
+	if (environment == NULL || writer == NULL || report == NULL ||
+	    writer->device_count != environment->device_count) {
+		return BTRFS_INVALID_ARGUMENT;
+	}
+	bt_zero(report, sizeof(*report));
+	error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
+	if (error == BTRFS_OK) {
+		for (index = 0; index < fs->device_count && fs->devices[index].id != id; index++) {
+		}
+		error = index == fs->device_count ? BTRFS_NOT_FOUND : BTRFS_OK;
+	}
+	if (error == BTRFS_OK) {
+		old = fs->devices[index].size;
+		available = index == 0 ? environment->size_bytes
+				       : environment->devices[index - 1].size_bytes;
+		/* btrfs_ioctl_resize: at least 256 MiB, at most the device, in
+		 * whole sectors. */
+		error = size < BT_RESIZE_MINIMUM ? BTRFS_INVALID_ARGUMENT
+		    : size > available		 ? BTRFS_RANGE
+						 : BTRFS_OK;
+		size &= ~((uint64_t)fs->info.sector_size - 1);
+	}
+	btrfs_unmount(fs);
+	fs = NULL;
+	if (error != BTRFS_OK || size == old) {
+		return error;
+	}
+	/* Shrinking moves the groups past the new end first. */
+	if (size < old) {
+		error = bt_relocate_device(environment, writer, id, size, BT_BALANCE_WORK, report);
+	}
+	if (error == BTRFS_OK) {
+		error = btrfs_mount(environment, BTRFS_TOP_LEVEL_TREE, &fs);
+	}
+	if (error == BTRFS_OK) {
+		error = btrfs_transaction_begin(fs, writer, &transaction);
+	}
+	if (error == BTRFS_OK) {
+		error = bt_tx_resize_device(transaction, id, size);
+	}
+	if (error == BTRFS_OK) {
+		error = btrfs_transaction_commit(transaction);
+		report->commits += error == BTRFS_OK;
+	}
+	btrfs_transaction_destroy(transaction);
+	btrfs_unmount(fs);
 	return error;
 }

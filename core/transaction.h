@@ -276,11 +276,17 @@ enum btrfs_result bt_tx_add_device(struct btrfs_transaction *transaction,
  * device item goes and the superblocks' device count and size shrink; its
  * own superblocks are not written. */
 enum btrfs_result bt_tx_remove_device(struct btrfs_transaction *transaction, uint64_t id);
-/* Relocates every group with a stripe on the device named id, the one
- * whose stripe there lies highest first, as Linux's btrfs_shrink_device
- * does, while no new chunk takes the device (core/balance.c). */
+/* Sets the size of the device named id, past which no stripe may lie: its
+ * device item and superblock item, and the superblocks' total, change; its
+ * superblock copies follow the new size. */
+enum btrfs_result bt_tx_resize_device(
+    struct btrfs_transaction *transaction, uint64_t id, uint64_t size);
+/* Relocates every group with a stripe on the device named id ending past
+ * limit (0: every one), the one whose stripe there lies highest first, as
+ * Linux's btrfs_shrink_device does, while no new chunk takes a stripe there
+ * past limit (core/balance.c). */
 enum btrfs_result bt_relocate_device(const struct btrfs_environment *environment,
-    const struct btrfs_write_environment *writer, uint64_t id, size_t work,
+    const struct btrfs_write_environment *writer, uint64_t id, uint64_t limit, size_t work,
     struct btrfs_balance_report *report);
 /* The index of the volume's device named id, or the device count. */
 size_t bt_tx_device_index(const struct btrfs_transaction *transaction, uint64_t id);

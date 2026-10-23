@@ -712,6 +712,19 @@ stays, as Linux leaves it. A crash before the last commit is durable leaves
 the volume with the device, which recovery without it refuses (UNSUPPORTED, a
 device is missing); afterwards recovery without it completes the commit.
 
+`btrfs_device_resize` is Linux's `btrfs filesystem resize` of one device: the
+size, in whole sectors, must be at least 256 MiB (INVALID_ARGUMENT) and at most
+what the device holds (RANGE), as `btrfs_ioctl_resize` requires. Growing
+records it in the device's chunk-tree and superblock items and the
+superblocks' total in one commit (`btrfs_grow_device`); shrinking first
+relocates every group with a stripe on the device ending past the new end,
+the highest first, while new chunks stay below it there
+(`bt_space_limit_device`), then records the size (`btrfs_shrink_device`). The
+device's superblock copies follow its new size. Superblock recovery takes the
+size and used bytes of a device whose copies all predate the selection from
+the selection's chunk tree, and only then requires the devices' sizes to sum
+to the volume's.
+
 ## Scrub
 
 `btrfs_scrub` is Linux's `btrfs scrub`, an explicit, exclusive operation: it

@@ -32,9 +32,10 @@ bt_recovery_read(void *context, uint64_t offset, void *buffer, size_t length)
 	return device->read(device->context, offset, buffer, length);
 }
 
-/* The used bytes of each device without a copy at the selected generation,
- * from the selection's chunk tree, whose device item must otherwise agree
- * with the device's own. */
+/* The size and used bytes of each device without a copy at the selected
+ * generation, from the selection's chunk tree (a commit may have resized
+ * the device or placed chunks on it), whose device item must otherwise
+ * name the same device. */
 static enum btrfs_result
 bt_recovery_items(const struct btrfs_fs *fs, struct bt_recovery_device *devices, size_t count)
 {
@@ -59,9 +60,10 @@ bt_recovery_items(const struct btrfs_fs *fs, struct bt_recovery_device *devices,
 			item = (const void *)record.data;
 			if (bt_key_compare(record.key, key) != 0 || record.size != sizeof(*item) ||
 			    !bt_equal(item->uuid, own->uuid, BTRFS_UUID_SIZE) ||
-			    bt_u64(item->total_bytes) != bt_u64(own->total_bytes)) {
+			    bt_u64(item->total_bytes) > devices[i].size) {
 				error = BTRFS_CORRUPT;
 			} else {
+				own->total_bytes = item->total_bytes;
 				own->used_bytes = item->used_bytes;
 				bt_super_seal(&devices[i].expected, BT_SUPER_OFFSET);
 			}
@@ -88,6 +90,7 @@ bt_recovery_validate(
 	struct bt_root roots = { 0 };
 	struct bt_root extents = { 0 };
 	uint8_t *node;
+	uint64_t total = 0;
 	size_t i;
 	enum btrfs_result error;
 
@@ -99,12 +102,23 @@ bt_recovery_validate(
 		further[i - 1].read = bt_recovery_read;
 	}
 	uncached.devices = count > 1 ? further : NULL;
-	error = bt_mount_super(&uncached, &devices[0].expected, BT_SUPER_OFFSET,
-	    BTRFS_TOP_LEVEL_TREE, bt_u64(devices[0].expected.log_root) != 0, &fs);
+	error =
+	    bt_mount_super(&uncached, &devices[0].expected, BT_SUPER_OFFSET, BTRFS_TOP_LEVEL_TREE,
+		BT_MOUNT_SIZES | (bt_u64(devices[0].expected.log_root) != 0 ? BT_MOUNT_LOGGED : 0U),
+		&fs);
 	if (error != BTRFS_OK) {
 		return error;
 	}
 	error = bt_recovery_items(fs, devices, count);
+	/* With every device's size known, they sum to the volume's. */
+	for (i = 0; error == BTRFS_OK && i < count; i++) {
+		total += bt_u64(devices[i].expected.device.total_bytes);
+		error = total < bt_u64(devices[i].expected.device.total_bytes) ? BTRFS_CORRUPT
+									       : BTRFS_OK;
+	}
+	if (error == BTRFS_OK && total != bt_u64(devices[0].expected.total_bytes)) {
+		error = BTRFS_CORRUPT;
+	}
 	if (error == BTRFS_OK) {
 		error = bt_find_root(fs, BT_DEV_TREE, &roots);
 	}
@@ -441,6 +455,11 @@ btrfs_recover_supers(const struct btrfs_environment *environment,
 	}
 	if (error == BTRFS_OK && stale != 0) {
 		error = bt_recovery_validate(environment, devices, count);
+		/* The selection's sizes fix the copies each device holds. */
+		if (error == BTRFS_OK) {
+			report->present = 0;
+			error = bt_recovery_compare(devices, count, report, &stale);
+		}
 		if (error == BTRFS_OK && writer == NULL) {
 			error = BTRFS_RECOVERY_REQUIRED;
 		}

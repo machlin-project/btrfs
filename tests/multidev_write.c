@@ -96,8 +96,11 @@
 #define BALANCE_EVERY_GROUP 101U
 /* No device of a volume has this id. */
 #define UNKNOWN_DEVICE UINT64_C(1000)
-/* With --devices, the UUID of the device added. */
+/* With --devices, the UUID of the device added, and resizes: below Linux's
+ * smallest, and the unit a shrink stops below the highest stripe in. */
 #define ADDED_UUID 0x7aU
+#define RESIZE_TOO_SMALL ((UINT64_C(256) << 20) - 4096U)
+#define RESIZE_BELOW (UINT64_C(1) << 20)
 
 struct file {
 	char path[MANIFEST_LINE];
@@ -722,8 +725,11 @@ mount_state(struct volume *state, struct btrfs_fs **fs, size_t *recoveries)
 		REQUIRE(btrfs_recover_supers(&environment, NULL, 0, &report) == BTRFS_OK &&
 		    report.rewritten == 0);
 		(*recoveries)++;
-	} else {
-		REQUIRE(result == BTRFS_OK);
+	} else if (result != BTRFS_OK) {
+		fprintf(stderr, "recovery of %zu devices: %s (copy %u of device %u selected)\n",
+		    state->members, btrfs_result_string(result), report.selected,
+		    report.selected_device);
+		exit(1);
 	}
 	REQUIRE(btrfs_mount(&environment, BTRFS_TOP_LEVEL_TREE, fs) == BTRFS_OK);
 }
@@ -1152,8 +1158,9 @@ magic_cleared(struct volume *volume, size_t image, unsigned mirror)
 
 /* With --devices: the spare image joins the volume (its device item as
  * Linux's btrfs_init_new_device writes one), a device of the volume cannot
- * join again, then the device the volume is mounted from leaves, every group
- * moving off it; both read as before and their crash states are checked. */
+ * join again, a device shrinks and grows back, with Linux's resize refusals,
+ * then the device the volume is mounted from leaves, every group moving off
+ * it; each reads as before and their crash states are checked. */
 static void
 devices_phase(struct volume *volume, struct model *model, const struct namespace_digest *expected,
     uint32_t *seed, size_t *states, size_t *recoveries, size_t *later, size_t *copies)
@@ -1175,12 +1182,18 @@ devices_phase(struct volume *volume, struct model *model, const struct namespace
 	uint64_t total;
 	uint64_t added = 0;
 	uint64_t removed;
+	uint64_t resized;
+	uint64_t shrunk = 0;
 	uint64_t size;
 	size_t spare = volume->devices - 1;
 	size_t first;
 	size_t count;
 	size_t leaving;
 	size_t i;
+	size_t j;
+	size_t target = 0;
+	uint64_t end;
+	unsigned stripe;
 
 	memset(uuid, ADDED_UUID, sizeof(uuid));
 	mount_volume(volume, 0, &fs);
@@ -1222,6 +1235,59 @@ devices_phase(struct volume *volume, struct model *model, const struct namespace
 	btrfs_unmount(fs);
 	check_device_crashes(
 	    volume, first, count, &before, expected, seed, states, recoveries, later);
+
+	/* The device whose stripes reach furthest shrinks to just below its
+	 * highest one, so that its group moves, and grows back to its whole
+	 * size. */
+	before.members = volume->members;
+	memcpy(before.member, volume->member, sizeof(before.member));
+	mount_volume(volume, 0, &fs);
+	for (j = 0; j < fs->chunk_count; j++) {
+		for (stripe = 0; stripe < fs->chunks[j].stripes; stripe++) {
+			end =
+			    fs->chunks[j].physical[stripe] + bt_chunk_stripe_length(&fs->chunks[j]);
+			if (end > shrunk) {
+				shrunk = end;
+				target = fs->chunks[j].devices[stripe];
+			}
+		}
+	}
+	resized = fs->devices[target].id;
+	size = fs->devices[target].size;
+	shrunk = (shrunk - RESIZE_BELOW) & ~(RESIZE_BELOW - 1);
+	REQUIRE(shrunk >= RESIZE_TOO_SMALL + 4096U);
+	btrfs_unmount(fs);
+	count = volume->count;
+	volume_environment(volume, 0, &environment, &writer, readers, writers);
+	REQUIRE(btrfs_device_resize(&environment, &writer, resized, RESIZE_TOO_SMALL, &report) ==
+	    BTRFS_INVALID_ARGUMENT);
+	REQUIRE(
+	    btrfs_device_resize(&environment, &writer, resized, size + 1, &report) == BTRFS_RANGE);
+	REQUIRE(btrfs_device_resize(&environment, &writer, UNKNOWN_DEVICE, size, &report) ==
+	    BTRFS_NOT_FOUND);
+	REQUIRE(volume->count == count);
+	for (i = 0; i < 2; i++) {
+		first = volume->count;
+		volume_environment(volume, 0, &environment, &writer, readers, writers);
+		REQUIRE(btrfs_device_resize(&environment, &writer, resized, i == 0 ? shrunk : size,
+			    &report) == BTRFS_OK);
+		REQUIRE(i == 1 || report.groups > 0);
+		mount_volume(volume, 0, &fs);
+		REQUIRE(fs->devices[target].id == resized &&
+		    fs->devices[target].size == (i == 0 ? shrunk : size));
+		for (j = 0; j < fs->chunk_count; j++) {
+			for (stripe = 0; stripe < fs->chunks[j].stripes; stripe++) {
+				end = fs->chunks[j].physical[stripe] +
+				    bt_chunk_stripe_length(&fs->chunks[j]);
+				REQUIRE(fs->chunks[j].devices[stripe] != target ||
+				    end <= fs->devices[target].size);
+			}
+		}
+		check_model(fs, model, i == 0 ? "device shrunk" : "device grown", copies);
+		btrfs_unmount(fs);
+		check_device_crashes(volume, first, volume->count, &before, expected, seed, states,
+		    recoveries, later);
+	}
 
 	/* The device the volume is mounted from leaves. */
 	mount_volume(volume, 0, &fs);
@@ -1558,10 +1624,11 @@ main(int argc, char **argv)
 		printf(
 		    "multi-device devices: %zu devices, %zu files; five commits read back as the "
 		    "model holds them and pass both audits (%zu checksummed copies); %zu crash "
-		    "states read as a commit, %zu taking a further transaction; a device joined "
-		    "and the first device left, every group moving off it, reading the same, as "
-		    "do %zu of their crash states (%zu with the devices after; %zu states after "
-		    "superblock recovery in all); refusals before any write PASS\n",
+		    "states read as a commit, %zu taking a further transaction; a device joined, "
+		    "another shrank below its highest group and grew back, and the first device "
+		    "left, every group moving off it, reading the same, as do %zu of their crash "
+		    "states (%zu with the devices after; %zu states after superblock recovery in "
+		    "all); refusals before any write PASS\n",
 		    devices, model.count, copies, states, resumed, device_states, later_states,
 		    recoveries);
 		return 0;
