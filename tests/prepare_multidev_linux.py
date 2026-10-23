@@ -12,7 +12,8 @@ snapshot), unmount, run `btrfs check --readonly --check-data-csum`, print
 the devices' chunk profiles and the manifest.
 
 verify: on images this implementation wrote, run the same check, mount,
-print the manifest, write a file, balance every group with Linux's own
+scrub every copy read-only (reporting whether Linux finds no errors), print
+the manifest, write a file, balance every group with Linux's own
 allocator (reporting whether it completes, since a full volume may refuse),
 print the chunk profiles, unmount and check again.
 
@@ -161,6 +162,11 @@ def verify_init(count: int) -> str:
 btrfs device scan
 btrfs check --readonly --check-data-csum /dev/vda
 mount -t btrfs -o noatime /dev/vda /mnt
+if btrfs scrub start -B -r /mnt > /tmp/scrub 2>&1 && grep -q 'no errors found' /tmp/scrub; then
+    echo BTRFS_MULTI_SCRUB_CLEAN
+else
+    sed 's/^/BTRFS_MULTI_SCRUB:/' /tmp/scrub
+fi
 manifest
 printf 'written after the check\\n' > /mnt/after-check
 sync

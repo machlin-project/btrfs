@@ -399,6 +399,10 @@ enum btrfs_result bt_raid56_rebuild(const struct btrfs_fs *fs, const struct bt_c
  * node is verified otherwise as any other. */
 #define BT_OWNER_ANY UINT64_MAX
 enum btrfs_result bt_tree_read(const struct btrfs_fs *fs, struct bt_root root, void *buffer);
+/* Verifies a node read from one copy as bt_tree_read verifies it: checksum,
+ * identity, level, generation, owner and items. */
+enum btrfs_result bt_tree_verify(
+    const struct btrfs_fs *fs, struct bt_root root, const uint8_t *block);
 /* bt_tree_read that returns a node in place when it can: *node is a stored
  * node, pinned until bt_tree_release(*handle), or buffer after a device read. */
 enum btrfs_result bt_tree_source(const struct btrfs_fs *fs, struct bt_root root, void *buffer,

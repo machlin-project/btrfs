@@ -411,6 +411,43 @@ relocate(const char *path, int argc, char **argv)
 /* Block groups the balance command lists or relocates at most. */
 #define INSPECT_GROUPS 4096U
 
+/* Explicit scrub: every copy of every tree block and checksummed data sector
+ * verified; with --apply, copies that fail are rewritten from good ones. */
+static int
+scrub(const char *path, int argc, char **argv)
+{
+	struct btrfs_scrub_report report;
+	struct btrfs_write_environment writer;
+	struct btrfs_image image;
+	int apply = argc == 1 && strcmp(argv[0], "--apply") == 0;
+	enum btrfs_result error;
+
+	if (argc > (apply ? 1 : 0)) {
+		fprintf(stderr, "Usage: btrfs-inspect IMAGE scrub [--apply]\n");
+		return 2;
+	}
+	if ((apply ? btrfs_image_open_writable(path, &image) : btrfs_image_open(path, &image)) !=
+	    0) {
+		perror("open image");
+		return 1;
+	}
+	btrfs_image_writer(&image, &writer);
+	error = btrfs_scrub(&image.environment, apply ? &writer : NULL, &report);
+	printf("{\"result\":\"%s\",\"apply\":%s,\"tree_copies\":%" PRIu64
+	       ",\"data_copies\":%" PRIu64 ",\"unchecked\":%" PRIu64 ",\"corrupted\":%" PRIu64
+	       ",\"unreadable\":%" PRIu64 ",\"repaired\":%" PRIu64 ",\"unrepairable\":%" PRIu64
+	       ",\"super_copies\":%" PRIu64 ",\"super_errors\":%" PRIu64 "}\n",
+	    btrfs_result_string(error), apply ? "true" : "false", report.tree_copies,
+	    report.data_copies, report.unchecked, report.corrupted, report.unreadable,
+	    report.repaired, report.unrepairable, report.super_copies, report.super_errors);
+	btrfs_image_close(&image);
+	if (image.live_allocations != 0 || image.live_bytes != 0) {
+		fprintf(stderr, "allocation leak\n");
+		return 1;
+	}
+	return error == BTRFS_OK ? 0 : 3;
+}
+
 /* Profiles btrfs-progs names after convert=. */
 static const struct {
 	const char *name;
@@ -609,6 +646,7 @@ main(int argc, char **argv)
 		    "btrfs-inspect IMAGE recover [--apply] [--acknowledged "
 		    "GENERATION]\n       btrfs-inspect IMAGE replay [--apply]\n       "
 		    "btrfs-inspect IMAGE relocate [--apply]\n       "
+		    "btrfs-inspect IMAGE scrub [--apply]\n       "
 		    "btrfs-inspect IMAGE balance [--apply [GROUP...|-d[ARGS] -m[ARGS] "
 		    "-s[ARGS]]]\n");
 		return 2;
@@ -624,6 +662,9 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[argument + 1], "balance") == 0) {
 		return balance(argv[argument], argc - argument - 2, argv + argument + 2);
+	}
+	if (strcmp(argv[argument + 1], "scrub") == 0) {
+		return scrub(argv[argument], argc - argument - 2, argv + argument + 2);
 	}
 	if (btrfs_image_open(argv[argument], &image) != 0) {
 		perror("open image");

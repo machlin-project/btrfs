@@ -13,7 +13,7 @@ sources = files('core/support.c', 'core/chunk.c', 'core/tree.c', 'core/mount.c',
   'core/data.c', 'core/fst.c', 'core/namespace.c', 'core/rename.c', 'core/subvolume.c', 'core/drop.c',
   'core/group.c', 'core/cache.c', 'core/checksum.c', 'core/replay.c', 'core/qgroup.c',
   'core/verity.c', 'core/heuristic.c', 'core/relocation.c', 'core/balance.c',
-  'core/device.c',
+  'core/device.c', 'core/scrub.c',
   'core/raid56.c')
 fuzz_flags = get_option('fuzzer') ? ['-fsanitize=fuzzer-no-link'] : []
 if get_option('fuzzer')
@@ -113,6 +113,9 @@ multidev_test = executable('btrfs-multidev-test', 'tests/multidev.c', 'tests/ref
 multidev_write_test = executable('btrfs-multidev-write-test', 'tests/multidev_write.c',
   'tests/references.c', 'tests/namespace_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
+scrub_test = executable('btrfs-scrub-test', 'tests/scrub.c', 'tests/references.c',
+  'tests/namespace_audit.c', include_directories: inc, link_with: [posix, core],
+  dependencies: [zlib, zstd])
 balance_test = executable('btrfs-balance-test', 'tests/balance.c', 'tests/references.c',
   'tests/namespace_audit.c', 'tests/qgroup_audit.c', include_directories: inc,
   link_with: [posix, core], dependencies: [zlib, zstd])
@@ -343,6 +346,20 @@ if fixtures != ''
     test(profile[0] + '-writes', multidev_write_test,
       args: profile[2] + [profile[0], join_paths(fixtures, profile[0] + '.expected.tsv'),
         '-'] + images, timeout: 1200, suite: 'images')
+  endforeach
+  # Scrub: one copy of every seventh tree block and checksummed data sector
+  # corrupted, found, and rewritten from a good copy where there is one.
+  foreach profile : [['multi-raid1', 2], ['multi-raid10', 4], ['multi-raid1c4', 4],
+      ['multi-raid0', 3], ['multi-raid5', 3], ['multi-raid6', 4], ['checksums-blake2', 1],
+      ['transactions', 1]]
+    images = []
+    foreach index : range(profile[1])
+      images += join_paths(fixtures, profile[1] == 1 ? profile[0] + '.raw'
+        : profile[0] + '-' + index.to_string() + '.raw')
+    endforeach
+    test('scrub-' + profile[0], scrub_test,
+      args: (profile[0] == 'transactions' ? ['--faults'] : []) +
+        [profile[0], meson.current_build_dir()] + images, timeout: 600, suite: 'images')
   endforeach
   # Balance: every block group relocated on its own, with its crash states,
   # then all in turn; the files read as before and sharing stays. A full

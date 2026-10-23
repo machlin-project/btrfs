@@ -111,6 +111,12 @@ bt_validate_node(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *
 	return built ? BTRFS_OK : bt_node_items(fs, block);
 }
 
+enum btrfs_result
+bt_tree_verify(const struct btrfs_fs *fs, struct bt_root root, const uint8_t *block)
+{
+	return bt_validate_node(fs, root, block, 0);
+}
+
 /* The shared cache holds only nodes committed in this view. */
 static struct btrfs_cache *
 bt_tree_cache(const struct btrfs_fs *fs, struct bt_root root)

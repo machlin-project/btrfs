@@ -712,6 +712,26 @@ stays, as Linux leaves it. A crash before the last commit is durable leaves
 the volume with the device, which recovery without it refuses (UNSUPPORTED, a
 device is missing); afterwards recovery without it completes the commit.
 
+## Scrub
+
+`btrfs_scrub` is Linux's `btrfs scrub`, an explicit, exclusive operation: it
+mounts the volume without the node cache, walks the extent tree, and reads
+every copy of every tree block it names from its device, verifying it as a
+read does (checksum, identity, level, the extent item's generation, owner and
+items), and every copy of every data sector with a checksum against it;
+sectors without one (NODATASUM, preallocated) are counted, not verified. Every
+superblock copy is checked and counted; `btrfs_recover_supers` resolves them.
+With a writer (every device's; not on a degraded mount), each copy that does
+not verify or cannot be read is rewritten in place from the first copy that
+verifies, the bytes the committed trees already name, and every device written
+gets a barrier; nothing else changes, so a crash during repair leaves the
+volume as it was or with more good copies. A RAID5/6 block or sector is read
+from its data stripe; its rebuilds from parity are read only when that fails
+and repair the data stripe, which parity still matches. Parity itself is not
+verified. CORRUPT reports a block or sector no copy of which verifies, a
+superblock copy that fails, or failed copies without a writer. `btrfs-inspect IMAGE scrub [--apply]` offers
+it for image files.
+
 ## Format features
 
 A metadata UUID (METADATA_UUID, `btrfstune -m`) separates the filesystem's

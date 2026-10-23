@@ -530,6 +530,22 @@ allocator) and an empty `cmp`. `BTRFS_MULTI_REBALANCED` reports that Linux's
 balance completed; `BTRFS_MULTI_REBALANCE_REFUSED` prints its error and the
 volume's usage, as a full volume may refuse for space.
 
+## Scrub
+
+`btrfs-scrub-test [--keep] NAME DIR IMAGE...` (`tests/scrub.c`) clones a
+volume's devices into DIR, scrubs it clean, then corrupts one copy of every
+seventh tree block that has another copy and of every seventh checksummed data
+sector where it lies (never two RAID5/6 data stripes of one row at one
+offset), and one superblock copy. A scrub without a writer must find every
+corrupted copy and write nothing; with a writer it must repair every one with
+a good copy and leave the rest; superblock recovery rewrites the superblock
+copy; then the volume reads as before and passes the reference audit. The
+`scrub-*` Meson tests run it on RAID1, RAID10, RAID1C4, RAID0 (data without
+another copy), RAID5, RAID6, DUP (`checksums-blake2`) and single
+(`transactions`) volumes and delete the clones; `--keep` leaves them for
+Linux, whose `verify` phase scrubs read-only first
+(`BTRFS_MULTI_SCRUB_CLEAN`).
+
 ## Balance
 
 `btrfs-balance-test IMAGE WORK [EXPORT]` (`tests/balance.c`) relocates every

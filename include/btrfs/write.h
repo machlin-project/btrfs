@@ -222,6 +222,39 @@ enum btrfs_result btrfs_balance(const struct btrfs_environment *environment,
     const struct btrfs_write_environment *writer, const struct btrfs_balance_args *args,
     struct btrfs_balance_report *report);
 
+struct btrfs_scrub_report {
+	/* Copies read and verified: of tree blocks, and of data sectors with
+	 * checksums. */
+	uint64_t tree_copies;
+	uint64_t data_copies;
+	/* Data sectors without checksums (NODATASUM, preallocated), unverified. */
+	uint64_t unchecked;
+	/* Copies that did not verify, and that could not be read. */
+	uint64_t corrupted;
+	uint64_t unreadable;
+	/* Copies rewritten from a copy that verifies. */
+	uint64_t repaired;
+	/* Tree blocks and data sectors no copy of which verifies. */
+	uint64_t unrepairable;
+	/* Superblock copies verified, and those that did not verify, which
+	 * btrfs_recover_supers resolves. */
+	uint64_t super_copies;
+	uint64_t super_errors;
+};
+
+/* Explicit, exclusive scrub, as Linux's btrfs scrub: every copy of every tree
+ * block and of every checksummed data sector the extent tree names is read
+ * from its device and verified as a read verifies it, and every superblock
+ * copy is checked. With a writer (every device's, not on a degraded mount:
+ * UNSUPPORTED), each copy that does not verify or cannot be read is rewritten
+ * in place from a copy that verifies, followed by a barrier on each device
+ * written; a NULL writer only inspects. RAID5/6 rebuilds from parity repair
+ * a data stripe; parity itself is not verified. CORRUPT when some block or
+ * sector has no copy that verifies, a superblock copy fails, or copies fail
+ * without a writer; report counts them. */
+enum btrfs_result btrfs_scrub(const struct btrfs_environment *environment,
+    const struct btrfs_write_environment *writer, struct btrfs_scrub_report *report);
+
 /* Linux's btrfs device add (btrfs_init_new_device): the device, read through
  * device and written through output, joins the volume the environment and
  * writer name (every device of it) with the next device id (*id) and uuid,
